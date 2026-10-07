@@ -395,13 +395,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// directory that a scan finds is asked from the backend and queued, for the next round.
   /// So the order holds for every directory: watch, commit, then scan.
   fn round(&mut self, path: &mut PathBuf, names: &mut Vec<ScanEntry>) {
-    let covers_more = self.commit();
+    let now_watched = self.commit();
     let mut scans = mem::take(&mut self.scans);
     self.tree.take_scans(&mut scans);
-    if covers_more {
-      // After `take_scans`: what this queues waits for the commit of the next round.
-      self.ask_again();
-    }
+    // After `take_scans`: what this queues waits for the commit of the next round.
+    self.ask_again(now_watched);
     for &(key, depth) in &scans {
       let Some(dir) = self.tree.get_mut(key).and_then(Node::dir_mut) else { continue };
       if let Some(queued) = &mut dir.scan {

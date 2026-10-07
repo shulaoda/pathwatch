@@ -25,8 +25,8 @@ impl Backend for PollBackend {
 
   fn unwatch(&mut self, _key: DirKey) {}
 
-  fn commit(&mut self) -> io::Result<()> {
-    Ok(())
+  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
+    Ok(Vec::new())
   }
 
   fn translate(&mut self, raw: Self::Raw, _hint: &mut dyn FnMut(Hint<'_>)) {

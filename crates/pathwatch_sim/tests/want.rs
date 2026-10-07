@@ -589,12 +589,14 @@ fn a_polled_directory_is_asked_again_when_a_stream_above_it_starts() {
   d.fs.mkdir("/p/a/b").unwrap();
   d.fs.write("/p/a/b/f.js", "22").unwrap();
 
-  // `/p` tells its contents now, with a stream. `/` and `/p/a` are asked again: `/p/a` lies
-  // below the new stream, and its look after the commit finds the other directory.
+  // `/p` tells its contents now, with a stream. `/p/a` lies below the new stream, so it is
+  // asked again, and its look after the commit finds the other directory. `/` lies above the
+  // stream and is not asked again.
   d.watch(&["/p/x.js"]);
   let calls = asked(&d.fs);
-  let again = [at("/p", Some(Contents)), at("/", Some(Names)), at("/p/a", Some(Names))];
-  assert!(calls.windows(3).any(|calls| calls == again), "{calls:?}");
+  let again = [at("/p", Some(Contents)), at("/p/a", Some(Names))];
+  assert!(calls.windows(2).any(|calls| calls == again), "{calls:?}");
+  assert_eq!(calls.iter().filter(|call| **call == at("/", Some(Names))).count(), 1, "{calls:?}");
   assert_eq!(settled(&mut d), ["U /p/a/b/f.js"]);
   // Only `/` is polled now: it is looked at, and `p` in it.
   assert_eq!(lstats_of_the_next_poll(&mut d), 2);

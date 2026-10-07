@@ -575,10 +575,9 @@ is this timer with the poll backend.**
 
 **Asked again.** `NotWatched` is not for ever. A commit can start an OS watch for a tree that
 holds a polled directory (FSEvents: a stream path that went up to a common directory, or a
-watched path higher up). The backend says so (`Backend::covers_more`), and the engine calls
-`watch` again for each polled directory that was asked before (`ask_again`). One that is
-reported now gets a shallow scan after the next commit (watch, commit, then scan), and no poll
-looks at it any more.
+watched path higher up). Then `commit` returns the keys of these directories, and the engine
+calls `watch` again for each of them (`ask_again`). One that is reported now gets a shallow
+scan after the next commit (watch, commit, then scan), and no poll looks at it any more.
 
 **A directory that was renamed away and back.** A watch by path (FSEvents) stands at a path.
 When a directory above it is renamed away, changed, and renamed back, the stream heard nothing,
@@ -736,10 +735,11 @@ The time is the time of the looks at the disk. What the backend takes to make wa
 ## 6. Backend interface
 
 `crates/pathwatch/src/backend.rs`. The trait has four methods that every backend writes
-(`watch`, `unwatch`, `commit`, `translate`), `raw_bytes`, which says how many bytes a raw
-notification keeps on the heap (5.13), and `covers_more`, which says that the last commit made
-the backend report a directory that got `NotWatched` before (5.10, "Asked again"). The rules for a backend are the doc comment of the
-trait, as one list of 12. That list is the one place for them.
+(`watch`, `unwatch`, `commit`, `translate`), and `raw_bytes`, which says how many bytes a raw
+notification keeps on the heap (5.13). `commit` returns the keys of the directories that got
+`NotWatched` before and that the backend reports now (5.10, "Asked again"). The rules for a
+backend are the doc comment of the trait, as one list of 12. That list is the one place for
+them.
 
 ## 7. Backends
 

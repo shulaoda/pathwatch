@@ -17,8 +17,8 @@ use std::{fmt, io, path::Path, sync::Arc};
 ///    now. If that needs a new OS watch, the new one is live before the old one goes.
 /// 4. **The answer is the truth.** [`Coverage`] says which changes make hints from now on. After
 ///    `NotWatched` or `Failed` nothing is watched for the key. A `commit` can make an OS watch
-///    report a directory that got `NotWatched` before: then [`Backend::covers_more`] says so,
-///    and the engine asks again for the directories that it polls.
+///    report a directory that got `NotWatched` before: then `commit` returns its key, and the
+///    engine asks for it again.
 /// 5. **Want.** For one key the [`Want`] only goes up, until `unwatch(key)`. More hints than
 ///    asked for are fine, fewer are not.
 /// 6. **Keys.** One OS watch can serve several keys: two spellings of one directory, or a renamed
@@ -47,18 +47,14 @@ pub trait Backend: Send + 'static {
 
   /// Make every watch asked for since the last call live. On an error none of them is.
   ///
-  /// Only a backend that starts one OS watch for many directories (FSEvents) has work here.
-  fn commit(&mut self) -> io::Result<()>;
-
-  /// Whether the last `commit` started an OS watch that reports a directory that got
-  /// `NotWatched` before. Then the engine calls `watch` again for each directory that it polls,
-  /// with the `Want` of before. One that is reported now is not polled any more.
+  /// Returns the keys that got `NotWatched` and whose directories an OS watch reports now. The
+  /// engine calls `watch` again for each of them, with the `Want` of before, and does not poll
+  /// one that is reported.
   ///
-  /// Only a backend whose answer for a directory depends on the OS watches of other
-  /// directories (FSEvents) says yes.
-  fn covers_more(&self) -> bool {
-    false
-  }
+  /// Only a backend that starts one OS watch for many directories (FSEvents) has work here,
+  /// and only such a backend returns a key: its answer for a directory depends on the OS
+  /// watches of other directories.
+  fn commit(&mut self) -> io::Result<Vec<DirKey>>;
 
   /// Turn one raw notification into hints.
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>));

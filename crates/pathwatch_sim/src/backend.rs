@@ -54,8 +54,6 @@ pub struct SimBackend {
   below: FxHashMap<DirKey, PathBuf>,
   /// By prefix: the real directory of each key that got `NotWatched`.
   not_watched: FxHashMap<DirKey, PathBuf>,
-  /// By prefix: the last `commit` started a stream above one of them.
-  covers_more: bool,
 }
 
 impl SimBackend {
@@ -70,7 +68,6 @@ impl SimBackend {
       pending: Vec::new(),
       below: FxHashMap::default(),
       not_watched: FxHashMap::default(),
-      covers_more: false,
     }
   }
 }
@@ -123,9 +120,8 @@ impl Backend for SimBackend {
     self.unbind(key);
   }
 
-  fn commit(&mut self) -> io::Result<()> {
+  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
     self.fs.enter(|calls| calls.commit += 1);
-    self.covers_more = false;
     let pending = mem::take(&mut self.pending);
     let mut state = self.fs.lock();
     let kernel = &mut state.kernel;
@@ -143,7 +139,8 @@ impl Backend for SimBackend {
       return Err(watch_limit("no room for one more stream"));
     }
     let is_new = |dir: &Path| new.iter().any(|stream| dir.starts_with(stream));
-    self.covers_more = self.not_watched.values().any(|dir| is_new(dir));
+    let now_streamed: Vec<DirKey> =
+      self.not_watched.iter().filter(|(_, dir)| is_new(dir)).map(|(&key, _)| key).collect();
     let mut bound = Vec::new();
     for (key, real) in pending {
       let next = &mut kernel.next_stream;
@@ -172,11 +169,7 @@ impl Backend for SimBackend {
     for (key, old) in left {
       self.leave(key, old);
     }
-    Ok(())
-  }
-
-  fn covers_more(&self) -> bool {
-    self.covers_more
+    Ok(now_streamed)
   }
 
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {

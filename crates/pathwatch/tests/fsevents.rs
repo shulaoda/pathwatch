@@ -132,8 +132,9 @@ impl Harness {
     key
   }
 
-  fn commit(&mut self) {
-    self.backend.commit().unwrap();
+  /// Says which keys that got `NotWatched` a stream reports now.
+  fn commit(&mut self) -> Vec<DirKey> {
+    self.backend.commit().unwrap()
   }
 
   /// Watches a directory of the playground, and waits until the records from before the watch
@@ -974,9 +975,7 @@ fn many_covers_share_stream_paths_on_common_directories() {
   let group = DirKey::new(1000, 0);
   let coverage = h.backend.watch(group, &h.path("g0"), Want::Names);
   assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
-  assert!(!h.backend.covers_more());
-  h.commit();
-  assert!(h.backend.covers_more());
+  assert_eq!(h.commit(), [group]);
   assert_eq!(h.backend.stream_count(), 1);
   // The groups go up one after the other, in path order, until the paths fit: three groups
   // are one path each, and the directories of the last one keep their own.
@@ -992,8 +991,7 @@ fn many_covers_share_stream_paths_on_common_directories() {
   let group = h.watch(1000, &h.path("g0"), Want::Names);
   let coverage = h.backend.watch(DirKey::new(1001, 0), &h.path(""), Want::Names);
   assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
-  h.commit();
-  assert!(!h.backend.covers_more());
+  assert_eq!(h.commit(), []);
   assert_eq!(h.backend.stream_count(), 1);
 
   // Each key gets the path below its own directory, also where a path is shared.
@@ -1016,8 +1014,7 @@ fn many_covers_share_stream_paths_on_common_directories() {
   // One more directory below a shared path needs no new stream.
   let new = h.watch(2000, &h.path("g0/apart"), Want::Contents);
   assert_eq!(h.backend.pending(), NO_PATHS);
-  h.commit();
-  assert!(!h.backend.covers_more());
+  assert_eq!(h.commit(), []);
   assert_eq!(h.backend.stream_count(), 1);
   File::create(h.path("g0/apart/new")).unwrap();
   h.hints_until(&[changed(new, "new"), changed(group, "apart/new")]);

@@ -39,7 +39,6 @@ pub struct FsEventsBackend {
   covers: Covers,
   streams: Streams,
   not_watched: FxHashMap<DirKey, PathBuf>,
-  covers_more: bool,
   last_parent: Option<RealParent>,
 }
 
@@ -49,7 +48,6 @@ impl FsEventsBackend {
       covers: Covers::default(),
       streams: Streams::new(sink)?,
       not_watched: FxHashMap::default(),
-      covers_more: false,
       last_parent: None,
     })
   }
@@ -84,24 +82,20 @@ impl Backend for FsEventsBackend {
     self.covers.remove(key);
   }
 
-  fn commit(&mut self) -> io::Result<()> {
+  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
     self.streams.stop_retired();
-    self.covers_more = false;
     self.last_parent = None;
     if self.streams.pending.is_empty() {
-      return Ok(());
+      return Ok(Vec::new());
     }
-    let result = self.streams.start_pending(&self.covers);
+    let started = self.streams.start_pending(&self.covers);
     let streamed = &self.streams.paths;
-    match result {
-      Ok(()) => self.covers_more = self.not_watched.values().any(|dir| streamed.holds(dir)),
-      Err(_) => self.covers.retain(|dir| streamed.holds(dir)),
+    if let Err(error) = started {
+      self.covers.retain(|dir| streamed.holds(dir));
+      return Err(error);
     }
-    result
-  }
-
-  fn covers_more(&self) -> bool {
-    self.covers_more
+    let now_streamed = self.not_watched.iter().filter(|(_, dir)| streamed.holds(dir));
+    Ok(now_streamed.map(|(&key, _)| key).collect())
   }
 
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {

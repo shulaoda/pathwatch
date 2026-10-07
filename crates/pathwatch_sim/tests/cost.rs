@@ -197,7 +197,7 @@ impl<B: Backend> Backend for Timed<B> {
     timed(&self.outside, || self.inner.unwatch(key));
   }
 
-  fn commit(&mut self) -> io::Result<()> {
+  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
     timed(&self.outside, || self.inner.commit())
   }
 
@@ -235,8 +235,8 @@ impl Backend for ByHand {
 
   fn unwatch(&mut self, _key: DirKey) {}
 
-  fn commit(&mut self) -> io::Result<()> {
-    Ok(())
+  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
+    Ok(Vec::new())
   }
 
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {

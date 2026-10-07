@@ -114,18 +114,21 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       && (self.tree[key].is_ancestor() || !self.ignores(key, path, EntryKind::Dir))
   }
 
-  /// Makes the watches asked for since the last commit live. `true`: the backend reports more
-  /// directories now than its answers said (see `ask_again`).
-  pub(super) fn commit(&mut self) -> bool {
+  /// Makes the watches asked for since the last commit live. Gives the directories that the
+  /// backend did not watch and that it reports now (see `ask_again`).
+  pub(super) fn commit(&mut self) -> Vec<DirKey> {
     if self.backend_failed {
-      return false;
+      return Vec::new();
     }
     let started = self.fs.now();
     let committed = self.backend.commit();
     // Making watches live can take long: a new stream of FSEvents takes a quarter of a
     // second. That is paid once, not for every look at the disk, so the pacing leaves it out.
     self.commit_took += self.fs.now().duration_since(started).unwrap_or_default();
-    let Err(error) = committed else { return self.backend.covers_more() };
+    let error = match committed {
+      Ok(now_watched) => return now_watched,
+      Err(error) => error,
+    };
     // None of the watches asked for since the last commit is live. `ask` queued each of those
     // nodes for a scan, so they are all in the queue. A node in the queue that was asked
     // earlier is taken for failed too: it is polled and asked again, which loses nothing.
@@ -142,20 +145,17 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         self.set_watch(key, Coverage::Failed(error), &path);
       }
     }
-    false
+    Vec::new()
   }
 
-  /// Asks the backend again for every directory that is polled because the backend said
-  /// `NotWatched`: an OS watch that the last commit started may report it now.
+  /// Asks the backend again for each of these directories: it said `NotWatched` for them, and
+  /// an OS watch that the last commit started reports them now.
   ///
   /// A directory that is reported now is scanned once after the next commit, as after every
   /// ask: watch, commit, then scan. From then on no poll looks at it.
-  pub(super) fn ask_again(&mut self) {
-    self.tree.tidy_polled();
-    // Only the directories that are on the list now: `set_watch` can put one on it.
-    for index in 0..self.tree.polled.len() {
-      let key = self.tree.polled[index];
-      let Some(dir) = self.tree[key].dir() else { continue };
+  pub(super) fn ask_again(&mut self, keys: Vec<DirKey>) {
+    for key in keys {
+      let Some(dir) = self.tree.get(key).and_then(Node::dir) else { continue };
       let (Watch::Polled, Some(want)) = (dir.watch, dir.asked) else { continue };
       let path = self.tree.path(key);
       let answer = self.backend.watch(key, &path, want);
