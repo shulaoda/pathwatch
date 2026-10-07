@@ -66,6 +66,30 @@ impl FsEventsBackend {
     })
   }
 
+  pub fn stream_count(&self) -> usize {
+    self.streams.running.len()
+  }
+
+  pub fn retiring_count(&self) -> usize {
+    self.streams.retiring.len()
+  }
+
+  pub fn covers(&self) -> Vec<&Path> {
+    self.covers.by_dir.paths()
+  }
+
+  pub fn cover_of_key(&self) -> &FxHashMap<DirKey, PathBuf> {
+    &self.covers.dir_of
+  }
+
+  pub fn streamed(&self) -> Vec<&Path> {
+    self.streams.paths.paths()
+  }
+
+  pub fn pending(&self) -> Vec<&Path> {
+    self.streams.pending.paths()
+  }
+
   fn real_path(&mut self, dir: &Path, want: Want) -> io::Result<PathBuf> {
     let real = match (want, dir.parent(), dir.file_name()) {
       (Want::Contents, Some(parent), Some(name)) => {
@@ -169,32 +193,6 @@ impl Backend for FsEventsBackend {
 
   fn raw_bytes(raw: &Self::Raw) -> usize {
     raw.paths.len() + size_of_val(raw.records.as_slice())
-  }
-}
-
-impl FsEventsBackend {
-  pub fn stream_count(&self) -> usize {
-    self.streams.running.len()
-  }
-
-  pub fn retiring_count(&self) -> usize {
-    self.streams.retiring.len()
-  }
-
-  pub fn covers(&self) -> Vec<&Path> {
-    self.covers.by_dir.paths()
-  }
-
-  pub fn cover_of_key(&self) -> &FxHashMap<DirKey, PathBuf> {
-    &self.covers.dir_of
-  }
-
-  pub fn streamed(&self) -> Vec<&Path> {
-    self.streams.paths.paths()
-  }
-
-  pub fn pending(&self) -> Vec<&Path> {
-    self.streams.pending.paths()
   }
 }
 
