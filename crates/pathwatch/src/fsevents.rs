@@ -16,10 +16,7 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-use crate::{
-  backend::{Backend, Coverage, DirKey, Hint, Sink, Want, watch_limit},
-  placement::place,
-};
+use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want, watch_limit};
 
 /// With this many streams running, a `commit` does not add one more: it starts new streams for
 /// all covers in their place.
@@ -66,7 +63,7 @@ pub mod flag {
 /// - A cover that no stream reports yet becomes a stream path at the next `commit`. Streams are
 ///   only added, so a cover is never without one.
 /// - With more than [`MAX_STREAM_PATHS`] stream paths, they go up to directories that the
-///   covers have in common ([`place`]), but never to a directory that is too high (see
+///   covers have in common (`place`), but never to a directory that is too high (see
 ///   `is_too_high`). A cover below a running stream path needs no new stream.
 /// - A stream path can report much that no cover holds. A record goes to the keys of the covers
 ///   that hold its path, and to nobody else.
@@ -386,11 +383,9 @@ impl FsEventsBackend {
   /// The stream paths for the covers of now: at most [`MAX_STREAM_PATHS`], if the covers can go
   /// up to common directories that are not too high. Every cover is at or below one of them.
   fn stream_paths(&self) -> Vec<PathBuf> {
-    // Every cover counts as one that wants the contents: its key was told that a stream reports
-    // its whole tree, whatever it asked for.
-    let wanted: Vec<(DirKey, &Path, Want)> =
-      self.cover_of_key.iter().map(|(&key, real)| (key, real.as_path(), Want::Contents)).collect();
-    place(&wanted, MAX_STREAM_PATHS, is_too_high).into_iter().map(|place| place.dir).collect()
+    // Every cover counts, whatever its key asked for: the key was told that a stream reports
+    // its whole tree.
+    place(self.cover_of_key.values().map(PathBuf::as_path), MAX_STREAM_PATHS)
   }
 
   /// Starts the streams for `paths`: all of them, or none. It is one stream for every
@@ -549,6 +544,80 @@ pub fn is_too_high(dir: &Path) -> bool {
     [b"private", b"var", b"folders", below @ ..] => below.len() <= 3,
     _ => false,
   }
+}
+
+/// Decides where the stream paths go for `covers`. No stream path is below another, and every
+/// cover is at or below one. The same covers give the same stream paths, in whatever order they
+/// come. It is the rule for the handles of the Windows backend (`place` in `windows.rs`).
+///
+/// 1. Each cover with no other cover above it is a stream path.
+/// 2. If that makes more than `max` stream paths, paths go up to a directory that they have in
+///    common and become one: the deepest common directory first, and of two that are equally
+///    deep the first in path order. So the stream paths stay as low as the limit allows.
+/// 3. No path goes up to a directory that is too high ([`is_too_high`]). So more than `max`
+///    stream paths can be left.
+fn place<'a>(covers: impl Iterator<Item = &'a Path>, max: usize) -> Vec<PathBuf> {
+  // Paths sort part by part, so everything below a path comes right after it.
+  let mut tops: Vec<&Path> = covers.collect();
+  tops.sort_unstable();
+  tops.dedup_by(|cover, top| cover.starts_with(top));
+
+  // `shared[i]`: how many parts the tops `i` and `i + 1` have in common at their start. The
+  // directory made of these parts is the lowest one that holds both. `joined[i]`: one stream
+  // path reports both.
+  let shared: Vec<usize> = tops.windows(2).map(|pair| common_parts(pair[0], pair[1])).collect();
+  let mut joined = vec![false; shared.len()];
+  let mut count = tops.len();
+  let mut depths = shared.clone();
+  depths.sort_unstable_by(|a, b| b.cmp(a));
+  depths.dedup();
+  'deepest_first: for depth in depths {
+    let mut at = 0;
+    while at < shared.len() {
+      // The tops `at..=end` are all the tops below one directory of `depth` parts.
+      let end = at + shared[at..].iter().take_while(|&&parts| parts >= depth).count();
+      if end == at {
+        at += 1;
+        continue;
+      }
+      if count <= max {
+        break 'deepest_first;
+      }
+      // Two of them part right below that directory: it is the lowest one that holds them
+      // all. If they all go on together, a directory below it holds them, and its turn was
+      // before.
+      if shared[at..end].contains(&depth) && !is_too_high(&first_parts(tops[at], depth)) {
+        for joined in &mut joined[at..end] {
+          count -= usize::from(!*joined);
+          *joined = true;
+        }
+      }
+      at = end;
+    }
+  }
+
+  // One stream path for each run of joined tops, on the directory that the whole run has in
+  // common.
+  let mut paths = Vec::with_capacity(count);
+  let mut first = 0;
+  while first < tops.len() {
+    let pairs = joined[first..].iter().take_while(|&&joined| joined).count();
+    paths.push(match shared[first..first + pairs].iter().min() {
+      Some(&parts) => first_parts(tops[first], parts),
+      None => tops[first].to_owned(),
+    });
+    first += pairs + 1;
+  }
+  paths
+}
+
+/// How many parts the two paths have in common at their start.
+fn common_parts(a: &Path, b: &Path) -> usize {
+  a.components().zip(b.components()).take_while(|(a, b)| a == b).count()
+}
+
+fn first_parts(path: &Path, count: usize) -> PathBuf {
+  path.components().take(count).collect()
 }
 
 /// Drops every path that lies below another path of the list: a stream for the upper one
@@ -1016,7 +1085,50 @@ unsafe extern "C" {
 mod tests {
   use std::path::{Path, PathBuf};
 
-  use super::{Dirs, is_too_high, top_most};
+  use super::{Dirs, is_too_high, place, top_most};
+
+  fn paths(paths: &[&str]) -> Vec<PathBuf> {
+    paths.iter().map(PathBuf::from).collect()
+  }
+
+  /// The stream paths for these covers.
+  fn placed(covers: &[&str], max: usize) -> Vec<PathBuf> {
+    place(covers.iter().map(Path::new), max)
+  }
+
+  #[test]
+  fn each_cover_with_no_cover_above_it_is_a_stream_path_while_there_is_room() {
+    let mut covers =
+      ["/Users/me/p/b", "/Users/me/p/a/x", "/Users/me/p/ab", "/Users/me/p/a", "/Users/me/p/a"];
+    // `/Users/me/p/ab` is not below `/Users/me/p/a`: paths are compared part by part.
+    let expected = paths(&["/Users/me/p/a", "/Users/me/p/ab", "/Users/me/p/b"]);
+    assert_eq!(placed(&covers, 3), expected);
+    covers.reverse();
+    assert_eq!(placed(&covers, 3), expected);
+    assert_eq!(placed(&[], 3), paths(&[]));
+  }
+
+  #[test]
+  fn more_covers_than_stream_paths_share_the_lowest_common_directories() {
+    let covers =
+      ["/Users/me/p/a/1", "/Users/me/p/a/2", "/Users/me/p/b/1", "/Users/me/p/b/2", "/Users/me/q"];
+    assert_eq!(placed(&covers, 5), paths(&covers));
+    // Of two common directories that are equally deep, the first in path order is taken.
+    assert_eq!(
+      placed(&covers, 4),
+      paths(&["/Users/me/p/a", "/Users/me/p/b/1", "/Users/me/p/b/2", "/Users/me/q"])
+    );
+    assert_eq!(placed(&covers, 3), paths(&["/Users/me/p/a", "/Users/me/p/b", "/Users/me/q"]));
+    assert_eq!(placed(&covers, 2), paths(&["/Users/me/p", "/Users/me/q"]));
+  }
+
+  #[test]
+  fn no_stream_path_goes_up_to_a_directory_that_is_too_high() {
+    // `/Users/me` is all that `p` and `q` have in common, so more than `max` are left.
+    let covers = ["/Users/me/p/a", "/Users/me/p/b", "/Users/me/q"];
+    assert_eq!(placed(&covers, 1), paths(&["/Users/me/p", "/Users/me/q"]));
+    assert_eq!(placed(&covers, 0), paths(&["/Users/me/p", "/Users/me/q"]));
+  }
 
   #[test]
   fn top_most_drops_what_lies_below_another_path() {

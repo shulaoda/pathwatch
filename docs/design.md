@@ -797,8 +797,8 @@ As built:
 - **Stream paths.** A stream path is a directory that a stream was started for. Usually it is a
   cover with no cover above it. With more than 64 stream paths (`MAX_STREAM_PATHS`; the probe
   above: up to 100 paths cost nothing), a commit places all covers again by the rule of
-  `placement::place`, the same rule as for the handles of Windows: paths go up to directories
-  that covers have in common, the deepest first, until 64 are left. A path never goes up to a
+  `place`, the same rule as for the handles of Windows: paths go up to directories that covers
+  have in common, the deepest first, until 64 are left. A path never goes up to a
   directory that is too high (`is_too_high`): `/`, a directory in `/`, one more name down (a
   home, the top of a volume, `/private/tmp`), and the temporary directory of a user with the
   directories above it. Where only such a directory would do, the paths stay apart. A cover

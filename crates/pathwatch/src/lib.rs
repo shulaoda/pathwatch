@@ -106,8 +106,6 @@ pub mod fsevents;
 #[doc(hidden)]
 pub mod inotify;
 #[doc(hidden)]
-pub mod placement;
-#[doc(hidden)]
 pub mod poll;
 #[doc(hidden)]
 pub mod windows;
