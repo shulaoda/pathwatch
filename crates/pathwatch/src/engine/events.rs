@@ -1,0 +1,178 @@
+//! The events of one flush, and the delete delay.
+//!
+//! A check makes no event: it changes the node and puts it on the list `Engine::touched`.
+//! `finish` reads each touched node once, so a path gets one event for a flush.
+
+use std::time::Instant;
+
+use super::{Engine, Output};
+use crate::{
+  backend::{Backend, DirKey},
+  event::{Event, EventKind},
+  fs::Fs,
+  tree::{Added, Dir, Kind, Mark, Node, Watch, emptied},
+};
+
+impl<B: Backend, F: Fs> Engine<B, F> {
+  /// Reads every node that the flush touched and hands the events over as one batch. Also the
+  /// end of the baseline of a `watch` call. A node that nothing needs any more is freed.
+  pub(super) fn finish(&mut self, out: &mut Output) {
+    let mut touched = std::mem::take(&mut self.touched);
+    for key in touched.drain(..) {
+      // No node: it was freed, or it is on the list twice.
+      let Some(node) = self.tree.get_mut(key) else { continue };
+      let kind = event_of(node);
+      node.set_told(matches!(node.kind, Kind::File(_)));
+      node.set_changed(false);
+      node.set_added(Added::No);
+      node.set_baseline(false);
+      if let Some(kind) = kind {
+        // Built in the buffer, so that the path of the event is one allocation of its size.
+        self.tree.path_into(key, &mut self.path);
+        out.events.push(Event { path: self.path.clone(), kind });
+      }
+      self.tree.prune(key);
+    }
+    self.touched = emptied(touched);
+    out.errors.append(&mut self.errors);
+  }
+
+  /// Nothing is at the node `key`, and the tree has a file or a directory there.
+  ///
+  /// The first look only holds the node: `Node::told`, the fingerprint and everything below
+  /// stay as they are. The second look, one delete delay later, decides: still nothing is a
+  /// `Delete`, and a file that is back is compared with what was there before.
+  pub(super) fn missing(&mut self, key: DirKey) {
+    let now = self.now.expect("a check runs inside a flush");
+    let delay = self.options.delete_delay;
+    let node = &self.tree[key];
+    // The handler does not know the file, so there is no `Delete` to hold back.
+    let unknown_file = matches!(node.kind, Kind::File(_)) && !node.told();
+    match self.tree.held_until(key) {
+      Some(until) if until > now => {}
+      None if !delay.is_zero() && !unknown_file => self.hold(key, now + delay),
+      _ => self.gone(key),
+    }
+  }
+
+  /// Holds the node `key` until `until`. For a directory, the backend forgets its watch now:
+  /// if the directory comes back, it is watched again and scanned deep.
+  fn hold(&mut self, key: DirKey, until: Instant) {
+    if let Kind::Dir(dir) = &mut self.tree[key].kind {
+      let asked = dir.asked.is_some();
+      // No OS watch covers it from now on. That is what the node says if its hold ends
+      // without a look, because a node above is held too.
+      *dir = Dir { watch: Watch::Polled, ..Dir::new(dir.id, dir.complete) };
+      if asked && !self.backend_failed {
+        self.backend.unwatch(key);
+      }
+    }
+    self.tree.list_if_polled(key);
+    self.tree.hold(key, until);
+    self.hold_queue.push_back((until, key));
+  }
+
+  /// What the tree has at the node `key` is gone for good.
+  pub(super) fn gone(&mut self, key: DirKey) {
+    match self.tree[key].kind {
+      Kind::File(_) => self.forget_file(key),
+      Kind::Dir(_) => self.vanish(key),
+      Kind::Missing => {}
+    }
+  }
+
+  /// No file is at the node `key` any more. If the handler believes in one, the end of the
+  /// flush tells it.
+  pub(super) fn forget_file(&mut self, key: DirKey) {
+    self.tree[key].kind = Kind::Missing;
+    self.tree.set_content(key, None);
+    self.tree.unhold(key);
+    self.touched.push(key);
+  }
+
+  /// The time of the next second look.
+  pub(super) fn next_hold(&self) -> Option<Instant> {
+    self.hold_queue.front().map(|(until, _)| *until)
+  }
+
+  /// Marks each held node whose time is over for its second look. `true`: there is one, so a
+  /// flush has to run.
+  pub(super) fn mark_due_holds(&mut self, now: Instant) -> bool {
+    let mut any = false;
+    while let Some(&(until, key)) = self.hold_queue.front()
+      && until <= now
+    {
+      self.hold_queue.pop_front();
+      // Not when the tree has another time for the node, or none: the hold is over, or the
+      // node was held again later.
+      if self.tree.held_until(key) == Some(until) {
+        self.tree.mark(key, Mark::default());
+        any = true;
+      }
+    }
+    any
+  }
+}
+
+/// The event that is due for a node at the end of a flush: what the handler believes against
+/// what is at the node now, whatever happened in between.
+fn event_of(node: &Node) -> Option<EventKind> {
+  // A held file is still a file here: its `Delete` waits.
+  let is_file = matches!(node.kind, Kind::File(_));
+  match (node.told(), is_file) {
+    (true, false) => Some(EventKind::Delete),
+    // The baseline of a `watch` call is known without an event.
+    (false, true) if !node.baseline() => Some(EventKind::Create),
+    (true, true) if node.changed() => Some(EventKind::Update),
+    _ => None,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::ffi::OsStr;
+
+  use super::event_of;
+  use crate::{
+    event::EventKind::{Create, Delete, Update},
+    fs::DirId,
+    tree::{Dir, Fingerprint, Kind, Tree},
+  };
+
+  /// What the changes of one path inside one flush come to. The first one decides what the
+  /// handler believed before the flush (`told`), and the last one what is at the node at the
+  /// end of it.
+  #[test]
+  fn the_event_of_a_node() {
+    let file = Kind::File(Fingerprint { modified: 0, size: 1, id: 1 });
+    let dir = Kind::Dir(Dir::new(DirId::default(), true));
+    // What the handler believed, what is there now, `changed`, `baseline`.
+    let table = [
+      (false, file, false, false, Some(Create), "a file came"),
+      (false, file, true, false, Some(Create), "it came and was written: it is still new"),
+      (false, Kind::Missing, false, false, None, "it came and went"),
+      (false, Kind::Missing, true, false, None, "it came, was written and went"),
+      (false, file, false, true, None, "a file of the baseline"),
+      (false, file, true, true, None, "a file of the baseline was written"),
+      (false, Kind::Missing, false, true, None, "a file of the baseline went away again"),
+      (false, dir, false, true, None, "a directory of the baseline"),
+      (true, Kind::Missing, false, false, Some(Delete), "a known file went"),
+      (true, Kind::Missing, true, false, Some(Delete), "it was written and went"),
+      (true, dir, false, false, Some(Delete), "a directory took its place"),
+      (true, file, true, false, Some(Update), "it was written, or it went and came"),
+      (true, file, false, false, None, "it is the same file"),
+      (true, file, true, true, Some(Update), "the baseline hides no change of a known file"),
+      (true, Kind::Missing, false, true, Some(Delete), "and no `Delete` of one"),
+    ];
+    for (told, kind, changed, baseline, expected, what) in table {
+      let mut tree = Tree::new();
+      let key = tree.insert_child(Tree::ROOT, OsStr::new("/"));
+      let node = &mut tree[key];
+      node.kind = kind;
+      node.set_told(told);
+      node.set_changed(changed);
+      node.set_baseline(baseline);
+      assert_eq!(event_of(node), expected, "{what}");
+    }
+  }
+}

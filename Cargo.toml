@@ -1,0 +1,56 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+pathwatch = { version = "0.0.0", path = "crates/pathwatch" }
+
+bitflags = { version = "2.13.2", default-features = false }
+hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
+libc = "0.2.180"
+rustc-hash = "2.1.2"
+tempfile = "3.26.0"
+windows-sys = "0.61.2"
+
+[workspace.lints.clippy]
+# Same guidelines as rolldown: restriction rules are opt-in, pedantic is on, and a rule is only
+# turned off for the whole workspace when it is a false positive or pure noise.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+allow_attributes = "deny"
+clone_on_ref_ptr = "deny"
+empty_drop = "deny"
+exit = "deny"
+filetype_is_file = "deny"
+get_unwrap = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+unused_result_ok = "deny"
+as_underscore = "deny"
+pathbuf_init_then_push = "deny"
+self_named_module_files = "deny"
+unnecessary_self_imports = "deny"
+
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+similar_names = "allow"
+struct_field_names = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+new_without_default = "allow"
+
+[profile.release]
+debug = "line-tables-only"

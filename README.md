@@ -1,0 +1,321 @@
+# pathwatch
+
+`pathwatch` watches paths and tells you which files were created, updated or deleted.
+
+```rust
+use std::sync::mpsc;
+
+use pathwatch::{Config, EventKind, Watcher};
+
+fn main() -> Result<(), pathwatch::Error> {
+  // Everything at or below a directory named `node_modules`.
+  let config = Config::default()
+    .with_ignored(|path, _kind| path.components().any(|part| part.as_os_str() == "node_modules"));
+
+  // The handler runs on the thread of the watcher: it only passes each batch on.
+  let (sender, batches) = mpsc::channel();
+  let watcher = Watcher::with_config(config, move |result| {
+    let _ = sender.send(result);
+  })?;
+
+  // A directory, a file, and a path that does not exist yet.
+  watcher.watch_all(["/project/src", "/project/package.json", "/project/not-there-yet.json"])?;
+
+  for result in batches {
+    match result {
+      Ok(events) => {
+        for event in events {
+          match event.kind {
+            EventKind::Create => println!("create {}", event.path.display()),
+            EventKind::Update => println!("update {}", event.path.display()),
+            EventKind::Delete => println!("delete {}", event.path.display()),
+          }
+        }
+      }
+      Err(error) => eprintln!("{error}"),
+    }
+  }
+  Ok(())
+}
+```
+
+To try it on your own files:
+
+```
+cargo run -p pathwatch --example watch -- src package.json not-there-yet.json
+cargo run -p pathwatch --example dev_server -- path/to/project
+```
+
+## The API
+
+| Call | What it does |
+|---|---|
+| `Watcher::new(handler)` | Starts a watcher with the default `Config`. Nothing is watched yet. |
+| `Watcher::with_config(config, handler)` | The same, with your `Config`. |
+| `watch(path)`, `watch_all(paths)` | Watches a path: a file, a directory (with everything below it), or a path that does not exist yet. Returns when the path is watched. Watching a path again does nothing. |
+| `unwatch(path)`, `unwatch_all(paths)` | Takes back a `watch` of this very path. Nothing is reported for it. |
+| `close()` | Stops the watcher and waits for its thread. Dropping the `Watcher` does the same. |
+
+`watch`, `unwatch` and `close` can be called from any thread, and from inside the handler.
+`watch` and `unwatch` return an error only for a path that cannot be used (`InvalidPath`) and
+when the watcher is closed (`Closed`). A path that the OS cannot watch or read is no error
+there: the handler gets it.
+
+## Events
+
+Only files are reported, never a directory.
+
+| Event | Meaning |
+|---|---|
+| `Create` | A file is there that you were not told about. |
+| `Update` | The file may have other content: its modification time, its size, or the file itself is another one. |
+| `Delete` | The file that you were told about is gone. |
+
+The handler gets `Ok(events)`, one batch, or `Err(error)`. It runs on the thread of the
+watcher, so it should only pass the batch on.
+
+- A batch is never empty and has at most one event for a path. Its order is not promised.
+- An event path is the watched path as you gave it, or that path and the rest below it.
+- An error means that something could not be watched or read. The watcher keeps running.
+  `error.kind()` is one of `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`.
+  The handler gets one error of a kind for a batch, with one path that shows the problem.
+
+## Options
+
+| `Config` method | Default | Meaning |
+|---|---|---|
+| `with_ignored(f)` | nothing is ignored | `f(path, kind) -> bool`, where `kind` is `EntryKind::File` or `EntryKind::Dir`. A path for which it returns `true` is never reported. An ignored directory is never read or watched. It must give the same answer for the same input, and if it ignores a directory it must ignore everything below it. It is asked about the paths you watch too (promise 10). |
+| `with_debounce(d)` | 50 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch still goes out every 500 ms, or every `4 × d` if that is longer. Zero: no waiting. |
+| `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
+| `with_poll_interval(d)` | 100 ms | The shortest pause between two rounds of polling. The least is 1 ms. On a big set of paths the pause is longer: at least nine times as long as the round took. |
+| `with_compare_contents(bool)` | `false` | Compare the content of every file, not only its size and time. Slow: it reads every file that it checks. |
+
+The settings cannot be changed after the watcher is made.
+
+## Promises
+
+Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the first lines of
+`promises.rs` say which).
+
+1. **A watched path is a file, a directory or nothing.** A file is anything that is not a
+   directory: also a socket, and a symbolic link inside a watched directory.
+2. **Events are the difference to the disk.** The last event for a path tells its state: after
+   `Create` or `Update` the file is there, after `Delete` it is not. When things are quiet, the
+   files you were told about are the files on the disk.
+3. **`Update`.** `touch` is an `Update`; `chmod` is not. An atomic save (write a temporary
+   file, rename it over) is an `Update`, with no `Delete` and no `Create`. So is a file that is
+   removed and written again within 100 ms. There can be more `Update` events than writes.
+4. **What exists when `watch` returns is not reported.** Every change after that is.
+5. **The watch belongs to the path.** It keeps working when a missing path becomes a file or a
+   directory, when a file becomes a directory or the other way round, when a whole chain of
+   missing directories appears at once, and when a name on the way to the path changes its
+   kind.
+6. **A directory is its files.** A directory that comes (made, moved in) is one `Create` for
+   each file below it. One that goes (removed, moved out, renamed) is one `Delete` for each
+   file that you were told about.
+7. **`unwatch` reports nothing.** A file that another watched path still covers stays known,
+   and its changes are reported as before.
+8. **Paths.** A relative path is joined to the current directory at the time of the call. `.`,
+   `..` and repeated separators are cleaned by text; no link is resolved. A path that cannot be
+   used (empty, a NUL in it, a file system root) is `InvalidPath`; the other paths of the same
+   `watch_all` call are watched.
+9. **Calls inside the handler.** `watch`, `unwatch` and `close` work there. They take effect
+   when the handler has returned.
+10. **The ignore filter.** Nothing is reported from inside an ignored directory, and the
+    directory is not read or watched. The filter applies to watched paths too. A watched path
+    that it ignores as a file and as a directory is not watched at all: no events, no error,
+    no cost. A watched path that it ignores only for the kind that is there now counts as
+    missing until its kind changes. A watched path is dropped when the filter ignores the
+    directory that holds it or, while directories above it are missing, the lowest one that
+    exists: a file that was reported for it gets its `Delete`, then the path is forgotten as
+    `unwatch` of it would do it; `watch` it again to have it looked at again. A filter must ignore everything below a directory that it
+    ignores: then no path is ever dropped. One that only looks at the last name of the path
+    gives results that depend on which directories exist.
+11. **Nothing beside a watched path.** A file next to a watched file is not reported.
+12. **Symbolic links.** A watched path that is a link, or that goes through one, is followed,
+    and its events carry the spelling you gave. A link inside a watched directory is a file: it
+    is not followed.
+13. **Spelling.** On a disk that takes two spellings of a name for one (letter case, Unicode
+    form: the usual disks of macOS and Windows), a watched path gets its events under the
+    spelling you gave. A name below a watched directory is spelled as on the disk.
+
+## Holes
+
+What is not reported, or reported wrongly. All of these are known and not fixed.
+
+- **A writer that keeps a file open.** macOS reports nothing until the file is closed; the
+  same for a write through `mmap`. Windows is expected to do the same (not checked).
+- **A write through another hard link** of a watched file is not reported.
+- **A rewrite of the same size that puts the old modification time back** is not reported on
+  macOS and with polling. Linux reports it. `with_compare_contents(true)` finds it everywhere.
+- **A mount over a watched directory** is not noticed until something else makes the watcher
+  look there.
+- **Two watched paths that are two spellings of one file** (macOS, Windows): only the spelling
+  of the disk gets the events. With polling both get them.
+- **A watched path in another spelling, inside a directory that you watch too:** the file is
+  reported under the spelling of the disk only.
+- **A watched path in another spelling, where one spelling has only ASCII letters and the
+  other has not** (the Kelvin sign for `K`): no events on macOS and Windows. With polling it
+  works.
+- **A young file above 16 MiB, or one that cannot be read, under polling:** it gets one
+  `Update` when it is 2 s old, also when nothing changed, and also when it was written just
+  before `watch`.
+- **The link of a watched path changes** (it points somewhere else now): found by a poll,
+  within a second, or within the poll interval when polling is on.
+- **macOS, Windows: the directories above a watched path** are polled once a second. When
+  they are removed, or removed and made again, the events can come up to a second late. On
+  macOS, when such a directory is renamed away, changed and renamed back between two polls,
+  the change is found in most cases, not in all (`docs/design.md` 5.10).
+- **macOS: many watched paths and a busy disk.** Events come late when the watcher has many
+  separate paths and other programs write a lot. Measured while 50,000 other files were
+  written: 0.1 s with 100 paths, 0.9 s with 500, 1.8 s with 1,000, 3.5 s with 2,000. Nothing is
+  lost. Other FSEvents users in the same process are late too.
+- **Windows: the directories above a watched directory cannot be renamed** while it is
+  watched. The OS refuses it.
+- **Windows: a junction or a directory link below a watched directory** gets no events.
+- **Windows: more than 64 directories** share handles. A watched path that is then spelled in
+  another way than the disk (more than the case of ASCII letters, or a short 8.3 name) gets no
+  events.
+- **Where the OS watches are put depends on the order of the `watch` calls.** Nothing is
+  missed.
+- **The Windows backend has not run on Windows yet.** It is type-checked, and its parts that
+  call no Windows are tested on other systems. See `docs/windows-open-points.md`. Until it is
+  checked, `with_polling(true)` is the safe choice on Windows.
+- **Android was never built.** It is set to use the same code as Linux.
+
+## Timing
+
+- **Normally** an event comes within the quiet time (50 ms) plus what the OS takes to tell
+  about a change (about 1 to 15 ms).
+- **With polling** a change is found by the next round: within the poll interval (100 ms), or
+  later on a big set of paths, because the pause is at least nine times as long as a round.
+- **Under a flood** of changes a batch still goes out at least every 500 ms.
+- **A `Delete`** comes 100 ms late: only after the path was found empty twice. It comes at once
+  when a directory is found where the file was, or a file where the directory was, or when a
+  file below a watched directory is renamed to another spelling of its name (another letter
+  case, on macOS and Windows). An error of the disk that says nothing is never a `Delete`;
+  "permission denied" counts as missing.
+- **Lost notifications** (the OS dropped some, or more than 16 MiB of them waited for the
+  watcher) are repaired by reading the disk again. These scans are paced: after one that took
+  `t`, the next one waits `9 × t`.
+
+## Coming from notify, chokidar or @parcel/watcher
+
+| What | In pathwatch | Note |
+|---|---|---|
+| watch | `watch(path)`, `watch_all(paths)` | Offered. There is no recursive mode: a directory is always watched with everything below it. A path may be a file, or not exist yet. No globs. |
+| unwatch | `unwatch(path)`, `unwatch_all(paths)` | Offered differently: it takes back a `watch` of the same path. It cannot cut a part out of a watched directory; use the ignore filter. |
+| close | `close()`, or drop the watcher | Offered. |
+| ignored | `Config::with_ignored(f)` | Offered differently: one function, set when the watcher is made. No glob list, no change later. It is asked about watched paths too: a path that it ignores as a file and as a directory is not watched. It must ignore everything below a directory that it ignores. |
+| polling | `with_polling`, `with_poll_interval` | Offered. On top of that, a directory that the OS cannot watch is polled without an option, and so is everything when the watch API cannot start. |
+| debounce | `with_debounce` | Offered, and built in. Left out: waiting until a file stops growing (chokidar `awaitWriteFinish`). A slow writer gives more than one `Update`. |
+| atomic writes | always on | Offered differently: no option. A file that is back within 100 ms is one `Update`. |
+| ignore initial | always on | Left out: what exists at `watch` time is never reported. Read the directory yourself if you need the list. |
+| directory events | none | Left out: a directory is reported as its files, so a moved directory needs no walk on your side. |
+| rename events | none | Left out: a rename is a `Delete` and a `Create`. The watcher never reads what the OS says happened; it compares the disk with what it told you. |
+| symlinks | no option | Offered differently: a watched path is followed, a link inside a watched directory is a file. Following links inside a watched directory is left out. |
+| errors | `Err(error)` to the handler | Offered. The watcher keeps running after every error. |
+| depth, `since` | none | Left out: no depth limit and no changes from before the call. |
+
+## Platforms
+
+| OS | Watch API | Limits |
+|---|---|---|
+| Linux, Android | inotify | One kernel watch for each directory, so a big tree needs a high `fs.inotify.max_user_watches`. At the limit the handler gets `WatchLimit` and the directory is polled once a second. When inotify cannot start at all, the handler is told once and the watcher polls everything. Changes made on another machine (NFS, a folder shared with a VM) are not reported: use polling there. |
+| macOS | FSEvents | See "Holes". A process can run 512 streams; one watcher keeps about 8. |
+| Windows | `ReadDirectoryChangesW` | Not run yet. At most 64 handles; more directories share a handle on a directory above them. No handle is put on `C:\`, `C:\Users` or `C:\Users\<name>`: what could only be watched from there is polled. |
+| every other target | none: always polling | The cost grows with the number of watched files. |
+
+Rust 1.88 or newer.
+
+## The repository
+
+```
+crates/
+  pathwatch/                 the crate, and the only one that is published
+    src/
+      lib.rs                 the crate docs; re-exports the API
+      config.rs  error.rs  event.rs
+      watcher.rs             the thread and the queue; picks the backend
+      backend.rs             the `Backend` trait: what the engine asks of an OS watch API
+      inotify.rs  fsevents.rs  windows.rs  poll.rs     one backend each
+      engine/                the engine: watched_paths, check, filter, scan, os_watch, events
+      tree/  fs.rs  path.rs
+    tests/
+      disk/                  the promises above, on the real disk
+      watcher.rs             the thread
+      inotify.rs  fsevents.rs  windows.rs     each backend alone, on its OS
+      windows_parts.rs       the parts of the Windows backend that call no Windows
+    examples/                watch.rs, dev_server.rs
+  pathwatch_sim/             fixtures for tests, not published
+    src/                     a disk and backends in memory
+    tests/                   the engine tests on them, with a fuzzer and a cost program
+docs/
+  design.md                  how it works
+  windows-open-points.md     what to check on a Windows machine
+```
+
+`pathwatch` shows seven names: `Watcher`, `Config`, `Event`, `EventKind`, `EntryKind`, `Error`,
+`ErrorKind`. Its other public modules are hidden from the docs. They are there for the tests and
+can change in any release.
+
+## Tests
+
+```
+cargo test --workspace
+```
+
+This runs, on the machine it is called on:
+
+- the engine on a simulated disk, with a fuzzer (`crates/pathwatch_sim/tests`, on Unix hosts),
+- the backend of this OS against the real watch API (`crates/pathwatch/tests/inotify.rs`,
+  `fsevents.rs` or `windows.rs`),
+- the watcher thread (`tests/watcher.rs`),
+- the parts of the Windows backend that call no Windows (`tests/windows_parts.rs`),
+- the promises on the real disk, each once with the backend of this OS and once with polling
+  (`tests/disk`).
+
+| Platform | How |
+|---|---|
+| macOS | `cargo test --workspace` |
+| Linux | `cargo test --workspace`. From macOS with OrbStack: `orb bash -c 'source $HOME/.cargo/env; cd <this directory> && CARGO_TARGET_DIR=$HOME/pathwatch-target-inotify cargo test --workspace'`. The tests use the temporary directory of the VM, because inotify does not see changes that macOS makes on the shared folder. |
+| Windows | `cargo test --workspace` on a Windows machine. **This has not been done yet.** From another OS only a type check is possible: `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` |
+| Android | Nothing. It was never built. |
+| WASI | Only a type check: `cargo check -p pathwatch --target wasm32-wasip1-threads` |
+
+The fuzzer (`crates/pathwatch_sim/tests/fuzz.rs`):
+
+```sh
+# The quick run: 250 seeds for each backend. It is a part of `cargo test --workspace`.
+cargo test -p pathwatch_sim --test fuzz
+
+# The long run, with a range of seeds of your choice.
+PATHWATCH_FUZZ_FIRST=100000 PATHWATCH_FUZZ_SEEDS=20000 \
+  cargo test --release -p pathwatch_sim --test fuzz big -- --ignored
+
+# One seed again, on every backend, with the short story of each failure.
+PATHWATCH_FUZZ_SEED=1234 cargo test -p pathwatch_sim --test fuzz replay -- --ignored --nocapture
+```
+
+More:
+
+```sh
+# What the engine costs for big cases. Run it before and after a change and compare.
+cargo test --release -p pathwatch_sim --test cost -- --ignored --nocapture
+
+# Also prints how long `watch` takes for 20,000 watched files.
+cargo test -p pathwatch --test disk -- --nocapture
+
+# The FSEvents test that fills the stream limit of the process. It runs alone.
+cargo test -p pathwatch --test fsevents -- --ignored failed_start
+
+# The inotify test of the watch limit. It needs a lowered limit.
+unshare -Ur sh -c 'echo 8 > /proc/sys/user/max_inotify_watches &&
+  cargo test -p pathwatch --test inotify -- --ignored'
+
+# Lints, the docs, and the oldest Rust.
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p pathwatch --no-deps
+cargo +1.88 check --workspace --all-targets
+```

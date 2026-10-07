@@ -1,0 +1,10 @@
+{
+  "name": "pathwatch-bench-js",
+  "private": true,
+  "type": "module",
+  "description": "The Node adapters of the pathwatch benchmark",
+  "dependencies": {
+    "@parcel/watcher": "^2.6.0",
+    "chokidar": "^5.0.0"
+  }
+}

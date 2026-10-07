@@ -1,0 +1,462 @@
+//! When the engine acts: the quiet time before a flush, the poll, and the rest after a slow scan.
+//! A story moves the clock by hand (`advance`, `step`) and compares `Engine::deadline` and the
+//! events of each batch (`C`, `U`, `D` and the path).
+
+#![cfg(unix)]
+
+use std::time::Duration;
+
+use pathwatch::{ErrorKind, engine::Options, poll::PollBackend};
+use pathwatch_sim::{
+  Deliver, Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, caught_up, ignore_node_modules, settled,
+  show, taken, window,
+};
+
+fn driver(mode: Mode) -> Driver<SimBackend> {
+  Driver::sim(mode, Options::default())
+}
+
+/// With no delay, the flush is due as soon as a hint is there.
+#[test]
+fn zero_delay() {
+  let mut d =
+    Driver::sim(Mode::Inode, Options { quiet_time: Duration::ZERO, ..Options::default() });
+  d.fs.mkdir("/p").unwrap();
+  d.watch(&["/p/a"]);
+  d.fs.write("/p/a", "1").unwrap();
+  d.deliver(usize::MAX);
+  assert_eq!(d.engine.deadline(), Some(d.now));
+  d.tick();
+  assert_eq!(taken(&mut d), ["C /p/a"]);
+  caught_up(&mut d);
+}
+
+/// The flush comes when no hint came for the quiet time: every hint that leaves work moves it.
+/// A hint for a name that no watched path can see leaves none, and moves nothing.
+#[test]
+fn the_flush_waits_for_the_quiet_time() {
+  let mut d = driver(Mode::Inode);
+  d.fs.mkdir("/p").unwrap();
+  d.fs.write("/p/a", "1").unwrap();
+  d.watch(&["/p/a"]);
+  let start = d.now;
+
+  // A save in four steps, 2 ms apart, is one batch.
+  for size in 2..6 {
+    d.fs.write("/p/a", "x".repeat(size)).unwrap();
+    assert_eq!(d.deliver(usize::MAX), 1);
+    assert_eq!(d.engine.deadline(), Some(d.now + Duration::from_millis(10)));
+    d.advance(Duration::from_millis(2));
+    d.tick();
+    assert_eq!(taken(&mut d), NONE);
+  }
+  // Another file of the directory is written. The OS tells, and nothing waits for it.
+  let due = d.engine.deadline();
+  assert_eq!(due, Some(start + Duration::from_millis(6 + 10)));
+  d.fs.write("/p/other", "1").unwrap();
+  assert_eq!(d.deliver(usize::MAX), 1);
+  assert_eq!(d.engine.deadline(), due);
+
+  assert!(d.step());
+  assert_eq!(d.now, start + Duration::from_millis(16));
+  assert_eq!(taken(&mut d), ["U /p/a"]);
+  // The next poll is the only thing left.
+  assert_eq!(d.engine.deadline(), Some(start + Duration::from_secs(1)));
+  caught_up(&mut d);
+}
+
+/// The longest wait grows with the quiet time: four times a quiet time of 200 ms. Hints that
+/// come every 150 ms never leave 200 ms of quiet, and the batch goes out after 800 ms.
+#[test]
+fn the_longest_wait_is_four_quiet_times() {
+  // No poll comes in between: a poll checks what waits, too.
+  let (quiet_time, poll_interval) = (Duration::from_millis(200), Duration::from_secs(60));
+  let mut d = Driver::sim(Mode::Inode, Options { quiet_time, poll_interval, ..Options::default() });
+  d.fs.mkdir("/p").unwrap();
+  d.fs.write("/p/a", "1").unwrap();
+  d.watch(&["/p"]);
+  let start = d.now;
+
+  let mut batches = Vec::new();
+  for round in 0..12_u64 {
+    d.fs.write("/p/a", format!("write {round}")).unwrap();
+    d.deliver(usize::MAX);
+    if round < 5 {
+      let due = (round * 150 + 200).min(800);
+      assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(due)));
+    }
+    // To the next write, or to the flush if that comes first.
+    let next_write = start + Duration::from_millis((round + 1) * 150);
+    while d.engine.deadline().is_some_and(|due| due <= next_write) {
+      assert!(d.step());
+      batches.push(((d.now - start).as_millis(), show(&d.take_events())));
+    }
+    d.advance(next_write - d.now);
+  }
+  let update = vec!["U /p/a".to_owned()];
+  assert_eq!(batches, [(800, update.clone()), (1700, update)]);
+  caught_up(&mut d);
+}
+
+/// The timers. Hints that keep coming move the flush, but they never starve a batch: it
+/// goes out 500 ms after its first hint at the latest. And a watch that failed is asked for
+/// again by each poll until it works; then the directory is polled no more.
+#[test]
+fn no_batch_starves_and_a_failed_watch_is_asked_again() {
+  let mut d = Driver::sim(Mode::Inode, Options::default());
+  d.fs.mkdir_all("/p/logs").unwrap();
+  d.fs.write("/p/a.js", "1").unwrap();
+  d.fs.write("/p/logs/x.log", "").unwrap();
+  d.watch(&["/p"]);
+  let start = d.now;
+  // A tool appends to a log every 3 ms, for more than a second. No 10 ms pass without a hint.
+  d.fs.write("/p/a.js", "22").unwrap();
+  let mut batches = Vec::new();
+  for round in 1..=400 {
+    d.fs.write("/p/logs/x.log", "line\n".repeat(round)).unwrap();
+    d.deliver(usize::MAX);
+    if round == 3 {
+      // The flush is due 10 ms after the last hint, not after the first one.
+      assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(6 + 10)));
+    }
+    d.advance(Duration::from_millis(3));
+    d.tick();
+    let events = show(&d.take_events());
+    if !events.is_empty() {
+      batches.push(((d.now - start).as_millis(), events));
+    }
+  }
+  // The first tick after 500 ms, and the first tick 500 ms after the hint that followed it.
+  let log = "U /p/logs/x.log".to_owned();
+  assert_eq!(batches, [(501, vec!["U /p/a.js".to_owned(), log.clone()]), (1002, vec![log])]);
+  assert_eq!(Sim::settled(&mut d), ["U /p/logs/x.log"]);
+  caught_up(&mut d);
+
+  let mut d = Driver::sim(Mode::Inode, Options::default());
+  d.fs.mkdir_all("/p/r/sub").unwrap();
+  d.fs.write("/p/r/sub/x", "1").unwrap();
+  d.fs.set_watch_limit(Some(3));
+  d.watch(&["/p/r"]);
+  assert_eq!(Sim::errors(&d), [ErrorKind::WatchLimit]);
+  let watches = d.fs.calls().watch;
+  let start = d.now;
+  Sim::settled(&mut d);
+  // One more try with every poll.
+  let polls = (d.now - start).as_secs();
+  assert!(polls >= 2);
+  assert_eq!(d.fs.calls().watch, watches + polls);
+  d.fs.set_watch_limit(None);
+  Sim::settled(&mut d);
+  let (watches, lstats, start) = (d.fs.calls().watch, d.fs.calls().lstat, d.now);
+  Sim::settled(&mut d);
+  // The watch works: no more tries, and the directory is polled no more. All that a poll still
+  // does is the check of `/` from the root.
+  let polls = (d.now - start).as_secs();
+  assert_eq!((d.fs.calls().watch, d.fs.calls().lstat), (watches, lstats + polls));
+  assert_eq!(Sim::errors(&d), [ErrorKind::WatchLimit]);
+  caught_up(&mut d);
+}
+
+/// A `watch` call sets the time of the first poll, and no later one moves it: a tool that
+/// watches one more path every 400 ms does not keep the poll away.
+#[test]
+fn a_later_watch_call_does_not_move_the_poll() {
+  let mut d = Driver::poll(Options::default());
+  d.fs.mkdir("/p").unwrap();
+  d.fs.write("/p/a.js", "1").unwrap();
+  d.watch(&["/p/a.js"]);
+  let first_poll = d.now + Duration::from_secs(1);
+  assert_eq!(d.engine.deadline(), Some(first_poll));
+
+  d.fs.write("/p/a.js", "22").unwrap();
+  for round in 0..2 {
+    d.advance(Duration::from_millis(400));
+    d.watch(&[format!("/p/later{round}.js")]);
+    assert_eq!(taken(&mut d), NONE);
+    assert_eq!(d.engine.deadline(), Some(first_poll));
+  }
+  assert!(d.step());
+  assert_eq!(d.now, first_poll);
+  assert_eq!(taken(&mut d), ["U /p/a.js"]);
+  caught_up(&mut d);
+}
+
+/// A poll round that takes 50 ms is followed by a rest of nine times that. A round that takes
+/// no time is followed by the poll interval.
+#[test]
+fn a_slow_poll_round_is_followed_by_a_rest() {
+  let options = Options { poll_interval: Duration::from_millis(100), ..Options::default() };
+  let mut d = Driver::poll(options);
+  d.fs.mkdir_all("/p/R").unwrap();
+  d.fs.write("/p/R/a", "1").unwrap();
+  d.watch(&["/p/R"]);
+  let start = d.now;
+  assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(100)));
+  assert!(d.step());
+  assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(200)));
+
+  d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(50)));
+  assert!(d.step());
+  assert_eq!(d.fs.traps_run(), 1);
+  // 200 ms, the 50 ms of the round, and 450 ms of rest.
+  assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(700)));
+  // A change is found by the next round, not sooner.
+  d.fs.write("/p/R/a", "22").unwrap();
+  assert!(d.step());
+  assert_eq!(d.now, start + Duration::from_millis(700));
+  assert_eq!(taken(&mut d), ["U /p/R/a"]);
+  assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(800)));
+  caught_up(&mut d);
+}
+
+/// What the backend takes to make watches live is not paced: it is paid once, not at every
+/// look. Only the time of the looks at the disk counts.
+#[test]
+fn the_time_of_a_commit_is_not_paced() {
+  let mut d = Driver::sim(Mode::Prefix, Options::default());
+  d.fs.mkdir_all("/p/R").unwrap();
+  d.watch(&["/p/R"]);
+  let start = d.now;
+  let second = Duration::from_secs(1);
+
+  // The first call of a poll round is the commit of the backend.
+  let commits = d.fs.calls().commit;
+  d.fs.at_call(0, |fs| fs.advance(Duration::from_millis(250)));
+  assert!(d.step());
+  assert_eq!((d.fs.traps_run(), d.fs.calls().commit), (1, commits + 1));
+  assert_eq!(d.engine.deadline(), Some(start + second * 2));
+
+  // The second call is a look at the disk.
+  let lstats = d.fs.calls().lstat;
+  d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(250)));
+  assert!(d.step());
+  assert_eq!(d.fs.traps_run(), 2);
+  assert!(d.fs.calls().lstat > lstats);
+  // The 250 ms of the round, and a rest of nine times that.
+  assert_eq!(d.engine.deadline(), Some(start + second * 2 + Duration::from_millis(2500)));
+  caught_up(&mut d);
+}
+
+/// After a scan of everything that took 30 ms, the next one for lost notifications waits
+/// until 300 ms after its start: its 30 ms, and a rest of nine times that. A plain hint does
+/// not wait for that.
+#[test]
+fn a_burst_of_lost_notifications_does_not_scan_without_a_pause() {
+  for mode in Mode::ALL {
+    let mut d = Driver::sim(mode, Options::default());
+    d.fs.mkdir_all("/p/r/sub").unwrap();
+    d.fs.write("/p/r/sub/a", "1").unwrap();
+    d.watch(&["/p/r"]);
+
+    d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(30)));
+    d.engine.overflow(d.now);
+    assert!(d.step());
+    assert_eq!(d.fs.traps_run(), 1, "{mode:?}");
+    let scanned = d.now;
+
+    d.fs.write("/p/r/sub/b", "1").unwrap();
+    d.fs.write("/p/r/sub/a", "22").unwrap();
+    d.fs.take_raw(1);
+    d.engine.overflow(d.now);
+    d.deliver(usize::MAX);
+    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(10)), "{mode:?}");
+    assert!(d.step());
+    assert_eq!(taken(&mut d), ["U /p/r/sub/a"], "{mode:?}");
+    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(300)), "{mode:?}");
+    assert!(d.step());
+    assert_eq!(taken(&mut d), ["C /p/r/sub/b"], "{mode:?}");
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// Two watches lose notifications, and the scans for both run in one flush that takes 30 ms.
+/// The next loss report waits until 300 ms after the start of that flush: its 30 ms, and a rest
+/// of nine times that. The rest is for all loss reports together, not for each watch. A plain
+/// hint does not wait.
+#[test]
+fn the_scans_after_loss_reports_are_paced_together() {
+  for mode in RECURSIVE {
+    let mut d = Driver::sim(mode, Options::default());
+    d.fs.mkdir_all("/p/A").unwrap();
+    d.fs.mkdir_all("/q/B").unwrap();
+    d.watch(&["/p/A", "/q/B"]);
+
+    d.fs.write("/p/A/x", "1").unwrap();
+    d.fs.write("/q/B/y", "1").unwrap();
+    assert!(d.fs.lose_raw(usize::MAX) >= 2, "{mode:?}");
+    assert_eq!(d.fs.pending_raw(), 2, "{mode:?}");
+    d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(30)));
+    assert_eq!(window(&mut d), ["C /p/A/x", "C /q/B/y"], "{mode:?}");
+    assert_eq!(d.fs.traps_run(), 1, "{mode:?}");
+    let scanned = d.now;
+
+    // One watch loses again. The other one tells a change as usual.
+    d.fs.write("/p/A/x2", "1").unwrap();
+    assert!(d.fs.lose_raw(usize::MAX) >= 1, "{mode:?}");
+    assert_eq!(d.fs.pending_raw(), 1, "{mode:?}");
+    d.fs.write("/q/B/y2", "1").unwrap();
+    assert!(d.deliver(usize::MAX) >= 2, "{mode:?}");
+    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(10)), "{mode:?}");
+    assert!(d.step());
+    assert_eq!(taken(&mut d), ["C /q/B/y2"], "{mode:?}");
+    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(300)), "{mode:?}");
+    assert!(d.step());
+    assert_eq!(taken(&mut d), ["C /p/A/x2"], "{mode:?}");
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// A loss report for a directory and a plain hint for a file in the same directory, in one
+/// flush. The loss scan is still a loss scan: a rest follows it. And while that rest runs, the
+/// next loss report waits, also when a plain hint for the same directory comes with it: the
+/// hint is checked at once, and the scan of everything else waits.
+///
+/// The parent of the directory is only polled, so with every mark in the directory the engine
+/// looks whether the directory is still the same one (`check_moved`). That look joined the
+/// loss report as a plain mark and took it out of the pacing: in a burst, where loss reports
+/// and plain hints come together, no loss scan was ever paced.
+#[test]
+fn a_plain_hint_does_not_end_the_wait_of_a_loss_report() {
+  for mode in RECURSIVE {
+    let mut d = Driver::sim(mode, Options::default());
+    d.fs.mkdir_all("/p/A").unwrap();
+    d.watch(&["/p/A"]);
+
+    // One notification is lost, the next one comes through.
+    d.fs.write("/p/A/x", "1").unwrap();
+    assert!(d.fs.lose_raw(usize::MAX) >= 1, "{mode:?}");
+    d.fs.write("/p/A/y", "1").unwrap();
+    d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(30)));
+    assert_eq!(window(&mut d), ["C /p/A/x", "C /p/A/y"], "{mode:?}");
+    assert_eq!(d.fs.traps_run(), 1, "{mode:?}");
+    let scanned = d.now;
+
+    // The same again, inside the rest: 30 ms of scan, and nine times that.
+    d.fs.write("/p/A/x2", "1").unwrap();
+    assert!(d.fs.lose_raw(usize::MAX) >= 1, "{mode:?}");
+    d.fs.write("/p/A/y2", "1").unwrap();
+    assert!(d.deliver(usize::MAX) >= 2, "{mode:?}");
+    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(10)), "{mode:?}");
+    assert!(d.step());
+    assert_eq!(taken(&mut d), ["C /p/A/y2"], "{mode:?}");
+    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(300)), "{mode:?}");
+    assert!(d.step());
+    assert_eq!(taken(&mut d), ["C /p/A/x2"], "{mode:?}");
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// Only the scans that a loss report asked for wait for the end of a rest. A deep check that
+/// a hint asked for by name does not: a tree that is moved in, and a directory that is renamed,
+/// are read at once.
+#[test]
+fn a_tree_that_is_moved_in_does_not_wait_for_the_rest() {
+  for mode in Mode::ALL {
+    let mut d = Driver::sim(mode, Options::default());
+    d.fs.mkdir_all("/p/r/sub").unwrap();
+    d.fs.mkdir_all("/elsewhere/tree/deep").unwrap();
+    d.fs.write("/elsewhere/tree/deep/f", "1").unwrap();
+    d.fs.write("/p/r/sub/a", "1").unwrap();
+    d.watch(&["/p/r"]);
+
+    d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(30)));
+    d.engine.overflow(d.now);
+    assert!(d.step());
+    assert_eq!(d.fs.traps_run(), 1, "{mode:?}");
+    let scanned = d.now;
+
+    // Notifications are lost once more: that scan waits. Then a tree is moved in and a
+    // directory is renamed.
+    d.engine.overflow(d.now);
+    d.fs.rename("/elsewhere/tree", "/p/r/tree").unwrap();
+    d.fs.rename("/p/r/sub", "/p/r/sub2").unwrap();
+    d.deliver(usize::MAX);
+    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(10)), "{mode:?}");
+    assert!(d.step());
+    assert_eq!(taken(&mut d), ["C /p/r/sub2/a", "C /p/r/tree/deep/f"], "{mode:?}");
+    // The `Delete` under the old name waits for its second look, not for the rest.
+    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(110)), "{mode:?}");
+    assert!(d.step());
+    assert_eq!(taken(&mut d), ["D /p/r/sub/a"], "{mode:?}");
+    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(300)), "{mode:?}");
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// A loss report waits for the end of a rest, and meanwhile a poll finds that the directory
+/// above its place is gone for good. The mark goes with the directory: nothing can be checked
+/// in a directory that is gone, and no mark is left where the tree has no directory.
+#[test]
+fn a_loss_report_waits_and_the_directory_above_goes_away() {
+  for mode in RECURSIVE {
+    let options = Options { delete_delay: Duration::ZERO, ..Options::default() };
+    let mut d = Driver::sim(mode, options);
+    d.fs.mkdir_all("/p/d/sub").unwrap();
+    d.fs.write("/p/d/sub/a.js", "1").unwrap();
+    d.fs.write("/p/x.js", "1").unwrap();
+    // Two watches for a tree, one inside the other: `/p/d` had its own before `/p` got one.
+    d.watch(&["/p/d"]);
+    d.watch(&["/p/x.js"]);
+    assert_eq!(d.fs.os_watches().len(), 2, "{mode:?}");
+
+    // A scan after lost notifications that takes 300 ms: the rest after it is longer than
+    // the time to the next poll.
+    d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(300)));
+    d.engine.overflow(d.now);
+    assert!(d.step());
+    assert_eq!(d.fs.traps_run(), 1, "{mode:?}");
+    // Both watches lose a notification, and both loss reports wait.
+    d.fs.write("/p/d/sub/a.js", "22").unwrap();
+    assert!(d.fs.lose_raw(usize::MAX) >= 2, "{mode:?}");
+    assert_eq!(window(&mut d), NONE, "{mode:?}");
+
+    // Nothing tells that `/p` is removed. The poll finds out, inside the rest.
+    d.fs.remove_all("/p").unwrap();
+    d.fs.take_raw(usize::MAX);
+    assert_eq!(window(&mut d), ["D /p/d/sub/a.js", "D /p/x.js"], "{mode:?}");
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// A watcher that watches nothing has nothing due: no poll wakes its thread. That is so before
+/// the first `watch`, after `unwatch` of every watched path, and after every watched path was
+/// dropped. The next `watch` brings the poll back.
+#[test]
+fn nothing_is_due_when_nothing_is_watched() {
+  fn story<B: Deliver>(mut d: Driver<B>, on: &str) {
+    let second = Duration::from_secs(1);
+    assert_eq!(d.engine.deadline(), None, "{on}");
+    // A path that `watch` does not take is no watched path.
+    d.watch(&[""]);
+    assert_eq!(d.engine.deadline(), None, "{on}");
+
+    d.fs.mkdir_all("/p/node_modules/pkg").unwrap();
+    d.fs.write("/p/a.js", "1").unwrap();
+    d.fs.write("/p/node_modules/pkg/x.js", "1").unwrap();
+    d.watch(&["/p/a.js", "/p/node_modules/pkg/x.js"]);
+    assert_eq!(d.engine.deadline(), Some(d.now + second), "{on}");
+    let poll = d.engine.deadline();
+    // One watched path is left: the poll stays.
+    d.unwatch(&["/p/a.js"]);
+    assert_eq!(d.engine.deadline(), poll, "{on}");
+    // The ignored directory is its watch target now: the last watched path is dropped.
+    d.fs.remove_all("/p/node_modules/pkg").unwrap();
+    assert_eq!(settled(&mut d), ["D /p/node_modules/pkg/x.js"], "{on}");
+    assert_eq!(d.engine.deadline(), None, "{on}");
+
+    d.watch(&["/p/a.js"]);
+    assert_eq!(d.engine.deadline(), Some(d.now + second), "{on}");
+    d.unwatch(&["/p/a.js"]);
+    assert_eq!(d.engine.deadline(), None, "{on}");
+    caught_up(&mut d);
+  }
+  for mode in Mode::ALL {
+    story(Driver::sim(mode, ignore_node_modules()), &format!("{mode:?}"));
+  }
+  story(Driver::<PollBackend>::poll(ignore_node_modules()), "Poll");
+}

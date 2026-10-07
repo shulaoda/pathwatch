@@ -1,0 +1,13 @@
+[package]
+name = "adapters"
+description = "One small program for each Rust library that the benchmark compares"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+pathwatch = { path = "../../crates/pathwatch" }
+# The newest 8.x of notify from crates.io.
+notify = "8"
+# The fork that rolldown uses today. Its library is named `notify` too, so it gets another name.
+notify_fork = { package = "rolldown-notify", git = "https://github.com/rolldown/notify" }

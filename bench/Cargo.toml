@@ -1,0 +1,13 @@
+# The benchmark harness is a workspace of its own: the lock file, the tests and the CI of
+# pathwatch never see the libraries that it compares.
+[workspace]
+members = ["driver", "adapters"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[profile.release]
+debug = "line-tables-only"
