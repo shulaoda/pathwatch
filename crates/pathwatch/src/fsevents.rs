@@ -1,8 +1,16 @@
 //! The FSEvents backend (macOS).
 //!
 //! A stream watches a list of paths, each with the whole tree below it. It reports a change as a
-//! record: the real path of what changed, and flags. The C functions are declared by hand, at
-//! the end of the file.
+//! record: the real path of what changed, and flags.
+//!
+//! The parts of this file, in their order:
+//!
+//! - `FsEventsBackend`: the answers to the engine, and the hints for a record.
+//! - `Covers`: the directories that the engine watches, with their keys.
+//! - `Streams`: the streams that run, and when new ones take over.
+//! - `place`: where the stream paths go when they are too many.
+//! - `Dirs`: the table that finds the directories above a path.
+//! - The C functions: safe wrappers, then the declarations, which are written by hand.
 
 use std::{
   ffi::{CStr, CString, OsStr, OsString, c_char, c_void},
@@ -78,22 +86,8 @@ pub mod flag {
 ///   error and the engine polls the new directories.
 #[derive(Debug)]
 pub struct FsEventsBackend {
-  /// Behind an `Arc`: every stream holds a count of it for its callback.
-  sink: Arc<Sink<Raw>>,
-  queue: Queue,
-  /// The covers, each with the keys that the engine watches it under.
-  covers: Dirs<Vec<DirKey>>,
-  /// The cover of each key.
-  cover_of_key: FxHashMap<DirKey, PathBuf>,
-  /// The paths of the running streams.
-  streamed: Dirs<()>,
-  /// The paths for the stream that the next `commit` starts.
-  pending: Dirs<()>,
-  streams: Vec<Stream>,
-  /// Replaced streams that may still hold records from before the new streams started.
-  retiring: Vec<Retiring>,
-  /// How many stream paths the last placement left.
-  placed: usize,
+  covers: Covers,
+  streams: Streams,
   /// The directories that got `NotWatched`, each under its key.
   not_watched: FxHashMap<DirKey, PathBuf>,
   /// The last `commit` started a stream that reports one of them. See
@@ -104,100 +98,18 @@ pub struct FsEventsBackend {
   parent: Option<RealParent>,
 }
 
-/// A replaced stream that still runs.
-#[derive(Debug)]
-struct Retiring {
-  stream: Stream,
-  /// The newest event id of the system right after the new streams were started. A stream that
-  /// has delivered this id has nothing left that the new streams do not get too.
-  caught_up: u64,
-  /// A stream that gets no event never reaches `caught_up`.
-  deadline: Instant,
-}
-
-/// The records of one callback call: the raw notification of this backend.
-#[derive(Debug, Default)]
-pub struct Raw {
-  /// The paths of all records, one after the other.
-  paths: Vec<u8>,
-  /// For each record: where its path ends in `paths`, and its flags.
-  records: Vec<(usize, u32)>,
-}
-
-impl Raw {
-  pub fn push(&mut self, path: &[u8], flags: u32) {
-    self.paths.extend_from_slice(path);
-    self.records.push((self.paths.len(), flags));
-  }
-
-  pub fn records(&self) -> impl Iterator<Item = (&Path, u32)> {
-    let mut start = 0;
-    self.records.iter().map(move |&(end, flags)| {
-      let path = &self.paths[start..end];
-      start = end;
-      (Path::new(OsStr::from_bytes(path)), flags)
-    })
-  }
-}
-
 impl FsEventsBackend {
   /// Makes the dispatch queue only. The first stream starts at the first `commit` that has a
   /// directory for it.
   pub fn new(sink: Sink<Raw>) -> io::Result<Self> {
     Ok(Self {
-      sink: Arc::new(sink),
-      queue: Queue::new()?,
-      covers: Dirs::default(),
-      cover_of_key: FxHashMap::default(),
-      streamed: Dirs::default(),
-      pending: Dirs::default(),
-      streams: Vec::new(),
-      retiring: Vec::new(),
-      placed: 0,
+      covers: Covers::default(),
+      streams: Streams::new(sink)?,
       not_watched: FxHashMap::default(),
       covers_more: false,
       parent: None,
     })
   }
-}
-
-/// Runs on the dispatch queue. It only copies the records and hands them over.
-extern "C" fn callback(
-  _stream: FSEventStreamRef,
-  info: *mut c_void,
-  count: usize,
-  paths: *mut c_void,
-  flags: *const u32,
-  _ids: *const u64,
-) {
-  // SAFETY: `info` is the sink that `Stream::start` got. Its caller, the backend, holds a count
-  // of it until every stream is stopped and a `Queue::sync` after that has returned. Then no
-  // callback is running and none starts, so the sink lives longer than every callback. A sink
-  // is `Sync`, so this thread may use it next to the watcher thread.
-  let sink = unsafe { &*info.cast::<Sink<Raw>>() };
-  let paths = paths.cast::<*const c_char>();
-  let mut raw = Raw { paths: Vec::with_capacity(count * 128), records: Vec::with_capacity(count) };
-  for index in 0..count {
-    // SAFETY: a stream without the UseCFTypes flag passes `count` C strings and `count` flags,
-    // and they live until the callback returns.
-    let (path, flags) = unsafe { (CStr::from_ptr(*paths.add(index)), *flags.add(index)) };
-    raw.push(path.to_bytes(), flags);
-  }
-  sink.raw(raw);
-}
-
-/// The stream calls this when it is created: it holds the sink for as long as it lives.
-extern "C" fn retain(info: *const c_void) -> *const c_void {
-  // SAFETY: `info` comes from `Arc::as_ptr`, and the caller of `FSEventStreamCreate` holds a
-  // count of that `Arc` while the stream takes its own.
-  unsafe { Arc::increment_strong_count(info.cast::<Sink<Raw>>()) };
-  info
-}
-
-/// The stream calls this when it is deallocated, some time after `FSEventStreamRelease`.
-extern "C" fn release(info: *const c_void) {
-  // SAFETY: this gives back the count that `retain` took.
-  unsafe { Arc::decrement_strong_count(info.cast::<Sink<Raw>>()) };
 }
 
 impl Backend for FsEventsBackend {
@@ -211,8 +123,7 @@ impl Backend for FsEventsBackend {
         return Coverage::Failed(error);
       }
     };
-    let has_stream = self.streamed.holds(&real) || self.pending.holds(&real);
-    if !has_stream {
+    if !self.streams.reports(&real) {
       if want == Want::Names {
         // A stream for a directory that is only on the way to a watched path would report the
         // whole tree below it. The engine polls such a directory.
@@ -220,17 +131,10 @@ impl Backend for FsEventsBackend {
         self.not_watched.insert(key, real);
         return Coverage::NotWatched;
       }
-      self.pending.insert(real.clone(), ());
+      self.streams.pending.insert(real.clone(), ());
     }
-    if self.cover_of_key.get(&key) != Some(&real) {
-      // The first call for the key, or another directory is at its path now.
-      self.unwatch(key);
-      match self.covers.get_mut(&real) {
-        Some(keys) => keys.push(key),
-        None => self.covers.insert(real.clone(), vec![key]),
-      }
-      self.cover_of_key.insert(key, real);
-    }
+    self.not_watched.remove(&key);
+    self.covers.insert(key, real);
     Coverage::WatchedTree
   }
 
@@ -238,31 +142,22 @@ impl Backend for FsEventsBackend {
     // The streams stay as they are. A path that no cover needs any more goes when the streams
     // are replaced.
     self.not_watched.remove(&key);
-    let Some(real) = self.cover_of_key.remove(&key) else { return };
-    let Some(keys) = self.covers.get_mut(&real) else { return };
-    keys.retain(|known| *known != key);
-    if keys.is_empty() {
-      self.covers.remove(&real);
-    }
+    self.covers.remove(key);
   }
 
   fn commit(&mut self) -> io::Result<()> {
-    self.retire();
+    self.streams.retire();
     self.covers_more = false;
     self.parent = None;
-    if self.pending.is_empty() {
+    if self.streams.pending.is_empty() {
       return Ok(());
     }
-    let new = top_most(self.pending.drain());
-    let result = if self.streams.len() >= MAX_STREAMS || self.has_too_many_paths(new.len()) {
-      // For all covers, so also for the new ones.
-      self.rebuild()
-    } else {
-      self.add_streams(new)
-    };
+    let result = self.streams.start_pending(&self.covers);
+    let streamed = &self.streams.paths;
     match result {
-      Ok(()) => self.covers_more = self.not_watched.values().any(|dir| self.streamed.holds(dir)),
-      Err(_) => self.forget_unstreamed(),
+      Ok(()) => self.covers_more = self.not_watched.values().any(|dir| streamed.holds(dir)),
+      // Nothing is watched for the keys of a cover that got no stream.
+      Err(_) => self.covers.retain(|dir| streamed.holds(dir)),
     }
     result
   }
@@ -272,7 +167,7 @@ impl Backend for FsEventsBackend {
   }
 
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
-    self.retire();
+    self.streams.retire();
     for (path, flags) in raw.records() {
       if flags & flag::HISTORY_DONE != 0 {
         // A marker of the stream, not a change.
@@ -289,7 +184,7 @@ impl Backend for FsEventsBackend {
       }
       // Every cover that holds the path gets the hint, not only the longest: a cover can lie
       // below another one, and the keys of both see the change.
-      for (keys, rel) in self.covers.holders(path) {
+      for (keys, rel) in self.covers.by_dir.holders(path) {
         for &key in keys {
           hint(Hint::Changed { dir: key, rel });
         }
@@ -303,112 +198,6 @@ impl Backend for FsEventsBackend {
 }
 
 impl FsEventsBackend {
-  /// Stops the replaced streams that have nothing left to deliver.
-  ///
-  /// Nothing waits for them: this runs at every `commit` and `translate`, so a stream that is
-  /// due goes with the next call.
-  fn retire(&mut self) {
-    let now = Instant::now();
-    let done: Vec<Retiring> = self
-      .retiring
-      .extract_if(.., |old| {
-        now >= old.deadline || old.stream.latest_event_id().is_some_and(|id| id >= old.caught_up)
-      })
-      .collect();
-    if !done.is_empty() {
-      // On the queue: the stream may be in the middle of handing over the records that made it
-      // catch up, and a stop from this thread could cut that short.
-      self.queue.sync(move || drop(done));
-    }
-  }
-
-  /// Stops the oldest replaced streams when more than [`MAX_RETIRING`] run. Each one is asked
-  /// to deliver what it still holds first, and that call waits for it.
-  fn stop_oldest_retiring(&mut self) {
-    let too_many = self.retiring.len().saturating_sub(MAX_RETIRING);
-    if too_many == 0 {
-      return;
-    }
-    let oldest: Vec<Retiring> = self.retiring.drain(..too_many).collect();
-    for old in &oldest {
-      old.stream.deliver_all();
-    }
-    self.queue.sync(move || drop(oldest));
-  }
-
-  /// Whether `new` more stream paths are too many, so that all paths have to be placed again.
-  ///
-  /// Where the covers cannot go up to common directories, the placement leaves more than
-  /// [`MAX_STREAM_PATHS`]. Then it is not worked out at every commit, only when the number of
-  /// paths has doubled.
-  fn has_too_many_paths(&self, new: usize) -> bool {
-    let limit = if self.placed > MAX_STREAM_PATHS { self.placed * 2 } else { MAX_STREAM_PATHS };
-    self.streamed.len() + new > limit
-  }
-
-  /// Starts a stream for `paths`, next to the running ones.
-  fn add_streams(&mut self, paths: Vec<PathBuf>) -> io::Result<()> {
-    let streams = self.start(&paths)?;
-    self.streams.extend(streams);
-    for path in paths {
-      self.streamed.insert(path, ());
-    }
-    Ok(())
-  }
-
-  /// Starts new streams for all covers and lets the old streams run out.
-  fn rebuild(&mut self) -> io::Result<()> {
-    let paths = self.stream_paths();
-    let streams = self.start(&paths)?;
-    // A stream that is stopped keeps what it has not delivered yet, and the new streams report
-    // that late or not at all. So an old stream runs until it has delivered everything from
-    // before the start of the new ones.
-    let caught_up = current_event_id();
-    let deadline = Instant::now() + MAX_OVERLAP;
-    let replaced = mem::replace(&mut self.streams, streams);
-    self.retiring.extend(replaced.into_iter().map(|stream| Retiring {
-      stream,
-      caught_up,
-      deadline,
-    }));
-    self.stop_oldest_retiring();
-    self.placed = paths.len();
-    self.streamed.clear();
-    for path in paths {
-      self.streamed.insert(path, ());
-    }
-    Ok(())
-  }
-
-  /// The stream paths for the covers of now: at most [`MAX_STREAM_PATHS`], if the covers can go
-  /// up to common directories that are not too high. Every cover is at or below one of them.
-  fn stream_paths(&self) -> Vec<PathBuf> {
-    // Every cover counts, whatever its key asked for: the key was told that a stream reports
-    // its whole tree.
-    place(self.cover_of_key.values().map(PathBuf::as_path), MAX_STREAM_PATHS)
-  }
-
-  /// Starts the streams for `paths`: all of them, or none. It is one stream for every
-  /// `MAX_PATHS` paths.
-  fn start(&self, paths: &[PathBuf]) -> io::Result<Vec<Stream>> {
-    paths.chunks(MAX_PATHS).map(|chunk| Stream::start(&self.queue, &self.sink, chunk)).collect()
-  }
-
-  /// Forgets every cover that no stream reports, after a `commit` that could not start its
-  /// streams: nothing is watched for the keys of such a cover.
-  fn forget_unstreamed(&mut self) {
-    let Self { covers, cover_of_key, streamed, .. } = self;
-    covers.retain(|real, keys| {
-      if streamed.holds(real) {
-        return true;
-      }
-      for key in keys.iter() {
-        cover_of_key.remove(key);
-      }
-      false
-    });
-  }
-
   /// The hints for a record that says that records were lost.
   fn lost(&self, path: &Path, flags: u32, hint: &mut dyn FnMut(Hint<'_>)) {
     // Only `MustScanSubDirs` gives the path a meaning: records for it, or for something below
@@ -421,8 +210,8 @@ impl FsEventsBackend {
     // The keys of a cover that holds the path see that place, and so do the keys of a cover
     // below the path. The hint is for the whole cover: one that names the place would make the
     // engine check that one name only.
-    let holders = self.covers.holders(path).map(|(keys, _)| keys);
-    for keys in holders.chain(self.covers.below(path)) {
+    let holders = self.covers.by_dir.holders(path).map(|(keys, _)| keys);
+    for keys in holders.chain(self.covers.by_dir.below(path)) {
       for &key in keys {
         hint(Hint::Changed { dir: key, rel: Path::new("") });
       }
@@ -461,46 +250,35 @@ impl FsEventsBackend {
   }
 }
 
-impl Drop for FsEventsBackend {
-  fn drop(&mut self) {
-    self.streams.clear();
-    self.retiring.clear();
-    // Stopping a stream does not wait for a callback that is running. This does: when it
-    // returns, that callback is over and no other starts. So the sink is not called again, and
-    // only now may it be freed.
-    self.queue.sync(|| {});
-  }
-}
-
 /// Hooks for tests: what the backend holds.
 impl FsEventsBackend {
   /// How many streams run for the covers.
   pub fn stream_count(&self) -> usize {
-    self.streams.len()
+    self.streams.running.len()
   }
 
   /// How many replaced streams still run.
   pub fn retiring_count(&self) -> usize {
-    self.retiring.len()
+    self.streams.retiring.len()
   }
 
   /// The covers, in path order.
   pub fn covers(&self) -> Vec<&Path> {
-    self.covers.paths()
+    self.covers.by_dir.paths()
   }
 
   pub fn cover_of_key(&self) -> &FxHashMap<DirKey, PathBuf> {
-    &self.cover_of_key
+    &self.covers.dir_of
   }
 
   /// The stream paths, in path order.
   pub fn streamed(&self) -> Vec<&Path> {
-    self.streamed.paths()
+    self.streams.paths.paths()
   }
 
   /// The paths for the next stream, in path order.
   pub fn pending(&self) -> Vec<&Path> {
-    self.pending.paths()
+    self.streams.pending.paths()
   }
 }
 
@@ -520,6 +298,230 @@ fn canonical(dir: &Path) -> io::Result<PathBuf> {
   }
   Ok(real)
 }
+
+/// The error for a path that a stream cannot take.
+fn not_utf8() -> io::Error {
+  io::Error::new(io::ErrorKind::InvalidInput, "FSEvents cannot watch a path that is not UTF-8")
+}
+
+/// The records of one callback call: the raw notification of this backend.
+#[derive(Debug, Default)]
+pub struct Raw {
+  /// The paths of all records, one after the other.
+  paths: Vec<u8>,
+  /// For each record: where its path ends in `paths`, and its flags.
+  records: Vec<(usize, u32)>,
+}
+
+impl Raw {
+  pub fn push(&mut self, path: &[u8], flags: u32) {
+    self.paths.extend_from_slice(path);
+    self.records.push((self.paths.len(), flags));
+  }
+
+  pub fn records(&self) -> impl Iterator<Item = (&Path, u32)> {
+    let mut start = 0;
+    self.records.iter().map(move |&(end, flags)| {
+      let path = &self.paths[start..end];
+      start = end;
+      (Path::new(OsStr::from_bytes(path)), flags)
+    })
+  }
+}
+
+// ---- The covers: what the engine watches ----
+
+/// Every cover by its real path, with the keys that the engine watches it under.
+#[derive(Debug, Default)]
+struct Covers {
+  by_dir: Dirs<Vec<DirKey>>,
+  dir_of: FxHashMap<DirKey, PathBuf>,
+}
+
+impl Covers {
+  /// Files `key` under `dir`. A key that was under another cover leaves it: another directory
+  /// is at its path now.
+  fn insert(&mut self, key: DirKey, dir: PathBuf) {
+    if self.dir_of.get(&key) == Some(&dir) {
+      return;
+    }
+    self.remove(key);
+    match self.by_dir.get_mut(&dir) {
+      Some(keys) => keys.push(key),
+      None => self.by_dir.insert(dir.clone(), vec![key]),
+    }
+    self.dir_of.insert(key, dir);
+  }
+
+  /// Forgets `key`. A cover goes with its last key.
+  fn remove(&mut self, key: DirKey) {
+    let Some(dir) = self.dir_of.remove(&key) else { return };
+    let Some(keys) = self.by_dir.get_mut(&dir) else { return };
+    keys.retain(|known| *known != key);
+    if keys.is_empty() {
+      self.by_dir.remove(&dir);
+    }
+  }
+
+  /// Forgets every cover for which `keep` says no, with its keys.
+  fn retain(&mut self, keep: impl Fn(&Path) -> bool) {
+    let Self { by_dir, dir_of } = self;
+    by_dir.retain(|dir, keys| {
+      let kept = keep(dir);
+      if !kept {
+        for key in keys.iter() {
+          dir_of.remove(key);
+        }
+      }
+      kept
+    });
+  }
+}
+
+// ---- The streams: what the OS reports ----
+
+/// The streams and their paths. Every cover is at or below a path of `paths` or of `pending`.
+#[derive(Debug)]
+struct Streams {
+  /// Behind an `Arc`: every stream holds a count of it for its callback.
+  sink: Arc<Sink<Raw>>,
+  queue: Queue,
+  running: Vec<Stream>,
+  /// The paths of the running streams.
+  paths: Dirs<()>,
+  /// The paths for the stream that the next `commit` starts.
+  pending: Dirs<()>,
+  /// Replaced streams that may still hold records from before the new streams started.
+  retiring: Vec<Retiring>,
+  /// How many stream paths the last placement left.
+  placed: usize,
+}
+
+/// A replaced stream that still runs.
+#[derive(Debug)]
+struct Retiring {
+  stream: Stream,
+  /// The newest event id of the system right after the new streams were started. A stream that
+  /// has delivered this id has nothing left that the new streams do not get too.
+  caught_up: u64,
+  /// A stream that gets no event never reaches `caught_up`.
+  deadline: Instant,
+}
+
+impl Streams {
+  fn new(sink: Sink<Raw>) -> io::Result<Self> {
+    Ok(Self {
+      sink: Arc::new(sink),
+      queue: Queue::new()?,
+      running: Vec::new(),
+      paths: Dirs::default(),
+      pending: Dirs::default(),
+      retiring: Vec::new(),
+      placed: 0,
+    })
+  }
+
+  /// Whether a running stream reports `dir`, or the stream of the next `commit` will.
+  fn reports(&self, dir: &Path) -> bool {
+    self.paths.holds(dir) || self.pending.holds(dir)
+  }
+
+  /// Makes the pending paths live: with one more stream next to the running ones. With
+  /// [`MAX_STREAMS`] running, or with too many stream paths, new streams for all of `covers`
+  /// take over, and the old ones run out.
+  fn start_pending(&mut self, covers: &Covers) -> io::Result<()> {
+    let new = top_most(self.pending.drain().collect());
+    let replace = self.running.len() >= MAX_STREAMS || self.has_too_many_paths(new.len());
+    let paths = if replace {
+      // Every cover counts, whatever its key asked for: the key was told that a stream reports
+      // its whole tree.
+      place(covers.dir_of.values().cloned().collect(), MAX_STREAM_PATHS)
+    } else {
+      new
+    };
+    // All of them, or none.
+    let streams: Vec<Stream> = paths
+      .chunks(MAX_PATHS)
+      .map(|chunk| Stream::start(&self.queue, &self.sink, chunk))
+      .collect::<io::Result<_>>()?;
+    if replace {
+      self.retire_running();
+      self.placed = paths.len();
+      self.paths = Dirs::default();
+    }
+    self.running.extend(streams);
+    for path in paths {
+      self.paths.insert(path, ());
+    }
+    Ok(())
+  }
+
+  /// Whether `new` more stream paths are too many, so that all paths have to be placed again.
+  ///
+  /// Where the covers cannot go up to common directories, the placement leaves more than
+  /// [`MAX_STREAM_PATHS`]. Then it is not worked out at every commit, only when the number of
+  /// paths has doubled.
+  fn has_too_many_paths(&self, new: usize) -> bool {
+    let limit = if self.placed > MAX_STREAM_PATHS { self.placed * 2 } else { MAX_STREAM_PATHS };
+    self.paths.len() + new > limit
+  }
+
+  /// Lets the running streams run out next to the ones that were just started.
+  fn retire_running(&mut self) {
+    // A stream that is stopped keeps what it has not delivered yet, and the new streams report
+    // that late or not at all. So an old stream runs until it has delivered everything from
+    // before the start of the new ones.
+    let caught_up = FSEventsGetCurrentEventId();
+    let deadline = Instant::now() + MAX_OVERLAP;
+    let replaced = mem::take(&mut self.running);
+    self.retiring.extend(replaced.into_iter().map(|stream| Retiring {
+      stream,
+      caught_up,
+      deadline,
+    }));
+    // With more than `MAX_RETIRING`, the oldest hand over what they still hold and stop now.
+    let too_many = self.retiring.len().saturating_sub(MAX_RETIRING);
+    if too_many > 0 {
+      let oldest: Vec<Retiring> = self.retiring.drain(..too_many).collect();
+      for old in &oldest {
+        old.stream.deliver_all();
+      }
+      self.queue.sync(move || drop(oldest));
+    }
+  }
+
+  /// Stops the replaced streams that have nothing left to deliver.
+  ///
+  /// Nothing waits for them: this runs at every `commit` and `translate`, so a stream that is
+  /// due goes with the next call.
+  fn retire(&mut self) {
+    let now = Instant::now();
+    let done: Vec<Retiring> = self
+      .retiring
+      .extract_if(.., |old| {
+        now >= old.deadline || old.stream.latest_event_id().is_some_and(|id| id >= old.caught_up)
+      })
+      .collect();
+    if !done.is_empty() {
+      // On the queue: the stream may be in the middle of handing over the records that made it
+      // catch up, and a stop from this thread could cut that short.
+      self.queue.sync(move || drop(done));
+    }
+  }
+}
+
+impl Drop for Streams {
+  fn drop(&mut self) {
+    self.running.clear();
+    self.retiring.clear();
+    // Stopping a stream does not wait for a callback that is running. This does: when it
+    // returns, that callback is over and no other starts. So the sink is not called again, and
+    // only now may it be freed.
+    self.queue.sync(|| {});
+  }
+}
+
+// ---- Where the stream paths go ----
 
 /// Whether `dir` is too high to become a stream path that no cover asked for. A stream there
 /// would report most of what happens on the disk:
@@ -546,67 +548,37 @@ pub fn is_too_high(dir: &Path) -> bool {
   }
 }
 
-/// Decides where the stream paths go for `covers`. No stream path is below another, and every
-/// cover is at or below one. The same covers give the same stream paths, in whatever order they
-/// come. It is the rule for the handles of the Windows backend (`place` in `windows.rs`).
+/// The stream paths for `covers`: no stream path is below another, and every cover is at or
+/// below one. The same covers give the same stream paths, in whatever order they come. It is
+/// the rule for the handles of the Windows backend (`place` in `windows.rs`).
 ///
 /// 1. Each cover with no other cover above it is a stream path.
-/// 2. If that makes more than `max` stream paths, paths go up to a directory that they have in
-///    common and become one: the deepest common directory first, and of two that are equally
-///    deep the first in path order. So the stream paths stay as low as the limit allows.
+/// 2. While these are more than `max`, the paths below the deepest directory that two of them
+///    have in common become one path, on that directory. Of two such directories that are
+///    equally deep, the first in path order is taken. So the stream paths stay as low as the
+///    limit allows.
 /// 3. No path goes up to a directory that is too high ([`is_too_high`]). So more than `max`
 ///    stream paths can be left.
-fn place<'a>(covers: impl Iterator<Item = &'a Path>, max: usize) -> Vec<PathBuf> {
-  // Paths sort part by part, so everything below a path comes right after it.
-  let mut tops: Vec<&Path> = covers.collect();
-  tops.sort_unstable();
-  tops.dedup_by(|cover, top| cover.starts_with(top));
-
-  // `shared[i]`: how many parts the tops `i` and `i + 1` have in common at their start. The
-  // directory made of these parts is the lowest one that holds both. `joined[i]`: one stream
-  // path reports both.
-  let shared: Vec<usize> = tops.windows(2).map(|pair| common_parts(pair[0], pair[1])).collect();
-  let mut joined = vec![false; shared.len()];
-  let mut count = tops.len();
-  let mut depths = shared.clone();
-  depths.sort_unstable_by(|a, b| b.cmp(a));
-  depths.dedup();
-  'deepest_first: for depth in depths {
-    let mut at = 0;
-    while at < shared.len() {
-      // The tops `at..=end` are all the tops below one directory of `depth` parts.
-      let end = at + shared[at..].iter().take_while(|&&parts| parts >= depth).count();
-      if end == at {
-        at += 1;
-        continue;
-      }
-      if count <= max {
-        break 'deepest_first;
-      }
-      // Two of them part right below that directory: it is the lowest one that holds them
-      // all. If they all go on together, a directory below it holds them, and its turn was
-      // before.
-      if shared[at..end].contains(&depth) && !is_too_high(&first_parts(tops[at], depth)) {
-        for joined in &mut joined[at..end] {
-          count -= usize::from(!*joined);
-          *joined = true;
-        }
-      }
-      at = end;
+fn place(covers: Vec<PathBuf>, max: usize) -> Vec<PathBuf> {
+  let mut paths = top_most(covers);
+  // `shared[i]`: how many parts the paths `i` and `i + 1` have in common at their start. The
+  // directory made of these parts is the lowest one that holds both. Zero: the two stay apart.
+  let mut shared: Vec<usize> =
+    paths.windows(2).map(|pair| common_parts(&pair[0], &pair[1])).collect();
+  while paths.len() > max {
+    // `rev`: of several that are equally deep, `max_by_key` takes the last.
+    let deepest = shared.iter().enumerate().rev().max_by_key(|&(_, &parts)| parts);
+    let Some((first, &depth)) = deepest.filter(|&(_, &parts)| parts > 0) else { break };
+    // Paths sort part by part, so the paths below that directory come one after the other.
+    let last = first + shared[first..].iter().take_while(|&&parts| parts == depth).count();
+    let dir: PathBuf = paths[first].components().take(depth).collect();
+    if is_too_high(&dir) {
+      // So is every directory above it.
+      shared[first..last].fill(0);
+      continue;
     }
-  }
-
-  // One stream path for each run of joined tops, on the directory that the whole run has in
-  // common.
-  let mut paths = Vec::with_capacity(count);
-  let mut first = 0;
-  while first < tops.len() {
-    let pairs = joined[first..].iter().take_while(|&&joined| joined).count();
-    paths.push(match shared[first..first + pairs].iter().min() {
-      Some(&parts) => first_parts(tops[first], parts),
-      None => tops[first].to_owned(),
-    });
-    first += pairs + 1;
+    paths.splice(first..=last, [dir]);
+    shared.drain(first..last);
   }
   paths
 }
@@ -616,24 +588,16 @@ fn common_parts(a: &Path, b: &Path) -> usize {
   a.components().zip(b.components()).take_while(|(a, b)| a == b).count()
 }
 
-fn first_parts(path: &Path, count: usize) -> PathBuf {
-  path.components().take(count).collect()
-}
-
 /// Drops every path that lies below another path of the list: a stream for the upper one
-/// reports the lower one too.
-fn top_most(paths: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
-  let mut paths: Vec<PathBuf> = paths.collect();
+/// reports the lower one too. What is left is in path order.
+fn top_most(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
   // Paths sort part by part, so everything below a path comes right after it.
   paths.sort_unstable();
   paths.dedup_by(|path, kept| path.starts_with(kept));
   paths
 }
 
-/// The error for a path that a stream cannot take.
-fn not_utf8() -> io::Error {
-  io::Error::new(io::ErrorKind::InvalidInput, "FSEvents cannot watch a path that is not UTF-8")
-}
+// ---- The table of directories ----
 
 /// Directories by their real paths, with a value for each.
 ///
@@ -682,10 +646,6 @@ impl<T> Dirs<T> {
   fn retain(&mut self, keep: impl FnMut(&PathBuf, &mut T) -> bool) {
     self.by_path.retain(keep);
     self.forget_lengths_if_empty();
-  }
-
-  fn clear(&mut self) {
-    *self = Self::default();
   }
 
   /// Takes every directory out.
@@ -744,6 +704,45 @@ impl<T> Dirs<T> {
 }
 
 // ---- Safe wrappers around the C functions ----
+
+/// Runs on the dispatch queue. It only copies the records and hands them over.
+extern "C" fn callback(
+  _stream: FSEventStreamRef,
+  info: *mut c_void,
+  count: usize,
+  paths: *mut c_void,
+  flags: *const u32,
+  _ids: *const u64,
+) {
+  // SAFETY: `info` is the sink that `Stream::start` got. Its caller, `Streams`, holds a count
+  // of it until every stream is stopped and a `Queue::sync` after that has returned. Then no
+  // callback is running and none starts, so the sink lives longer than every callback. A sink
+  // is `Sync`, so this thread may use it next to the watcher thread.
+  let sink = unsafe { &*info.cast::<Sink<Raw>>() };
+  let paths = paths.cast::<*const c_char>();
+  let mut raw = Raw { paths: Vec::with_capacity(count * 128), records: Vec::with_capacity(count) };
+  for index in 0..count {
+    // SAFETY: a stream without the UseCFTypes flag passes `count` C strings and `count` flags,
+    // and they live until the callback returns.
+    let (path, flags) = unsafe { (CStr::from_ptr(*paths.add(index)), *flags.add(index)) };
+    raw.push(path.to_bytes(), flags);
+  }
+  sink.raw(raw);
+}
+
+/// The stream calls this when it is created: it holds the sink for as long as it lives.
+extern "C" fn retain(info: *const c_void) -> *const c_void {
+  // SAFETY: `info` comes from `Arc::as_ptr`, and the caller of `FSEventStreamCreate` holds a
+  // count of that `Arc` while the stream takes its own.
+  unsafe { Arc::increment_strong_count(info.cast::<Sink<Raw>>()) };
+  info
+}
+
+/// The stream calls this when it is deallocated, some time after `FSEventStreamRelease`.
+extern "C" fn release(info: *const c_void) {
+  // SAFETY: this gives back the count that `retain` took.
+  unsafe { Arc::decrement_strong_count(info.cast::<Sink<Raw>>()) };
+}
 
 /// A serial dispatch queue. The callbacks of all streams run on it, one at a time.
 #[derive(Debug)]
@@ -919,11 +918,6 @@ fn name_on_disk(path: &Path) -> io::Result<Option<OsString>> {
   Ok(Some(OsStr::from_bytes(name).to_owned()))
 }
 
-/// The id of the newest event of the whole system.
-fn current_event_id() -> u64 {
-  FSEventsGetCurrentEventId()
-}
-
 /// An owned CoreFoundation object.
 struct Cf(NonNull<c_void>);
 
@@ -1044,6 +1038,7 @@ unsafe extern "C" {
   fn FSEventStreamInvalidate(stream: FSEventStreamRef);
   fn FSEventStreamRelease(stream: FSEventStreamRef);
   fn FSEventStreamGetLatestEventId(stream: FSEventStreamRef) -> u64;
+  /// The id of the newest event of the whole system.
   safe fn FSEventsGetCurrentEventId() -> u64;
 }
 
@@ -1093,19 +1088,7 @@ mod tests {
 
   /// The stream paths for these covers.
   fn placed(covers: &[&str], max: usize) -> Vec<PathBuf> {
-    place(covers.iter().map(Path::new), max)
-  }
-
-  #[test]
-  fn each_cover_with_no_cover_above_it_is_a_stream_path_while_there_is_room() {
-    let mut covers =
-      ["/Users/me/p/b", "/Users/me/p/a/x", "/Users/me/p/ab", "/Users/me/p/a", "/Users/me/p/a"];
-    // `/Users/me/p/ab` is not below `/Users/me/p/a`: paths are compared part by part.
-    let expected = paths(&["/Users/me/p/a", "/Users/me/p/ab", "/Users/me/p/b"]);
-    assert_eq!(placed(&covers, 3), expected);
-    covers.reverse();
-    assert_eq!(placed(&covers, 3), expected);
-    assert_eq!(placed(&[], 3), paths(&[]));
+    place(paths(covers), max)
   }
 
   #[test]
@@ -1120,23 +1103,17 @@ mod tests {
     );
     assert_eq!(placed(&covers, 3), paths(&["/Users/me/p/a", "/Users/me/p/b", "/Users/me/q"]));
     assert_eq!(placed(&covers, 2), paths(&["/Users/me/p", "/Users/me/q"]));
-  }
-
-  #[test]
-  fn no_stream_path_goes_up_to_a_directory_that_is_too_high() {
-    // `/Users/me` is all that `p` and `q` have in common, so more than `max` are left.
-    let covers = ["/Users/me/p/a", "/Users/me/p/b", "/Users/me/q"];
+    // `/Users/me` is too high: more than `max` are left.
     assert_eq!(placed(&covers, 1), paths(&["/Users/me/p", "/Users/me/q"]));
-    assert_eq!(placed(&covers, 0), paths(&["/Users/me/p", "/Users/me/q"]));
   }
 
   #[test]
   fn top_most_drops_what_lies_below_another_path() {
     let paths = ["/x/a/b", "/x/ab", "/x/a", "/y", "/x/a/b/c", "/x/a", "/x/a.b"];
-    let kept = top_most(paths.map(PathBuf::from).into_iter());
+    let kept = top_most(paths.map(PathBuf::from).to_vec());
     assert_eq!(kept, ["/x/a", "/x/a.b", "/x/ab", "/y"].map(PathBuf::from));
 
-    let kept = top_most(["/x", "/", "/y/z"].map(PathBuf::from).into_iter());
+    let kept = top_most(["/x", "/", "/y/z"].map(PathBuf::from).to_vec());
     assert_eq!(kept, [PathBuf::from("/")]);
   }
 

@@ -151,8 +151,8 @@ The words, each for one idea:
 | young | a file whose modification time is too close to the check to trust | `Content` |
 | quiet time | the debounce: how long no hint must come before the disk is checked | `Options::quiet_time` |
 | rest | the pause after work that no hint asked for by name: a poll, the scans after loss reports | `REST`, `rest_until` |
-| cover | FSEvents only: a directory that the engine watches and a stream reports | `covers` in `fsevents.rs` |
-| stream path | FSEvents only: a directory that a stream was started for; it reports the whole tree below | `streamed` in `fsevents.rs` |
+| cover | FSEvents only: a directory that the engine watches and a stream reports | `Covers` in `fsevents.rs` |
+| stream path | FSEvents only: a directory that a stream was started for; it reports the whole tree below | `Streams::paths` in `fsevents.rs` |
 
 `tree/mod.rs` holds the data, and `engine/` has one file for each job (`mod.rs` says which).
 
