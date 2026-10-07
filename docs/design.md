@@ -579,6 +579,13 @@ watched path higher up). Then `commit` returns the keys of these directories, an
 calls `watch` again for each of them (`ask_again`). One that is reported now gets a shallow
 scan after the next commit (watch, commit, then scan), and no poll looks at it any more.
 
+**Given back.** A directory can have a watch of its own and lie below a watch for a tree: its
+path was watched first, and a path above it later. When such a directory is scanned deep, its
+own watch is given back after the next commit, and it relies on the watch above (`still_there`,
+`give_back_covered`). So it does not matter which of the two paths was watched first. It
+happens only with a deep scan: a watch that goes takes with it what it has not delivered yet,
+and the scan after it finds what that watch did not tell.
+
 **A directory that was renamed away and back.** A watch by path (FSEvents) stands at a path.
 When a directory above it is renamed away, changed, and renamed back, the stream heard nothing,
 and the poll of the directory above finds the same directory at the same path. So for a
@@ -777,6 +784,12 @@ Facts from probes on macOS (APFS):
 - A renamed or moved directory gives one record for the directory and none for what is inside.
 - Flags are merged and stay set for many seconds. So flags are never read as "what happened".
 - Stopping a stream throws away what it has not delivered.
+- Records are lost without a word when one stream takes over from another while files are
+  written fast (4 threads without a pause, 300 files). An old stream that was stopped as soon
+  as it had delivered the event id of the moment of the start: a change was missed in 5 of 30
+  runs, also with a synchronous flush before the stop. A new stream that was started from the
+  event id of that moment (`sinceWhen`), with a flush and no overlap: 8 of 30 runs. With 500 ms
+  of overlap: none in 40. With a loss report at the stop: none in 40, also with no overlap.
 - Limits: 512 started streams for a process, 4,096 paths for a stream.
 - A write to a file that stays open, and a write through `mmap`, is not reported before close.
 - Many stream paths lose nothing, but they are slow while other programs write a lot. Time
@@ -808,13 +821,21 @@ As built:
   (one `getattrlist` call). A link, and a name that differs by more than the case of ASCII
   letters, are left to the OS (`realpath`).
 - **Streams are only added.** `commit` starts one stream for the new paths (one for every 4,096).
-  Old streams keep running, so nothing is ever in a gap. With 8 streams running, or with too
-  many stream paths, `commit` starts new streams for all covers in their place, and an old
-  stream is stopped when it has delivered everything from before that start, or after 500 ms.
-  At most 64 old streams run on (`MAX_RETIRING_STREAMS`): with more, the oldest are told to deliver what
-  they hold (`FSEventStreamFlushSync`) and are stopped at once, so that commits that come fast
-  do not use up the 512 streams. If the streams cannot start, `commit` returns the watch limit
-  error and the old streams keep running.
+  Old streams keep running, so nothing is ever in a gap. With 8 streams running, with too many
+  stream paths, or when a new path lies above a running one, `commit` starts new streams for
+  all covers in their place: so no stream path lies below another, and no record comes twice
+  for long. If the streams cannot start, `commit` returns the watch limit error and the old
+  streams keep running.
+- **An old stream that stops.** A replaced stream runs on for 500 ms next to the new ones. When
+  it is stopped, the backend puts one loss report into the queue (`MustScanSubDirs` for `/`,
+  so `Lost`), and the engine reads everything again: a stream that stops takes with it what it
+  has not delivered, and the new one may not have told everything from its first moments (see
+  the probe). Streams that stop at the same time share one report, and the scans of loss
+  reports are paced (5.13). The stop is made by the first `commit` or `translate` after the
+  500 ms: the poll of the directories above the covers brings a `commit` every second, so an
+  old stream does not wait for the next change. At most 64 old streams run on (`MAX_RETIRING_STREAMS`): with more,
+  the oldest are stopped at once, in the same way, so that commits that come fast do not use
+  up the 512 streams.
 - **Hints.** A record becomes one `Changed` for each key of each cover that holds its path;
   the rest of the path is `rel`. The covers are found by one table lookup for each directory
   above the path that can be a cover. A record under no cover is dropped: a stream path on a
@@ -962,7 +983,8 @@ Known holes of the engine:
 - A write through another hard link of a watched file. A mount over a watched directory.
 - FSEvents and Windows: after `rm -r` of the directories above a watched path, the engine
   learns that an upper directory is gone only at the next poll.
-- Where the OS watches are put depends on the order of the `watch` calls. Nothing is missed.
+- Where the OS watches are put depends on what was watched and unwatched before: a stream stays
+  where it is until the streams are replaced. Nothing is missed.
 
 Known holes of the backends are in 7.1 to 7.3. The Windows backend has not run on Windows.
 Android was never built.

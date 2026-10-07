@@ -556,39 +556,28 @@ fn cover_above_a_cover() {
   let low = h.cover(1, "up/low");
   let up = h.watch(2, &h.path("up"), Want::Contents);
   h.commit();
-  assert_eq!(h.backend.stream_count(), 2);
+  // The stream of the upper directory reports the lower one too, so it takes the place of
+  // the stream that ran there: no path of a stream lies below another.
+  assert_eq!(h.backend.stream_count(), 1);
+  assert_eq!(h.backend.streamed(), [h.real("up")]);
 
-  // Both streams deliver the record, so each hint can come twice.
+  // The replaced stream may still run and deliver the record too, so each hint can come twice.
   File::create(h.path("up/low/a")).unwrap();
-  h.hints_until(&[changed(low, "a"), changed(up, "low/a")]);
+  let mut hints = h.hints_until(&[changed(low, "a"), changed(up, "low/a")]);
   File::create(h.path("up/b")).unwrap();
-  let mut hints = h.hints_until(&[changed(up, "b")]);
+  hints.extend(h.hints_until(&[changed(up, "b")]));
   hints.extend(h.sync(up));
   assert!(!rels(&hints, low).contains("b"));
 
-  // More covers, until one stream replaces all streams. It has only the upper directory.
-  for index in 0..MAX_STREAMS {
-    let dir = h.path(&format!("other-{index}"));
-    fs::create_dir(&dir).unwrap();
-    h.watch(100 + u32::try_from(index).unwrap(), &dir, Want::Contents);
-    h.commit();
-    if h.backend.stream_count() == 1 {
-      break;
-    }
-  }
-  assert_eq!(h.backend.stream_count(), 1);
-  assert!(h.backend.streamed().contains(&h.real("up").as_path()));
-  assert!(!h.backend.streamed().contains(&h.real("up/low").as_path()));
-
-  File::create(h.path("up/low/c")).unwrap();
-  h.hints_until(&[changed(low, "c"), changed(up, "low/c")]);
-
-  // And when the replaced streams are gone.
+  // And when the replaced stream is gone. A loss report comes with its stop: it takes with it
+  // what it has not delivered.
   let deadline = Instant::now() + TIMEOUT;
   while h.backend.retiring_count() > 0 {
-    h.sync(up);
+    hints.extend(h.sync(up));
     assert!(Instant::now() < deadline, "{} streams never stop", h.backend.retiring_count());
   }
+  hints.extend(h.sync(up));
+  assert!(hints.contains(&Seen::Lost), "{hints:?}");
   File::create(h.path("up/low/d")).unwrap();
   h.hints_until(&[changed(low, "d"), changed(up, "low/d")]);
 }
@@ -1340,6 +1329,11 @@ fn the_cost_of_single_files() {
   let took = started.elapsed();
   say(&format!("one `watch` call for each file: {took:.1?}, {} errors", each.out.errors.len()));
   assert_eq!(each.out.errors.len(), 0, "{:?}", each.out.errors);
+  // Every new directory started a stream, and the streams were replaced many times. When a
+  // replaced stream stops, the engine reads everything again: that settles first.
+  let settling = each.run(Duration::from_secs(3));
+  say(&format!("  then the replaced streams stop: {settling} lstat in 3 s, and no event"));
+  assert_eq!(each.out.events.len(), 0, "{:?}", each.out.events);
   let idle = each.run(Duration::from_secs(3)) / 3;
   say(&format!("  then idle: {idle} lstat a second"));
   assert!(idle <= poll_budget, "{idle} lstat in an idle second");

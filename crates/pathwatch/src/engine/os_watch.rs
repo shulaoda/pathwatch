@@ -2,7 +2,7 @@
 //! live, and what is polled because no OS watch tells about it.
 
 use std::{
-  io,
+  io, mem,
   path::{Path, PathBuf},
 };
 
@@ -22,17 +22,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// when `force` says that the watch may be gone. `path` is the path of the directory.
   pub(super) fn arm(&mut self, key: DirKey, path: &mut PathBuf, force: bool) {
     let Some(asked) = self.tree[key].dir().map(|dir| dir.asked) else { return };
-    let covered_from_above = self.tree.parent(key).is_some_and(|parent| {
-      // A watch for a tree reports the real directories below it. A directory that is reached
-      // through a link is not one of them.
-      let linked = self.tree.link(key).is_some();
-      !linked && matches!(self.tree[parent].watch(), Watch::WatchedTree | Watch::FromAbove)
-    });
     if self.backend_failed {
       return self.set_state(key, Watch::Polled);
     }
     // A watch above covers this directory, and the backend holds none for it.
-    if asked.is_none() && covered_from_above {
+    if asked.is_none() && self.is_covered_from_above(key) {
       return self.set_state(key, Watch::FromAbove);
     }
     // For one key the want only goes up (rule 5 of the backend), and no more than the
@@ -42,6 +36,50 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       return;
     }
     self.ask(key, path, want);
+  }
+
+  /// Whether a watch for a tree above the directory `key` reports it too. Such a watch reports
+  /// the real directories below it. A directory that is reached through a link is not one of
+  /// them.
+  fn is_covered_from_above(&self, key: DirKey) -> bool {
+    let linked = self.tree.link(key).is_some();
+    let above = self.tree.parent(key).map(|parent| self.tree[parent].watch());
+    !linked && matches!(above, Some(Watch::WatchedTree | Watch::FromAbove))
+  }
+
+  /// Whether the directory `key` has a watch of its own that it does not need: a watch above
+  /// covers it. That happens when the path above was watched later.
+  pub(super) fn has_a_watch_to_give_back(&self, key: DirKey) -> bool {
+    let has_its_own = self.tree[key].dir().is_some_and(|dir| dir.asked.is_some());
+    has_its_own && !self.backend_failed && self.is_covered_from_above(key)
+  }
+
+  /// Gives back the watch of each directory on the list `covered`. The commit is done, so the
+  /// watch above is live.
+  ///
+  /// A watch that goes takes with it what it has not delivered yet. So only a directory that
+  /// is scanned deep after this is on the list: that scan finds what the watch did not tell.
+  pub(super) fn give_back_covered(&mut self) {
+    let mut covered = mem::take(&mut self.covered);
+    for key in covered.drain(..) {
+      // Nothing is on disk below a held node: its second look decides for this one too.
+      if self.tree.get(key).is_none() || self.tree.frozen(key) {
+        continue;
+      }
+      if self.has_a_watch_to_give_back(key) {
+        self.backend.unwatch(key);
+        if let Some(dir) = self.tree[key].dir_mut() {
+          dir.asked = None;
+        }
+        self.set_state(key, Watch::FromAbove);
+      } else {
+        // The watch above is gone again, and `still_there` did not ask for its own, which may
+        // be gone too. The ask queues the node again, so its scan waits for the next commit.
+        let mut path = self.tree.path(key);
+        self.arm(key, &mut path, true);
+      }
+    }
+    self.covered = covered;
   }
 
   /// Asks the backend to watch the directory `key` with `want`, and queues the scan.
@@ -118,6 +156,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// backend did not watch and that it reports now (see `ask_again`).
   pub(super) fn commit(&mut self) -> Vec<DirKey> {
     if self.backend_failed {
+      self.covered.clear();
       return Vec::new();
     }
     let started = self.fs.now();
@@ -129,6 +168,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       Ok(now_watched) => return now_watched,
       Err(error) => error,
     };
+    // The watch above a directory on the list `covered` may not be live: the directory keeps
+    // its own. It waits for a scan, so the loop below takes it for failed like the others, and
+    // it is asked again.
+    self.covered.clear();
     // None of the watches asked for since the last commit is live. `ask` queued each of those
     // nodes for a scan, so they are all in the queue. A node in the queue that was asked
     // earlier is taken for failed too: it is polled and asked again, which loses nothing.

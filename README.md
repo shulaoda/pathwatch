@@ -176,8 +176,8 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 - **Windows: more than 64 directories** share handles. A watched path that is then spelled in
   another way than the disk (more than the case of ASCII letters, or a short 8.3 name) gets no
   events.
-- **Where the OS watches are put depends on the order of the `watch` calls.** Nothing is
-  missed.
+- **Where the OS watches are put depends on what was watched and unwatched before.** A stream of
+  macOS stays where it is until the streams are replaced. Nothing is missed.
 - **The Windows backend has not run on Windows yet.** It is type-checked, and its parts that
   call no Windows are tested on other systems. See `docs/windows-open-points.md`. Until it is
   checked, `with_polling(true)` is the safe choice on Windows.

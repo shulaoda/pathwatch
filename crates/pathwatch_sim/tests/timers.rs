@@ -398,10 +398,7 @@ fn a_loss_report_waits_and_the_directory_above_goes_away() {
     d.fs.mkdir_all("/p/d/sub").unwrap();
     d.fs.write("/p/d/sub/a.js", "1").unwrap();
     d.fs.write("/p/x.js", "1").unwrap();
-    // Two watches for a tree, one inside the other: `/p/d` had its own before `/p` got one.
     d.watch(&["/p/d"]);
-    d.watch(&["/p/x.js"]);
-    assert_eq!(d.fs.os_watches().len(), 2, "{mode:?}");
 
     // A scan after lost notifications that takes 300 ms: the rest after it is longer than
     // the time to the next poll.
@@ -409,6 +406,10 @@ fn a_loss_report_waits_and_the_directory_above_goes_away() {
     d.engine.overflow(d.now);
     assert!(d.step());
     assert_eq!(d.fs.traps_run(), 1, "{mode:?}");
+    // Two watches for a tree, one inside the other: `/p/d` had its own before `/p` got one,
+    // and nothing has read `/p/d` again since, so it still has it.
+    d.watch(&["/p/x.js"]);
+    assert_eq!(d.fs.os_watches().len(), 2, "{mode:?}");
     // Both watches lose a notification, and both loss reports wait.
     d.fs.write("/p/d/sub/a.js", "22").unwrap();
     assert!(d.fs.lose_raw(usize::MAX) >= 2, "{mode:?}");

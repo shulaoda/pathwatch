@@ -140,6 +140,9 @@ pub struct Engine<B: Backend, F: Fs> {
   /// The registered names whose watch target the filter ignores. The end of the flush drops
   /// the watched paths at and below them, with a `Delete` for each file that the handler knows.
   dropped: Vec<DirKey>,
+  /// The directories that give the watch of their own back after the next commit: a watch
+  /// above covers them (see `still_there`).
+  covered: Vec<DirKey>,
   /// With loose spelling: the nodes that the listing of the running scan named.
   listed: FxHashSet<DirKey>,
   /// A read of the disk failed during the running scan.
@@ -181,6 +184,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       commit_took: Duration::ZERO,
       touched: Vec::new(),
       dropped: Vec::new(),
+      covered: Vec::new(),
       listed: FxHashSet::default(),
       scan_had_error: false,
       path: PathBuf::new(),
@@ -398,7 +402,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let now_watched = self.commit();
     let mut scans = mem::take(&mut self.scans);
     self.tree.take_scans(&mut scans);
-    // After `take_scans`: what this queues waits for the commit of the next round.
+    // After `take_scans`: what these two queue waits for the commit of the next round.
+    self.give_back_covered();
     self.ask_again(now_watched);
     for &(key, depth) in &scans {
       let Some(dir) = self.tree.get_mut(key).and_then(Node::dir_mut) else { continue };

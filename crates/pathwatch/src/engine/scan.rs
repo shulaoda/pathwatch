@@ -192,9 +192,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// A directory is still on disk at the node `key`.
   pub(super) fn still_there(&mut self, key: DirKey, path: &mut PathBuf, deep: bool) {
-    // Also when not `deep`: the node may want more now, or the watch above that covered it may
-    // be gone or may not reach it any more.
-    self.arm(key, path, deep);
+    if deep && self.has_a_watch_to_give_back(key) {
+      // A watch above covers this directory, and everything below it is read again after the
+      // next commit. So its own watch can go then: where the OS watches are does not depend on
+      // which of the two paths was watched first.
+      self.covered.push(key);
+    } else {
+      // Also when not `deep`: the node may want more now, or the watch above that covered it
+      // may be gone or may not reach it any more.
+      self.arm(key, path, deep);
+    }
     if deep {
       self.tree.queue_scan(key, Depth::Deep);
     }

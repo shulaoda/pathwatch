@@ -1,4 +1,5 @@
 use std::{
+  collections::VecDeque,
   ffi::OsStr,
   fs, io, mem,
   ops::Range,
@@ -16,7 +17,7 @@ use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want};
 pub const MAX_STREAMS: usize = 8;
 pub const MAX_STREAM_PATHS: usize = 64;
 pub const MAX_PATHS_PER_STREAM: usize = 4096;
-pub const MAX_RETIRING_STREAMS: usize = 64;
+const MAX_RETIRING_STREAMS: usize = 64;
 const RETIRING_TIMEOUT: Duration = Duration::from_millis(500);
 const EXPECTED_PATH_BYTES: usize = 128;
 
@@ -60,7 +61,7 @@ impl FsEventsBackend {
         paths: Dirs::default(),
         pending: Dirs::default(),
         path_limit: MAX_STREAM_PATHS,
-        retiring: Vec::new(),
+        retiring: VecDeque::new(),
       },
       not_watched: FxHashMap::default(),
       last_parent: None,
@@ -72,7 +73,7 @@ impl FsEventsBackend {
   }
 
   pub fn retiring_count(&self) -> usize {
-    self.streams.retiring.len()
+    self.streams.retiring.iter().map(|old| old.streams.len()).sum()
   }
 
   pub fn covers(&self) -> Vec<&Path> {
@@ -275,21 +276,22 @@ struct Streams {
   paths: Dirs<()>,
   pending: Dirs<()>,
   path_limit: usize,
-  retiring: Vec<Retiring>,
+  retiring: VecDeque<Retiring>,
 }
 
 #[derive(Debug)]
 struct Retiring {
-  stream: Stream,
-  caught_up_at: u64,
+  streams: Vec<Stream>,
   deadline: Instant,
 }
 
 impl Streams {
   fn start_pending(&mut self, covers: &Covers) -> io::Result<()> {
     let new = top_most(self.pending.drain().collect());
-    let replace =
-      self.running.len() >= MAX_STREAMS || self.paths.len() + new.len() > self.path_limit;
+    let lies_above_a_stream = |path: &PathBuf| self.paths.below(path).next().is_some();
+    let replace = self.running.len() >= MAX_STREAMS
+      || self.paths.len() + new.len() > self.path_limit
+      || new.iter().any(lies_above_a_stream);
     let paths = if replace {
       place(covers.dir_of.values().cloned().collect(), MAX_STREAM_PATHS)
     } else {
@@ -300,7 +302,12 @@ impl Streams {
       .map(|chunk| Stream::start(&self.queue, &self.sink, chunk))
       .collect::<io::Result<_>>()?;
     if replace {
-      self.retire_running();
+      let replaced = mem::take(&mut self.running);
+      if !replaced.is_empty() {
+        let deadline = Instant::now() + RETIRING_TIMEOUT;
+        self.retiring.push_back(Retiring { streams: replaced, deadline });
+      }
+      self.stop_retired();
       self.paths = Dirs::default();
       self.path_limit =
         if paths.len() > MAX_STREAM_PATHS { 2 * paths.len() } else { MAX_STREAM_PATHS };
@@ -312,33 +319,22 @@ impl Streams {
     Ok(())
   }
 
-  fn retire_running(&mut self) {
-    let caught_up_at = ffi::FSEventsGetCurrentEventId();
-    let deadline = Instant::now() + RETIRING_TIMEOUT;
-    let replaced = mem::take(&mut self.running);
-    self.retiring.extend(replaced.into_iter().map(|stream| Retiring {
-      stream,
-      caught_up_at,
-      deadline,
-    }));
-    let too_many = self.retiring.len().saturating_sub(MAX_RETIRING_STREAMS);
-    if too_many > 0 {
-      let oldest: Vec<Retiring> = self.retiring.drain(..too_many).collect();
-      for old in &oldest {
-        old.stream.deliver_all();
-      }
-      self.queue.sync(move || drop(oldest));
-    }
-  }
-
   fn stop_retired(&mut self) {
     let now = Instant::now();
-    let is_done = |old: &mut Retiring| {
-      now >= old.deadline || old.stream.latest_event_id().is_some_and(|id| id >= old.caught_up_at)
-    };
-    let done: Vec<Retiring> = self.retiring.extract_if(.., is_done).collect();
-    if !done.is_empty() {
-      self.queue.sync(move || drop(done));
+    let mut still_running: usize = self.retiring.iter().map(|old| old.streams.len()).sum();
+    let mut stopped = Vec::new();
+    while let Some(oldest) = self.retiring.front() {
+      if now < oldest.deadline && still_running <= MAX_RETIRING_STREAMS {
+        break;
+      }
+      still_running -= oldest.streams.len();
+      stopped.extend(self.retiring.pop_front());
+    }
+    if !stopped.is_empty() {
+      self.queue.sync(move || drop(stopped));
+      let mut may_have_lost = Raw::default();
+      may_have_lost.push(b"/", flag::MUST_SCAN_SUB_DIRS);
+      self.sink.raw(may_have_lost);
     }
   }
 }
@@ -572,15 +568,6 @@ mod ffi {
       }
       Err(watch_limit(ERROR_STREAM_START))
     }
-
-    pub(super) fn deliver_all(&self) {
-      unsafe { FSEventStreamFlushSync(self.0.as_ptr()) };
-    }
-
-    pub(super) fn latest_event_id(&self) -> Option<u64> {
-      let id = unsafe { FSEventStreamGetLatestEventId(self.0.as_ptr()) };
-      (id != SINCE_NOW).then_some(id)
-    }
   }
 
   impl Drop for Stream {
@@ -782,12 +769,9 @@ mod ffi {
     ) -> FSEventStreamRef;
     fn FSEventStreamSetDispatchQueue(stream: FSEventStreamRef, queue: DispatchQueue);
     fn FSEventStreamStart(stream: FSEventStreamRef) -> u8;
-    fn FSEventStreamFlushSync(stream: FSEventStreamRef);
     fn FSEventStreamStop(stream: FSEventStreamRef);
     fn FSEventStreamInvalidate(stream: FSEventStreamRef);
     fn FSEventStreamRelease(stream: FSEventStreamRef);
-    fn FSEventStreamGetLatestEventId(stream: FSEventStreamRef) -> u64;
-    pub(super) safe fn FSEventsGetCurrentEventId() -> u64;
   }
 
   #[link(name = "CoreFoundation", kind = "framework")]

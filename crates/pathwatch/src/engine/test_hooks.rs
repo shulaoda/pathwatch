@@ -182,6 +182,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if !self.touched.is_empty() {
       return Err("touched nodes are left over from a flush".to_owned());
     }
+    if !self.covered.is_empty() {
+      return Err("a directory still waits to give its watch back after a flush".to_owned());
+    }
     Ok(())
   }
 }

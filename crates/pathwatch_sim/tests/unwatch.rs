@@ -182,28 +182,30 @@ fn unwatch_gives_a_watch_for_a_tree_back() {
 }
 
 /// Where one watch covers a whole tree: single files are watched, three directories deep, and
-/// then the tree above them. Each directory on the way has a watch for its tree then. When the
-/// tree is taken back, each of them gives that watch back, and what is below is scanned deep:
-/// once from the top, not once for each level that gave a watch back.
+/// then the tree above them. The watch of the tree takes over: each directory below gives its
+/// own back, so it does not matter which of them was watched first. When the tree is taken
+/// back, each directory asks for its own again, and what is below is scanned deep once.
 #[test]
-fn unwatch_a_tree_above_watched_files_scans_it_once() {
+fn a_tree_above_watched_files_takes_their_watches_over() {
   for mode in RECURSIVE {
     let mut d = Driver::sim(mode, Options::default());
     let mut files = Vec::new();
-    for dir in ["/p/t/a/src/x", "/p/t/a/src/y", "/p/t/b/src/x", "/p/t/b/src/y"] {
+    let dirs = ["/p/t/a/src/x", "/p/t/a/src/y", "/p/t/b/src/x", "/p/t/b/src/y"];
+    for dir in dirs {
       d.fs.mkdir_all(dir).unwrap();
       for file in 0..5 {
         files.push(format!("{dir}/file{file}.js"));
         d.fs.write(files.last().unwrap(), "1").unwrap();
       }
     }
+    let of_the_files: Vec<_> = dirs.map(|dir| at(dir, Contents)).into();
     d.watch(&files);
+    assert_eq!(os_watches(&d.fs), of_the_files, "{mode:?}");
     d.watch(&["/p/t"]);
     assert_eq!(settled(&mut d), NONE, "{mode:?}");
-    // By prefix, the 4 directories on the way below the tree start no stream of their own:
-    // they were asked again when the stream of the tree started, and they use that one.
-    let os_watch_count = if mode == Mode::Prefix { 5 } else { 9 };
-    assert_eq!(os_watches(&d.fs).len(), os_watch_count, "{mode:?}");
+    assert_eq!(os_watches(&d.fs), [at("/p/t", Contents)], "{mode:?}");
+    d.fs.write("/p/t/a/src/x/file1.js", "22").unwrap();
+    assert_eq!(settled(&mut d), ["U /p/t/a/src/x/file1.js"], "{mode:?}");
 
     let before = d.fs.calls();
     d.unwatch(&["/p/t"]);
@@ -211,22 +213,11 @@ fn unwatch_a_tree_above_watched_files_scans_it_once() {
     let after = d.fs.calls();
     // One look for each of the 8 directories and the 20 files below the tree.
     assert_eq!(after.lstat - before.lstat, 28, "{mode:?}");
-    // The 5 directories that only lead to watched files give their watch back. Then the
-    // backend is asked once for each of the 9 directories: the top one when it gives its watch
-    // back, and the others when the deep scan comes to them.
-    assert_eq!(after.unwatch - before.unwatch, 5, "{mode:?}");
-    let wide = ["/p/t/a/src/x", "/p/t/a/src/y", "/p/t/b/src/x", "/p/t/b/src/y"];
-    let mut left: Vec<_> = wide.map(|dir| at(dir, Contents)).into();
-    if mode == Mode::Prefix {
-      // By prefix, the stream of the tree still runs when its directory is asked again, for
-      // names: the directories below it use it. So the answer is a watch for the tree again,
-      // the 4 directories on the way are not asked, and the stream stays, as with FSEvents.
-      assert_eq!(after.watch - before.watch, 5, "{mode:?}");
-      left.insert(0, at("/p/t", Contents));
-    } else {
-      assert_eq!(after.watch - before.watch, 9, "{mode:?}");
-    }
-    assert_eq!(os_watches(&d.fs), left, "{mode:?}");
+    // The tree gives its watch back, and the backend is asked once for each of the 9
+    // directories: the top one then, and the others when the deep scan comes to them.
+    assert_eq!(after.unwatch - before.unwatch, 1, "{mode:?}");
+    assert_eq!(after.watch - before.watch, 9, "{mode:?}");
+    assert_eq!(os_watches(&d.fs), of_the_files, "{mode:?}");
 
     d.fs.write("/p/t/b/src/y/file3.js", "22").unwrap();
     d.fs.write("/p/t/b/src/y/new.js", "1").unwrap();
