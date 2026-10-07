@@ -1,6 +1,7 @@
 use std::{
   ffi::OsStr,
   fs, io, mem,
+  ops::Range,
   os::unix::ffi::OsStrExt,
   path::{Component, Path, PathBuf},
   sync::Arc,
@@ -399,13 +400,12 @@ fn top_most(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 #[derive(Debug)]
 struct Dirs<T> {
   by_path: FxHashMap<PathBuf, T>,
-  shortest_path: usize,
-  longest_path: usize,
+  path_lengths: Range<usize>,
 }
 
 impl<T> Default for Dirs<T> {
   fn default() -> Self {
-    Self { by_path: FxHashMap::default(), shortest_path: usize::MAX, longest_path: 0 }
+    Self { by_path: FxHashMap::default(), path_lengths: Range { start: usize::MAX, end: 0 } }
   }
 }
 
@@ -420,8 +420,7 @@ impl<T> Dirs<T> {
 
   fn insert(&mut self, dir: PathBuf, value: T) {
     let len = dir.as_os_str().len();
-    self.shortest_path = self.shortest_path.min(len);
-    self.longest_path = self.longest_path.max(len);
+    self.path_lengths = self.path_lengths.start.min(len)..self.path_lengths.end.max(len + 1);
     self.by_path.insert(dir, value);
   }
 
@@ -445,7 +444,7 @@ impl<T> Dirs<T> {
 
   fn reset_lengths_if_empty(&mut self) {
     if self.by_path.is_empty() {
-      (self.shortest_path, self.longest_path) = (usize::MAX, 0);
+      self.path_lengths = Range { start: usize::MAX, end: 0 };
     }
   }
 
@@ -464,8 +463,8 @@ impl<T> Dirs<T> {
     let bytes = path.as_os_str().as_bytes();
     path
       .ancestors()
-      .skip_while(|dir| dir.as_os_str().len() > self.longest_path)
-      .take_while(|dir| dir.as_os_str().len() >= self.shortest_path)
+      .skip_while(|dir| dir.as_os_str().len() >= self.path_lengths.end)
+      .take_while(|dir| dir.as_os_str().len() >= self.path_lengths.start)
       .filter_map(move |dir| {
         let value = self.by_path.get(dir)?;
         let rest = &bytes[dir.as_os_str().len()..];
