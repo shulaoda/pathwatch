@@ -205,27 +205,21 @@ struct RealParent {
 #[derive(Debug, Default)]
 pub struct Raw {
   paths: Vec<u8>,
-  records: Vec<RawRecord>,
-}
-
-#[derive(Debug)]
-struct RawRecord {
-  path_end: usize,
-  flags: u32,
+  records: Vec<(usize, u32)>,
 }
 
 impl Raw {
   pub fn push(&mut self, path: &[u8], flags: u32) {
     self.paths.extend_from_slice(path);
-    self.records.push(RawRecord { path_end: self.paths.len(), flags });
+    self.records.push((self.paths.len(), flags));
   }
 
   pub fn records(&self) -> impl Iterator<Item = (&Path, u32)> {
     let mut start = 0;
-    self.records.iter().map(move |record| {
-      let path = &self.paths[start..record.path_end];
-      start = record.path_end;
-      (Path::new(OsStr::from_bytes(path)), record.flags)
+    self.records.iter().map(move |&(end, flags)| {
+      let path = &self.paths[start..end];
+      start = end;
+      (Path::new(OsStr::from_bytes(path)), flags)
     })
   }
 }
