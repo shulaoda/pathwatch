@@ -1,24 +1,30 @@
-#![expect(clippy::undocumented_unsafe_blocks, reason = "this file has no comments")]
-
 use std::{
-  ffi::{CStr, CString, OsStr, OsString, c_char, c_void},
+  ffi::OsStr,
   fs, io, mem,
   os::unix::ffi::OsStrExt,
   path::{Component, Path, PathBuf},
-  ptr::{self, NonNull},
   sync::Arc,
   time::{Duration, Instant},
 };
 
 use rustc_hash::FxHashMap;
 
-use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want, watch_limit};
+use self::ffi::{Queue, Stream};
+use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want};
 
 pub const MAX_STREAMS: usize = 8;
 pub const MAX_STREAM_PATHS: usize = 64;
 pub const MAX_PATHS_PER_STREAM: usize = 4096;
 pub const MAX_RETIRING_STREAMS: usize = 64;
 const RETIRING_TIMEOUT: Duration = Duration::from_millis(500);
+const EXPECTED_PATH_BYTES: usize = 128;
+
+const ERROR_PATH_NOT_UTF8: &str = "FSEvents cannot watch a path that is not UTF-8";
+const ERROR_QUEUE_CREATE: &str = "dispatch_queue_create failed";
+const ERROR_STREAM_CREATE: &str = "FSEventStreamCreate failed";
+const ERROR_STREAM_START: &str =
+  "FSEvents cannot start one more stream (512 streams, 4,096 paths each)";
+const ERROR_NAME_ON_DISK: &str = "getattrlist gave no name";
 
 pub mod flag {
   pub const MUST_SCAN_SUB_DIRS: u32 = 0x1;
@@ -46,10 +52,39 @@ impl FsEventsBackend {
   pub fn new(sink: Sink<Raw>) -> io::Result<Self> {
     Ok(Self {
       covers: Covers::default(),
-      streams: Streams::new(sink)?,
+      streams: Streams {
+        sink: Arc::new(sink),
+        queue: Queue::new()?,
+        running: Vec::new(),
+        paths: Dirs::default(),
+        pending: Dirs::default(),
+        path_limit: MAX_STREAM_PATHS,
+        retiring: Vec::new(),
+      },
       not_watched: FxHashMap::default(),
       last_parent: None,
     })
+  }
+
+  fn real_path(&mut self, dir: &Path, want: Want) -> io::Result<PathBuf> {
+    let real = match (want, dir.parent(), dir.file_name()) {
+      (Want::Contents, Some(parent), Some(name)) => {
+        let last = match self.last_parent.take() {
+          Some(last) if last.asked == parent => last,
+          _ => RealParent { asked: parent.to_owned(), real: fs::canonicalize(parent)? },
+        };
+        let real_parent = &self.last_parent.insert(last).real;
+        match ffi::name_on_disk(dir)? {
+          Some(on_disk) if on_disk.eq_ignore_ascii_case(name) => real_parent.join(on_disk),
+          _ => fs::canonicalize(dir)?,
+        }
+      }
+      _ => fs::canonicalize(dir)?,
+    };
+    if real.to_str().is_none() {
+      return Err(io::Error::new(io::ErrorKind::InvalidInput, ERROR_PATH_NOT_UTF8));
+    }
+    Ok(real)
   }
 }
 
@@ -64,7 +99,8 @@ impl Backend for FsEventsBackend {
         return Coverage::Failed(error);
       }
     };
-    if !self.streams.reports(&real) {
+    let has_stream = self.streams.paths.holds(&real) || self.streams.pending.holds(&real);
+    if !has_stream {
       if want == Want::Names {
         self.unwatch(key);
         self.not_watched.insert(key, real);
@@ -100,19 +136,30 @@ impl Backend for FsEventsBackend {
 
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     self.streams.stop_retired();
+    let covers = &self.covers.by_dir;
     for (path, flags) in raw.records() {
       if flags & flag::HISTORY_DONE != 0 {
         continue;
       }
       if flags & flag::RECORDS_LOST != 0 {
-        self.lost(path, flags, hint);
+        let names_a_place = flags & flag::MUST_SCAN_SUB_DIRS != 0 && path != Path::new("/");
+        if !names_a_place {
+          hint(Hint::Lost);
+          continue;
+        }
+        let holders = covers.holders(path).map(|(keys, _)| keys);
+        for keys in holders.chain(covers.below(path)) {
+          for &key in keys {
+            hint(Hint::Changed { dir: key, rel: Path::new("") });
+          }
+        }
         continue;
       }
       let is_touched_dir = flags & flag::IS_DIR != 0 && flags & flag::ENTRY_CAME_OR_WENT == 0;
       if is_touched_dir {
         continue;
       }
-      for (keys, rel) in self.covers.by_dir.holders(path) {
+      for (keys, rel) in covers.holders(path) {
         for &key in keys {
           hint(Hint::Changed { dir: key, rel });
         }
@@ -122,41 +169,6 @@ impl Backend for FsEventsBackend {
 
   fn raw_bytes(raw: &Self::Raw) -> usize {
     raw.paths.len() + size_of_val(raw.records.as_slice())
-  }
-}
-
-impl FsEventsBackend {
-  fn lost(&self, path: &Path, flags: u32, hint: &mut dyn FnMut(Hint<'_>)) {
-    let names_a_place = flags & flag::MUST_SCAN_SUB_DIRS != 0 && path != Path::new("/");
-    if !names_a_place {
-      hint(Hint::Lost);
-      return;
-    }
-    let holders = self.covers.by_dir.holders(path).map(|(keys, _)| keys);
-    for keys in holders.chain(self.covers.by_dir.below(path)) {
-      for &key in keys {
-        hint(Hint::Changed { dir: key, rel: Path::new("") });
-      }
-    }
-  }
-
-  fn real_path(&mut self, dir: &Path, want: Want) -> io::Result<PathBuf> {
-    let (Want::Contents, Some(parent), Some(name)) = (want, dir.parent(), dir.file_name()) else {
-      return canonical(dir);
-    };
-    let real_parent = self.real_parent(parent)?;
-    match name_on_disk(dir)? {
-      Some(on_disk) if on_disk.eq_ignore_ascii_case(name) => utf8(real_parent.join(on_disk)),
-      _ => canonical(dir),
-    }
-  }
-
-  fn real_parent(&mut self, parent: &Path) -> io::Result<&Path> {
-    let last = match self.last_parent.take() {
-      Some(last) if last.asked == parent => last,
-      _ => RealParent { asked: parent.to_owned(), real: canonical(parent)? },
-    };
-    Ok(&self.last_parent.insert(last).real)
   }
 }
 
@@ -192,18 +204,6 @@ struct RealParent {
   real: PathBuf,
 }
 
-fn canonical(dir: &Path) -> io::Result<PathBuf> {
-  utf8(fs::canonicalize(dir)?)
-}
-
-fn utf8(path: PathBuf) -> io::Result<PathBuf> {
-  if path.to_str().is_some() { Ok(path) } else { Err(not_utf8()) }
-}
-
-fn not_utf8() -> io::Error {
-  io::Error::new(io::ErrorKind::InvalidInput, "FSEvents cannot watch a path that is not UTF-8")
-}
-
 #[derive(Debug, Default)]
 pub struct Raw {
   paths: Vec<u8>,
@@ -217,15 +217,6 @@ struct RawRecord {
 }
 
 impl Raw {
-  const EXPECTED_PATH_BYTES: usize = 128;
-
-  fn with_capacity(records: usize) -> Self {
-    Self {
-      paths: Vec::with_capacity(records * Self::EXPECTED_PATH_BYTES),
-      records: Vec::with_capacity(records),
-    }
-  }
-
   pub fn push(&mut self, path: &[u8], flags: u32) {
     self.paths.extend_from_slice(path);
     self.records.push(RawRecord { path_end: self.paths.len(), flags });
@@ -302,22 +293,6 @@ struct Retiring {
 }
 
 impl Streams {
-  fn new(sink: Sink<Raw>) -> io::Result<Self> {
-    Ok(Self {
-      sink: Arc::new(sink),
-      queue: Queue::new()?,
-      running: Vec::new(),
-      paths: Dirs::default(),
-      pending: Dirs::default(),
-      path_limit: MAX_STREAM_PATHS,
-      retiring: Vec::new(),
-    })
-  }
-
-  fn reports(&self, dir: &Path) -> bool {
-    self.paths.holds(dir) || self.pending.holds(dir)
-  }
-
   fn start_pending(&mut self, covers: &Covers) -> io::Result<()> {
     let new = top_most(self.pending.drain().collect());
     let replace =
@@ -345,7 +320,7 @@ impl Streams {
   }
 
   fn retire_running(&mut self) {
-    let caught_up_at = FSEventsGetCurrentEventId();
+    let caught_up_at = ffi::FSEventsGetCurrentEventId();
     let deadline = Instant::now() + RETIRING_TIMEOUT;
     let replaced = mem::take(&mut self.running);
     self.retiring.extend(replaced.into_iter().map(|stream| Retiring {
@@ -400,8 +375,13 @@ pub fn is_too_high(dir: &Path) -> bool {
 
 fn place(covers: Vec<PathBuf>, max: usize) -> Vec<PathBuf> {
   let mut paths = top_most(covers);
-  let mut joins: Vec<Option<usize>> =
-    paths.windows(2).map(|pair| Some(shared_depth(&pair[0], &pair[1]))).collect();
+  let mut joins: Vec<Option<usize>> = paths
+    .windows(2)
+    .map(|pair| {
+      let shared = pair[0].components().zip(pair[1].components()).take_while(|(a, b)| a == b);
+      Some(shared.count())
+    })
+    .collect();
   while paths.len() > max {
     let Some(depth) = joins.iter().flatten().copied().max() else { break };
     let Some(first) = joins.iter().position(|&join| join == Some(depth)) else { break };
@@ -416,10 +396,6 @@ fn place(covers: Vec<PathBuf>, max: usize) -> Vec<PathBuf> {
     }
   }
   paths
-}
-
-fn shared_depth(a: &Path, b: &Path) -> usize {
-  a.components().zip(b.components()).take_while(|(a, b)| a == b).count()
 }
 
 fn top_most(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -451,8 +427,9 @@ impl<T> Dirs<T> {
   }
 
   fn insert(&mut self, dir: PathBuf, value: T) {
-    self.shortest_path = self.shortest_path.min(byte_len(&dir));
-    self.longest_path = self.longest_path.max(byte_len(&dir));
+    let len = dir.as_os_str().len();
+    self.shortest_path = self.shortest_path.min(len);
+    self.longest_path = self.longest_path.max(len);
     self.by_path.insert(dir, value);
   }
 
@@ -491,12 +468,18 @@ impl<T> Dirs<T> {
   }
 
   fn holders<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = (&'a T, &'a Path)> {
-    let path = without_trailing_slash(path);
+    let path = path.components().as_path();
+    let bytes = path.as_os_str().as_bytes();
     path
       .ancestors()
-      .skip_while(|dir| byte_len(dir) > self.longest_path)
-      .take_while(|dir| byte_len(dir) >= self.shortest_path)
-      .filter_map(move |dir| Some((self.by_path.get(dir)?, rest_below(dir, path))))
+      .skip_while(|dir| dir.as_os_str().len() > self.longest_path)
+      .take_while(|dir| dir.as_os_str().len() >= self.shortest_path)
+      .filter_map(move |dir| {
+        let value = self.by_path.get(dir)?;
+        let rest = &bytes[dir.as_os_str().len()..];
+        let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+        Some((value, Path::new(OsStr::from_bytes(rest))))
+      })
   }
 
   fn below(&self, path: &Path) -> impl Iterator<Item = &T> {
@@ -507,345 +490,351 @@ impl<T> Dirs<T> {
   }
 }
 
-fn byte_len(path: &Path) -> usize {
-  path.as_os_str().len()
-}
+#[expect(clippy::undocumented_unsafe_blocks, reason = "this file has no comments")]
+mod ffi {
+  use std::{
+    ffi::{CStr, CString, OsStr, OsString, c_char, c_void},
+    io, mem,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    ptr::{self, NonNull},
+    sync::Arc,
+  };
 
-fn without_trailing_slash(path: &Path) -> &Path {
-  path.components().as_path()
-}
+  use super::{
+    ERROR_NAME_ON_DISK, ERROR_PATH_NOT_UTF8, ERROR_QUEUE_CREATE, ERROR_STREAM_CREATE,
+    ERROR_STREAM_START, EXPECTED_PATH_BYTES, Raw,
+  };
+  use crate::backend::{Sink, watch_limit};
 
-fn rest_below<'a>(dir: &Path, path: &'a Path) -> &'a Path {
-  let rest = &path.as_os_str().as_bytes()[byte_len(dir)..];
-  Path::new(OsStr::from_bytes(rest.strip_prefix(b"/").unwrap_or(rest)))
-}
+  #[derive(Debug)]
+  pub(super) struct Queue(NonNull<c_void>);
 
-extern "C" fn callback(
-  _stream: FSEventStreamRef,
-  info: *mut c_void,
-  count: usize,
-  paths: *mut c_void,
-  flags: *const u32,
-  _ids: *const u64,
-) {
-  let sink = unsafe { &*info.cast::<Sink<Raw>>() };
-  let paths = paths.cast::<*const c_char>();
-  let mut raw = Raw::with_capacity(count);
-  for index in 0..count {
-    let (path, flags) = unsafe { (CStr::from_ptr(*paths.add(index)), *flags.add(index)) };
-    raw.push(path.to_bytes(), flags);
-  }
-  sink.raw(raw);
-}
+  unsafe impl Send for Queue {}
 
-extern "C" fn retain(info: *const c_void) -> *const c_void {
-  unsafe { Arc::increment_strong_count(info.cast::<Sink<Raw>>()) };
-  info
-}
+  impl Queue {
+    pub(super) fn new() -> io::Result<Self> {
+      let queue = unsafe { dispatch_queue_create(c"pathwatch.fsevents".as_ptr(), ptr::null()) };
+      NonNull::new(queue).map(Self).ok_or_else(|| io::Error::other(ERROR_QUEUE_CREATE))
+    }
 
-extern "C" fn release(info: *const c_void) {
-  unsafe { Arc::decrement_strong_count(info.cast::<Sink<Raw>>()) };
-}
-
-#[derive(Debug)]
-struct Queue(NonNull<c_void>);
-
-unsafe impl Send for Queue {}
-
-impl Queue {
-  fn new() -> io::Result<Self> {
-    let queue = unsafe { dispatch_queue_create(c"pathwatch.fsevents".as_ptr(), ptr::null()) };
-    NonNull::new(queue).map(Self).ok_or_else(|| io::Error::other("dispatch_queue_create failed"))
+    pub(super) fn sync<F: FnOnce() + Send>(&self, work: F) {
+      extern "C" fn run<F: FnOnce() + Send>(context: *mut c_void) {
+        let work = unsafe { &mut *context.cast::<Option<F>>() };
+        if let Some(work) = work.take() {
+          work();
+        }
+      }
+      let mut work = Some(work);
+      unsafe { dispatch_sync_f(self.0.as_ptr(), (&raw mut work).cast(), run::<F>) };
+    }
   }
 
-  fn sync<F: FnOnce() + Send>(&self, work: F) {
-    extern "C" fn run<F: FnOnce() + Send>(context: *mut c_void) {
-      let work = unsafe { &mut *context.cast::<Option<F>>() };
-      if let Some(work) = work.take() {
-        work();
+  impl Drop for Queue {
+    fn drop(&mut self) {
+      unsafe { dispatch_release(self.0.as_ptr()) };
+    }
+  }
+
+  #[derive(Debug)]
+  pub(super) struct Stream(NonNull<c_void>);
+
+  unsafe impl Send for Stream {}
+
+  impl Stream {
+    pub(super) fn start(
+      queue: &Queue,
+      sink: &Arc<Sink<Raw>>,
+      paths: &[PathBuf],
+    ) -> io::Result<Self> {
+      let array = path_array(paths)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, ERROR_PATH_NOT_UTF8))?;
+      let context = FSEventStreamContext {
+        version: 0,
+        info: Arc::as_ptr(sink).cast_mut().cast(),
+        retain: Some(retain),
+        release: Some(release),
+        copy_description: None,
+      };
+      let stream = unsafe {
+        FSEventStreamCreate(
+          ptr::null(),
+          callback,
+          &raw const context,
+          array.0.as_ptr(),
+          SINCE_NOW,
+          0.0,
+          CREATE_FILE_EVENTS | CREATE_NO_DEFER,
+        )
+      };
+      let stream = NonNull::new(stream).ok_or_else(|| io::Error::other(ERROR_STREAM_CREATE))?;
+      let started = unsafe {
+        FSEventStreamSetDispatchQueue(stream.as_ptr(), queue.0.as_ptr());
+        FSEventStreamStart(stream.as_ptr()) != 0
+      };
+      if started {
+        return Ok(Self(stream));
+      }
+      unsafe {
+        FSEventStreamInvalidate(stream.as_ptr());
+        FSEventStreamRelease(stream.as_ptr());
+      }
+      Err(watch_limit(ERROR_STREAM_START))
+    }
+
+    pub(super) fn deliver_all(&self) {
+      unsafe { FSEventStreamFlushSync(self.0.as_ptr()) };
+    }
+
+    pub(super) fn latest_event_id(&self) -> Option<u64> {
+      let id = unsafe { FSEventStreamGetLatestEventId(self.0.as_ptr()) };
+      (id != SINCE_NOW).then_some(id)
+    }
+  }
+
+  impl Drop for Stream {
+    fn drop(&mut self) {
+      unsafe {
+        FSEventStreamStop(self.0.as_ptr());
+        FSEventStreamInvalidate(self.0.as_ptr());
+        FSEventStreamRelease(self.0.as_ptr());
       }
     }
-    let mut work = Some(work);
-    unsafe { dispatch_sync_f(self.0.as_ptr(), (&raw mut work).cast(), run::<F>) };
   }
-}
 
-impl Drop for Queue {
-  fn drop(&mut self) {
-    unsafe { dispatch_release(self.0.as_ptr()) };
-  }
-}
-
-#[derive(Debug)]
-struct Stream(NonNull<c_void>);
-
-unsafe impl Send for Stream {}
-
-impl Stream {
-  fn start(queue: &Queue, sink: &Arc<Sink<Raw>>, paths: &[PathBuf]) -> io::Result<Self> {
-    let array = path_array(paths).ok_or_else(not_utf8)?;
-    let context = FSEventStreamContext {
-      version: 0,
-      info: Arc::as_ptr(sink).cast_mut().cast(),
-      retain: Some(retain),
-      release: Some(release),
-      copy_description: None,
+  pub(super) fn name_on_disk(path: &Path) -> io::Result<Option<OsString>> {
+    let c_path = CString::new(path.as_os_str().as_bytes())?;
+    let wanted = AttrList {
+      bitmap_count: ATTR_BIT_MAP_COUNT,
+      reserved: 0,
+      common: ATTR_CMN_NAME | ATTR_CMN_OBJTYPE,
+      volume: 0,
+      dir: 0,
+      file: 0,
+      fork: 0,
     };
-    let stream = unsafe {
-      FSEventStreamCreate(
-        ptr::null(),
-        callback,
-        &raw const context,
-        array.0.as_ptr(),
-        SINCE_NOW,
-        0.0,
-        CREATE_FILE_EVENTS | CREATE_NO_DEFER,
+    let mut found = NameAndType {
+      length: 0,
+      name: AttrReference { offset: 0, length: 0 },
+      object_type: 0,
+      name_bytes: [0; MAX_NAME_BYTES],
+    };
+    let result = unsafe {
+      getattrlist(
+        c_path.as_ptr(),
+        (&raw const wanted).cast_mut().cast(),
+        (&raw mut found).cast(),
+        size_of::<NameAndType>(),
+        FSOPT_NOFOLLOW,
       )
     };
-    let stream =
-      NonNull::new(stream).ok_or_else(|| io::Error::other("FSEventStreamCreate failed"))?;
-    let started = unsafe {
-      FSEventStreamSetDispatchQueue(stream.as_ptr(), queue.0.as_ptr());
-      FSEventStreamStart(stream.as_ptr()) != 0
+    if result != 0 {
+      return Err(io::Error::last_os_error());
+    }
+    if found.object_type == VLNK {
+      return Ok(None);
+    }
+    let start = usize::try_from(found.name.offset).ok().and_then(|offset_from_reference| {
+      (mem::offset_of!(NameAndType, name) + offset_from_reference)
+        .checked_sub(mem::offset_of!(NameAndType, name_bytes))
+    });
+    let len_without_nul =
+      usize::try_from(found.name.length).ok().and_then(|len| len.checked_sub(1));
+    let name =
+      start.zip(len_without_nul).and_then(|(start, len)| found.name_bytes.get(start..start + len));
+    let name = name.ok_or_else(|| io::Error::other(ERROR_NAME_ON_DISK))?;
+    Ok(Some(OsStr::from_bytes(name).to_owned()))
+  }
+
+  extern "C" fn callback(
+    _stream: FSEventStreamRef,
+    info: *mut c_void,
+    count: usize,
+    paths: *mut c_void,
+    flags: *const u32,
+    _ids: *const u64,
+  ) {
+    let sink = unsafe { &*info.cast::<Sink<Raw>>() };
+    let paths = paths.cast::<*const c_char>();
+    let mut raw = Raw {
+      paths: Vec::with_capacity(count * EXPECTED_PATH_BYTES),
+      records: Vec::with_capacity(count),
     };
-    if started {
-      return Ok(Self(stream));
+    for index in 0..count {
+      let (path, flags) = unsafe { (CStr::from_ptr(*paths.add(index)), *flags.add(index)) };
+      raw.push(path.to_bytes(), flags);
     }
-    unsafe {
-      FSEventStreamInvalidate(stream.as_ptr());
-      FSEventStreamRelease(stream.as_ptr());
-    }
-    Err(watch_limit("FSEvents cannot start one more stream (512 streams, 4,096 paths each)"))
+    sink.raw(raw);
   }
 
-  fn deliver_all(&self) {
-    unsafe { FSEventStreamFlushSync(self.0.as_ptr()) };
+  extern "C" fn retain(info: *const c_void) -> *const c_void {
+    unsafe { Arc::increment_strong_count(info.cast::<Sink<Raw>>()) };
+    info
   }
 
-  fn latest_event_id(&self) -> Option<u64> {
-    let id = unsafe { FSEventStreamGetLatestEventId(self.0.as_ptr()) };
-    (id != SINCE_NOW).then_some(id)
+  extern "C" fn release(info: *const c_void) {
+    unsafe { Arc::decrement_strong_count(info.cast::<Sink<Raw>>()) };
   }
-}
 
-impl Drop for Stream {
-  fn drop(&mut self) {
-    unsafe {
-      FSEventStreamStop(self.0.as_ptr());
-      FSEventStreamInvalidate(self.0.as_ptr());
-      FSEventStreamRelease(self.0.as_ptr());
+  struct Cf(NonNull<c_void>);
+
+  impl Drop for Cf {
+    fn drop(&mut self) {
+      unsafe { CFRelease(self.0.as_ptr()) };
     }
   }
-}
 
-fn name_on_disk(path: &Path) -> io::Result<Option<OsString>> {
-  let c_path = CString::new(path.as_os_str().as_bytes())?;
-  let wanted = AttrList {
-    bitmap_count: ATTR_BIT_MAP_COUNT,
-    reserved: 0,
-    common: ATTR_CMN_NAME | ATTR_CMN_OBJTYPE,
-    volume: 0,
-    dir: 0,
-    file: 0,
-    fork: 0,
-  };
-  let mut found = NameAndType {
-    length: 0,
-    name: AttrReference { offset: 0, length: 0 },
-    object_type: 0,
-    name_bytes: [0; MAX_NAME_BYTES],
-  };
-  let result = unsafe {
-    getattrlist(
-      c_path.as_ptr(),
-      (&raw const wanted).cast_mut().cast(),
-      (&raw mut found).cast(),
-      size_of::<NameAndType>(),
-      FSOPT_NOFOLLOW,
-    )
-  };
-  if result != 0 {
-    return Err(io::Error::last_os_error());
-  }
-  if found.object_type == VLNK {
-    return Ok(None);
-  }
-  found
-    .name()
-    .map(|name| Some(name.to_owned()))
-    .ok_or_else(|| io::Error::other("getattrlist gave no name"))
-}
-
-impl NameAndType {
-  fn name(&self) -> Option<&OsStr> {
-    let offset_from_reference = usize::try_from(self.name.offset).ok()?;
-    let start = (mem::offset_of!(Self, name) + offset_from_reference)
-      .checked_sub(mem::offset_of!(Self, name_bytes))?;
-    let len_without_nul = usize::try_from(self.name.length).ok()?.checked_sub(1)?;
-    let bytes = self.name_bytes.get(start..start + len_without_nul)?;
-    Some(OsStr::from_bytes(bytes))
-  }
-}
-
-struct Cf(NonNull<c_void>);
-
-impl Cf {
-  fn new(object: CFTypeRef) -> Option<Self> {
-    NonNull::new(object.cast_mut()).map(Self)
-  }
-}
-
-impl Drop for Cf {
-  fn drop(&mut self) {
-    unsafe { CFRelease(self.0.as_ptr()) };
-  }
-}
-
-fn path_array(paths: &[PathBuf]) -> Option<Cf> {
-  let strings = paths
-    .iter()
-    .map(|path| {
-      let bytes = path.as_os_str().as_bytes();
-      Cf::new(unsafe {
-        CFStringCreateWithBytes(
-          ptr::null(),
-          bytes.as_ptr(),
-          bytes.len().cast_signed(),
-          ENCODING_UTF8,
-          0,
-        )
+  fn path_array(paths: &[PathBuf]) -> Option<Cf> {
+    let strings = paths
+      .iter()
+      .map(|path| {
+        let bytes = path.as_os_str().as_bytes();
+        let string = unsafe {
+          CFStringCreateWithBytes(
+            ptr::null(),
+            bytes.as_ptr(),
+            bytes.len().cast_signed(),
+            ENCODING_UTF8,
+            0,
+          )
+        };
+        NonNull::new(string.cast_mut()).map(Cf)
       })
-    })
-    .collect::<Option<Vec<Cf>>>()?;
-  let values: Vec<CFTypeRef> =
-    strings.iter().map(|string| string.0.as_ptr().cast_const()).collect();
-  Cf::new(unsafe {
-    CFArrayCreate(
-      ptr::null(),
-      values.as_ptr(),
-      values.len().cast_signed(),
-      &raw const TYPE_ARRAY_CALLBACKS,
-    )
-  })
-}
+      .collect::<Option<Vec<Cf>>>()?;
+    let values: Vec<CFTypeRef> =
+      strings.iter().map(|string| string.0.as_ptr().cast_const()).collect();
+    let array = unsafe {
+      CFArrayCreate(
+        ptr::null(),
+        values.as_ptr(),
+        values.len().cast_signed(),
+        &raw const TYPE_ARRAY_CALLBACKS,
+      )
+    };
+    NonNull::new(array.cast_mut()).map(Cf)
+  }
 
-const CREATE_NO_DEFER: u32 = 0x2;
-const CREATE_FILE_EVENTS: u32 = 0x10;
-const SINCE_NOW: u64 = u64::MAX;
-const ENCODING_UTF8: u32 = 0x0800_0100;
+  const CREATE_NO_DEFER: u32 = 0x2;
+  const CREATE_FILE_EVENTS: u32 = 0x10;
+  const SINCE_NOW: u64 = u64::MAX;
+  const ENCODING_UTF8: u32 = 0x0800_0100;
 
-const ATTR_BIT_MAP_COUNT: u16 = 5;
-const ATTR_CMN_NAME: u32 = 0x1;
-const ATTR_CMN_OBJTYPE: u32 = 0x8;
-const FSOPT_NOFOLLOW: u32 = 0x1;
-const VLNK: u32 = 5;
+  const ATTR_BIT_MAP_COUNT: u16 = 5;
+  const ATTR_CMN_NAME: u32 = 0x1;
+  const ATTR_CMN_OBJTYPE: u32 = 0x8;
+  const FSOPT_NOFOLLOW: u32 = 0x1;
+  const VLNK: u32 = 5;
+  const MAX_NAME_BYTES: usize = 768;
 
-const MAX_NAME_BYTES: usize = 768;
+  type CFTypeRef = *const c_void;
+  type FSEventStreamRef = *mut c_void;
+  type DispatchQueue = *mut c_void;
 
-#[repr(C)]
-struct AttrList {
-  bitmap_count: u16,
-  reserved: u16,
-  common: u32,
-  volume: u32,
-  dir: u32,
-  file: u32,
-  fork: u32,
-}
+  type FSEventStreamCallback = extern "C" fn(
+    stream: FSEventStreamRef,
+    info: *mut c_void,
+    count: usize,
+    paths: *mut c_void,
+    flags: *const u32,
+    ids: *const u64,
+  );
 
-#[repr(C)]
-struct NameAndType {
-  length: u32,
-  name: AttrReference,
-  object_type: u32,
-  name_bytes: [u8; MAX_NAME_BYTES],
-}
+  #[repr(C)]
+  struct FSEventStreamContext {
+    version: isize,
+    info: *mut c_void,
+    retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    release: Option<extern "C" fn(*const c_void)>,
+    copy_description: Option<extern "C" fn(*const c_void) -> CFTypeRef>,
+  }
 
-#[repr(C)]
-struct AttrReference {
-  offset: i32,
-  length: u32,
-}
+  #[repr(C)]
+  struct ArrayCallbacks {
+    _opaque: [u8; 0],
+  }
 
-type CFTypeRef = *const c_void;
-type FSEventStreamRef = *mut c_void;
-type DispatchQueue = *mut c_void;
+  #[repr(C)]
+  struct AttrList {
+    bitmap_count: u16,
+    reserved: u16,
+    common: u32,
+    volume: u32,
+    dir: u32,
+    file: u32,
+    fork: u32,
+  }
 
-type FSEventStreamCallback = extern "C" fn(
-  stream: FSEventStreamRef,
-  info: *mut c_void,
-  count: usize,
-  paths: *mut c_void,
-  flags: *const u32,
-  ids: *const u64,
-);
+  #[repr(C)]
+  struct NameAndType {
+    length: u32,
+    name: AttrReference,
+    object_type: u32,
+    name_bytes: [u8; MAX_NAME_BYTES],
+  }
 
-#[repr(C)]
-struct FSEventStreamContext {
-  version: isize,
-  info: *mut c_void,
-  retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
-  release: Option<extern "C" fn(*const c_void)>,
-  copy_description: Option<extern "C" fn(*const c_void) -> CFTypeRef>,
-}
+  #[repr(C)]
+  struct AttrReference {
+    offset: i32,
+    length: u32,
+  }
 
-#[repr(C)]
-struct ArrayCallbacks {
-  _opaque: [u8; 0],
-}
+  #[link(name = "CoreServices", kind = "framework")]
+  unsafe extern "C" {
+    fn FSEventStreamCreate(
+      allocator: CFTypeRef,
+      callback: FSEventStreamCallback,
+      context: *const FSEventStreamContext,
+      paths: CFTypeRef,
+      since: u64,
+      latency: f64,
+      flags: u32,
+    ) -> FSEventStreamRef;
+    fn FSEventStreamSetDispatchQueue(stream: FSEventStreamRef, queue: DispatchQueue);
+    fn FSEventStreamStart(stream: FSEventStreamRef) -> u8;
+    fn FSEventStreamFlushSync(stream: FSEventStreamRef);
+    fn FSEventStreamStop(stream: FSEventStreamRef);
+    fn FSEventStreamInvalidate(stream: FSEventStreamRef);
+    fn FSEventStreamRelease(stream: FSEventStreamRef);
+    fn FSEventStreamGetLatestEventId(stream: FSEventStreamRef) -> u64;
+    pub(super) safe fn FSEventsGetCurrentEventId() -> u64;
+  }
 
-#[link(name = "CoreServices", kind = "framework")]
-unsafe extern "C" {
-  fn FSEventStreamCreate(
-    allocator: CFTypeRef,
-    callback: FSEventStreamCallback,
-    context: *const FSEventStreamContext,
-    paths: CFTypeRef,
-    since: u64,
-    latency: f64,
-    flags: u32,
-  ) -> FSEventStreamRef;
-  fn FSEventStreamSetDispatchQueue(stream: FSEventStreamRef, queue: DispatchQueue);
-  fn FSEventStreamStart(stream: FSEventStreamRef) -> u8;
-  fn FSEventStreamFlushSync(stream: FSEventStreamRef);
-  fn FSEventStreamStop(stream: FSEventStreamRef);
-  fn FSEventStreamInvalidate(stream: FSEventStreamRef);
-  fn FSEventStreamRelease(stream: FSEventStreamRef);
-  fn FSEventStreamGetLatestEventId(stream: FSEventStreamRef) -> u64;
-  safe fn FSEventsGetCurrentEventId() -> u64;
-}
+  #[link(name = "CoreFoundation", kind = "framework")]
+  unsafe extern "C" {
+    #[link_name = "kCFTypeArrayCallBacks"]
+    static TYPE_ARRAY_CALLBACKS: ArrayCallbacks;
+    fn CFStringCreateWithBytes(
+      allocator: CFTypeRef,
+      bytes: *const u8,
+      len: isize,
+      encoding: u32,
+      is_external: u8,
+    ) -> CFTypeRef;
+    fn CFArrayCreate(
+      allocator: CFTypeRef,
+      values: *const CFTypeRef,
+      count: isize,
+      callbacks: *const ArrayCallbacks,
+    ) -> CFTypeRef;
+    fn CFRelease(object: CFTypeRef);
+  }
 
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-  #[link_name = "kCFTypeArrayCallBacks"]
-  static TYPE_ARRAY_CALLBACKS: ArrayCallbacks;
-  fn CFStringCreateWithBytes(
-    allocator: CFTypeRef,
-    bytes: *const u8,
-    len: isize,
-    encoding: u32,
-    is_external: u8,
-  ) -> CFTypeRef;
-  fn CFArrayCreate(
-    allocator: CFTypeRef,
-    values: *const CFTypeRef,
-    count: isize,
-    callbacks: *const ArrayCallbacks,
-  ) -> CFTypeRef;
-  fn CFRelease(object: CFTypeRef);
-}
-
-unsafe extern "C" {
-  fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> DispatchQueue;
-  fn dispatch_release(object: DispatchQueue);
-  fn dispatch_sync_f(queue: DispatchQueue, context: *mut c_void, work: extern "C" fn(*mut c_void));
-  fn getattrlist(
-    path: *const c_char,
-    wanted: *mut c_void,
-    buffer: *mut c_void,
-    size: usize,
-    options: u32,
-  ) -> i32;
+  unsafe extern "C" {
+    fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> DispatchQueue;
+    fn dispatch_release(object: DispatchQueue);
+    fn dispatch_sync_f(
+      queue: DispatchQueue,
+      context: *mut c_void,
+      work: extern "C" fn(*mut c_void),
+    );
+    fn getattrlist(
+      path: *const c_char,
+      wanted: *mut c_void,
+      buffer: *mut c_void,
+      size: usize,
+      options: u32,
+    ) -> i32;
+  }
 }
 
 #[cfg(test)]
