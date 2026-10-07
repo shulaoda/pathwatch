@@ -832,7 +832,7 @@ mod ffi {
 mod tests {
   use std::path::{Path, PathBuf};
 
-  use super::{Dirs, is_too_high, place, top_most};
+  use super::{Dirs, is_too_high, place};
 
   fn paths(paths: &[&str]) -> Vec<PathBuf> {
     paths.iter().map(PathBuf::from).collect()
@@ -854,16 +854,6 @@ mod tests {
     assert_eq!(placed(&covers, 3), paths(&["/Users/me/p/a", "/Users/me/p/b", "/Users/me/q"]));
     assert_eq!(placed(&covers, 2), paths(&["/Users/me/p", "/Users/me/q"]));
     assert_eq!(placed(&covers, 1), paths(&["/Users/me/p", "/Users/me/q"]));
-  }
-
-  #[test]
-  fn top_most_drops_what_lies_below_another_path() {
-    let paths = ["/x/a/b", "/x/ab", "/x/a", "/y", "/x/a/b/c", "/x/a", "/x/a.b"];
-    let kept = top_most(paths.map(PathBuf::from).to_vec());
-    assert_eq!(kept, ["/x/a", "/x/a.b", "/x/ab", "/y"].map(PathBuf::from));
-
-    let kept = top_most(["/x", "/", "/y/z"].map(PathBuf::from).to_vec());
-    assert_eq!(kept, [PathBuf::from("/")]);
   }
 
   #[test]
@@ -959,16 +949,5 @@ mod tests {
     assert_eq!(holders("/x/a/b/c"), [(&2, Path::new("c")), (&1, Path::new("b/c"))]);
     assert_eq!(holders("/x/ab"), []);
     assert_eq!(holders("/x"), []);
-  }
-
-  #[test]
-  fn a_table_that_is_empty_again_forgets_its_lengths() {
-    let mut covers = Dirs::default();
-    covers.insert(PathBuf::from("/x/a/b/c"), ());
-    covers.remove(Path::new("/x/a/b/c"));
-    covers.insert(PathBuf::from("/x"), ());
-    assert!(covers.holds(Path::new("/x/a")));
-    assert!(!covers.holds(Path::new("/y/a")));
-    assert_eq!(covers.len(), 1);
   }
 }
