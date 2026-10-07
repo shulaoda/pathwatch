@@ -15,14 +15,10 @@ use rustc_hash::FxHashMap;
 use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want, watch_limit};
 
 pub const MAX_STREAMS: usize = 8;
-
 pub const MAX_STREAM_PATHS: usize = 64;
-
-const MAX_OVERLAP: Duration = Duration::from_millis(500);
-
-pub const MAX_RETIRING: usize = 64;
-
-pub const MAX_PATHS: usize = 4096;
+pub const MAX_PATHS_PER_STREAM: usize = 4096;
+pub const MAX_RETIRING_STREAMS: usize = 64;
+const RETIRING_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub mod flag {
   pub const MUST_SCAN_SUB_DIRS: u32 = 0x1;
@@ -33,6 +29,9 @@ pub mod flag {
   pub const REMOVED: u32 = 0x200;
   pub const RENAMED: u32 = 0x800;
   pub const IS_DIR: u32 = 0x2_0000;
+
+  pub const RECORDS_LOST: u32 = MUST_SCAN_SUB_DIRS | USER_DROPPED | KERNEL_DROPPED;
+  pub const ENTRY_CAME_OR_WENT: u32 = CREATED | REMOVED | RENAMED;
 }
 
 #[derive(Debug)]
@@ -41,7 +40,7 @@ pub struct FsEventsBackend {
   streams: Streams,
   not_watched: FxHashMap<DirKey, PathBuf>,
   covers_more: bool,
-  parent: Option<RealParent>,
+  last_parent: Option<RealParent>,
 }
 
 impl FsEventsBackend {
@@ -51,7 +50,7 @@ impl FsEventsBackend {
       streams: Streams::new(sink)?,
       not_watched: FxHashMap::default(),
       covers_more: false,
-      parent: None,
+      last_parent: None,
     })
   }
 }
@@ -86,9 +85,9 @@ impl Backend for FsEventsBackend {
   }
 
   fn commit(&mut self) -> io::Result<()> {
-    self.streams.retire();
+    self.streams.stop_retired();
     self.covers_more = false;
-    self.parent = None;
+    self.last_parent = None;
     if self.streams.pending.is_empty() {
       return Ok(());
     }
@@ -106,16 +105,17 @@ impl Backend for FsEventsBackend {
   }
 
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
-    self.streams.retire();
+    self.streams.stop_retired();
     for (path, flags) in raw.records() {
       if flags & flag::HISTORY_DONE != 0 {
         continue;
       }
-      if flags & (flag::MUST_SCAN_SUB_DIRS | flag::USER_DROPPED | flag::KERNEL_DROPPED) != 0 {
+      if flags & flag::RECORDS_LOST != 0 {
         self.lost(path, flags, hint);
         continue;
       }
-      if flags & flag::IS_DIR != 0 && flags & (flag::CREATED | flag::REMOVED | flag::RENAMED) == 0 {
+      let is_touched_dir = flags & flag::IS_DIR != 0 && flags & flag::ENTRY_CAME_OR_WENT == 0;
+      if is_touched_dir {
         continue;
       }
       for (keys, rel) in self.covers.by_dir.holders(path) {
@@ -147,22 +147,22 @@ impl FsEventsBackend {
   }
 
   fn real_path(&mut self, dir: &Path, want: Want) -> io::Result<PathBuf> {
-    let (Want::Contents, Some(above), Some(name)) = (want, dir.parent(), dir.file_name()) else {
+    let (Want::Contents, Some(parent), Some(name)) = (want, dir.parent(), dir.file_name()) else {
       return canonical(dir);
     };
-    let parent = match self.parent.take() {
-      Some(parent) if parent.asked == above => parent,
-      _ => RealParent { asked: above.to_owned(), real: canonical(above)? },
-    };
-    let real = match name_on_disk(dir)? {
-      Some(on_disk) if on_disk.eq_ignore_ascii_case(name) => parent.real.join(on_disk),
-      _ => canonical(dir)?,
-    };
-    self.parent = Some(parent);
-    if real.to_str().is_none() {
-      return Err(not_utf8());
+    let real_parent = self.real_parent(parent)?;
+    match name_on_disk(dir)? {
+      Some(on_disk) if on_disk.eq_ignore_ascii_case(name) => utf8(real_parent.join(on_disk)),
+      _ => canonical(dir),
     }
-    Ok(real)
+  }
+
+  fn real_parent(&mut self, parent: &Path) -> io::Result<&Path> {
+    let last = match self.last_parent.take() {
+      Some(last) if last.asked == parent => last,
+      _ => RealParent { asked: parent.to_owned(), real: canonical(parent)? },
+    };
+    Ok(&self.last_parent.insert(last).real)
   }
 }
 
@@ -199,11 +199,11 @@ struct RealParent {
 }
 
 fn canonical(dir: &Path) -> io::Result<PathBuf> {
-  let real = fs::canonicalize(dir)?;
-  if real.to_str().is_none() {
-    return Err(not_utf8());
-  }
-  Ok(real)
+  utf8(fs::canonicalize(dir)?)
+}
+
+fn utf8(path: PathBuf) -> io::Result<PathBuf> {
+  if path.to_str().is_some() { Ok(path) } else { Err(not_utf8()) }
 }
 
 fn not_utf8() -> io::Error {
@@ -213,21 +213,36 @@ fn not_utf8() -> io::Error {
 #[derive(Debug, Default)]
 pub struct Raw {
   paths: Vec<u8>,
-  records: Vec<(usize, u32)>,
+  records: Vec<RawRecord>,
+}
+
+#[derive(Debug)]
+struct RawRecord {
+  path_end: usize,
+  flags: u32,
 }
 
 impl Raw {
+  const EXPECTED_PATH_BYTES: usize = 128;
+
+  fn with_capacity(records: usize) -> Self {
+    Self {
+      paths: Vec::with_capacity(records * Self::EXPECTED_PATH_BYTES),
+      records: Vec::with_capacity(records),
+    }
+  }
+
   pub fn push(&mut self, path: &[u8], flags: u32) {
     self.paths.extend_from_slice(path);
-    self.records.push((self.paths.len(), flags));
+    self.records.push(RawRecord { path_end: self.paths.len(), flags });
   }
 
   pub fn records(&self) -> impl Iterator<Item = (&Path, u32)> {
     let mut start = 0;
-    self.records.iter().map(move |&(end, flags)| {
-      let path = &self.paths[start..end];
-      start = end;
-      (Path::new(OsStr::from_bytes(path)), flags)
+    self.records.iter().map(move |record| {
+      let path = &self.paths[start..record.path_end];
+      start = record.path_end;
+      (Path::new(OsStr::from_bytes(path)), record.flags)
     })
   }
 }
@@ -281,14 +296,14 @@ struct Streams {
   running: Vec<Stream>,
   paths: Dirs<()>,
   pending: Dirs<()>,
+  path_limit: usize,
   retiring: Vec<Retiring>,
-  placed: usize,
 }
 
 #[derive(Debug)]
 struct Retiring {
   stream: Stream,
-  caught_up: u64,
+  caught_up_at: u64,
   deadline: Instant,
 }
 
@@ -300,8 +315,8 @@ impl Streams {
       running: Vec::new(),
       paths: Dirs::default(),
       pending: Dirs::default(),
+      path_limit: MAX_STREAM_PATHS,
       retiring: Vec::new(),
-      placed: 0,
     })
   }
 
@@ -311,20 +326,22 @@ impl Streams {
 
   fn start_pending(&mut self, covers: &Covers) -> io::Result<()> {
     let new = top_most(self.pending.drain().collect());
-    let replace = self.running.len() >= MAX_STREAMS || self.has_too_many_paths(new.len());
+    let replace =
+      self.running.len() >= MAX_STREAMS || self.paths.len() + new.len() > self.path_limit;
     let paths = if replace {
       place(covers.dir_of.values().cloned().collect(), MAX_STREAM_PATHS)
     } else {
       new
     };
     let streams: Vec<Stream> = paths
-      .chunks(MAX_PATHS)
+      .chunks(MAX_PATHS_PER_STREAM)
       .map(|chunk| Stream::start(&self.queue, &self.sink, chunk))
       .collect::<io::Result<_>>()?;
     if replace {
       self.retire_running();
-      self.placed = paths.len();
       self.paths = Dirs::default();
+      self.path_limit =
+        if paths.len() > MAX_STREAM_PATHS { 2 * paths.len() } else { MAX_STREAM_PATHS };
     }
     self.running.extend(streams);
     for path in paths {
@@ -333,21 +350,16 @@ impl Streams {
     Ok(())
   }
 
-  fn has_too_many_paths(&self, new: usize) -> bool {
-    let limit = if self.placed > MAX_STREAM_PATHS { self.placed * 2 } else { MAX_STREAM_PATHS };
-    self.paths.len() + new > limit
-  }
-
   fn retire_running(&mut self) {
-    let caught_up = FSEventsGetCurrentEventId();
-    let deadline = Instant::now() + MAX_OVERLAP;
+    let caught_up_at = FSEventsGetCurrentEventId();
+    let deadline = Instant::now() + RETIRING_TIMEOUT;
     let replaced = mem::take(&mut self.running);
     self.retiring.extend(replaced.into_iter().map(|stream| Retiring {
       stream,
-      caught_up,
+      caught_up_at,
       deadline,
     }));
-    let too_many = self.retiring.len().saturating_sub(MAX_RETIRING);
+    let too_many = self.retiring.len().saturating_sub(MAX_RETIRING_STREAMS);
     if too_many > 0 {
       let oldest: Vec<Retiring> = self.retiring.drain(..too_many).collect();
       for old in &oldest {
@@ -357,14 +369,12 @@ impl Streams {
     }
   }
 
-  fn retire(&mut self) {
+  fn stop_retired(&mut self) {
     let now = Instant::now();
-    let done: Vec<Retiring> = self
-      .retiring
-      .extract_if(.., |old| {
-        now >= old.deadline || old.stream.latest_event_id().is_some_and(|id| id >= old.caught_up)
-      })
-      .collect();
+    let is_done = |old: &mut Retiring| {
+      now >= old.deadline || old.stream.latest_event_id().is_some_and(|id| id >= old.caught_up_at)
+    };
+    let done: Vec<Retiring> = self.retiring.extract_if(.., is_done).collect();
     if !done.is_empty() {
       self.queue.sync(move || drop(done));
     }
@@ -380,12 +390,13 @@ impl Drop for Streams {
 }
 
 pub fn is_too_high(dir: &Path) -> bool {
+  const DATA_VOLUME: [&[u8]; 3] = [b"System", b"Volumes", b"Data"];
   let names = dir.components().filter_map(|part| match part {
     Component::Normal(name) => Some(name.as_bytes()),
     _ => None,
   });
   let names: Vec<&[u8]> = names.collect();
-  let names = names.strip_prefix(&[&b"System"[..], b"Volumes", b"Data"]).unwrap_or(&names);
+  let names = names.strip_prefix(&DATA_VOLUME).unwrap_or(&names);
   match names {
     [] | [_] | [_, _] => true,
     [b"private", b"var", b"folders", below @ ..] => below.len() <= 3,
@@ -395,24 +406,25 @@ pub fn is_too_high(dir: &Path) -> bool {
 
 fn place(covers: Vec<PathBuf>, max: usize) -> Vec<PathBuf> {
   let mut paths = top_most(covers);
-  let mut shared: Vec<usize> =
-    paths.windows(2).map(|pair| common_parts(&pair[0], &pair[1])).collect();
+  let mut joins: Vec<Option<usize>> =
+    paths.windows(2).map(|pair| Some(shared_depth(&pair[0], &pair[1]))).collect();
   while paths.len() > max {
-    let deepest = shared.iter().enumerate().rev().max_by_key(|&(_, &parts)| parts);
-    let Some((first, &depth)) = deepest.filter(|&(_, &parts)| parts > 0) else { break };
-    let last = first + shared[first..].iter().take_while(|&&parts| parts == depth).count();
+    let Some(depth) = joins.iter().flatten().copied().max() else { break };
+    let Some(first) = joins.iter().position(|&join| join == Some(depth)) else { break };
     let dir: PathBuf = paths[first].components().take(depth).collect();
+    let below = paths[first..].iter().take_while(|path| path.starts_with(&dir)).count();
+    let joins_below = first..first + below - 1;
     if is_too_high(&dir) {
-      shared[first..last].fill(0);
-      continue;
+      joins[joins_below].fill(None);
+    } else {
+      paths.splice(first..first + below, [dir]);
+      joins.drain(joins_below);
     }
-    paths.splice(first..=last, [dir]);
-    shared.drain(first..last);
   }
   paths
 }
 
-fn common_parts(a: &Path, b: &Path) -> usize {
+fn shared_depth(a: &Path, b: &Path) -> usize {
   a.components().zip(b.components()).take_while(|(a, b)| a == b).count()
 }
 
@@ -425,13 +437,13 @@ fn top_most(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 #[derive(Debug)]
 struct Dirs<T> {
   by_path: FxHashMap<PathBuf, T>,
-  shortest: usize,
-  longest: usize,
+  shortest_path: usize,
+  longest_path: usize,
 }
 
 impl<T> Default for Dirs<T> {
   fn default() -> Self {
-    Self { by_path: FxHashMap::default(), shortest: usize::MAX, longest: 0 }
+    Self { by_path: FxHashMap::default(), shortest_path: usize::MAX, longest_path: 0 }
   }
 }
 
@@ -445,9 +457,8 @@ impl<T> Dirs<T> {
   }
 
   fn insert(&mut self, dir: PathBuf, value: T) {
-    let len = dir.as_os_str().len();
-    self.shortest = self.shortest.min(len);
-    self.longest = self.longest.max(len);
+    self.shortest_path = self.shortest_path.min(byte_len(&dir));
+    self.longest_path = self.longest_path.max(byte_len(&dir));
     self.by_path.insert(dir, value);
   }
 
@@ -457,21 +468,21 @@ impl<T> Dirs<T> {
 
   fn remove(&mut self, dir: &Path) {
     self.by_path.remove(dir);
-    self.forget_lengths_if_empty();
+    self.reset_lengths_if_empty();
   }
 
   fn retain(&mut self, keep: impl FnMut(&PathBuf, &mut T) -> bool) {
     self.by_path.retain(keep);
-    self.forget_lengths_if_empty();
+    self.reset_lengths_if_empty();
   }
 
   fn drain(&mut self) -> impl Iterator<Item = PathBuf> {
     mem::take(self).by_path.into_keys()
   }
 
-  fn forget_lengths_if_empty(&mut self) {
+  fn reset_lengths_if_empty(&mut self) {
     if self.by_path.is_empty() {
-      (self.shortest, self.longest) = (usize::MAX, 0);
+      (self.shortest_path, self.longest_path) = (usize::MAX, 0);
     }
   }
 
@@ -486,18 +497,12 @@ impl<T> Dirs<T> {
   }
 
   fn holders<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = (&'a T, &'a Path)> {
-    let path = path.components().as_path();
-    let bytes = path.as_os_str().as_bytes();
+    let path = without_trailing_slash(path);
     path
       .ancestors()
-      .skip_while(|dir| dir.as_os_str().len() > self.longest)
-      .take_while(|dir| dir.as_os_str().len() >= self.shortest)
-      .filter_map(move |dir| {
-        let value = self.by_path.get(dir)?;
-        let rest = &bytes[dir.as_os_str().len()..];
-        let rest = rest.strip_prefix(b"/").unwrap_or(rest);
-        Some((value, Path::new(OsStr::from_bytes(rest))))
-      })
+      .skip_while(|dir| byte_len(dir) > self.longest_path)
+      .take_while(|dir| byte_len(dir) >= self.shortest_path)
+      .filter_map(move |dir| Some((self.by_path.get(dir)?, rest_below(dir, path))))
   }
 
   fn below(&self, path: &Path) -> impl Iterator<Item = &T> {
@@ -506,6 +511,19 @@ impl<T> Dirs<T> {
     below.sort_unstable_by_key(|(dir, _)| dir.as_path());
     below.into_iter().map(|(_, value)| value)
   }
+}
+
+fn byte_len(path: &Path) -> usize {
+  path.as_os_str().len()
+}
+
+fn without_trailing_slash(path: &Path) -> &Path {
+  path.components().as_path()
+}
+
+fn rest_below<'a>(dir: &Path, path: &'a Path) -> &'a Path {
+  let rest = &path.as_os_str().as_bytes()[byte_len(dir)..];
+  Path::new(OsStr::from_bytes(rest.strip_prefix(b"/").unwrap_or(rest)))
 }
 
 extern "C" fn callback(
@@ -518,7 +536,7 @@ extern "C" fn callback(
 ) {
   let sink = unsafe { &*info.cast::<Sink<Raw>>() };
   let paths = paths.cast::<*const c_char>();
-  let mut raw = Raw { paths: Vec::with_capacity(count * 128), records: Vec::with_capacity(count) };
+  let mut raw = Raw::with_capacity(count);
   for index in 0..count {
     let (path, flags) = unsafe { (CStr::from_ptr(*paths.add(index)), *flags.add(index)) };
     raw.push(path.to_bytes(), flags);
@@ -637,28 +655,42 @@ fn name_on_disk(path: &Path) -> io::Result<Option<OsString>> {
     file: 0,
     fork: 0,
   };
-  let mut buffer = [0u8; 16 + 768];
+  let mut found = NameAndType {
+    length: 0,
+    name: AttrReference { offset: 0, length: 0 },
+    object_type: 0,
+    name_bytes: [0; MAX_NAME_BYTES],
+  };
   let result = unsafe {
     getattrlist(
       c_path.as_ptr(),
       (&raw const wanted).cast_mut().cast(),
-      buffer.as_mut_ptr().cast(),
-      buffer.len(),
+      (&raw mut found).cast(),
+      size_of::<NameAndType>(),
       FSOPT_NOFOLLOW,
     )
   };
   if result != 0 {
     return Err(io::Error::last_os_error());
   }
-  let field =
-    |at: usize| u32::from_ne_bytes([buffer[at], buffer[at + 1], buffer[at + 2], buffer[at + 3]]);
-  let (offset, len, kind) = (field(4) as usize, field(8) as usize, field(12));
-  if kind == VLNK {
+  if found.object_type == VLNK {
     return Ok(None);
   }
-  let name = len.checked_sub(1).and_then(|len| buffer.get(4 + offset..4 + offset + len));
-  let name = name.ok_or_else(|| io::Error::other("getattrlist gave no name"))?;
-  Ok(Some(OsStr::from_bytes(name).to_owned()))
+  found
+    .name()
+    .map(|name| Some(name.to_owned()))
+    .ok_or_else(|| io::Error::other("getattrlist gave no name"))
+}
+
+impl NameAndType {
+  fn name(&self) -> Option<&OsStr> {
+    let offset_from_reference = usize::try_from(self.name.offset).ok()?;
+    let start = (mem::offset_of!(Self, name) + offset_from_reference)
+      .checked_sub(mem::offset_of!(Self, name_bytes))?;
+    let len_without_nul = usize::try_from(self.name.length).ok()?.checked_sub(1)?;
+    let bytes = self.name_bytes.get(start..start + len_without_nul)?;
+    Some(OsStr::from_bytes(bytes))
+  }
 }
 
 struct Cf(NonNull<c_void>);
@@ -714,6 +746,8 @@ const ATTR_CMN_OBJTYPE: u32 = 0x8;
 const FSOPT_NOFOLLOW: u32 = 0x1;
 const VLNK: u32 = 5;
 
+const MAX_NAME_BYTES: usize = 768;
+
 #[repr(C)]
 struct AttrList {
   bitmap_count: u16,
@@ -723,6 +757,20 @@ struct AttrList {
   dir: u32,
   file: u32,
   fork: u32,
+}
+
+#[repr(C)]
+struct NameAndType {
+  length: u32,
+  name: AttrReference,
+  object_type: u32,
+  name_bytes: [u8; MAX_NAME_BYTES],
+}
+
+#[repr(C)]
+struct AttrReference {
+  offset: i32,
+  length: u32,
 }
 
 type CFTypeRef = *const c_void;

@@ -811,7 +811,7 @@ As built:
   Old streams keep running, so nothing is ever in a gap. With 8 streams running, or with too
   many stream paths, `commit` starts new streams for all covers in their place, and an old
   stream is stopped when it has delivered everything from before that start, or after 500 ms.
-  At most 64 old streams run on (`MAX_RETIRING`): with more, the oldest are told to deliver what
+  At most 64 old streams run on (`MAX_RETIRING_STREAMS`): with more, the oldest are told to deliver what
   they hold (`FSEventStreamFlushSync`) and are stopped at once, so that commits that come fast
   do not use up the 512 streams. If the streams cannot start, `commit` returns the watch limit
   error and the old streams keep running.

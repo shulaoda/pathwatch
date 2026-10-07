@@ -25,7 +25,9 @@ use pathwatch::{
   backend::{Backend, Coverage, DirKey, Hint, Signal, Sink, Want, is_watch_limit},
   engine::{Engine, Options, Output},
   fs::{FileType, Fs, Meta, StdFs},
-  fsevents::{FsEventsBackend, MAX_PATHS, MAX_STREAM_PATHS, MAX_STREAMS, Raw, flag, is_too_high},
+  fsevents::{
+    FsEventsBackend, MAX_PATHS_PER_STREAM, MAX_STREAM_PATHS, MAX_STREAMS, Raw, flag, is_too_high,
+  },
 };
 use tempfile::TempDir;
 
@@ -906,7 +908,7 @@ fn more_covers_than_one_stream_can_hold() {
   let mut h = Harness::new();
   let top = fs::canonicalize(std::env::temp_dir()).unwrap();
   assert!(is_too_high(&top), "the test needs a temporary directory that is too high: {top:?}");
-  let count = u32::try_from(MAX_PATHS).unwrap() + 4;
+  let count = u32::try_from(MAX_PATHS_PER_STREAM).unwrap() + 4;
   let dirs: Vec<TempDir> = (0..count).map(|_| tempfile::tempdir_in(&top).unwrap()).collect();
   for (index, dir) in (0..count).zip(&dirs) {
     h.watch(index, dir.path(), Want::Contents);
