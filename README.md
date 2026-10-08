@@ -150,6 +150,9 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   macOS and with polling. Linux reports it. `with_compare_contents(true)` finds it everywhere.
 - **A mount over a watched directory** is not noticed until something else makes the watcher
   look there.
+- **A directory on a network drive, or shared with another machine** (NFS, a folder of the
+  host in a virtual machine or a container): changes that the other machine makes are not
+  reported, and nothing tells the watcher so. `with_polling(true)` finds them.
 - **Two watched paths that are two spellings of one file** (macOS, Windows): only the spelling
   of the disk gets the events. With polling both get them.
 - **A watched path in another spelling, inside a directory that you watch too:** the file is

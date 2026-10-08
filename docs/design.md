@@ -767,8 +767,12 @@ them.
   watch and its keys stay, and the next `watch` of the engine moves the key to the directory
   that is at the path now. `DELETE_SELF`, `IGNORED` and `UNMOUNT` → forget the watch, `Changed`
   with an empty `rel` for each key.
-- A reader thread hands over the bytes of each read. The watcher thread adds and removes the
-  kernel watches itself, so nothing needs a lock.
+- A reader thread hands over the bytes of each read. It reads at most once a millisecond
+  (`READ_INTERVAL`), and at once again after a read that filled more than half of its buffer.
+  A first change is read when it comes; what follows inside the millisecond comes with the
+  next read. While events wait in the queue, the kernel merges one that repeats the last one,
+  and the two threads wake up a thousand times a second at most (the probe below). The watcher
+  thread adds and removes the kernel watches itself, so nothing needs a lock.
 - `ENOSPC` → `Failed` with the watch limit error. Every other error → `Failed` with that error.
 
 Limits: `MOVE_SELF` comes only when the watched directory itself is renamed; a move of a
@@ -786,6 +790,18 @@ default, two events for a new file):
   threads: 15 to 20 overflows in a run, and 36 to 47 % of the events come. A reader with the
   bare API that only counts gets the same, so the reader thread of the backend is not the
   cause: the writers hold the lock of the queue.
+- Small writes into files of one watched directory, on a disk: every `write` call is an
+  event. With a read for every wake-up, one writer (a million writes a second for half a
+  second) cost the reader thread 220 ms on a CPU and the thread that takes its reads 130 ms,
+  for 85,000 events in 75,000 reads. With a read a millisecond: 2 ms and 3 ms, for 190 events
+  in 135 reads. Eight writers for five seconds: 3 s and 1 s before, 0.6 s and 0.05 s now, for
+  the same four million events. No overflow in either case. One new file is read 60 µs after
+  the call, as before. The floods above overflow as often as before, and the writers of the
+  flood on tmpfs are faster (1.3 million files a second, from 0.8): the reader takes the lock
+  of the queue less often.
+- A directory that is shared with another machine (seen from a virtual machine, file system
+  `fuseblk`): `inotify_add_watch` works, changes that are made inside the machine come, and
+  changes that the other machine makes do not come at all. Nothing tells the backend so.
 - The queue and its lock belong to the inotify instance. With the directories on two
   instances the overflow is gone or rare, with four it is gone, also when one thread reads
   all of them. This is not built: a user has 128 instances by default, an overflow needs more

@@ -9,6 +9,7 @@ use std::{
   path::Path,
   sync::Arc,
   thread::{self, JoinHandle},
+  time::{Duration, Instant},
 };
 
 use rustc_hash::FxHashMap;
@@ -23,6 +24,7 @@ const WATCH_FLAGS: u32 = libc::IN_EXCL_UNLINK | libc::IN_ONLYDIR | libc::IN_MASK
 const WATCH_ENDED: u32 = libc::IN_IGNORED | libc::IN_UNMOUNT | libc::IN_DELETE_SELF;
 const NEW_CONTENT: u32 = libc::IN_MODIFY | libc::IN_CREATE | libc::IN_MOVED_TO;
 const READ_BUFFER_LEN: usize = 64 * 1024;
+const READ_INTERVAL: Duration = Duration::from_millis(1);
 
 const ERROR_WATCH_LIMIT: &str = "the inotify watch limit is reached (fs.inotify.max_user_watches)";
 
@@ -168,6 +170,7 @@ impl Drop for InotifyBackend {
 
 fn forward(fds: &Fds, sink: &Sink<Vec<u8>>) {
   let mut buffer = vec![0; READ_BUFFER_LEN];
+  let mut next_read = Instant::now();
   let error = loop {
     match ffi::wait_until_readable([&fds.inotify, &fds.stop]) {
       Ok([_, true]) => return,
@@ -175,9 +178,14 @@ fn forward(fds: &Fds, sink: &Sink<Vec<u8>>) {
       Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
       Err(error) => break error,
     }
+    thread::sleep(next_read.saturating_duration_since(Instant::now()));
     match (&fds.inotify).read(&mut buffer) {
       Ok(0) => break io::ErrorKind::UnexpectedEof.into(),
-      Ok(len) => sink.raw(buffer[..len].to_vec()),
+      Ok(len) => {
+        sink.raw(buffer[..len].to_vec());
+        let is_behind = len > READ_BUFFER_LEN / 2;
+        next_read = Instant::now() + if is_behind { Duration::ZERO } else { READ_INTERVAL };
+      }
       Err(error)
         if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
       Err(error) => break error,
