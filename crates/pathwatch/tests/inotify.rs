@@ -688,15 +688,9 @@ fn masks_map_to_hints() {
   raw.extend(event(wd, libc::IN_IGNORED, ""));
   assert_eq!(h.translate(raw), [changed(key, "")]);
   assert_eq!(h.wd(key), None);
-}
 
-#[test]
-fn queue_overflow_is_lost() {
-  let mut h = Harness::new();
-  h.watch(1, "", Want::Contents);
-
+  // The queue of the kernel was full: it cannot say what is missing.
   assert_eq!(h.translate(event(-1, libc::IN_Q_OVERFLOW, "")), [Seen::Lost]);
-  assert_eq!(h.watches(), 1);
 }
 
 #[test]

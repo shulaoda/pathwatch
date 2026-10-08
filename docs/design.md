@@ -775,6 +775,24 @@ Limits: `MOVE_SELF` comes only when the watched directory itself is renamed; a m
 directory above it is told by the watches on the way. Expected and not tested: a removed
 directory that a process holds open sends `DELETE_SELF` only when that process lets go.
 
+Facts from probes on Linux (13 CPUs, the queue limit of 16,384 events that Linux has by
+default, two events for a new file):
+
+- With 20,000 directories, `watch` takes 0.6 to 0.7 µs for a directory (0.3 to 0.4 µs for one
+  that has a watch), `unwatch` 0.6 to 0.7 µs, and `translate` 7 ns for an event.
+- New files on a disk (btrfs), 200,000 a second from 4 or from 8 threads: no overflow, and
+  every event comes.
+- New files on tmpfs. 800,000 a second from 4 threads: no overflow. 900,000 a second from 8
+  threads: 15 to 20 overflows in a run, and 36 to 47 % of the events come. A reader with the
+  bare API that only counts gets the same, so the reader thread of the backend is not the
+  cause: the writers hold the lock of the queue.
+- The queue and its lock belong to the inotify instance. With the directories on two
+  instances the overflow is gone or rare, with four it is gone, also when one thread reads
+  all of them. This is not built: a user has 128 instances by default, an overflow needs more
+  events than a disk gives, and the hints of one instance come in the order of the changes,
+  which the tests of the backend rest on. After an overflow the engine reads everything
+  again (`Lost`).
+
 ### 7.2 FSEvents (`fsevents.rs`)
 
 Facts from probes on macOS (APFS):
