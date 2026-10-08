@@ -20,7 +20,5 @@ impl Backend for PollBackend {
 
   fn unwatch(&mut self, _key: DirKey) {}
 
-  fn translate(&mut self, raw: Self::Raw, _hint: &mut dyn FnMut(Hint<'_>)) {
-    match raw {}
-  }
+  fn translate(&mut self, _raw: Self::Raw, _hint: &mut dyn FnMut(Hint<'_>)) {}
 }

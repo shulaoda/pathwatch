@@ -1,11 +1,8 @@
-//! The errors that a watcher reports.
-
 use std::{
   error, fmt, io,
   path::{Path, PathBuf},
 };
 
-/// What [`ErrorKind::WatchLimit`] means on this OS, for the text of the error.
 const WATCH_LIMIT: &str = if cfg!(any(target_os = "linux", target_os = "android")) {
   "raise fs.inotify.max_user_watches or fs.inotify.max_user_instances"
 } else if cfg!(target_os = "macos") {
@@ -16,9 +13,6 @@ const WATCH_LIMIT: &str = if cfg!(any(target_os = "linux", target_os = "android"
   "a limit of the OS is reached"
 };
 
-/// An error of the watcher.
-///
-/// Its [`source`](std::error::Error::source) is the error of the OS, when there is one.
 #[derive(Debug)]
 pub struct Error {
   kind: ErrorKind,
@@ -31,13 +25,10 @@ impl Error {
     Self { kind, path, source }
   }
 
-  /// What went wrong.
   pub fn kind(&self) -> ErrorKind {
     self.kind
   }
 
-  /// One path that shows the problem. More paths can have it: the handler gets one error of
-  /// a kind for a batch, not one for each path.
   pub fn path(&self) -> Option<&Path> {
     self.path.as_deref()
   }
@@ -72,25 +63,11 @@ impl error::Error for Error {
   }
 }
 
-/// What went wrong.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[non_exhaustive]
 pub enum ErrorKind {
-  /// A path given to `watch` or `unwatch` cannot be used: it is empty, has a NUL byte, goes
-  /// above the root with `..`, or is a file system root (`/`, `C:\`, `\\server\share`). On
-  /// Windows also a path of a device, and `C:name`.
   InvalidPath,
-  /// The OS has no room for more watches. The watcher keeps running: what has no watch is
-  /// read on a timer until there is room.
-  ///
-  /// - Linux: the settings `fs.inotify.max_user_watches` and `fs.inotify.max_user_instances`.
-  /// - macOS: the limit of `FSEvents` streams of one process.
-  /// - Windows: the limit of handles of this watcher.
   WatchLimit,
-  /// A path cannot be read. For events it counts as missing.
   PermissionDenied,
-  /// Another error of the OS.
   Io,
-  /// The watcher is closed, or its thread is gone because the handler panicked.
   Closed,
 }
