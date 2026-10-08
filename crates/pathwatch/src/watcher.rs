@@ -483,10 +483,6 @@ impl<R: Send + 'static> Backend for NoBackend<R> {
 
   fn unwatch(&mut self, _key: DirKey) {}
 
-  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
-    Ok(Vec::new())
-  }
-
   fn translate(&mut self, _raw: R, _hint: &mut dyn FnMut(Hint<'_>)) {}
 }
 

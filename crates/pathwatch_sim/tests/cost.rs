@@ -235,10 +235,6 @@ impl Backend for ByHand {
 
   fn unwatch(&mut self, _key: DirKey) {}
 
-  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
-    Ok(Vec::new())
-  }
-
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     for kept in raw.iter() {
       hint(kept.hint());

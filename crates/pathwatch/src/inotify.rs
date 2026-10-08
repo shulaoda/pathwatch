@@ -112,10 +112,6 @@ impl Backend for InotifyBackend {
     self.unbind(key);
   }
 
-  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
-    Ok(Vec::new())
-  }
-
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     let mut rest = raw.as_slice();
     while let Some((event, tail)) = split_event(rest) {

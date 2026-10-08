@@ -130,10 +130,6 @@ impl Backend for Direct {
 
   fn unwatch(&mut self, _: DirKey) {}
 
-  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
-    Ok(Vec::new())
-  }
-
   fn translate(&mut self, (dir, name): Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     hint(Hint::Written { dir, rel: Path::new(name) });
   }

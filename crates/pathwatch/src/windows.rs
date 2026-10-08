@@ -535,11 +535,6 @@ impl Backend for WindowsBackend {
     self.finish(change);
   }
 
-  /// Nothing to do: a handle is live when `watch` returns.
-  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
-    Ok(Vec::new())
-  }
-
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     translate(&mut self.handles, raw, hint);
   }
