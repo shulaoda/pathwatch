@@ -1,16 +1,11 @@
-//! The poll backend (every target).
-
 use std::{convert::Infallible, io, path::Path};
 
 use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want};
 
-/// The backend that watches nothing. Every directory is answered `NotWatched`, so the engine
-/// polls all of them.
 #[derive(Debug)]
 pub struct PollBackend;
 
 impl PollBackend {
-  /// It has no thread and never uses the sink.
   pub fn new(_sink: Sink<Infallible>) -> io::Result<Self> {
     Ok(Self)
   }
