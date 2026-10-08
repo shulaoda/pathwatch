@@ -38,6 +38,15 @@ the real disk, with this backend and with polling.
 
 ## Not verified on Windows
 
+- **The spelling of a name** (`Fs::name_on_disk` in `fs.rs`). On a disk that takes two
+  spellings of a name for one, a look asks how the disk spells the name that `lstat` found
+  (design 5.2). Here that is `FindFirstFileW` for the path, and the name that it gives back.
+  It was only compiled. To check: it gives the name as the directory holds it, also for a
+  link; and a path of more than 260 units works (std puts such a path into `\\?\` form for
+  its own calls, this call passes the path as it is).
+- **How a name that is gone is spelled in a record.** FSEvents names a removed entry as the
+  caller spelled it, and the engine is right for both spellings. Which one
+  `ReadDirectoryChangesW` gives is not known.
 - **How lost records show up.** Expected: the read completes with success and zero bytes. The
   error `ERROR_NOTIFY_ENUM_DIR` is taken the same way. Zero bytes mean that the buffer of this
   one handle was too small. So both become `Changed` with an empty `rel` for each key that the

@@ -5,17 +5,16 @@ use std::path::PathBuf;
 
 use super::{
   Engine,
-  check::{Found, is_missing},
+  check::{Found, Listed, is_missing},
 };
 use crate::{
   backend::{Backend, DirKey},
-  fs::{DirId, FileType, Fs},
+  fs::{DirId, Fs},
   tree::{Depth, Dir, Kind, Mark, Watch},
 };
 
-/// One node to check in a scan, with the type that the listing gave for it. `None`: the tree
-/// knew the node, and the listing was not asked about it.
-pub(super) type ScanEntry = (DirKey, Option<FileType>);
+/// One node to check in a scan, with what the listing said about it.
+pub(super) type ScanEntry = (DirKey, Listed);
 
 /// The scan of one directory.
 impl<B: Backend, F: Fs> Engine<B, F> {
@@ -39,7 +38,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.path_into(key, path);
     self.scan_had_error = false;
     names.clear();
-    names.extend(self.tree.children(key).map(|child| (child, None)));
+    names.extend(self.tree.children(key).map(|child| (child, Listed::NotAsked)));
     let known = names.len();
     self.listed.clear();
     let listing =
@@ -47,20 +46,24 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if listing == Listing::Stop {
       return;
     }
+    // With loose spelling, a listing of the whole directory tells how the disk spells each
+    // name: a node of the tree is one of them, or the disk has no entry under its name.
     let names_are_known = listing == Listing::Whole && self.options.loose_spelling;
     let names_only = depth == Depth::Names && names_are_known;
 
     let why = if depth == Depth::Deep { Mark::DEEP } else { Mark::default() };
-    for (index, &(child, kind)) in names.iter().enumerate() {
-      if names_are_known && self.has_another_spelling(child, path) {
-        continue;
-      }
+    for (index, &(child, listed)) in names.iter().enumerate() {
+      let listed = match listed {
+        Listed::NotAsked if names_are_known && self.listed.contains(&child) => Listed::Named(None),
+        Listed::NotAsked if names_are_known => Listed::NotNamed,
+        said => said,
+      };
       // The tree knew the node, and the listing names it: it is as it was.
-      if names_only && index < known && self.listed.contains(&child) {
+      if names_only && index < known && matches!(listed, Listed::Named(_)) {
         continue;
       }
       // A check frees no node but its own.
-      self.check(child, path, kind, why);
+      self.check(child, path, listed, why);
     }
     // This runs after the commit, so a watch that is said to have failed did fail.
     if let Some(dir) = self.tree[key].dir_mut() {
@@ -81,7 +84,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let result = self.fs.read_dir(path, &mut |name, kind| {
       let node = tree.child(key, name).unwrap_or_else(|| {
         let new = tree.insert_child(key, name);
-        names.push((new, kind));
+        names.push((new, Listed::Named(kind)));
         new
       });
       if let Some(listed) = &mut listed {
@@ -114,44 +117,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   fn check_from_parent(&mut self, key: DirKey, path: &mut PathBuf) {
     let Some(parent) = self.tree.parent(key) else { return };
     self.tree.path_into(parent, path);
-    self.check(key, path, None, Mark::default());
-  }
-
-  /// With loose spelling, `lstat` finds an entry under every spelling of its name, but a
-  /// listing names it in one way only: as the disk spells it. So the listing is the truth for
-  /// the name of an entry that was found (a registered name keeps the spelling of the caller,
-  /// and `lstat` is asked about it).
-  ///
-  /// `true`: the listing did not name the entry at the node `child`, the disk still finds one
-  /// there, and says that it spells the name in another way. Under this name the entry is gone
-  /// at once. It is not held, because the second look would find it again.
-  ///
-  /// `path` is the path of the directory. It is the same after the call.
-  fn has_another_spelling(&mut self, child: DirKey, path: &mut PathBuf) -> bool {
-    let node = &self.tree[child];
-    if node.is_registered() || self.listed.contains(&child) {
-      return false;
-    }
-    path.push(self.tree.name(child));
-    let another = match self.fs.lstat(path) {
-      // The real path of a link is the path of its target, so it does not tell how the disk
-      // spells the link: the listing is believed.
-      Ok(meta) if meta.kind == FileType::Symlink => true,
-      // The disk is asked for its spelling: an entry that is found under its own name was
-      // missed by the listing, or it came after the listing. That one is there.
-      Ok(_) => {
-        self.fs.real_path(path).is_ok_and(|real| real.file_name() != Some(self.tree.name(child)))
-      }
-      Err(_) => false,
-    };
-    path.pop();
-    if another {
-      // A mark would ask `lstat` about this name once more.
-      self.tree.take_mark(child);
-      self.gone(child);
-      self.tree.prune(child);
-    }
-    another
+    self.check(key, path, Listed::NotAsked, Mark::default());
   }
 }
 

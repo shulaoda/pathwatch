@@ -1,7 +1,8 @@
 //! A watched path in another spelling than the disk has, on a disk that ignores the case of
-//! letters (`SimFs::set_ignore_case`). The OS names an entry as the disk spells it, so a hint for
-//! a name that is not registered makes the directory check the registered names that can be it.
-//! The events (`C`, `U`, `D` and the path) carry the registered spelling.
+//! letters (`SimFs::set_ignore_case`). The OS names an entry that is there as the disk spells
+//! it, and one that is gone as the caller spelled it. So a hint for a name that the tree does
+//! not have makes the directory check the names that can be it. The events (`C`, `U`, `D` and
+//! the path) carry the registered spelling.
 
 #![cfg(unix)]
 
@@ -232,10 +233,9 @@ fn a_watched_path_in_another_spelling_inside_a_watched_directory() {
 
 // ---- an entry below a watched directory gets another spelling ----
 //
-// `lstat` finds the entry under the old name too. A listing does not: it names an entry as the
-// disk spells it. So the directory is scanned when a look finds an entry at a name that the
-// tree did not have, and an entry of the tree that the listing does not name, while `lstat`
-// still finds it, is gone at once.
+// `lstat` finds the entry under the old name too. So the disk is asked how it spells a name
+// that was found, when that is not sure: the tree did not have the name, or it has the name in
+// two spellings. An entry that the disk spells in another way is gone at once.
 
 /// A rename inside a watched directory that changes only the case of the letters: the file
 /// under the old name is gone, and there is a new one. Both events come in one batch.
@@ -369,7 +369,7 @@ fn a_file_that_comes_back_right_after_the_listing_is_not_another_spelling() {
   assert!(d.step());
   assert_eq!(d.fs.traps_run(), 1);
   // The disk was asked how it spells the name.
-  assert_eq!(d.fs.calls().real_path, 1);
+  assert_eq!(d.fs.calls().name_on_disk, 1);
   assert_eq!(taken(&mut d), ["U /p/R/app.js"]);
   caught_up(&mut d);
 }
@@ -451,12 +451,10 @@ fn a_watched_directory_is_renamed_to_another_case() {
 }
 
 /// A new entry in a watched directory, on a disk that takes two spellings of a name for one.
-/// Only a listing tells how the disk spells the new name, and whether a known entry is gone
-/// for it. So the names of the directory are compared with one listing. The entries that the
-/// tree knew and that the listing names are not looked at: one look for the new entry, however
-/// many entries the directory has.
+/// The disk is asked how it spells the one new name. No listing is made, however many entries
+/// the directory has, and a file that the tree knows is looked at as on any disk.
 #[test]
-fn a_new_entry_costs_one_look_and_one_listing() {
+fn a_new_entry_costs_one_look_and_one_question() {
   for entries in [3, 300] {
     let mut d = Driver::sim(Mode::Inode, loose());
     d.fs.set_ignore_case(true);
@@ -466,21 +464,77 @@ fn a_new_entry_costs_one_look_and_one_listing() {
     }
     d.watch(&["/p/r"]);
     assert_eq!(settled(&mut d), NONE);
+    // How often the disk was asked: `lstat`, the spelling of a name, a listing.
+    let asked = |d: &Driver<_>| {
+      let calls = d.fs.calls();
+      [calls.lstat, calls.name_on_disk, calls.read_dir]
+    };
+    let since = |before: [u64; 3], d: &Driver<_>| {
+      let after = asked(d);
+      [after[0] - before[0], after[1] - before[1], after[2] - before[2]]
+    };
 
-    let before = d.fs.calls();
+    let before = asked(&d);
     d.fs.write("/p/r/new.js", "1").unwrap();
     assert_eq!(window(&mut d), ["C /p/r/new.js"], "{entries}");
-    let after = d.fs.calls();
-    assert_eq!((after.lstat - before.lstat, after.read_dir - before.read_dir), (1, 1), "{entries}");
+    assert_eq!(since(before, &d), [1, 1, 0], "{entries}");
 
-    // The listing still finds what it is for: a known entry that has another spelling now.
-    // One look for each of the two names that the hints give, and one more for the old name,
-    // which the listing does not have.
-    let before = d.fs.calls();
+    let before = asked(&d);
+    d.fs.write("/p/r/file2.js", "22").unwrap();
+    assert_eq!(window(&mut d), ["U /p/r/file2.js"], "{entries}");
+    assert_eq!(since(before, &d), [1, 0, 0], "{entries}");
+
+    // A known entry gets another spelling: a look and a question for each of the two names.
+    let before = asked(&d);
     d.fs.rename("/p/r/file1.js", "/p/r/FILE1.js").unwrap();
     assert_eq!(window(&mut d), ["C /p/r/FILE1.js", "D /p/r/file1.js"], "{entries}");
-    let after = d.fs.calls();
-    assert_eq!((after.lstat - before.lstat, after.read_dir - before.read_dir), (3, 1), "{entries}");
+    assert_eq!(since(before, &d), [2, 2, 0], "{entries}");
     caught_up(&mut d);
   }
+}
+
+/// The OS names an entry that is gone as the caller spelled it. The file that the caller
+/// meant is found by its name without the case of the letters, and no listing is made.
+#[test]
+fn an_entry_goes_through_another_spelling_of_its_name() {
+  on_all(&loose(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().mkdir_all("/p/R").unwrap();
+    d.fs().write("/p/R/app.js", "1").unwrap();
+    d.fs().write("/p/R/other.js", "1").unwrap();
+    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
+
+    d.fs().remove("/p/R/APP.JS").unwrap();
+    assert_eq!(d.settled(), ["D /p/R/app.js"], "{on}");
+    d.fs().rename("/p/R/Other.js", "/p/away.js").unwrap();
+    assert_eq!(d.settled(), ["D /p/R/other.js"], "{on}");
+    d.caught_up();
+
+    // The name is free: a file that comes there is a new one.
+    d.fs().write("/p/R/app.js", "22").unwrap();
+    assert_eq!(d.settled(), ["C /p/R/app.js"], "{on}");
+    d.caught_up();
+  });
+}
+
+/// A name with a letter outside ASCII: the table of the tree does not find its other
+/// spellings. Such a name is asked from the disk at every look, and when a name that is gone
+/// names no node, one listing shows which node is gone.
+#[test]
+fn a_name_with_a_letter_outside_ascii() {
+  on_all(&loose(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().mkdir_all("/p/R").unwrap();
+    d.fs().write("/p/R/Caf\u{e9}.js", "1").unwrap();
+    d.fs().write("/p/R/th\u{e9}.js", "1").unwrap();
+    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
+
+    d.fs().rename("/p/R/Caf\u{e9}.js", "/p/R/caf\u{e9}.js").unwrap();
+    assert_eq!(d.window(), ["D /p/R/Caf\u{e9}.js", "C /p/R/caf\u{e9}.js"], "{on}");
+    assert_eq!(d.settled(), NONE, "{on}");
+
+    d.fs().remove("/p/R/TH\u{e9}.JS").unwrap();
+    assert_eq!(d.settled(), ["D /p/R/th\u{e9}.js"], "{on}");
+    d.caught_up();
+  });
 }

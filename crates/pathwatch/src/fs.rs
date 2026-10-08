@@ -1,7 +1,7 @@
 //! How the engine sees the disk.
 
 use std::{
-  ffi::OsStr,
+  ffi::{OsStr, OsString},
   fs::{self, File, Metadata},
   hash::Hasher,
   io::{self, Read},
@@ -33,6 +33,12 @@ pub trait Fs {
   /// The path that `path` leads to, without any symbolic link in it, and with every name as
   /// the disk spells it.
   fn real_path(&self, path: &Path) -> io::Result<PathBuf>;
+
+  /// The last name of `path` as the disk spells it. A link at the end is not followed.
+  ///
+  /// It is asked only on a disk that takes two spellings of a name for one. There `lstat` finds
+  /// an entry under every spelling of its name, and this call tells which one the entry has.
+  fn name_on_disk(&self, path: &Path) -> io::Result<OsString>;
 
   /// The clock that the modification times come from.
   fn now(&self) -> SystemTime;
@@ -137,9 +143,126 @@ impl Fs for StdFs {
     fs::canonicalize(path)
   }
 
+  fn name_on_disk(&self, path: &Path) -> io::Result<OsString> {
+    name_on_disk(path)
+  }
+
   fn now(&self) -> SystemTime {
     SystemTime::now()
   }
+}
+
+/// macOS: `getattrlist` gives the name that the directory holds for the entry, in one call.
+#[cfg(target_vendor = "apple")]
+fn name_on_disk(path: &Path) -> io::Result<OsString> {
+  use std::{
+    ffi::{CString, c_char, c_void},
+    mem,
+    os::unix::ffi::OsStrExt,
+  };
+
+  /// `struct attrlist`: the attributes that are asked for.
+  #[repr(C)]
+  struct AttrList {
+    bitmap_count: u16,
+    reserved: u16,
+    common: u32,
+    volume: u32,
+    dir: u32,
+    file: u32,
+    fork: u32,
+  }
+  /// The answer for the name alone: the length of all of it, where the name starts, counted
+  /// from the field `name_offset`, how long it is with its NUL, and then its bytes.
+  #[repr(C)]
+  struct Answer {
+    length: u32,
+    name_offset: i32,
+    name_length: u32,
+    bytes: [u8; NAME_BYTES],
+  }
+  const ATTR_BIT_MAP_COUNT: u16 = 5;
+  const ATTR_CMN_NAME: u32 = 0x1;
+  const FSOPT_NOFOLLOW: u32 = 0x1;
+  /// A name is at most 255 UTF-16 units, each at most three bytes here, and a NUL.
+  const NAME_BYTES: usize = 255 * 3 + 1;
+  unsafe extern "C" {
+    fn getattrlist(
+      path: *const c_char,
+      wanted: *mut c_void,
+      answer: *mut c_void,
+      size: usize,
+      options: u32,
+    ) -> i32;
+  }
+
+  let c_path = CString::new(path.as_os_str().as_bytes())?;
+  let wanted = AttrList {
+    bitmap_count: ATTR_BIT_MAP_COUNT,
+    reserved: 0,
+    common: ATTR_CMN_NAME,
+    volume: 0,
+    dir: 0,
+    file: 0,
+    fork: 0,
+  };
+  let mut answer = Answer { length: 0, name_offset: 0, name_length: 0, bytes: [0; NAME_BYTES] };
+  // SAFETY: `c_path` ends with a NUL, `wanted` is a whole `attrlist` that the call only reads,
+  // and the call writes at most `size_of::<Answer>()` bytes into `answer`.
+  let result = unsafe {
+    getattrlist(
+      c_path.as_ptr(),
+      (&raw const wanted).cast_mut().cast(),
+      (&raw mut answer).cast(),
+      size_of::<Answer>(),
+      FSOPT_NOFOLLOW,
+    )
+  };
+  if result != 0 {
+    return Err(io::Error::last_os_error());
+  }
+  let start = usize::try_from(answer.name_offset).ok().and_then(|from_the_field| {
+    (mem::offset_of!(Answer, name_offset) + from_the_field)
+      .checked_sub(mem::offset_of!(Answer, bytes))
+  });
+  let len = usize::try_from(answer.name_length).ok().and_then(|with_nul| with_nul.checked_sub(1));
+  let name = start.zip(len).and_then(|(start, len)| answer.bytes.get(start..start + len));
+  let name = name.ok_or_else(|| io::Error::other("getattrlist gave no name"))?;
+  Ok(OsStr::from_bytes(name).to_owned())
+}
+
+/// Windows: a search for the one path gives the entry as the directory holds it.
+#[cfg(windows)]
+fn name_on_disk(path: &Path) -> io::Result<OsString> {
+  use std::{
+    mem,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+  };
+
+  use windows_sys::Win32::{
+    Foundation::INVALID_HANDLE_VALUE,
+    Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW},
+  };
+
+  let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+  // SAFETY: all zeros is a valid value of this plain struct of numbers.
+  let mut found: WIN32_FIND_DATAW = unsafe { mem::zeroed() };
+  // SAFETY: `wide` ends with a NUL, and the call writes one whole struct into `found`.
+  let search = unsafe { FindFirstFileW(wide.as_ptr(), &raw mut found) };
+  if search == INVALID_HANDLE_VALUE {
+    return Err(io::Error::last_os_error());
+  }
+  // SAFETY: `search` is the open handle that the call above gave, closed once.
+  unsafe { FindClose(search) };
+  let len = found.cFileName.iter().position(|&unit| unit == 0).unwrap_or(found.cFileName.len());
+  Ok(OsString::from_wide(&found.cFileName[..len]))
+}
+
+/// Everywhere else a name has one spelling: the one of the path.
+#[cfg(not(any(target_vendor = "apple", windows)))]
+fn name_on_disk(path: &Path) -> io::Result<OsString> {
+  fs::symlink_metadata(path)?;
+  path.file_name().map(OsStr::to_owned).ok_or_else(|| io::ErrorKind::InvalidInput.into())
 }
 
 fn meta(metadata: &Metadata) -> Meta {

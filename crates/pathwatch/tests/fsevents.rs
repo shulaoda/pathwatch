@@ -4,7 +4,7 @@
 
 use std::{
   collections::{HashMap, HashSet},
-  ffi::OsStr,
+  ffi::{OsStr, OsString},
   fs::{self, File, Permissions},
   io,
   os::unix::{
@@ -1330,6 +1330,10 @@ impl Fs for CountingFs {
 
   fn real_path(&self, path: &Path) -> io::Result<PathBuf> {
     self.disk.real_path(path)
+  }
+
+  fn name_on_disk(&self, path: &Path) -> io::Result<OsString> {
+    self.disk.name_on_disk(path)
   }
 
   fn now(&self) -> SystemTime {

@@ -9,7 +9,7 @@
 use std::{
   alloc::{GlobalAlloc, Layout, System},
   cell::Cell,
-  ffi::OsStr,
+  ffi::{OsStr, OsString},
   io,
   path::{Path, PathBuf},
   sync::{
@@ -106,6 +106,10 @@ impl Fs for PlainDisk {
 
   fn real_path(&self, path: &Path) -> io::Result<PathBuf> {
     Ok(path.to_path_buf())
+  }
+
+  fn name_on_disk(&self, path: &Path) -> io::Result<OsString> {
+    Ok(path.file_name().unwrap_or_default().to_owned())
   }
 
   fn now(&self) -> SystemTime {

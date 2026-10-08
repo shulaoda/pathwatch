@@ -156,6 +156,10 @@ impl Fs for Timed<SimFs> {
     timed(&self.outside, || self.inner.real_path(path))
   }
 
+  fn name_on_disk(&self, path: &Path) -> io::Result<OsString> {
+    timed(&self.outside, || self.inner.name_on_disk(path))
+  }
+
   fn now(&self) -> SystemTime {
     timed(&self.outside, || self.inner.now())
   }
@@ -813,11 +817,11 @@ fn j_a_new_file_in_a_watched_directory() {
   const NEW: u32 = 20;
   let _serial = serial();
   // On a disk that takes two spellings of a name for one, a new name can be another spelling
-  // of an entry that the tree has, and only a listing tells. So the flush that finds a new
-  // entry compares the names of its directory with one listing. It looks at the new entry only.
+  // of an entry that the tree has. So the look that finds a new entry asks the disk how it
+  // spells that one name. It makes no listing, however many entries the directory has.
   for entries in [200, ENTRIES] {
     for loose_spelling in [false, true] {
-      let (mut looks, mut listings) = (0, 0);
+      let (mut looks, mut questions, mut listings) = (0, 0, 0);
       let [cost] = best(|| {
         let fs = SimFs::new();
         fs.mkdir_all("/big/dir").unwrap();
@@ -842,13 +846,15 @@ fn j_a_new_file_in_a_watched_directory() {
         }
         let after = run.fs.calls();
         looks = (after.lstat - before.lstat) / u64::from(NEW);
+        questions = (after.name_on_disk - before.name_on_disk) / u64::from(NEW);
         listings = (after.read_dir - before.read_dir) / u64::from(NEW);
         [run.take_cost()]
       });
       let spelling = if loose_spelling { "loose" } else { "strict" };
       cost.show_each(&format!("j. one new file among {entries} files ({spelling} spelling)"), NEW);
       say(&format!(
-        "   {looks} looks at the disk (lstat) and {listings} listings for each new file"
+        "   {looks} looks at the disk (lstat), {questions} questions for a name and {listings} \
+         listings for each new file"
       ));
     }
   }

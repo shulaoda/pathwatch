@@ -187,9 +187,14 @@ struct Config {
   debounce: Duration,
   delete_delay: Duration,
   poll_interval: Duration,
-  /// The engine takes the disk for one that knows a name under two spellings. The disk of
-  /// the run is not such a disk, so the rule for it only costs looks: it must do no harm.
+  /// The engine takes the disk for one that knows a name under two spellings. On a disk that
+  /// is not such a disk, the rule for it only costs looks: it must do no harm.
   loose_spelling: bool,
+  /// The disk is such a disk, and the engine knows it. Then some changes name an entry in
+  /// upper case: the entry is the same, and the OS tells about a name that is gone in the
+  /// spelling of the change. No change gives an entry such a name, so the watched paths and
+  /// the disk keep one spelling.
+  ignore_case: bool,
   disk: DiskConfig,
   /// The shortest watched path, in names. With 3, the directories at the top only lead to
   /// watched paths, and a backend that watches whole trees does not watch them.
@@ -203,7 +208,7 @@ impl Config {
   fn new(seed: u64, backend: Target, steps: usize) -> Self {
     let mut random = Random::new(seed ^ 0xC0F1_6000);
     let millis = Duration::from_millis;
-    Self {
+    let mut config = Self {
       backend,
       filter: random.pick(&[0, 1, 1, 2, 3]),
       debounce: millis(random.pick(&[10, 10, 0, 50])),
@@ -229,7 +234,10 @@ impl Config {
       steps,
       checks: if random.chance(50) { 2 } else { 0 },
       loose_spelling: random.chance(25),
-    }
+      ignore_case: random.chance(50),
+    };
+    config.ignore_case &= config.loose_spelling;
+    config
   }
 
   fn options(&self) -> Options {
@@ -637,6 +645,8 @@ struct Shared {
   /// Set by a change that only a poll can see with the prefix backend.
   moved_unseen: AtomicBool,
   watch_moves: bool,
+  /// `Config::ignore_case`.
+  ignore_case: bool,
   /// How many operations of the run were started.
   reached: AtomicUsize,
 }
@@ -679,9 +689,21 @@ fn outcome(result: &io::Result<()>) -> &'static str {
 fn change_disk(fs: &SimFs, change: &Disk, shared: &Shared) -> String {
   let serial = shared.serial();
   let at = |place: &Place| place.resolve(fs, shared.filter, &lock(&shared.watched));
+  // Every third change names its entry in upper case, on a disk that takes that for the same
+  // name. Only an entry that is there: a new entry would get the name.
+  let in_upper_case = |path: String| {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", &path));
+    let is_there =
+      fs.read(&path).is_some() || fs.read_link(&path).is_some() || fs.dir_object(&path).is_some();
+    if shared.ignore_case && serial.is_multiple_of(3) && is_there {
+      format!("{dir}/{}", name.to_ascii_uppercase())
+    } else {
+      path
+    }
+  };
   match change {
     Disk::Write { path, same_size, parents } => {
-      let path = at(path);
+      let path = in_upper_case(at(path));
       if *parents && let Some(parent) = Path::new(&path).parent() {
         let _ = fs.mkdir_all(parent);
       }
@@ -698,15 +720,15 @@ fn change_disk(fs: &SimFs, change: &Disk, shared: &Shared) -> String {
       format!("mkdir -p {path}{}", outcome(&fs.mkdir_all(&path)))
     }
     Disk::Remove { path } => {
-      let path = at(path);
+      let path = in_upper_case(at(path));
       format!("rm {path}{}", outcome(&fs.remove(&path)))
     }
     Disk::RemoveAll { path } => {
-      let path = at(path);
+      let path = in_upper_case(at(path));
       format!("rm -r {path}{}", outcome(&fs.remove_all(&path)))
     }
     Disk::Rename { from, to } => {
-      let (from, to) = (at(from), at(to));
+      let (from, to) = (in_upper_case(at(from)), at(to));
       format!("mv {from} {to}{}", outcome(&fs.rename(&from, &to)))
     }
     Disk::Flip { path } => {
@@ -787,6 +809,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     fs.set_birth_times(config.disk.birth_times);
     fs.set_reuse_inode_numbers(config.disk.reuse_inode_numbers);
     fs.set_listing_kinds(config.disk.listing_kinds);
+    fs.set_ignore_case(config.ignore_case);
     Self {
       config: config.clone(),
       engine: Engine::new(backend, fs.clone(), config.options()),
@@ -1395,6 +1418,7 @@ fn play(config: &Config, ops: &[Op]) -> Result<(), Failure> {
     serial: AtomicU64::new(0),
     moved_unseen: AtomicBool::new(false),
     watch_moves: config.backend == Target::Sim(Mode::Prefix),
+    ignore_case: config.ignore_case,
     reached: AtomicUsize::new(0),
   });
   QUIET_PANICS.set(true);

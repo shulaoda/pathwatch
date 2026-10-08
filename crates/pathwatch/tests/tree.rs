@@ -581,6 +581,23 @@ fn a_name_that_can_be_another_spelling() {
   assert!(f.tree.hint(changed(f.r, "New.js", false)));
   assert_eq!(marks(&f.tree), ["/p/r|New.js|d", "/p|f.js|w"]);
   assert_eq!(f.tree.to_scan, []);
+  clear_marks(&mut f.tree);
+
+  // A complete node does not know the name: the OS names an entry that is gone as the caller
+  // spelled it, so the nodes that differ in the case of their letters are checked too.
+  assert!(!f.tree.has_other_spelling(f.sub));
+  assert!(f.tree.hint(changed(f.r, "SUB", false)));
+  assert_eq!(marks(&f.tree), ["/p/r|SUB|d", "/p/r|sub|d"]);
+  // While the tree has both, the disk has to say which of the two it has.
+  let other = f.tree.child(f.r, OsStr::new("SUB")).unwrap();
+  assert!(f.tree.has_other_spelling(f.sub) && f.tree.has_other_spelling(other));
+  clear_marks(&mut f.tree);
+  assert!(!f.tree.has_other_spelling(f.sub));
+  // The table does not find the other spellings of a name with a byte outside ASCII: such a
+  // name marks no other node in a complete node, and its own spelling is never sure.
+  assert!(f.tree.hint(changed(f.r, "s\u{dc}b", false)));
+  assert_eq!(marks(&f.tree), ["/p/r|s\u{dc}b|d"]);
+  assert!(f.tree.has_other_spelling(f.tree.child(f.r, OsStr::new("s\u{dc}b")).unwrap()));
 }
 
 #[test]

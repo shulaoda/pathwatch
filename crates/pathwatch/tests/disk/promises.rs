@@ -27,6 +27,7 @@
 //! 13. Spelling: `p::watched_paths_in_another_spelling`, `a_watched_file_in_another_unicode_form`,
 //!     `names_below_a_watched_directory_are_spelled_as_on_the_disk`,
 //!     `a_file_is_renamed_to_another_letter_case`,
+//!     `a_file_goes_through_another_spelling_of_its_name`,
 //!     `a_directory_is_renamed_to_another_letter_case`.
 
 use std::{
@@ -679,6 +680,27 @@ fn a_file_is_renamed_to_another_letter_case() {
     w.expect(&[(Delete, "r/ReadMe.md"), (Create, "r/README.md")]);
     w.remove("r/README.md");
     w.expect(&[(Delete, "r/README.md")]);
+  });
+}
+
+/// A file that is removed, or renamed away, through another spelling of its name is gone. The
+/// OS names it as the caller spelled it then.
+#[test]
+fn a_file_goes_through_another_spelling_of_its_name() {
+  each_backend(|w| {
+    w.write("r/App.js", "1");
+    w.write("r/Other.js", "1");
+    // Only a disk that takes two spellings of a name for one finds a file in this way.
+    if !w.path("R").exists() {
+      return;
+    }
+    w.watch(&["r"]);
+
+    w.remove("r/APP.JS");
+    w.rename("r/other.JS", "away.js");
+    w.expect(&[(Delete, "r/App.js"), (Delete, "r/Other.js")]);
+    w.write("r/App.js", "22");
+    w.expect(&[(Create, "r/App.js")]);
   });
 }
 

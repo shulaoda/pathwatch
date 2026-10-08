@@ -186,10 +186,13 @@ fn a_disk_that_tells_the_case_apart() {
   assert_eq!(fs.read("/P/a.js"), None);
 }
 
-/// A notification names the entry as the disk spells it, whatever spelling the writer used.
+/// A notification names an entry that is there as the disk spells it, whatever spelling the
+/// writer used, and an entry that is gone as the caller spelled it. An engine that knows about
+/// such a disk finds the file both times.
 #[test]
-fn a_notification_has_the_spelling_of_the_disk() {
-  on_modes(&Mode::ALL, &Options::default(), |d, on| {
+fn the_spelling_of_a_notification() {
+  let loose = Options { loose_spelling: true, ..Options::default() };
+  on_modes(&Mode::ALL, &loose, |d, on| {
     d.fs().set_ignore_case(true);
     d.fs().mkdir_all("/Proj/Src").unwrap();
     d.fs().write("/Proj/Src/App.js", "1").unwrap();

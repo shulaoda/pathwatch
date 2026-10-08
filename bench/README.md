@@ -86,8 +86,8 @@ Full sizes. `--scale` multiplies them, `--quick` is `--scale 0.05` with a quiet 
 | S7 big directory | 20,000 files in one directory | the one directory | first edit; 100 single edits; 100 single new files; a burst of 2,000 new files; 100 files removed one by one |
 
 S7 is there for a watcher that lists a directory when something in it changes: it pays for
-every entry of the directory. pathwatch does that for a new file on a disk that takes two
-spellings of a name for one (macOS, Windows).
+every entry of the directory. pathwatch did that for a new file on a disk that takes two
+spellings of a name for one (macOS, Windows), until it asked the disk for the one name.
 
 ## How to run it
 

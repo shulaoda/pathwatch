@@ -248,44 +248,72 @@ Two marks for one node become one. `Lost` sets a flag: the next flush that the p
 A hint that was dropped moves nothing.
 
 **Another spelling.** The usual disks of macOS and Windows find `App.js` when the entry is
-`app.js`, and the same for two Unicode forms of a name. So a path can be watched in a spelling
-that no notification carries: the OS names an entry as the disk spells it. On such a disk
-(`Options::loose_spelling`), the hint that would be dropped in step 4 marks each registered
-child of `X` that can be the name `c` (`can_be_one_name`):
+`app.js`, and the same for two Unicode forms of a name. `Config` says so for these two
+systems (`Options::loose_spelling`), and nothing of this runs anywhere else. Three facts are
+behind the rules, the first two measured with FSEvents on APFS:
 
-- the two names are equal when the case of ASCII letters is left out, or
-- both names have a byte outside ASCII. The rules of the disk for such letters are not known
-  here, so two such names can always be one name.
+- The OS names an entry that is there as the disk spells it, whatever spelling the writer
+  used.
+- The OS names an entry that is gone (removed, or renamed away) as the caller spelled it.
+- `lstat` finds an entry under every spelling of its name. The disk can say how it spells the
+  name of one entry (`Fs::name_on_disk`: `getattrlist` on macOS, 2 µs; `FindFirstFileW` on
+  Windows), and a listing names each entry in that one way.
 
-The mark is deep, because the names below can be spelled in another way too. If no child can
-be the name, the hint is dropped and costs no look at the disk. The events carry the
-registered spelling.
+So a name can be spelled in a way that no entry has, and a look must not take it for an entry.
+Watchman does the same on such a disk: it asks for the name after each `stat`, and takes
+another spelling for "not there".
+
+**A hint for a name that the tree does not have** (`Tree::other_spelling`). In a partial
+directory, the hint that would be dropped in step 4 marks each registered child that can be
+the name: a watched path keeps the spelling of its caller. In a complete directory, the hint
+marks the name as always, and also each child that can be the name: the OS may tell in this
+way that the child is gone. Two names can be one name (`can_be_one_name`) when
+
+- they are equal when the case of ASCII letters is left out, or
+- both have a byte outside ASCII. The rules of the disk for such letters are not known here,
+  so two such names can always be one name.
 
 A name of ASCII letters is found through the table: its hash leaves out the case of ASCII
 letters (`child_hash`), so the children that differ only in that are filed under one hash. Such
-a hint costs one lookup more, however many registered children the directory has: 18 ns
-next to 20,000 of them, where comparing with each child took 53 µs. A name with a byte
-outside ASCII is still compared with every child.
+a hint costs one lookup more, however many children the directory has: 18 ns next to 20,000
+registered ones, where comparing with each child took 53 µs. A name with a byte outside ASCII
+is compared with every registered child of a partial directory. In a complete directory it
+marks no other child: there can be many of them. The marks are deep, because the names below
+can be spelled in another way too. If no child can be the name, the hint costs no look at the
+disk. The events carry the registered spelling.
 
-**The listing tells the spelling.** On such a disk `lstat` finds an entry under every spelling
-of its name, so after a rename from `app.js` to `App.js` both names look alive. A listing names
-an entry in one way only: as the disk spells it. So in a scan that listed the whole directory,
-a child that the listing did not name is looked at in another way (`has_another_spelling`):
+**A look asks for the spelling when it is not sure** (`Engine::spelling_is_unsure`). A look
+that found an entry with `lstat` asks the disk for the name of that entry when
 
-- `lstat` finds nothing: the usual check (it is held, 5.9).
-- `lstat` finds an entry and the real path of it ends in another name: the entry is gone under
-  this name, at once and with no hold, because a second look would find it again.
-- the real path ends in this name: the listing missed the entry, or it came after the listing.
-  It stays.
-- a link: its real path is the path of its target and tells nothing, so the listing is
-  believed and the link is gone under this name.
+- the tree had nothing at the name, or the node is held: the name comes from a hint, and a
+  hint can be for a name that is gone;
+- another node of the directory can be the same name (`Tree::has_other_spelling`): the disk
+  has only one of the two. A name with a byte outside ASCII counts as such a name at every
+  look, because the table does not find its other spellings;
+- the look is part of a scan that listed the whole directory, and the listing did not name it.
 
-A registered name is left out: it keeps the spelling of the caller, and `lstat` is asked about
-it. The scan has to come: when a mark of the flush finds an entry where the tree had nothing,
-or a held node, and the name is not registered, the flush scans the names of the directory of
-the node once (`Depth::Names`): a node that the tree knew and that the listing names is not
-looked at. So a new entry in a watched directory costs one `lstat` and one listing on such a
-disk, however many entries the directory has.
+A look is sure, and asks nothing, for a registered name (it keeps the spelling of its caller),
+for a name that the listing of the running scan gave, and for a node of the tree that has no
+other spelling in the tree: the edit of a file that the tree knows costs what it costs on any
+disk.
+
+When the disk spells the name in another way (`Found::OtherSpelling`), nothing is at the name
+of the node: what the tree has there is gone at once and with no hold, because a second look
+would find the entry again. The disk gave the name that the entry has. If the tree has no
+node for it, one is made and looked at in the same flush. If it has one, that node has a look
+of its own: a hint named it, or the scan reaches it.
+
+**A name with a byte outside ASCII that is gone.** Its hint marks no other node in a complete
+directory. So when a look finds nothing at such a name, and the tree had nothing there, the
+flush scans the names of the directory once (`Depth::Names`): a node that the tree knew and
+that the listing names is not looked at, and a node that the listing does not name is looked
+at. This is the one case in which a spelling costs a listing.
+
+What it costs: a new file in a watched directory is one `lstat` and one question for its name,
+however many entries the directory has. (Before, each flush with a new name listed the
+directory: with 20,000 files in it, 100 new files cost 1,617 ms of CPU time, and notify 18 ms.)
+A file that goes through another spelling of its name is one lookup in the table and one
+`lstat`. (Before, it was missed: `rm App.js` for the file `app.js` gave no `Delete`.)
 
 What this does not cover is in section 9.
 

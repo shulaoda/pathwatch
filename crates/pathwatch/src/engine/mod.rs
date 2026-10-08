@@ -22,7 +22,7 @@ use std::{
 
 use rustc_hash::FxHashSet;
 
-use self::scan::ScanEntry;
+use self::{check::Listed, scan::ScanEntry};
 pub use crate::tree::Fingerprint;
 use crate::{
   backend::{Backend, DirKey, Signal},
@@ -367,23 +367,29 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         continue;
       }
       loss_checks_ran |= mark.lost;
-      // With loose spelling, `lstat` finds an entry under every spelling of its name. So when
-      // this look finds an entry where the tree had none, or a held one, only a listing tells
-      // how the disk spells it, and whether another node is gone for it: the names of the
-      // directory are scanned in this flush (see `has_another_spelling`).
+      // With loose spelling, the OS names an entry that is gone as the caller spelled it. The
+      // node of that entry got a mark with the hint when the two names differ only in the
+      // case of ASCII letters (`Tree::other_spelling`). A name with a byte outside ASCII says
+      // nothing about its node: when the tree does not have the name and the disk has nothing
+      // there, a listing shows which node is gone.
       let node = &self.tree[key];
-      let was_absent = matches!(node.kind, Kind::Missing) || node.is_held();
-      let name_is_unsure = self.options.loose_spelling && was_absent && !node.is_registered();
+      let names_no_node = self.options.loose_spelling
+        && matches!(node.kind, Kind::Missing)
+        && !node.is_registered()
+        && !self.tree.name(key).is_ascii();
       if path_of != Some(parent) {
         self.tree.path_into(parent, path);
         path_of = Some(parent);
       }
       // A check leaves the path of the directory in `path`.
-      self.check(key, path, None, mark);
-      let is_there = |node: &Node| !matches!(node.kind, Kind::Missing) && !node.is_held();
-      if name_is_unsure && self.tree.get(key).is_some_and(is_there) {
-        // The entry was just looked at, and so were the others at their last change: only
-        // the names are compared.
+      self.check(key, path, Listed::NotAsked, mark);
+      let is_there = |node: &Node| !matches!(node.kind, Kind::Missing);
+      if names_no_node
+        && !self.tree.get(key).is_some_and(is_there)
+        && self.tree[parent].is_complete()
+      {
+        // Every entry of the directory was looked at when it changed last: only the names
+        // are compared.
         self.tree.queue_scan(parent, Depth::Names);
       }
     }

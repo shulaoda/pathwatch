@@ -785,9 +785,12 @@ impl Tree {
         continue;
       }
       let written = last && written;
-      let child = match child {
-        Some(child) => self.key(child),
-        None => self.insert_child(self.key(at), name),
+      let child = if let Some(child) = child {
+        self.key(child)
+      } else {
+        // The node in the slot `at` is complete here, and the name is new to it.
+        self.other_spelling(at, name);
+        self.insert_child(self.key(at), name)
       };
       self.mark(child, Mark { deep: !written, written, lost: false });
       return true;
@@ -902,23 +905,29 @@ impl Tree {
     false
   }
 
-  /// A hint names the entry `name` of the partial node in the slot `at`, and no registered
-  /// child has that name. No watched path can see the entry, unless the disk takes two
-  /// spellings of a name for one: then a registered child can be the entry in another spelling.
-  /// Each such child is checked, and deep, because the names below it can be spelled in
-  /// another way too. `false`: there is no such child.
+  /// A hint names the entry `name` of the node in the slot `at`, and the tree has no such child
+  /// there, or none that a watched path can see. On a disk that takes two spellings of a name
+  /// for one, a child can still be meant: the OS names an entry that is gone as the caller
+  /// spelled it, and a watched path keeps the spelling of its caller. So each child that can
+  /// be the name is checked, and deep, because the names below it can be spelled in another
+  /// way too. In a partial node only a registered child counts. `false`: there is no such child.
+  ///
+  /// In a complete node a name with a byte outside ASCII marks nothing: every such child could
+  /// be meant, and there can be many. The engine lists the directory if it has to.
   fn other_spelling(&mut self, at: u32, name: &OsStr) -> bool {
     if !self.loose_spelling {
       return false;
     }
-    let first_child = linked(&self.slots, at).first_child;
+    let dir = linked(&self.slots, at);
+    let (first_child, is_complete) = (dir.first_child, dir.is_complete());
     let Self { slots, names, index, marked, .. } = self;
     let mut found = false;
     // Marks the node in the slot `child` if it can be the entry. Gives the child after it.
     let mut mark_if_it_can_be = |child: u32| {
       let node = slots[child as usize].node_mut().expect("a link points to a live node");
-      let can_be =
-        node.parent == at && node.is_registered() && can_be_one_name(name_of(names, node), name);
+      let can_be = node.parent == at
+        && (is_complete || node.is_registered())
+        && can_be_one_name(name_of(names, node), name);
       if can_be {
         found = true;
         if node.add_mark(Mark::DEEP) {
@@ -930,11 +939,11 @@ impl Tree {
     if name.is_ascii() {
       // Only the same letters in another case can be this name, and the table files those
       // under the hash of this name. So a flood of names that nobody watches costs one more
-      // lookup for each, however many registered children the node has.
+      // lookup for each, however many children the node has.
       for &child in index.iter_hash(child_hash(at, name)) {
         mark_if_it_can_be(child);
       }
-    } else {
+    } else if !is_complete {
       // Every name with a byte outside ASCII can be this name: each child is looked at.
       let mut child = first_child;
       while child != NONE {
@@ -942,6 +951,22 @@ impl Tree {
       }
     }
     found
+  }
+
+  /// Whether the tree cannot say that the node `key` has its name as the disk spells it, on a
+  /// disk that takes two spellings of a name for one: another node of the same directory has
+  /// the name in another case of its ASCII letters, so one of the two is not on the disk. Or
+  /// the name has a byte outside ASCII: then the table does not find such a node.
+  pub fn has_other_spelling(&self, key: DirKey) -> bool {
+    let Some(node) = self.get(key) else { return false };
+    let name = name_of(&self.names, node);
+    let is_other = |&other: &u32| {
+      let other_node = linked(&self.slots, other);
+      other != key.index()
+        && other_node.parent == node.parent
+        && can_be_one_name(name_of(&self.names, other_node), name)
+    };
+    !name.is_ascii() || self.index.iter_hash(child_hash(node.parent, name)).any(is_other)
   }
 }
 

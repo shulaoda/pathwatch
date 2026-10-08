@@ -129,7 +129,7 @@ impl SimFs {
     if matches!(&state.inodes[&id].content, Content::Dir(entries) if !entries.is_empty()) {
       return Err(error(io::ErrorKind::DirectoryNotEmpty));
     }
-    state.delete(dir, &name);
+    state.delete(dir, &name, said(path.as_ref(), &name));
     Ok(())
   }
 
@@ -140,7 +140,7 @@ impl SimFs {
     if !state.entries(dir)?.contains_key(&name) {
       return Err(error(io::ErrorKind::NotFound));
     }
-    state.delete(dir, &name);
+    state.delete(dir, &name, said(path.as_ref(), &name));
     Ok(())
   }
 
@@ -188,7 +188,7 @@ impl SimFs {
     }
     state.entries_mut(from_dir).remove(from_name);
     state.touch(from_dir);
-    state.notify(from_dir, from_name, Act::MoveFrom, is_dir);
+    state.notify(from_dir, said(from.as_ref(), from_name), Act::MoveFrom, is_dir);
     state.entries_mut(to_dir).insert(to_name.to_owned(), id);
     state.touch(to_dir);
     state.touch_entry(id);
@@ -299,7 +299,9 @@ impl SimFs {
   /// Whether names that differ only in the case of ASCII letters are one name, as on the
   /// usual disks of macOS and Windows. A lookup finds `A.js` as `a.js`. A listing, a real path
   /// and a notification give the name as the disk spells it: the spelling of the call that
-  /// made the entry or renamed it last. Off by default. Set it before the first entry is made.
+  /// made the entry or renamed it last. A notification for a name that is gone (removed, or
+  /// renamed away) gives it as the call spelled it, as FSEvents does. Off by default. Set it
+  /// before the first entry is made.
   pub fn set_ignore_case(&self, ignore_case: bool) {
     self.lock().ignore_case = ignore_case;
   }
@@ -489,6 +491,12 @@ impl Fs for SimFs {
     state.look_up(path, true).map(|id| state.real_path(id))
   }
 
+  fn name_on_disk(&self, path: &Path) -> io::Result<OsString> {
+    self.enter(|calls| calls.name_on_disk += 1);
+    let state = self.lock();
+    state.look_up(path, false).map(|id| state.inodes[&id].name.clone())
+  }
+
   fn now(&self) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_nanos(self.lock().clock)
   }
@@ -503,6 +511,7 @@ pub struct Calls {
   pub hash: u64,
   pub link_target: u64,
   pub real_path: u64,
+  pub name_on_disk: u64,
   pub watch: u64,
   pub unwatch: u64,
   pub commit: u64,
@@ -517,6 +526,7 @@ impl Calls {
       + self.hash
       + self.link_target
       + self.real_path
+      + self.name_on_disk
       + self.watch
       + self.commit
   }
@@ -731,19 +741,20 @@ impl State {
   }
 
   /// Takes the entry `name` out of `dir` and frees its inode, with everything below it first.
-  fn delete(&mut self, dir: u64, name: &OsStr) {
+  /// The OS tells about it under the name `said`.
+  fn delete(&mut self, dir: u64, name: &OsStr, said: &OsStr) {
     let Some(id) = self.entries_mut(dir).get(name).copied() else { return };
     let below: Vec<OsString> = match &self.inodes[&id].content {
       Content::Dir(entries) => entries.keys().cloned().collect(),
       _ => Vec::new(),
     };
     for child in &below {
-      self.delete(id, child);
+      self.delete(id, child, child);
     }
     self.entries_mut(dir).remove(name);
     self.touch(dir);
     let is_dir = self.forget(id);
-    self.notify(dir, name, Act::Remove, is_dir);
+    self.notify(dir, said, Act::Remove, is_dir);
   }
 
   /// Frees an inode that no directory lists any more. Says whether it was a directory.
@@ -794,6 +805,12 @@ impl State {
       }
     }
   }
+}
+
+/// The name under which the OS tells that the entry `name` is gone: the last name of the path
+/// of the call. An entry that is gone has no spelling of its own any more.
+fn said<'a>(path: &'a Path, name: &'a OsStr) -> &'a OsStr {
+  path.file_name().unwrap_or(name)
 }
 
 struct Inode {
