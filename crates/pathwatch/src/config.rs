@@ -1,8 +1,8 @@
 //! The settings of a watcher.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{fmt, path::Path, sync::Arc, time::Duration};
 
-use crate::engine::Options;
+use crate::engine::{Ignored, Options};
 
 /// How often the watcher polls what the OS does not watch for it, when polling is off: the
 /// directories above the watched ones, and directories whose watch failed.
@@ -24,27 +24,33 @@ const SHORTEST_POLL_INTERVAL: Duration = Duration::from_millis(1);
 ///   .with_ignored(|path, _kind| path.components().any(|part| part.as_os_str() == "node_modules"))
 ///   .with_debounce(Duration::from_millis(20));
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
-  options: Options,
+  ignored: Option<Ignored>,
+  debounce: Duration,
   polling: bool,
   poll_interval: Duration,
 }
 
 impl Default for Config {
   fn default() -> Self {
-    // The usual disks of macOS and Windows find a name under another case of its letters, and
-    // under another Unicode form.
-    let loose_spelling = cfg!(any(target_vendor = "apple", windows));
     Self {
-      options: Options {
-        quiet_time: Duration::from_millis(50),
-        loose_spelling,
-        ..Options::default()
-      },
+      ignored: None,
+      debounce: Duration::from_millis(50),
       polling: false,
       poll_interval: Duration::from_millis(100),
     }
+  }
+}
+
+impl fmt::Debug for Config {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("Config")
+      .field("ignored", &self.ignored.is_some())
+      .field("debounce", &self.debounce)
+      .field("polling", &self.polling)
+      .field("poll_interval", &self.poll_interval)
+      .finish()
   }
 }
 
@@ -53,10 +59,10 @@ impl Config {
   /// out, when no change was noticed for this long. Default: 50 ms. Zero: no waiting.
   ///
   /// While changes keep coming, a batch still goes out every 500 ms, or every four times
-  /// `quiet` if that is longer.
+  /// `debounce` if that is longer.
   #[must_use]
-  pub fn with_debounce(mut self, quiet: Duration) -> Self {
-    self.options.quiet_time = quiet;
+  pub fn with_debounce(mut self, debounce: Duration) -> Self {
+    self.debounce = debounce;
     self
   }
 
@@ -99,7 +105,7 @@ impl Config {
     mut self,
     ignored: impl Fn(&Path, EntryKind) -> bool + Send + Sync + 'static,
   ) -> Self {
-    self.options.ignored = Some(Arc::new(ignored));
+    self.ignored = Some(Arc::new(ignored));
     self
   }
 
@@ -126,16 +132,6 @@ impl Config {
     self
   }
 
-  /// Compare the content of every file, not only its size and time. Default: `false`.
-  ///
-  /// The watcher then reads every file that it checks, so it is slow. It helps where
-  /// modification times cannot be trusted.
-  #[must_use]
-  pub fn with_compare_contents(mut self, compare: bool) -> Self {
-    self.options.compare_contents = compare;
-    self
-  }
-
   pub(crate) fn polling(&self) -> bool {
     self.polling
   }
@@ -143,8 +139,15 @@ impl Config {
   /// The settings of the engine, for a watcher that polls everything (`true`) or one that has
   /// a native backend.
   pub(crate) fn into_options(self, polling: bool) -> Options {
-    let poll_interval = if polling { self.poll_interval } else { FALLBACK_POLL_INTERVAL };
-    Options { poll_interval, ..self.options }
+    Options {
+      ignored: self.ignored,
+      debounce: self.debounce,
+      poll_interval: if polling { self.poll_interval } else { FALLBACK_POLL_INTERVAL },
+      // The usual disks of macOS and Windows find a name under another case of its letters,
+      // and under another Unicode form.
+      loose_spelling: cfg!(any(target_vendor = "apple", windows)),
+      ..Options::default()
+    }
   }
 }
 

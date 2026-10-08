@@ -78,7 +78,7 @@ impl<B: Deliver> Driver<B> {
     // Long enough for two polls, a pending delete and the time a young file is hashed.
     let settle = options.poll_interval * 2
       + options.delete_delay
-      + options.quiet_time * 2
+      + options.debounce * 2
       + Duration::from_secs(2);
     Self {
       ignored: options.ignored.clone(),

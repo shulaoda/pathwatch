@@ -75,7 +75,7 @@ fn s3_deleted_and_created_again_inside_the_delete_delay() {
 
   side_by_side(|polling| {
     let options = Options {
-      quiet_time: Duration::from_millis(50),
+      debounce: Duration::from_millis(50),
       delete_delay: DELETE_DELAY,
       poll_interval: if polling { POLL_INTERVAL } else { Duration::from_secs(1) },
       loose_spelling: cfg!(any(target_vendor = "apple", windows)),

@@ -149,28 +149,8 @@ fn a_young_link_points_elsewhere_inside_one_time_step() {
 }
 
 #[test]
-fn compare_contents_sees_what_the_fingerprint_hides() {
-  for compare_contents in [false, true] {
-    let options = Options { compare_contents, ..Options::default() };
-    let mut d = poll_with_coarse_time(Duration::from_secs(3600), options);
-    d.fs.write("/p/a", "x=1;").unwrap();
-    d.watch(&["/p/a"]);
-    assert_eq!(settled(&mut d), NONE);
-
-    // Same size, same hour, and the file is not young: only the content tells.
-    d.fs.write("/p/a", "x=2;").unwrap();
-    let expected: &[&str] = if compare_contents { &["U /p/a"] } else { &[] };
-    assert_eq!(settled(&mut d), expected);
-    caught_up(&mut d);
-  }
-}
-
-#[test]
 fn only_regular_files_are_opened() {
-  let mut d = poll_with_coarse_time(
-    Duration::from_millis(1),
-    Options { compare_contents: true, ..Options::default() },
-  );
+  let mut d = poll_with_coarse_time(Duration::from_millis(1), Options::default());
   d.fs.mkdir("/p/r").unwrap();
   d.fs.write("/p/r/file", "1").unwrap();
   d.fs.symlink("/p/r/file", "/p/r/link").unwrap();

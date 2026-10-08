@@ -184,10 +184,9 @@ struct Config {
   /// `c` are ignored. So the filter ignores everything below a directory that it ignores, and
   /// it still answers in two ways for the two kinds.
   filter: u8,
-  quiet_time: Duration,
+  debounce: Duration,
   delete_delay: Duration,
   poll_interval: Duration,
-  compare_contents: bool,
   /// The engine takes the disk for one that knows a name under two spellings. The disk of
   /// the run is not such a disk, so the rule for it only costs looks: it must do no harm.
   loose_spelling: bool,
@@ -207,14 +206,13 @@ impl Config {
     Self {
       backend,
       filter: random.pick(&[0, 1, 1, 2, 3]),
-      quiet_time: millis(random.pick(&[10, 10, 0, 50])),
+      debounce: millis(random.pick(&[10, 10, 0, 50])),
       delete_delay: millis(random.pick(&[100, 100, 0, 400])),
       poll_interval: millis(if backend == Target::Poll {
         random.pick(&[100, 100, 1000])
       } else {
         1000
       }),
-      compare_contents: random.chance(15),
       disk: DiskConfig {
         time_step: random.pick(&[
           Duration::from_nanos(1),
@@ -239,10 +237,9 @@ impl Config {
     let ignored: Ignored = Arc::new(move |path, kind| ignored(filter, path, kind));
     Options {
       ignored: (filter != 0).then_some(ignored),
-      quiet_time: self.quiet_time,
+      debounce: self.debounce,
       delete_delay: self.delete_delay,
       poll_interval: self.poll_interval,
-      compare_contents: self.compare_contents,
       loose_spelling: self.loose_spelling,
     }
   }
@@ -1298,7 +1295,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     // scan, and for a young file that cannot be compared: where only the poll looks at it, the
     // `Update` that it may owe comes with the first poll that finds it two seconds old.
     let end = self.now
-      + config.quiet_time
+      + config.debounce
       + config.delete_delay
       + config.poll_interval * 2
       + Duration::from_secs(2);

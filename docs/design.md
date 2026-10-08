@@ -32,7 +32,7 @@ watcher.close();
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
 | `Error` | `kind()`, `path()` (one path that shows the problem), `source()` (the error of the OS). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`. One error of a kind is handed over for a flush. |
-| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 50 ms (5.13); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything; `with_compare_contents(bool)` (5.8). |
+| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 50 ms (5.13); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. |
 
 `Watcher` is `Send + Sync`.
 
@@ -149,7 +149,7 @@ The words, each for one idea:
 | held | a look found nothing at the node; what the tree has there, and below, stays until the second look | `Node::is_held`, `Tree::hold` |
 | delete delay | the time between the two looks: 100 ms | `Options::delete_delay` |
 | young | a file whose modification time is too close to the check to trust | `Content` |
-| quiet time | the debounce: how long no hint must come before the disk is checked | `Options::quiet_time` |
+| quiet time | the debounce: how long no hint must come before the disk is checked | `Options::debounce` |
 | rest | the pause after work that no hint asked for by name: a poll, the scans after loss reports | `REST`, `rest_until` |
 | cover | FSEvents only: a directory that the engine watches and a stream reports | `Covers` in `fsevents.rs` |
 | stream path | FSEvents only: a directory that a stream was started for; it reports the whole tree below | `Streams::paths` in `fsevents.rs` |
@@ -470,8 +470,6 @@ when nothing changed (section 9).
 
 When the file is gone between the `lstat` and the read of the hash, the check says nothing and
 the node is checked again at the next flush.
-
-`with_compare_contents(true)` keeps and compares the hash at every check.
 
 ### 5.9 Events, and the delete delay
 

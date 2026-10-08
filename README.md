@@ -88,7 +88,6 @@ watcher, so it should only pass the batch on.
 | `with_debounce(d)` | 50 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch still goes out every 500 ms, or every `4 × d` if that is longer. Zero: no waiting. |
 | `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
 | `with_poll_interval(d)` | 100 ms | The shortest pause between two rounds of polling. The least is 1 ms. On a big set of paths the pause is longer: at least nine times as long as the round took. |
-| `with_compare_contents(bool)` | `false` | Compare the content of every file, not only its size and time. Slow: it reads every file that it checks. |
 
 The settings cannot be changed after the watcher is made.
 
@@ -147,7 +146,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   same for a write through `mmap`. Windows is expected to do the same (not checked).
 - **A write through another hard link** of a watched file is not reported.
 - **A rewrite of the same size that puts the old modification time back** is not reported on
-  macOS and with polling. Linux reports it. `with_compare_contents(true)` finds it everywhere.
+  macOS and with polling. Linux reports it.
 - **A mount over a watched directory** is not noticed until something else makes the watcher
   look there.
 - **A directory on a network drive, or shared with another machine** (NFS, a folder of the

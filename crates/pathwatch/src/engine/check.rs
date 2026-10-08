@@ -287,12 +287,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       _ => None,
     };
     let young = meta.kind != FileType::Other && self.is_young(key, meta.modified);
-    let keep_hash = young || self.options.compare_contents;
     // A stored hash is compared one last time when the file is not young any more.
     let compare = old.is_some_and(|(old, content)| {
       old == fingerprint && matches!(content, Some(Content::Hash(_)))
     });
-    let hash = if keep_hash || compare {
+    let hash = if young || compare {
       match self.content_hash(path, meta) {
         Ok(hash) => hash,
         // The entry went away after the `lstat`, or it is of another kind now. This check
@@ -339,7 +338,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.tree.unhold(key);
     }
     let content = match hash {
-      Some(hash) if keep_hash => Some(Content::Hash(hash)),
+      Some(hash) if young => Some(Content::Hash(hash)),
       None if young => Some(Content::Unknown),
       _ => None,
     };

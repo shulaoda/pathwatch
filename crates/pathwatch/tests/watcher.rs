@@ -28,7 +28,7 @@ type Results = Receiver<Result<Vec<Event>, Error>>;
 
 fn quick() -> Options {
   Options {
-    quiet_time: Duration::from_millis(2),
+    debounce: Duration::from_millis(2),
     delete_delay: Duration::from_millis(20),
     poll_interval: Duration::from_millis(5),
     ..Options::default()

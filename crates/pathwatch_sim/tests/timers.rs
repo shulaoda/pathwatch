@@ -19,8 +19,7 @@ fn driver(mode: Mode) -> Driver<SimBackend> {
 /// With no delay, the flush is due as soon as a hint is there.
 #[test]
 fn zero_delay() {
-  let mut d =
-    Driver::sim(Mode::Inode, Options { quiet_time: Duration::ZERO, ..Options::default() });
+  let mut d = Driver::sim(Mode::Inode, Options { debounce: Duration::ZERO, ..Options::default() });
   d.fs.mkdir("/p").unwrap();
   d.watch(&["/p/a"]);
   d.fs.write("/p/a", "1").unwrap();
@@ -70,8 +69,8 @@ fn the_flush_waits_for_the_quiet_time() {
 #[test]
 fn the_longest_wait_is_four_quiet_times() {
   // No poll comes in between: a poll checks what waits, too.
-  let (quiet_time, poll_interval) = (Duration::from_millis(200), Duration::from_secs(60));
-  let mut d = Driver::sim(Mode::Inode, Options { quiet_time, poll_interval, ..Options::default() });
+  let (debounce, poll_interval) = (Duration::from_millis(200), Duration::from_secs(60));
+  let mut d = Driver::sim(Mode::Inode, Options { debounce, poll_interval, ..Options::default() });
   d.fs.mkdir("/p").unwrap();
   d.fs.write("/p/a", "1").unwrap();
   d.watch(&["/p"]);

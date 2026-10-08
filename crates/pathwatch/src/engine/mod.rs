@@ -55,14 +55,12 @@ pub type Ignored = Arc<dyn Fn(&Path, EntryKind) -> bool + Send + Sync>;
 pub struct Options {
   pub ignored: Option<Ignored>,
   /// The debounce: the disk is checked when no hint came for this long. Zero: at once.
-  pub quiet_time: Duration,
+  pub debounce: Duration,
   /// How long a `Delete` waits for the file to come back, so that "remove, then write again"
   /// is one `Update`. Zero turns it off.
   pub delete_delay: Duration,
   /// The shortest time between two polls of what no OS watch covers.
   pub poll_interval: Duration,
-  /// Compare a hash of the content of every file at every check.
-  pub compare_contents: bool,
   /// The disk takes two spellings of a name for one: another case of the letters, or another
   /// Unicode form (the usual disks of macOS and Windows).
   pub loose_spelling: bool,
@@ -72,10 +70,9 @@ impl Default for Options {
   fn default() -> Self {
     Self {
       ignored: None,
-      quiet_time: Duration::from_millis(10),
+      debounce: Duration::from_millis(10),
       delete_delay: Duration::from_millis(100),
       poll_interval: Duration::from_secs(1),
-      compare_contents: false,
       loose_spelling: false,
     }
   }
@@ -85,10 +82,9 @@ impl fmt::Debug for Options {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("Options")
       .field("ignored", &self.ignored.is_some())
-      .field("quiet_time", &self.quiet_time)
+      .field("debounce", &self.debounce)
       .field("delete_delay", &self.delete_delay)
       .field("poll_interval", &self.poll_interval)
-      .field("compare_contents", &self.compare_contents)
       .field("loose_spelling", &self.loose_spelling)
       .finish()
   }
@@ -293,10 +289,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// A hint left work for a flush. The flush comes when no further hint came for the quiet
   /// time. Hints that keep coming move it, but not past the longest wait.
   fn schedule(&mut self, now: Instant) {
-    let quiet = self.options.quiet_time;
-    let longest = quiet.saturating_mul(4).max(LONGEST_WAIT);
+    let debounce = self.options.debounce;
+    let longest = debounce.saturating_mul(4).max(LONGEST_WAIT);
     let latest = *self.flush_by.get_or_insert(now + longest);
-    self.flush_at = Some((now + quiet).min(latest));
+    self.flush_at = Some((now + debounce).min(latest));
   }
 
   /// The time at which a loss report that had to wait gets its scans.

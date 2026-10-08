@@ -1355,7 +1355,7 @@ impl RealEngine {
     let lstats = Arc::new(AtomicUsize::new(0));
     let fs = CountingFs { disk: StdFs, lstats: Arc::clone(&lstats) };
     let options =
-      Options { quiet_time: Duration::from_millis(50), loose_spelling: true, ..Options::default() };
+      Options { debounce: Duration::from_millis(50), loose_spelling: true, ..Options::default() };
     Self { engine: Engine::new(backend, fs, options), signals, lstats, out: Output::default() }
   }
 
