@@ -47,6 +47,9 @@ the real disk, with this backend and with polling.
 - **How a name that is gone is spelled in a record.** FSEvents names a removed entry as the
   caller spelled it, and the engine is right for both spellings. Which one
   `ReadDirectoryChangesW` gives is not known.
+- **Which names the disk takes for one.** The rule for plain names (design 5.2) was measured
+  on APFS. NTFS compares names through its table of upper-case letters and knows no Unicode
+  forms, so it should take fewer names for one. Not checked.
 - **How lost records show up.** Expected: the read completes with success and zero bytes. The
   error `ERROR_NOTIFY_ENUM_DIR` is taken the same way. Zero bytes mean that the buffer of this
   one handle was too small. So both become `Changed` with an empty `rel` for each key that the

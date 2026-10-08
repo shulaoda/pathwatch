@@ -8,7 +8,7 @@
 use std::{
   collections::{BTreeMap, BTreeSet},
   fmt::Write as _,
-  io,
+  io, mem,
   panic::{self, AssertUnwindSafe},
   path::{Path, PathBuf},
   sync::{
@@ -192,8 +192,8 @@ struct Config {
   loose_spelling: bool,
   /// The disk is such a disk, and the engine knows it. Then some changes name an entry in
   /// upper case: the entry is the same, and the OS tells about a name that is gone in the
-  /// spelling of the change. No change gives an entry such a name, so the watched paths and
-  /// the disk keep one spelling.
+  /// spelling of the change. Some watched paths have a name in upper case too: a watched path
+  /// is the path that its caller gave, and an entry that a change makes at it gets that name.
   ignore_case: bool,
   disk: DiskConfig,
   /// The shortest watched path, in names. With 3, the directories at the top only lead to
@@ -572,6 +572,19 @@ fn covered(filter: u8, watched: &BTreeSet<PathBuf>, path: &Path) -> bool {
   watched.contains(path) || path.parent().is_some_and(|dir| tracked(filter, watched, dir))
 }
 
+/// Whether `path`, or a directory on the way down to it from the watched directory above, was
+/// registered while the watched paths were `before`. On a disk that takes two spellings of a
+/// name for one, such a name can be another spelling of an entry of that directory, and then
+/// the directory does not cover it. No text says that: it is what the engine saw on the disk.
+fn through_registered(
+  before: &BTreeSet<PathBuf>,
+  watched: &BTreeSet<PathBuf>,
+  path: &Path,
+) -> bool {
+  let mut on_the_way = path.ancestors().take_while(|at| !watched.contains(*at));
+  on_the_way.any(|at| before.iter().any(|old| old.starts_with(at)))
+}
+
 /// Whether a directory at `dir` would track every entry.
 fn tracked(filter: u8, watched: &BTreeSet<PathBuf>, dir: &Path) -> bool {
   let inside = watched.contains(dir) || dir.parent().is_some_and(|up| tracked(filter, watched, up));
@@ -670,8 +683,12 @@ impl Shared {
     let line = change();
     if let Some(before) = before {
       let after = ways(fs, &lock(&self.watched));
+      // On a disk that takes two spellings of a name for one, a directory can come back
+      // under another spelling, and a watch by path does not hear that: every move is one
+      // that only a poll can see.
       let moved = after.iter().any(|(path, (object, polled))| {
-        before.get(path).is_some_and(|(was, was_polled)| was != object && (*polled || *was_polled))
+        let unseen = |was_polled: &bool| *polled || *was_polled || self.ignore_case;
+        before.get(path).is_some_and(|(was, was_polled)| was != object && unseen(was_polled))
       });
       if moved {
         self.moved_unseen.store(true, Ordering::Relaxed);
@@ -953,6 +970,8 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
         }
         ToWatch::Bad(path) => ((*path).to_owned(), false),
       };
+      let text =
+        if valid && self.config.ignore_case { self.in_the_way_of_a_caller(&text) } else { text };
       // A path that the filter ignores for both kinds does not become a watched path.
       let filter = self.config.filter;
       if valid && can_be_watched(&|path, kind| ignored(filter, path, kind), Path::new(&text)) {
@@ -1004,6 +1023,22 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     self.check_view();
   }
 
+  /// A watched path as a caller can spell it on a disk that takes two spellings of a name for
+  /// one: of three paths, one has its last name in upper case, and one the name before that.
+  fn in_the_way_of_a_caller(&self, path: &str) -> String {
+    let mut names: Vec<String> = path.split('/').map(str::to_owned).collect();
+    let pick = match self.shared.serial() % 3 {
+      0 => names.len().checked_sub(1),
+      1 => names.len().checked_sub(2),
+      _ => None,
+    };
+    // Not the empty name in front of the first `/`.
+    if let Some(name) = pick.filter(|&at| at > 0).and_then(|at| names.get_mut(at)) {
+      name.make_ascii_uppercase();
+    }
+    names.join("/")
+  }
+
   fn unwatch(&mut self, paths: &[ToUnwatch]) {
     let mut texts = Vec::new();
     let mut new_watched = self.watched.clone();
@@ -1021,7 +1056,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     }
     self.say(format!("unwatch {texts:?}"));
     self.followed = followed(&new_watched);
-    self.watched.clone_from(&new_watched);
+    let before = mem::replace(&mut self.watched, new_watched.clone());
     *lock(&self.shared.watched) = new_watched;
 
     let traps = self.fs.traps_run();
@@ -1034,6 +1069,17 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     // whose `Delete` waits.
     let (filter, watched) = (self.config.filter, &self.watched);
     self.known.retain(|path, _| covered(filter, watched, path));
+    if self.config.ignore_case {
+      // Where only the disk says whether a watched directory covers a name, the engine is
+      // believed: it kept the answer of its last look, and `Engine::check_spellings` holds
+      // that answer to the disk. A `Create` in the same call is for a file that was forgotten.
+      let view = self.engine.view();
+      let event = |path: &Path| out.events.iter().find(|event| event.path == path);
+      self.known.retain(|path, _| {
+        !through_registered(&before, watched, path)
+          || event(path).map_or(view.contains(path), |event| event.kind != EventKind::Create)
+      });
+    }
     self.hear(&out, trapped);
     self.check_view();
   }
@@ -1365,6 +1411,9 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     // the engine: whatever the engine read then, it must have looked again since.
     if let Err(stale) = check_fingerprints(&self.fs, &self.watched, &self.engine.fingerprints()) {
       fail!("stale", "{stale}");
+    }
+    if let Err(wrong) = self.fs.quiet(|| self.engine.check_spellings()) {
+      fail!("spelling", "{wrong}");
     }
     if let Err(left) = self.engine.check_idle() {
       fail!("idle", "the engine is not done: {left}");

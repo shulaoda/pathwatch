@@ -28,7 +28,9 @@
 //!     `names_below_a_watched_directory_are_spelled_as_on_the_disk`,
 //!     `a_file_is_renamed_to_another_letter_case`,
 //!     `a_file_goes_through_another_spelling_of_its_name`,
-//!     `a_directory_is_renamed_to_another_letter_case`.
+//!     `a_directory_is_renamed_to_another_letter_case`,
+//!     `every_watched_spelling_of_a_file_gets_its_events`,
+//!     `watched_paths_through_another_spelling_inside_a_watched_directory`.
 
 use std::{
   env, fs,
@@ -701,6 +703,60 @@ fn a_file_goes_through_another_spelling_of_its_name() {
     w.expect(&[(Delete, "r/App.js"), (Delete, "r/Other.js")]);
     w.write("r/App.js", "22");
     w.expect(&[(Create, "r/App.js")]);
+  });
+}
+
+/// Every watched path is a question of its own: two watched paths that are two spellings of
+/// one file get their events both, and the watched directory around them reports the file
+/// under the name that the disk has.
+#[test]
+fn every_watched_spelling_of_a_file_gets_its_events() {
+  each_backend(|w| {
+    w.write("r/app.js", "1");
+    // Only a disk that takes two spellings of a name for one finds a file in this way.
+    if !w.path("R").exists() {
+      return;
+    }
+    w.watch(&["r", "r/App.js", "r/APP.JS"]);
+
+    w.write("r/app.js", "22");
+    w.expect(&[(Update, "r/app.js"), (Update, "r/App.js"), (Update, "r/APP.JS")]);
+    w.remove("r/app.js");
+    w.expect(&[(Delete, "r/app.js"), (Delete, "r/App.js"), (Delete, "r/APP.JS")]);
+    // The file comes back under a watched spelling: that is its name in the directory now.
+    w.write("r/App.js", "333");
+    w.expect(&[(Create, "r/App.js"), (Create, "r/APP.JS")]);
+  });
+}
+
+/// The same one level up: a watched file and a watched directory that are reached through
+/// another spelling of a directory inside a watched directory.
+#[test]
+fn watched_paths_through_another_spelling_inside_a_watched_directory() {
+  each_backend(|w| {
+    w.write("r/src/a.js", "1");
+    w.write("r/src/lib/b.js", "1");
+    if !w.path("R").exists() {
+      return;
+    }
+    w.watch(&["r", "r/SRC/a.js", "r/Src/LIB"]);
+
+    w.write("r/src/a.js", "22");
+    w.write("r/src/lib/c.js", "1");
+    w.expect(&[
+      (Update, "r/src/a.js"),
+      (Update, "r/SRC/a.js"),
+      (Create, "r/src/lib/c.js"),
+      (Create, "r/Src/LIB/c.js"),
+    ]);
+    w.remove("r/src/a.js");
+    w.remove("r/src/lib/b.js");
+    w.expect(&[
+      (Delete, "r/src/a.js"),
+      (Delete, "r/SRC/a.js"),
+      (Delete, "r/src/lib/b.js"),
+      (Delete, "r/Src/LIB/b.js"),
+    ]);
   });
 }
 

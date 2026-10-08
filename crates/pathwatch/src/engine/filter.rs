@@ -49,8 +49,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.ignores(key, &path, EntryKind::Dir)
   }
 
+  /// Whether the directory above the node `key` covers it: that directory tracks every entry,
+  /// and the node is one of its entries. A registered name that the directory lists under
+  /// another spelling is none (`Node::is_unlisted`).
+  pub(super) fn is_inside(&self, key: DirKey) -> bool {
+    !self.tree[key].is_unlisted()
+      && self.tree.parent(key).is_some_and(|parent| self.tracks_every_entry(parent))
+  }
+
   /// Whether a directory at the node `key` has to track every entry: the node is a watched
-  /// path, or the node above it tracks every entry; and the filter does not ignore the
+  /// path, or the node above it covers it (`is_inside`); and the filter does not ignore the
   /// directory.
   ///
   /// The tree can be behind this rule: a directory that becomes a watched path is complete in
@@ -67,6 +75,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // and then the filter is not asked at all.
     let (mut at, mut levels) = (key, 0);
     while !self.tree[at].is_path() {
+      // No entry of the directory above: nothing further up covers it.
+      if self.tree[at].is_unlisted() {
+        return false;
+      }
       let Some(parent) = self.tree.parent(at) else { return false };
       (at, levels) = (parent, levels + 1);
     }

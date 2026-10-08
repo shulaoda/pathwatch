@@ -541,17 +541,47 @@ fn a_hint_for_the_directory_itself_is_a_loss_report() {
   assert!(f.tree.hint(Hint::Lost) && f.tree.lost);
 }
 
-/// On a disk that takes two spellings of a name for one, a hint for a name that is not
-/// registered in a partial node marks the registered names that can be that name in another
-/// spelling, and nothing else.
+/// A watched path is the path that its caller gave, and the OS says what is at it. So the name
+/// of a hint also means each registered name that the OS can take for it, and nothing else.
 #[test]
 fn a_name_that_can_be_another_spelling() {
   let mut f = fixture();
-  // A strict disk: no watched path can see the name.
-  assert!(!f.tree.hint(changed(f.p, "F.JS", true)));
+  // On every disk: a registered name that differs only in the case of its letters. The look
+  // decides, so the mark never says "written".
+  assert!(f.tree.hint(changed(f.p, "F.JS", true)));
+  assert_eq!(marks(&f.tree), ["/p|f.js|d"]);
+  assert_eq!(f.tree.child(f.p, OsStr::new("F.JS")), None);
+  clear_marks(&mut f.tree);
+  // Both names are registered: each of them is looked at.
+  let upper = child(&mut f.tree, f.p, "F.JS");
+  assert!(f.tree.make_path(upper));
+  assert!(f.tree.hint(changed(f.p, "f.js", true)));
+  assert_eq!(marks(&f.tree), ["/p|F.JS|d", "/p|f.js|w"]);
+  clear_marks(&mut f.tree);
+  assert!(f.tree.drop_path(upper));
+  f.tree.prune(upper);
+  // The walk goes on below a registered directory in another spelling.
+  assert!(f.tree.hint(changed(f.p, "R/sub/a.js", true)));
+  assert_eq!(marks(&f.tree), ["/p/r/sub|a.js|d"]);
+  clear_marks(&mut f.tree);
+  // A name with an accent is no other spelling of anything on a strict disk.
+  let accent = child(&mut f.tree, f.p, "\u{e9}.js");
+  assert!(f.tree.make_path(accent));
+  assert!(!f.tree.hint(changed(f.p, "\u{c9}.js", true)));
   assert!(!f.tree.has_work());
 
   f.tree.loose_spelling = true;
+  // With loose spelling it can be every registered name that is not plain. A name of
+  // ideographs is plain: it is only itself.
+  assert!(f.tree.hint(changed(f.p, "\u{c9}.js", true)));
+  assert!(f.tree.hint(changed(f.p, "\u{444}", false)));
+  assert!(!f.tree.hint(changed(f.p, "\u{4e2d}", false)));
+  assert_eq!(marks(&f.tree), ["/p|\u{e9}.js|d"]);
+  clear_marks(&mut f.tree);
+  assert!(f.tree.drop_path(accent));
+  f.tree.prune(accent);
+  f.tree.check_links().unwrap();
+
   // No registered name of `/p` can be this one: the hint is dropped.
   assert!(!f.tree.hint(changed(f.p, "other.js", false)));
   assert!(!f.tree.hint(changed(f.p, "f.jsx", true)));
@@ -562,12 +592,9 @@ fn a_name_that_can_be_another_spelling() {
   assert!(!f.tree.has_work());
 
   assert!(f.tree.hint(changed(f.p, "F.JS", true)));
-  assert!(f.tree.hint(changed(f.p, "R/sub/a.js", false)));
-  // The rest of the path can be spelled in another way too, so the check goes deep.
-  assert_eq!(marks(&f.tree), ["/p|f.js|d", "/p|r|d"]);
+  assert!(f.tree.hint(changed(f.p, "R/sub", false)));
+  assert_eq!(marks(&f.tree), ["/p/r|sub|d", "/p|f.js|d"]);
   assert_eq!(f.tree.to_scan, []);
-  // No node is made for the name.
-  assert_eq!(f.tree.child(f.p, OsStr::new("F.JS")), None);
   clear_marks(&mut f.tree);
 
   // The other spelling is below a name that matches: `/p/gone` is no directory, so the name
@@ -588,16 +615,30 @@ fn a_name_that_can_be_another_spelling() {
   assert!(!f.tree.has_other_spelling(f.sub));
   assert!(f.tree.hint(changed(f.r, "SUB", false)));
   assert_eq!(marks(&f.tree), ["/p/r|SUB|d", "/p/r|sub|d"]);
-  // While the tree has both, the disk has to say which of the two it has.
+  // While the tree has both, the disk has to say which of the two it has, and a hint for one
+  // of them is a hint for the other.
   let other = f.tree.child(f.r, OsStr::new("SUB")).unwrap();
   assert!(f.tree.has_other_spelling(f.sub) && f.tree.has_other_spelling(other));
+  f.tree.take_mark(f.sub);
+  assert!(f.tree.hint(changed(f.r, "SUB", false)));
+  assert!(f.tree[f.sub].is_marked());
   clear_marks(&mut f.tree);
   assert!(!f.tree.has_other_spelling(f.sub));
-  // The table does not find the other spellings of a name with a byte outside ASCII: such a
-  // name marks no other node in a complete node, and its own spelling is never sure.
+  // The table does not find the other spellings of a name that is not plain: its own
+  // spelling is never sure, and a listing shows the others while the name is no entry.
+  let mut scans = Vec::new();
   assert!(f.tree.hint(changed(f.r, "s\u{dc}b", false)));
   assert_eq!(marks(&f.tree), ["/p/r|s\u{dc}b|d"]);
-  assert!(f.tree.has_other_spelling(f.tree.child(f.r, OsStr::new("s\u{dc}b")).unwrap()));
+  let accent = f.tree.child(f.r, OsStr::new("s\u{dc}b")).unwrap();
+  assert!(f.tree.has_other_spelling(accent));
+  f.tree.take_scans(&mut scans);
+  assert_eq!(scans, [(f.r, Depth::Names)]);
+  on_disk(&mut f.tree, accent, true);
+  assert!(f.tree.hint(changed(f.r, "s\u{dc}b", false)));
+  assert!(f.tree.hint(changed(f.r, "\u{4e2d}.js", false)));
+  f.tree.take_scans(&mut scans);
+  assert_eq!(scans, []);
+  assert!(!f.tree.has_other_spelling(f.tree.child(f.r, OsStr::new("\u{4e2d}.js")).unwrap()));
 }
 
 #[test]

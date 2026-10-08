@@ -249,8 +249,30 @@ A hint that was dropped moves nothing.
 
 **Another spelling.** The usual disks of macOS and Windows find `App.js` when the entry is
 `app.js`, and the same for two Unicode forms of a name. `Config` says so for these two
-systems (`Options::loose_spelling`), and nothing of this runs anywhere else. Three facts are
-behind the rules, the first two measured with FSEvents on APFS:
+systems (`Options::loose_spelling`). One rule decides everything here:
+
+> pathwatch reports what a program would see that asks the OS about each watched path by
+> itself, again and again: `lstat` for a watched file, the listing for a watched directory.
+
+So there are two kinds of names. A **registered name** (a watched path, or a name on the way
+to one) is the text that its caller gave. What is at it is what `lstat` finds there, under
+any spelling, and its events carry the spelling of the caller. A **listed name** (found below
+a watched directory) is the name as the disk spells it, and an entry has one such name. Every
+watched path is a question of its own: two watched paths that are two spellings of one file
+both get their events, and a watched path in another spelling inside a watched directory gets
+its events next to the ones that the directory reports under the name of the disk. A symbolic
+link is treated in the same way (a registered link is followed, a listed one is a file).
+Polling works like this by itself, and the OS watches have to give the same events.
+
+The other choices were weighed and dropped. Events under the name of the disk (notify does
+that) would make every caller turn its own paths into the names of the disk before it can
+match an event: rolldown matches by bytes and keeps the spelling of the import, so it would
+never rebuild. A path that counts as missing unless it is spelled like the disk (Watchman)
+gives no events and no error for a drive letter or a command line in another case. Whether an
+import may be spelled in another way than the disk is a question for the resolver, not for
+the watcher.
+
+Three facts are behind the mechanics, the first two measured with FSEvents on APFS:
 
 - The OS names an entry that is there as the disk spells it, whatever spelling the writer
   used.
@@ -259,61 +281,77 @@ behind the rules, the first two measured with FSEvents on APFS:
   name of one entry (`Fs::name_on_disk`: `getattrlist` on macOS, 2 µs; `FindFirstFileW` on
   Windows), and a listing names each entry in that one way.
 
-So a name can be spelled in a way that no entry has, and a look must not take it for an entry.
-Watchman does the same on such a disk: it asks for the name after each `stat`, and takes
-another spelling for "not there".
+**A hint is for every name that it can mean** (`Tree::others_meant`). The walk of step 4
+follows the child with the very name of the hint, and also
 
-**A hint for a name that the tree does not have** (`Tree::other_spelling`). In a partial
-directory, the hint that would be dropped in step 4 marks each registered child that can be
-the name: a watched path keeps the spelling of its caller. In a complete directory, the hint
-marks the name as always, and also each child that can be the name: the OS may tell in this
-way that the child is gone. Two names can be one name (`can_be_one_name`) when
+- each registered child that can be the same name. On every system, when the two differ only
+  in the case of ASCII letters: where the disk tells the two apart, the look finds what is at
+  its own name, and an engine that takes a loose disk for a strict one (a folder that Linux
+  shares with macOS) still follows its watched paths;
+- with loose spelling, in a complete directory, each child that can be the same name: an
+  entry has one spelling there, and the OS can name it in another one when it is gone.
 
-- they are equal when the case of ASCII letters is left out, or
-- both have a byte outside ASCII. The rules of the disk for such letters are not known here,
-  so two such names can always be one name.
+The walk goes on below each of them when the hint has more names, and the marks at the end
+are deep. If no child can be the name, the hint costs no look at the disk.
 
-A name of ASCII letters is found through the table: its hash leaves out the case of ASCII
-letters (`child_hash`), so the children that differ only in that are filed under one hash. Such
-a hint costs one lookup more, however many children the directory has: 18 ns next to 20,000
-registered ones, where comparing with each child took 53 µs. A name with a byte outside ASCII
-is compared with every registered child of a partial directory. In a complete directory it
-marks no other child: there can be many of them. The marks are deep, because the names below
-can be spelled in another way too. If no child can be the name, the hint costs no look at the
-disk. The events carry the registered spelling.
+Two names can be one name (`can_be_one_name`) when they are equal with the case of ASCII
+letters left out, or when none of the two is plain. A **plain** name (`is_plain`) has only
+ASCII characters and Han ideographs. An ideograph has no case and no second form, so a plain
+name has another spelling only in its ASCII letters. How a disk folds any other letter (an
+accent, Greek, kana, Hangul) is not known here, so two names that are not plain can always
+be one name.
 
-**A look asks for the spelling when it is not sure** (`Engine::spelling_is_unsure`). A look
-that found an entry with `lstat` asks the disk for the name of that entry when
+A plain name is found through the table: its hash leaves out the case of ASCII letters
+(`child_hash`), so the children that differ only in that are filed under one hash. Such a
+hint costs one lookup more, however many children the directory has: 18 ns next to 20,000
+registered ones, where comparing with each child took 53 µs. The registered names that are
+not plain are on a list for each directory (`Tree::not_plain`), and a hint with such a name
+marks all of them: one look for each. The other children of a complete directory are on no
+list, and there can be many. So when a hint names a name that is not plain, and the tree does
+not have it as an entry (`Node::is_entry`), the flush compares the names of the directory
+with one listing (`Depth::Names`): a node that the listing names is not looked at, and one
+that it does not name is. An edit of a file that the tree knows costs no listing.
 
-- the tree had nothing at the name, or the node is held: the name comes from a hint, and a
-  hint can be for a name that is gone;
+**A look asks for the spelling when it is not sure** (`Engine::spelling_is_unsure`). In a
+partial directory a look asks nothing: a registered name is whatever `lstat` finds. In a
+complete directory, a look that found an entry asks the disk for the name of that entry when
+
+- the node was no entry of the directory at the last look (`Node::is_entry`): the tree had
+  nothing there, the node is held, or the directory had the entry under another name. Such a
+  name comes from a hint or from a caller, and both can spell it as no entry is spelled;
 - another node of the directory can be the same name (`Tree::has_other_spelling`): the disk
-  has only one of the two. A name with a byte outside ASCII counts as such a name at every
-  look, because the table does not find its other spellings;
+  has only one of the two. A name that is not plain counts as such a name at every look;
 - the look is part of a scan that listed the whole directory, and the listing did not name it.
 
-A look is sure, and asks nothing, for a registered name (it keeps the spelling of its caller),
-for a name that the listing of the running scan gave, and for a node of the tree that has no
-other spelling in the tree: the edit of a file that the tree knows costs what it costs on any
-disk.
+A look is sure, and asks nothing, for a name that the listing of the running scan gave, and
+for an entry that the tree knows and that has no other spelling in the tree: the edit of a
+file that the tree knows costs what it costs on any disk.
 
-When the disk spells the name in another way (`Found::OtherSpelling`), nothing is at the name
-of the node: what the tree has there is gone at once and with no hold, because a second look
-would find the entry again. The disk gave the name that the entry has. If the tree has no
-node for it, one is made and looked at in the same flush. If it has one, that node has a look
-of its own: a hint named it, or the scan reaches it.
+When the disk spells the name in another way, the directory has no entry of this name.
 
-**A name with a byte outside ASCII that is gone.** Its hint marks no other node in a complete
-directory. So when a look finds nothing at such a name, and the tree had nothing there, the
-flush scans the names of the directory once (`Depth::Names`): a node that the tree knew and
-that the listing names is not looked at, and a node that the listing does not name is looked
-at. This is the one case in which a spelling costs a listing.
+- A name that is not registered is gone (`Found::OtherSpelling`): at once and with no hold,
+  because a second look would find the entry again.
+- A registered name is still the path of its caller, but the directory above does not cover
+  it: the node says so (`Node::is_unlisted`, read by `Engine::is_inside`). A watched path
+  reports what is at it as before. A name that only leads to a watched path has nothing of
+  its own: a file that the directory reported there is gone at once, and a directory there
+  becomes partial and keeps only what the watched paths below it cover (`uncover`).
+
+In both cases the disk gave the name that the entry has. If the tree has no node for it, one
+is made and looked at in the same flush.
+
+The flag is an answer of the disk that the tree keeps, so it can be old. It is asked again
+at every look of a node that is no sure entry, and the tests hold it to the disk when the
+tree has caught up (`Engine::check_spellings`). `unwatch` reads it: a path that the directory
+above does not list is forgotten in silence, like a path with no watched directory above it.
+If the flag was old, one `Create` follows when the look finds the entry.
 
 What it costs: a new file in a watched directory is one `lstat` and one question for its name,
 however many entries the directory has. (Before, each flush with a new name listed the
 directory: with 20,000 files in it, 100 new files cost 1,617 ms of CPU time, and notify 18 ms.)
 A file that goes through another spelling of its name is one lookup in the table and one
-`lstat`. (Before, it was missed: `rm App.js` for the file `app.js` gave no `Delete`.)
+`lstat`. (Before, it was missed: `rm App.js` for the file `app.js` gave no `Delete`.) A new
+name that is not plain costs one listing of the names of its directory in each flush.
 
 What this does not cover is in section 9.
 
@@ -1154,11 +1192,11 @@ uses polling).
 
 Known holes of the engine:
 
-- A watched path in another spelling than the disk has, inside a watched directory; and two
-  watched paths that are two spellings of one file: only the name of the disk gets the events.
-- A hint with an ASCII name never finds a registered name with a letter outside ASCII, and the
-  other way round (the Kelvin sign and `k`). Such a watched path gets no events from an OS
-  watch.
+- A hint with a plain name never finds a registered name that is not plain, and the other
+  way round (5.2). APFS takes a few characters for plain ones (measured): `ß` for `ss`, the
+  long s for `s`, the Kelvin sign for `k`, a ligature like `ﬁ` for its letters, and each of
+  the 1,002 CJK compatibility ideographs for its ideograph. A watched path that is spelled
+  with one of them, where the disk has the plain spelling, gets no events from an OS watch.
 - Under polling, a young file above 16 MiB, and one that cannot be read, gets one `Update`
   when it is 2 s old, also when nothing changed, and also one that was written just before
   `watch` (5.8).

@@ -113,7 +113,8 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
    each file below it. One that goes (removed, moved out, renamed) is one `Delete` for each
    file that you were told about.
 7. **`unwatch` reports nothing.** A file that another watched path still covers stays known,
-   and its changes are reported as before.
+   and its changes are reported as before. A watched directory covers the names that it
+   lists: not a path that is spelled in another way than the disk has it (13).
 8. **Paths.** A relative path is joined to the current directory at the time of the call. `.`,
    `..` and repeated separators are cleaned by text; no link is resolved. A path that cannot be
    used (empty, a NUL in it, a file system root) is `InvalidPath`; the other paths of the same
@@ -135,8 +136,12 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
     and its events carry the spelling you gave. A link inside a watched directory is a file: it
     is not followed.
 13. **Spelling.** On a disk that takes two spellings of a name for one (letter case, Unicode
-    form: the usual disks of macOS and Windows), a watched path gets its events under the
-    spelling you gave. A name below a watched directory is spelled as on the disk.
+    form: the usual disks of macOS and Windows), a watched path is the text you gave: what is
+    at it is what the OS finds there, and its events carry your spelling. A name below a
+    watched directory is spelled as on the disk. Every watched path is a question of its own.
+    Two watched paths that are two spellings of one file both get their events. So does a
+    watched path in another spelling inside a directory that you watch too: the directory
+    reports the file under the name of the disk, and the path under its own.
 
 ## Holes
 
@@ -152,13 +157,11 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 - **A directory on a network drive, or shared with another machine** (NFS, a folder of the
   host in a virtual machine or a container): changes that the other machine makes are not
   reported, and nothing tells the watcher so. `with_polling(true)` finds them.
-- **Two watched paths that are two spellings of one file** (macOS, Windows): only the spelling
-  of the disk gets the events. With polling both get them.
-- **A watched path in another spelling, inside a directory that you watch too:** the file is
-  reported under the spelling of the disk only.
-- **A watched path in another spelling, where one spelling has only ASCII letters and the
-  other has not** (the Kelvin sign for `K`): no events on macOS and Windows. With polling it
-  works.
+- **A watched path that is spelled with a look-alike character**, where the disk has plain
+  letters, or the other way round: `ß` for `ss`, the long s for `s`, the Kelvin sign for `K`,
+  a ligature like `ﬁ` for `fi`, a CJK compatibility ideograph for its ideograph. The disks of
+  macOS take these for one name. Such a path gets no events on macOS and Windows. With polling
+  it works.
 - **A young file above 16 MiB, or one that cannot be read, under polling:** it gets one
   `Update` when it is 2 s old, also when nothing changed, and also when it was written just
   before `watch`.

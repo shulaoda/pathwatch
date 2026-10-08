@@ -117,6 +117,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if node.is_path() && node.added() == Added::No {
       return true;
     }
+    // A directory above reports its own entries only.
+    if node.is_unlisted() {
+      return false;
+    }
     let Some(parent) = self.tree.parent(key) else { return false };
     if self.tree[parent].is_complete() {
       !self.tree[parent].baseline()
@@ -133,6 +137,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // nodes, and then the filter is not asked at all.
     let (mut at, mut levels) = (key, 0);
     while !(self.tree[at].is_path() && self.tree[at].added() == Added::No) {
+      if self.tree[at].is_unlisted() {
+        return false;
+      }
       let Some(parent) = self.tree.parent(at) else { return false };
       (at, levels) = (parent, levels + 1);
     }
@@ -199,7 +206,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // The node stays when a watched path lies below it. What is at the path counted because
     // the path was watched, or because it is inside a watched directory. Only the second
     // reason can be left.
-    if self.tree[key].is_registered() && !self.tracks_every_entry(parent) {
+    if self.tree[key].is_registered() && !self.is_inside(key) {
       self.uncover(key, tell_delete, false);
     }
     // When no watched path lies below it, the node is let go, and so are the nodes above it
@@ -240,7 +247,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   ///
   /// `scan_comes`: a directory above gave its watch for a whole tree back, so a deep scan
   /// comes here from there (see `narrow`).
-  fn uncover(&mut self, key: DirKey, tell_delete: bool, mut scan_comes: bool) {
+  pub(super) fn uncover(&mut self, key: DirKey, tell_delete: bool, mut scan_comes: bool) {
     let node = &mut self.tree[key];
     if !tell_delete {
       // Not told: the end of the call makes no `Delete` of it.
@@ -274,7 +281,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// nothing needs it.
   fn let_go(&mut self, key: DirKey, tell_delete: bool) {
     let Some(parent) = self.tree.parent(key) else { return };
-    let inside = self.tracks_every_entry(parent);
+    let inside = self.is_inside(key);
+    self.tree[key].set_unlisted(false);
     // Only a registered node is followed when it is a link. Now the link itself is the
     // entry, and a look has to find that.
     if self.tree.link(key).is_some() {

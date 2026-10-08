@@ -123,7 +123,9 @@ fn only_a_name_that_can_be_the_hinted_one_is_checked() {
     d.fs.write(format!("/p/src/other{file}.js"), "1").unwrap();
   }
   d.fs.write("/p/src/app.jsx", "1").unwrap();
-  assert_eq!(d.deliver(usize::MAX), 51);
+  // A name of ideographs is only itself, like a name of ASCII letters.
+  d.fs.write("/p/src/\u{4e2d}\u{6587}.js", "1").unwrap();
+  assert_eq!(d.deliver(usize::MAX), 52);
   // No hint left work: nothing is due but the poll, and the disk was not asked.
   assert_eq!(d.engine.deadline(), Some(d.now + std::time::Duration::from_secs(1)));
   assert_eq!(d.fs.calls(), before);
@@ -137,8 +139,8 @@ fn only_a_name_that_can_be_the_hinted_one_is_checked() {
   // The one registered name. The directory is not listed.
   assert_eq!((after.lstat - before.lstat, after.read_dir - before.read_dir), (1, 0));
 
-  // A name with a letter outside ASCII: the rules of the disk for such letters are not known,
-  // so every registered name with such a letter is checked, and no other.
+  // A name with an accent: the rules of the disk for such letters are not known, so every
+  // registered name with such a letter is checked, and no other.
   let before = d.fs.calls();
   d.fs.write("/p/src/caf\u{e9}.js", "1").unwrap();
   assert_eq!(window(&mut d), NONE);
@@ -187,10 +189,12 @@ fn the_other_spelling_of_a_directory_next_to_unrelated_names() {
   }
 }
 
-/// Where the disk knows a name under one spelling only, the engine is not told otherwise, and
-/// a name that is not registered costs nothing: no watched path can see it.
+/// A watched path is the path that its caller gave, and the OS says what is at it. So on every
+/// disk it is looked at when a name next to it changes that differs only in the case of its
+/// letters. On a disk that tells the two names apart, that is one look that finds nothing new.
+/// A name that is no spelling of a watched path costs nothing.
 #[test]
-fn a_strict_disk_costs_nothing() {
+fn a_strict_disk_costs_one_look() {
   let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir_all("/p/src").unwrap();
   d.fs.write("/p/src/app.js", "1").unwrap();
@@ -198,27 +202,28 @@ fn a_strict_disk_costs_nothing() {
   assert_eq!(pathwatch_sim::known(&d), NONE);
 
   let before = d.fs.calls();
-  d.fs.write("/p/src/app.js", "22").unwrap();
   d.fs.write("/p/src/other.js", "1").unwrap();
-  assert_eq!(d.deliver(usize::MAX), 2);
-  // No hint left work: nothing is due but the poll.
+  assert_eq!(d.deliver(usize::MAX), 1);
+  // The hint left no work: nothing is due but the poll.
   assert_eq!(d.engine.deadline(), Some(d.now + std::time::Duration::from_secs(1)));
   assert_eq!(d.fs.calls(), before);
+
+  d.fs.write("/p/src/app.js", "22").unwrap();
+  assert_eq!(window(&mut d), NONE);
+  assert_eq!(d.fs.calls().lstat - before.lstat, 1);
   // `App.js` is another file than `app.js` on this disk.
   d.fs.write("/p/src/App.js", "1").unwrap();
   assert_eq!(window(&mut d), ["C /p/src/App.js"]);
+  d.fs.write("/p/src/app.js", "333").unwrap();
+  assert_eq!(window(&mut d), NONE);
   caught_up(&mut d);
 }
 
-/// What the rule does not cover: the watch of a watched directory reports a registered name
-/// below it in the spelling of the disk, and the directory knows that name too. The hint finds
-/// the entry of the directory, and the registered spelling is not checked.
-///
-/// The file is then known under two names, and only the name of the disk gets the events. It
-/// is listed in `docs/design.md` as a known limit.
+/// Two watches are two questions. The watch of the directory reports the file as the disk
+/// spells it, and the watched path reports it in the spelling of its caller.
 #[test]
 fn a_watched_path_in_another_spelling_inside_a_watched_directory() {
-  on_modes(&RECURSIVE, &loose(), |d, on| {
+  on_all(&loose(), |d, on| {
     d.fs().set_ignore_case(true);
     d.fs().mkdir_all("/p/R").unwrap();
     d.fs().write("/p/R/app.js", "1").unwrap();
@@ -226,8 +231,70 @@ fn a_watched_path_in_another_spelling_inside_a_watched_directory() {
     assert_eq!(d.known(), ["/p/R/App.js", "/p/R/app.js"], "{on}");
 
     d.fs().write("/p/R/app.js", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/R/app.js"], "{on}");
-    d.not_caught_up("one file under two names: a known limit of a disk that ignores case");
+    assert_eq!(d.window(), ["U /p/R/App.js", "U /p/R/app.js"], "{on}");
+    d.fs().remove("/p/R/app.js").unwrap();
+    assert_eq!(d.settled(), ["D /p/R/App.js", "D /p/R/app.js"], "{on}");
+    d.fs().write("/p/R/app.js", "333").unwrap();
+    assert_eq!(d.settled(), ["C /p/R/App.js", "C /p/R/app.js"], "{on}");
+
+    // The entry goes and comes back as `App.js`, and no hint names `app.js`: the directory
+    // has no entry of that name any more.
+    d.fs().remove("/p/R/App.js").unwrap();
+    d.fs().write("/p/R/App.js", "4444").unwrap();
+    assert_eq!(d.settled(), ["U /p/R/App.js", "D /p/R/app.js"], "{on}");
+    d.caught_up();
+  });
+}
+
+/// A file at a name that only leads to a watched path, inside a watched directory. The file is
+/// an entry of the directory while the disk spells it like the watched path. When the disk
+/// spells it in another way, it is gone under this name at once: it is there, so no second
+/// look can bring it back.
+#[test]
+fn a_file_at_a_name_on_the_way_changes_its_spelling() {
+  on_all(&loose(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().mkdir_all("/p").unwrap();
+    d.fs().write("/p/SRC", "1").unwrap();
+    assert_eq!(d.watch(&["/p", "/p/SRC/a.js"]), NONE, "{on}");
+    assert_eq!(d.known(), ["/p/SRC"], "{on}");
+
+    d.fs().rename("/p/SRC", "/p/src").unwrap();
+    assert_eq!(d.window(), ["D /p/SRC", "C /p/src"], "{on}");
+    d.fs().rename("/p/src", "/p/SRC").unwrap();
+    assert_eq!(d.window(), ["C /p/SRC", "D /p/src"], "{on}");
+    // The same when a link that leads nowhere takes the place: the link is the entry.
+    d.fs().remove("/p/SRC").unwrap();
+    d.fs().symlink("/nowhere", "/p/src").unwrap();
+    assert_eq!(d.window(), ["D /p/SRC", "C /p/src"], "{on}");
+    d.caught_up();
+  });
+}
+
+/// The same one level up: a watched directory, and below it a watched file and a watched
+/// directory that are reached through another spelling of a directory in it. The hint comes
+/// for the directory at the top, and the walk goes on through each spelling.
+#[test]
+fn watched_paths_through_another_spelling_of_a_directory_inside_a_watched_directory() {
+  on_all(&loose(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().mkdir_all("/p/src/lib").unwrap();
+    d.fs().write("/p/src/a.js", "1").unwrap();
+    d.fs().write("/p/src/lib/b.js", "1").unwrap();
+    assert_eq!(d.watch(&["/p", "/p/SRC/a.js", "/p/Src/LIB"]), NONE, "{on}");
+
+    d.fs().write("/p/src/a.js", "22").unwrap();
+    assert_eq!(d.window(), ["U /p/SRC/a.js", "U /p/src/a.js"], "{on}");
+    d.fs().write("/p/src/lib/b.js", "22").unwrap();
+    d.fs().write("/p/src/lib/c.js", "1").unwrap();
+    let expected =
+      ["U /p/Src/LIB/b.js", "C /p/Src/LIB/c.js", "U /p/src/lib/b.js", "C /p/src/lib/c.js"];
+    assert_eq!(d.window(), expected, "{on}");
+    d.fs().remove("/p/src/a.js").unwrap();
+    d.fs().remove("/p/src/lib/b.js").unwrap();
+    let expected = ["D /p/SRC/a.js", "D /p/Src/LIB/b.js", "D /p/src/a.js", "D /p/src/lib/b.js"];
+    assert_eq!(d.settled(), expected, "{on}");
+    d.caught_up();
   });
 }
 
@@ -401,13 +468,11 @@ fn a_watched_file_is_renamed_to_another_letter_case() {
   });
 }
 
-/// The limit once more, in a directory that only leads to watched paths: two watched paths
-/// that are two spellings of one file. The hint names the file as the disk spells it, that
-/// name is registered, and so nothing makes the directory check its other registered names.
-/// Only the spelling of the disk gets the events. With polling both get them.
+/// Two watched paths that are two spellings of one file: each of them gets its events. The
+/// hint names the file as the disk spells it, and the other registered name is looked at too.
 #[test]
 fn two_watched_paths_that_are_two_spellings_of_one_file() {
-  on_modes(&Mode::ALL, &loose(), |d, on| {
+  on_all(&loose(), |d, on| {
     d.fs().set_ignore_case(true);
     d.fs().mkdir_all("/p/src").unwrap();
     d.fs().write("/p/src/app.js", "1").unwrap();
@@ -415,8 +480,53 @@ fn two_watched_paths_that_are_two_spellings_of_one_file() {
     assert_eq!(d.known(), ["/p/src/App.js", "/p/src/app.js"], "{on}");
 
     d.fs().write("/p/src/app.js", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/src/app.js"], "{on}");
-    d.not_caught_up("one file under two watched names: only the name of the disk is checked");
+    assert_eq!(d.window(), ["U /p/src/App.js", "U /p/src/app.js"], "{on}");
+    d.fs().remove("/p/src/APP.JS").unwrap();
+    assert_eq!(d.settled(), ["D /p/src/App.js", "D /p/src/app.js"], "{on}");
+    d.fs().write("/p/src/app.js", "333").unwrap();
+    assert_eq!(d.settled(), ["C /p/src/App.js", "C /p/src/app.js"], "{on}");
+    d.caught_up();
+  });
+}
+
+/// The same with a letter outside ASCII in the names. The table of the tree does not find
+/// the other name, so it comes from the list of such names.
+#[test]
+fn two_watched_spellings_with_a_letter_outside_ascii() {
+  on_all(&loose(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().mkdir_all("/p/src").unwrap();
+    d.fs().write("/p/src/caf\u{e9}.js", "1").unwrap();
+    d.fs().write("/p/src/th\u{e9}.js", "1").unwrap();
+    let watched = ["/p/src/Caf\u{e9}.js", "/p/src/caf\u{e9}.js", "/p/src/th\u{e9}.js"];
+    assert_eq!(d.watch(&watched), NONE, "{on}");
+
+    d.fs().write("/p/src/caf\u{e9}.js", "22").unwrap();
+    assert_eq!(d.window(), ["U /p/src/Caf\u{e9}.js", "U /p/src/caf\u{e9}.js"], "{on}");
+    d.fs().remove("/p/src/CAF\u{e9}.JS").unwrap();
+    assert_eq!(d.settled(), ["D /p/src/Caf\u{e9}.js", "D /p/src/caf\u{e9}.js"], "{on}");
+    d.caught_up();
+  });
+}
+
+/// The rule for a watched path needs no word about the disk. An engine that takes the disk
+/// for a strict one (Linux) still finds a watched file in another spelling, on a disk that
+/// ignores case (a folder that is shared with macOS or Windows).
+#[test]
+fn a_watched_path_in_another_spelling_with_an_engine_that_does_not_know_the_disk() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().mkdir_all("/p/src").unwrap();
+    d.fs().write("/p/src/app.js", "1").unwrap();
+    assert_eq!(d.watch(&["/p/src/App.js"]), NONE, "{on}");
+
+    d.fs().write("/p/src/app.js", "22").unwrap();
+    assert_eq!(d.window(), ["U /p/src/App.js"], "{on}");
+    d.fs().remove("/p/src/app.js").unwrap();
+    assert_eq!(d.settled(), ["D /p/src/App.js"], "{on}");
+    d.fs().write("/p/src/app.js", "333").unwrap();
+    assert_eq!(d.settled(), ["C /p/src/App.js"], "{on}");
+    d.caught_up();
   });
 }
 
@@ -518,8 +628,8 @@ fn an_entry_goes_through_another_spelling_of_its_name() {
 }
 
 /// A name with a letter outside ASCII: the table of the tree does not find its other
-/// spellings. Such a name is asked from the disk at every look, and when a name that is gone
-/// names no node, one listing shows which node is gone.
+/// spellings. Such a name is asked from the disk at every look, and when a hint names one
+/// that the tree does not have as an entry, one listing shows which node is gone.
 #[test]
 fn a_name_with_a_letter_outside_ascii() {
   on_all(&loose(), |d, on| {
@@ -535,6 +645,12 @@ fn a_name_with_a_letter_outside_ascii() {
 
     d.fs().remove("/p/R/TH\u{e9}.JS").unwrap();
     assert_eq!(d.settled(), ["D /p/R/th\u{e9}.js"], "{on}");
+
+    // The entry goes and comes back in another spelling before the engine looks. The hints
+    // name the new spelling only, and the listing shows that the old one is gone.
+    d.fs().remove("/p/R/CAF\u{e9}.js").unwrap();
+    d.fs().write("/p/R/CAF\u{e9}.js", "22").unwrap();
+    assert_eq!(d.settled(), ["C /p/R/CAF\u{e9}.js", "D /p/R/caf\u{e9}.js"], "{on}");
     d.caught_up();
   });
 }

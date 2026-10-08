@@ -58,6 +58,30 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
+  /// Checks `Node::is_unlisted` against the disk, when the tree has caught up with it. The
+  /// flag is an answer of the disk that the tree keeps: for a registered name in a complete
+  /// node whose entry is on the disk, it says whether the disk has the entry under another
+  /// name.
+  pub fn check_spellings(&self) -> Result<(), String> {
+    for (key, node) in self.tree.nodes() {
+      let in_complete = self.tree.parent(key).is_some_and(|parent| self.tree[parent].is_complete());
+      if !(self.options.loose_spelling && node.is_registered() && in_complete) {
+        continue;
+      }
+      let path = self.tree.path(key);
+      let Ok(name) = self.fs.name_on_disk(&path) else { continue };
+      let is_other = name != self.tree.name(key);
+      // A node with nothing in the tree is no entry of the directory, whatever its flag says.
+      let counts_as_entry = !node.is_unlisted() && !matches!(node.kind, Kind::Missing);
+      if (node.is_unlisted() && !is_other) || (counts_as_entry && !node.is_held() && is_other) {
+        let flag = if node.is_unlisted() { "another name" } else { "this name" };
+        let name = name.display();
+        return Err(format!("{}: the tree says {flag}, the disk has {name}", path.display()));
+      }
+    }
+    Ok(())
+  }
+
   /// Whether the node `key` has a directory that has to track every entry, but does not yet
   /// in the tree: the look that makes it complete is still to come.
   fn is_behind(&self, key: DirKey) -> bool {
@@ -126,7 +150,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         Kind::File(_) => {
           // 5. Where the node above is partial, also a file that it will track when it has
           // caught up with the rule.
-          if !node.is_path() && !self.tracks_every_entry(parent) {
+          if !node.is_path() && !self.is_inside(key) {
             return fail("a partial node knows a file that is no watched path");
           }
         }

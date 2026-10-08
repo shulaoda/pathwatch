@@ -240,6 +240,9 @@ impl<B: Deliver> Driver<B> {
     if let Err(stale) = check_fingerprints(&self.fs, &watched, &stored) {
       panic!("not caught up: {stale}");
     }
+    if let Err(wrong) = self.fs.quiet(|| self.engine.check_spellings()) {
+      panic!("not caught up: {wrong}");
+    }
     let on_disk = reportable(&self.fs, &ignored, &watched);
     assert_eq!(self.known, on_disk, "not caught up: the handler does not know the files on disk");
   }

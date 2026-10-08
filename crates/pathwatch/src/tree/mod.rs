@@ -10,9 +10,11 @@ mod names;
 
 use std::{
   ffi::OsStr,
-  iter, mem,
+  iter,
+  iter::Peekable,
+  mem,
   ops::{Index, IndexMut},
-  path::{Component, Path, PathBuf},
+  path::{Component, Components, Path, PathBuf},
   time::{Instant, SystemTime},
 };
 
@@ -120,6 +122,13 @@ impl Node {
   /// partial node, and it stays while nothing is at its path.
   pub fn is_registered(&self) -> bool {
     self.is_path() || self.is_ancestor()
+  }
+
+  /// Whether the node is an entry of its directory, as far as the tree knows: something was
+  /// at its path at the last look, no second look waits, and the directory lists the entry
+  /// under this spelling.
+  pub fn is_entry(&self) -> bool {
+    !matches!(self.kind, Kind::Missing) && !self.is_held() && !self.is_unlisted()
   }
 
   /// Adds a mark to the node. Two marks for one node become one. `true`: it had none.
@@ -266,6 +275,10 @@ pub struct Tree {
   holds: FxHashMap<DirKey, Instant>,
   /// The times of the directories that nothing but a poll of the directory above looks at.
   times: FxHashMap<DirKey, DirTimes>,
+  /// The registered nodes whose names are not plain ([`is_plain`]), by the slot of their
+  /// parent. The table does not find such a node under another spelling of its name, so a
+  /// hint finds it here ([`Tree::others_meant`]).
+  not_plain: FxHashMap<u32, Vec<u32>>,
   /// The nodes with a mark. A key can be stale.
   pub marked: Vec<DirKey>,
   /// The nodes that are queued for a scan. A key can be stale or be there twice.
@@ -301,6 +314,7 @@ impl Tree {
       contents: FxHashMap::default(),
       holds: FxHashMap::default(),
       times: FxHashMap::default(),
+      not_plain: FxHashMap::default(),
       marked: Vec::new(),
       to_scan: Vec::new(),
       polled: vec![Self::ROOT],
@@ -442,9 +456,8 @@ impl Tree {
     }
     let was_registered = node.is_registered();
     node.set_path(true);
-    let parent = node.parent;
-    if parent != NONE && !was_registered {
-      self.count_registered(parent);
+    if !was_registered {
+      self.count_registered(key.index());
     }
     true
   }
@@ -456,10 +469,8 @@ impl Tree {
       return false;
     }
     node.set_path(false);
-    let is_registered = node.is_registered();
-    let parent = node.parent;
-    if parent != NONE && !is_registered {
-      self.uncount_registered(parent);
+    if !node.is_registered() {
+      self.uncount_registered(key.index());
     }
     true
   }
@@ -578,30 +589,58 @@ impl Tree {
     }
   }
 
-  /// A child of the node in the slot `index` is registered now. That can make the node itself
-  /// registered, and so on up to the root.
-  fn count_registered(&mut self, mut index: u32) {
+  /// The node in the slot `child` is registered now, and its parent counts it. That can make
+  /// the parent registered too, and so on up to the root.
+  fn count_registered(&mut self, mut child: u32) {
     loop {
-      let node = self.linked_mut(index);
-      let was_registered = node.is_registered();
-      node.registered_children += 1;
-      if was_registered || node.parent == NONE {
+      self.list_not_plain(child, true);
+      let parent = linked(&self.slots, child).parent;
+      if parent == NONE {
         return;
       }
-      index = node.parent;
+      let node = self.linked_mut(parent);
+      let was_registered = node.is_registered();
+      node.registered_children += 1;
+      if was_registered {
+        return;
+      }
+      child = parent;
     }
   }
 
-  /// A child of the node in the slot `index` is not registered any more. That can end the
-  /// registration of the node itself, and so on up to the root.
-  fn uncount_registered(&mut self, mut index: u32) {
+  /// The node in the slot `child` is not registered any more. That can end the registration
+  /// of its parent too, and so on up to the root.
+  fn uncount_registered(&mut self, mut child: u32) {
     loop {
-      let node = self.linked_mut(index);
-      node.registered_children -= 1;
-      if node.is_registered() || node.parent == NONE {
+      self.list_not_plain(child, false);
+      let parent = linked(&self.slots, child).parent;
+      if parent == NONE {
         return;
       }
-      index = node.parent;
+      let node = self.linked_mut(parent);
+      node.registered_children -= 1;
+      if node.is_registered() {
+        return;
+      }
+      child = parent;
+    }
+  }
+
+  /// Puts the node in the slot `child` on the list of its parent in `not_plain`, or takes it
+  /// off, if its name is not plain.
+  fn list_not_plain(&mut self, child: u32, registered: bool) {
+    let node = linked(&self.slots, child);
+    if is_plain(name_of(&self.names, node)) {
+      return;
+    }
+    let parent = node.parent;
+    if registered {
+      self.not_plain.entry(parent).or_default().push(child);
+    } else if let Some(list) = self.not_plain.get_mut(&parent) {
+      list.retain(|&other| other != child);
+      if list.is_empty() {
+        self.not_plain.remove(&parent);
+      }
     }
   }
 }
@@ -666,7 +705,7 @@ fn hash_of(slots: &[Slot], names: &Names, index: u32) -> u64 {
 /// The hash under which the table files the child `name` of the node `parent`.
 ///
 /// The case of ASCII letters is left out of it: two names that differ in nothing else have one
-/// hash, and so [`Tree::other_spelling`] finds them in the table. No ready hasher does that
+/// hash, and so [`Tree::spellings`] finds them in the table. No ready hasher does that
 /// without a copy of the name, so the bytes are mixed here: 16 at a time, as two numbers that
 /// are multiplied, and the two halves of the product are folded into one.
 #[expect(clippy::cast_possible_truncation, reason = "the two halves of a product are taken")]
@@ -757,8 +796,7 @@ impl Tree {
     if !node.is_dir() {
       return self.mark_from_above(dir);
     }
-    let mut parts = rel.components().peekable();
-    if parts.peek().is_none() {
+    if rel.as_os_str().is_empty() {
       // The directory itself: the backend lost its watch, or notifications of it. Its parent
       // checks it. Nothing checks the root.
       let has_parent = node.parent != NONE;
@@ -767,35 +805,86 @@ impl Tree {
       }
       return has_parent;
     }
-    // The walk is done for every hint, so it goes by slots: no key is made on the way.
-    let mut at = dir.index();
+    self.mark_path(dir.index(), rel.components().peekable(), written)
+  }
+
+  /// The walk of `mark_below`: from the directory in the slot `at` through the names `parts`.
+  /// It is done for every hint, so it goes by slots, and no key is made on the way.
+  ///
+  /// A watched path is the path that its caller gave, and the OS decides what is at it. So a
+  /// name of the hint means the child with that name, and also each other child that the OS
+  /// can take for the same name (`Tree::others_meant`): the walk goes on from each of them.
+  fn mark_path(&mut self, mut at: u32, mut parts: Peekable<Components<'_>>, written: bool) -> bool {
+    // Whether the walk from a child under another spelling of a name left a mark.
+    let mut found = false;
     while let Some(part) = parts.next() {
-      let Component::Normal(name) = part else { return false };
-      let child = self.find(at, name);
+      let Component::Normal(name) = part else { return found };
+      let (child, has_other) = self.spellings(at, name);
       let below = child.map(|child| linked(&self.slots, child));
-      if !below.is_some_and(Node::is_registered) && !linked(&self.slots, at).is_complete() {
-        return self.other_spelling(at, name);
+      let is_dir = below.is_some_and(Node::is_dir);
+      let is_complete = linked(&self.slots, at).is_complete();
+      // Whether a watched path sees an entry of this name in the directory.
+      let is_seen = below.is_some_and(Node::is_registered) || is_complete;
+      // The table found the other spellings of a plain name. It does not find those of any
+      // other name: the registered ones are on a list, and a listing shows the others when
+      // the name is not an entry that the directory is known to have.
+      let not_in_table = self.loose_spelling
+        && (!self.not_plain.is_empty() || (is_complete && !below.is_some_and(Node::is_entry)));
+      if has_other || (not_in_table && !is_plain(name)) {
+        found |= self.mark_others(at, name, child, &parts);
+      }
+      if !is_seen {
+        return found;
       }
       let last = parts.peek().is_none();
       if !last
         && let Some(child) = child
-        && below.is_some_and(Node::is_dir)
+        && is_dir
       {
         at = child;
         continue;
       }
       let written = last && written;
-      let child = if let Some(child) = child {
-        self.key(child)
-      } else {
-        // The node in the slot `at` is complete here, and the name is new to it.
-        self.other_spelling(at, name);
-        self.insert_child(self.key(at), name)
+      let child = match child {
+        Some(child) => self.key(child),
+        None => self.insert_child(self.key(at), name),
       };
       self.mark(child, Mark { deep: !written, written, lost: false });
       return true;
     }
-    false
+    found
+  }
+
+  /// The walk of `mark_path` for the other children that the name `name` means in the node in
+  /// the slot `at`. `exact` is the child with this very name, and `rest` are the names that
+  /// come after it. Each of these children is walked like the one with the name. The mark at
+  /// the end never says `written`: the hint was for another name, and the look decides.
+  #[cold]
+  fn mark_others(
+    &mut self,
+    at: u32,
+    name: &OsStr,
+    exact: Option<u32>,
+    rest: &Peekable<Components<'_>>,
+  ) -> bool {
+    let last = rest.clone().peek().is_none();
+    let mut found = false;
+    let parent = linked(&self.slots, at);
+    let is_entry = exact.is_some_and(|exact| linked(&self.slots, exact).is_entry());
+    if self.loose_spelling && parent.is_complete() && !is_entry && !is_plain(name) {
+      // The name can be another spelling of each child that is not plain, and the table
+      // says nothing about them: the names are compared with a listing.
+      self.queue_scan(self.key(at), Depth::Names);
+    }
+    for other in self.others_meant(at, name, exact) {
+      if !last && linked(&self.slots, other).is_dir() {
+        found |= self.mark_path(other, rest.clone(), false);
+      } else {
+        self.mark(self.key(other), Mark::DEEP);
+        found = true;
+      }
+    }
+    found
   }
 
   /// Adds a mark to a node. Two marks for one node become one.
@@ -905,58 +994,63 @@ impl Tree {
     false
   }
 
-  /// A hint names the entry `name` of the node in the slot `at`, and the tree has no such child
-  /// there, or none that a watched path can see. On a disk that takes two spellings of a name
-  /// for one, a child can still be meant: the OS names an entry that is gone as the caller
-  /// spelled it, and a watched path keeps the spelling of its caller. So each child that can
-  /// be the name is checked, and deep, because the names below it can be spelled in another
-  /// way too. In a partial node only a registered child counts. `false`: there is no such child.
+  /// The child `name` of the live node in the slot `parent`, and whether the node has another
+  /// child whose name differs from `name` only in the case of ASCII letters. One walk through
+  /// the table finds both, because such names have one hash.
+  fn spellings(&self, parent: u32, name: &OsStr) -> (Option<u32>, bool) {
+    let (mut child, mut has_other) = (None, false);
+    for &index in self.index.iter_hash(child_hash(parent, name)) {
+      let node = linked(&self.slots, index);
+      if node.parent != parent {
+        continue;
+      }
+      let other = name_of(&self.names, node);
+      if other == name {
+        child = Some(index);
+      } else {
+        has_other |= other.eq_ignore_ascii_case(name);
+      }
+    }
+    (child, has_other)
+  }
+
+  /// A hint names the entry `name` of the node in the slot `at`, and `exact` is the child with
+  /// this very name. Gives every other child that can be meant with the name.
   ///
-  /// In a complete node a name with a byte outside ASCII marks nothing: every such child could
-  /// be meant, and there can be many. The engine lists the directory if it has to.
-  fn other_spelling(&mut self, at: u32, name: &OsStr) -> bool {
-    if !self.loose_spelling {
-      return false;
-    }
-    let dir = linked(&self.slots, at);
-    let (first_child, is_complete) = (dir.first_child, dir.is_complete());
-    let Self { slots, names, index, marked, .. } = self;
-    let mut found = false;
-    // Marks the node in the slot `child` if it can be the entry. Gives the child after it.
-    let mut mark_if_it_can_be = |child: u32| {
-      let node = slots[child as usize].node_mut().expect("a link points to a live node");
-      let can_be = node.parent == at
-        && (is_complete || node.is_registered())
-        && can_be_one_name(name_of(names, node), name);
-      if can_be {
-        found = true;
-        if node.add_mark(Mark::DEEP) {
-          marked.push(DirKey::new(child, node.generation));
-        }
-      }
-      node.next
+  /// - A registered child is the path that its caller gave, and the OS says what is at it. On
+  ///   a disk that takes two spellings of a name for one, that is the entry of the hint, so
+  ///   the child is looked at too. A name can be the same name when it differs only in the
+  ///   case of ASCII letters: such a child is meant on every system, and where the disk tells
+  ///   the two names apart, the look finds what is at its own name. With loose spelling, a
+  ///   name that is not plain can also be every registered child that is not plain: how the
+  ///   disk folds their letters is not known here.
+  /// - With loose spelling, an entry of a complete node has one spelling on the disk, and
+  ///   the OS names an entry that is gone as the caller spelled it. So each child that
+  ///   differs only in the case of ASCII letters is meant. (For a name that is not plain,
+  ///   `mark_others` asks for a listing.)
+  fn others_meant(&self, at: u32, name: &OsStr, exact: Option<u32>) -> Vec<u32> {
+    let any_child = self.loose_spelling && linked(&self.slots, at).is_complete();
+    let is_meant = |&child: &u32| {
+      let node = linked(&self.slots, child);
+      Some(child) != exact
+        && node.parent == at
+        && (any_child || node.is_registered())
+        && can_be_one_name(name_of(&self.names, node), name)
     };
-    if name.is_ascii() {
-      // Only the same letters in another case can be this name, and the table files those
-      // under the hash of this name. So a flood of names that nobody watches costs one more
-      // lookup for each, however many children the node has.
-      for &child in index.iter_hash(child_hash(at, name)) {
-        mark_if_it_can_be(child);
-      }
-    } else if !is_complete {
-      // Every name with a byte outside ASCII can be this name: each child is looked at.
-      let mut child = first_child;
-      while child != NONE {
-        child = mark_if_it_can_be(child);
-      }
+    if is_plain(name) {
+      self.index.iter_hash(child_hash(at, name)).copied().filter(is_meant).collect()
+    } else if self.loose_spelling {
+      let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
+      listed.iter().copied().filter(|&child| Some(child) != exact).collect()
+    } else {
+      Vec::new()
     }
-    found
   }
 
   /// Whether the tree cannot say that the node `key` has its name as the disk spells it, on a
   /// disk that takes two spellings of a name for one: another node of the same directory has
   /// the name in another case of its ASCII letters, so one of the two is not on the disk. Or
-  /// the name has a byte outside ASCII: then the table does not find such a node.
+  /// the name is not plain: then the table does not find such a node.
   pub fn has_other_spelling(&self, key: DirKey) -> bool {
     let Some(node) = self.get(key) else { return false };
     let name = name_of(&self.names, node);
@@ -966,16 +1060,32 @@ impl Tree {
         && other_node.parent == node.parent
         && can_be_one_name(name_of(&self.names, other_node), name)
     };
-    !name.is_ascii() || self.index.iter_hash(child_hash(node.parent, name)).any(is_other)
+    !is_plain(name) || self.index.iter_hash(child_hash(node.parent, name)).any(is_other)
   }
 }
 
 /// Whether `a` and `b` can be one name on a disk that takes two spellings of a name for one:
-/// they are equal when the case of ASCII letters is left out. How such a disk folds other
-/// letters is not known here, so two names that both have a byte outside ASCII can be one.
+/// they are equal when the case of ASCII letters is left out, or none of the two is plain.
 fn can_be_one_name(a: &OsStr, b: &OsStr) -> bool {
-  let (a, b) = (a.as_encoded_bytes(), b.as_encoded_bytes());
-  a.eq_ignore_ascii_case(b) || (!a.is_ascii() && !b.is_ascii())
+  a.eq_ignore_ascii_case(b) || (!is_plain(a) && !is_plain(b))
+}
+
+/// Whether the tree knows every other spelling of `name`, on a disk that takes two spellings
+/// of a name for one: the name has only ASCII characters and Han ideographs. An ideograph has
+/// no case and no second form, so such a name has another spelling only in the case of its
+/// ASCII letters. How a disk folds any other letter is not known here.
+///
+/// A disk also takes a few characters for plain ones: `ß` for `ss`, the long s and the Kelvin
+/// sign for `s` and `k`, a ligature like `ﬁ` for its letters, and a compatibility ideograph
+/// for its ideograph. A hint for the plain spelling does not reach a registered name that is
+/// spelled with one of them, and the other way round.
+fn is_plain(name: &OsStr) -> bool {
+  let is_plain = |letter: char| {
+    letter.is_ascii()
+      || matches!(letter, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}')
+      || matches!(letter, '\u{20000}'..='\u{2F7FF}' | '\u{30000}'..='\u{3FFFF}')
+  };
+  name.is_ascii() || name.to_str().is_some_and(|name| name.chars().all(is_plain))
 }
 
 /// What the tree keeps for a file whose fingerprint cannot be trusted at its next check: the
@@ -1135,6 +1245,22 @@ impl Tree {
     if reached != live || self.index.len() + 1 != live {
       return Err("a node is in no list of children, or not in the table".to_owned());
     }
+    let listed = |(parent, children): (&u32, &Vec<u32>)| {
+      !children.is_empty()
+        && children.iter().all(|&child| {
+          let node = self.slots.get(child as usize).and_then(Slot::node);
+          node.is_some_and(|node| {
+            node.parent == *parent && node.is_registered() && !is_plain(name_of(&self.names, node))
+          })
+        })
+    };
+    let registered = |node: &Node| node.is_registered() && !is_plain(name_of(&self.names, node));
+    let on_lists: usize = self.not_plain.values().map(Vec::len).sum();
+    if !self.not_plain.iter().all(listed)
+      || on_lists != self.nodes().filter(|(_, node)| registered(node)).count()
+    {
+      return Err("the list of the registered names that are not plain is wrong".to_owned());
+    }
     let free = self.free.iter().filter(|&&index| (index as usize) < self.slots.len()).count();
     if free + live != self.slots.len()
       || self.slots.last().is_some_and(|last| last.node().is_none())
@@ -1252,14 +1378,19 @@ mod tests {
     assert!(!same("App.js", "App.jsx"));
     assert!(!same("App.js", "Abb.js"));
     assert!(!same("a-b", "a_b"));
-    // Letters outside ASCII: the rules of the disk are not known, so any two such names can
-    // be one. `e` with an accent as one character and as two, and in upper case.
+    // Other letters: the rules of the disk are not known, so any two such names can be one.
+    // `e` with an accent as one character and as two, and in upper case.
     assert!(same("caf\u{e9}.js", "cafe\u{301}.js"));
     assert!(same("caf\u{e9}.js", "CAF\u{c9}.JS"));
-    assert!(same("\u{e9}", "\u{4e2d}"));
-    // One of the two is plain ASCII: the bytes decide.
+    assert!(same("\u{e9}", "\u{444}"));
+    // One of the two is plain: the bytes decide. An ideograph is plain, a compatibility
+    // ideograph is not.
     assert!(!same("cafe.js", "caf\u{e9}.js"));
     assert!(!same("caf\u{e9}.js", "cafe.js"));
+    assert!(same("\u{4e2d}\u{6587}.js", "\u{4e2d}\u{6587}.JS"));
+    assert!(!same("\u{4e2d}.js", "\u{6587}.js"));
+    assert!(!same("\u{4e2d}.js", "\u{e9}.js"));
+    assert!(same("\u{f967}.js", "\u{e9}.js"));
   }
 
   /// A time is kept as one number of nanoseconds. A time that the number cannot hold becomes

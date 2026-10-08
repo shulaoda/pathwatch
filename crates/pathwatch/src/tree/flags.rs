@@ -31,6 +31,8 @@ bitflags! {
     // `Added::Path` and `Added::Registered`. Neither: `Added::No`.
     const ADDED_PATH = 1 << 13;
     const ADDED_REGISTERED = 1 << 14;
+
+    const UNLISTED = 1 << 15;
   }
 }
 
@@ -105,6 +107,18 @@ impl Node {
   /// counts of the nodes above right.
   pub(super) fn set_path(&mut self, is_path: bool) {
     self.flags.set(Flags::IS_PATH, is_path);
+  }
+
+  /// The node is registered, and the last look that found an entry at its path found that
+  /// the directory above lists the entry under another spelling of the name. Then the node
+  /// is the path that its caller gave, and no entry of that directory: a watched directory
+  /// above does not cover it.
+  pub fn is_unlisted(&self) -> bool {
+    self.flags.contains(Flags::UNLISTED)
+  }
+
+  pub fn set_unlisted(&mut self, unlisted: bool) {
+    self.flags.set(Flags::UNLISTED, unlisted);
   }
 
   // The ignore filter gives the same answer for the same path and kind, so the node keeps it.

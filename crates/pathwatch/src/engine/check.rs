@@ -32,8 +32,9 @@ const HASH_LIMIT: u64 = 16 * 1024 * 1024;
 /// What is at a path, after the rules of what counts.
 pub(super) enum Found {
   Missing,
-  /// The disk has the entry under this other spelling of the name: nothing has the name of
-  /// the node. A second look would say the same, so what the tree has here is gone at once.
+  /// The disk has the entry under this other spelling of the name: the directory has no
+  /// entry with the name of the node. A second look would say the same, so what the tree has
+  /// here is gone at once.
   OtherSpelling(OsString),
   File(Meta),
   Dir {
@@ -176,6 +177,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         }
         if complete && !was_complete {
           self.make_complete(key, relinked);
+        } else if was_complete && !complete && self.tree[key].is_unlisted() {
+          // The directory above lists the entry under another name now. Only what a watched
+          // path below covers stays, and the files that were its entries are gone.
+          self.uncover(key, true, false);
         } else if complete && relinked && self.tree[key].added() == Added::Registered {
           // The running `watch` follows this link for the first time: what is behind it is
           // its baseline. (`register` put the node on the list `touched`.)
@@ -206,11 +211,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// what counts: an entry that no watched path covers, or that the filter ignores, is missing.
   fn read_entry(&mut self, parent: DirKey, key: DirKey, path: &Path, listed: Listed) -> Found {
     let node = &self.tree[key];
-    let (registered, is_ancestor) = (node.is_registered(), node.is_ancestor());
-    let inside = node.is_path() || self.tree[parent].is_complete();
+    let (registered, is_ancestor, is_path) =
+      (node.is_registered(), node.is_ancestor(), node.is_path());
+    let in_complete = self.tree[parent].is_complete();
 
     if !registered {
-      if !inside {
+      if !in_complete {
         // No watched path can see the entry. Or the directory is to be complete and the tree
         // is behind: then the look that makes it complete comes first, and this one waits.
         return if self.tracks_every_entry(parent) { Found::Unknown } else { Found::Missing };
@@ -227,8 +233,20 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       Ok(meta) => meta,
       Err(error) => return self.disk_error(parent, path, error),
     };
+    let unsure = self.options.loose_spelling && in_complete && self.spelling_is_unsure(key, listed);
+    // A registered name is the path that its caller gave. It is also an entry of the complete
+    // directory above only if that directory lists it under this very name. That is asked
+    // about the entry itself, so before a link is followed.
+    let mut other = None;
     let mut relinked = false;
     if registered {
+      if unsure {
+        other = match self.other_spelling(key, path) {
+          Ok(other) => other,
+          Err(error) => return self.disk_error(parent, path, error),
+        };
+      }
+      self.tree[key].set_unlisted(other.is_some());
       // Only a registered node is followed. Nothing watches a link, so every poll checks it.
       let link = (meta.kind == FileType::Symlink).then(|| self.real_place(path));
       let old = self.tree.link(key);
@@ -244,12 +262,17 @@ impl<B: Backend, F: Fs> Engine<B, F> {
               // see that the link changed, or a watch by path is never made again.
               self.tree.set_link(key, old);
             }
-            return found;
+            return match found {
+              // The link itself is an entry of the directory above, under another name.
+              Found::Missing if !is_path => other.map_or(Found::Missing, Found::OtherSpelling),
+              found => found,
+            };
           }
         };
       }
     }
 
+    let inside = is_path || (in_complete && other.is_none());
     let kind = entry_kind(meta.kind);
     let visible = inside && !self.ignores(key, path, kind);
     let found = match kind {
@@ -259,39 +282,46 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         Found::Dir { id: meta.dir_id, times, complete: visible, relinked }
       }
       EntryKind::File if visible => Found::File(meta),
-      _ => return Found::Missing,
+      _ => return other.map_or(Found::Missing, Found::OtherSpelling),
     };
-    if self.spelling_is_unsure(key, listed) {
-      match self.fs.name_on_disk(path) {
-        Ok(name) if name == self.tree.name(key) => {}
-        Ok(name) => return Found::OtherSpelling(name),
+    // A name that is not registered is asked after the filter: an ignored entry costs no
+    // question.
+    if !registered && unsure {
+      match self.other_spelling(key, path) {
+        Ok(None) => {}
+        Ok(Some(name)) => return Found::OtherSpelling(name),
         Err(error) => return self.disk_error(parent, path, error),
       }
     }
     found
   }
 
+  /// The name that the disk has for the entry at `path`, when it is not the name of the node
+  /// `key`.
+  fn other_spelling(&self, key: DirKey, path: &Path) -> io::Result<Option<OsString>> {
+    let name = self.fs.name_on_disk(path)?;
+    Ok(Some(name).filter(|name| name != self.tree.name(key)))
+  }
+
   /// Whether the disk has to say how it spells the name of the node `key`, where `lstat` just
-  /// found an entry.
+  /// found an entry in a complete directory, on a disk with loose spelling.
   ///
-  /// On a disk that takes two spellings of a name for one, `lstat` finds an entry under each
-  /// of them, and the OS names an entry that is gone as the caller spelled it. So an entry
-  /// that was found is under this name only if the disk spells it so, and that is not sure
-  /// for a name that the tree did not have, for a name that was gone, and while the tree has
-  /// two spellings of the name. A listing names an entry as the disk spells it: a node that
-  /// it named is sure, and one that it did not name is not. A registered name keeps the
-  /// spelling of its caller and is never asked.
+  /// On such a disk `lstat` finds an entry under every spelling of its name, and the OS names
+  /// an entry that is gone as the caller spelled it. So an entry that was found is under this
+  /// name only if the disk spells it so, and that is not sure for a name that was no entry
+  /// of the directory at the last look (`Node::is_entry`), and while the tree has two
+  /// spellings of the name. A listing names an entry as the disk spells it: a node that it
+  /// named is sure, and one that it did not name is not.
+  ///
+  /// An entry of the directory that is spelled in another way is not there under this name
+  /// (`Found::OtherSpelling`). A registered name is the path of its caller and is there all
+  /// the same, but then the directory above does not cover it (`Node::is_unlisted`).
   fn spelling_is_unsure(&self, key: DirKey, listed: Listed) -> bool {
     let node = &self.tree[key];
-    if !self.options.loose_spelling || node.is_registered() {
-      return false;
-    }
     match listed {
       Listed::Named(_) => false,
       Listed::NotNamed => true,
-      Listed::NotAsked => {
-        matches!(node.kind, Kind::Missing) || node.is_held() || self.tree.has_other_spelling(key)
-      }
+      Listed::NotAsked => !node.is_entry() || self.tree.has_other_spelling(key),
     }
   }
 
