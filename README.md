@@ -246,6 +246,7 @@ crates/
     tests/
       disk/                  the promises above, on the real disk
       watcher.rs             the thread
+      tree.rs                the tree of the engine, alone
       inotify.rs  fsevents.rs  windows.rs     each backend alone, on its OS
       windows_parts.rs       the parts of the Windows backend that call no Windows
     examples/                watch.rs, dev_server.rs

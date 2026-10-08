@@ -1075,8 +1075,9 @@ The test files of the simulator:
 
 **The other tests** (`crates/pathwatch`):
 
-- Private functions (a `mod tests` at the end of the file; for the tree, `tree/tests.rs`):
-  `tree/mod.rs`, `path.rs`, `fs.rs`, `engine/events.rs`, and helpers of the backends.
+- Private functions (a `mod tests` at the end of the file): `tree/mod.rs`, `path.rs`, `fs.rs`,
+  `engine/events.rs`, and helpers of the backends.
+- The tree alone (`tests/tree.rs`): the arena, the table, and the way from a hint to a mark.
 - Each backend alone (`tests/inotify.rs`, `fsevents.rs`, `windows.rs`, each on its OS). The
   Windows file has never run. `windows_parts.rs` runs on every OS. In `fsevents.rs` a test
   that makes many changes runs alone, and after the others where it can (`Turn`): a flood

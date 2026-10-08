@@ -35,7 +35,7 @@ const NONE: u32 = u32::MAX;
 /// one), something that counts is at its path, a mark waits on it, or the handler still has to
 /// hear that its file is gone. [`Tree::prune`] frees a node that has none of them.
 #[derive(Debug)]
-pub(crate) struct Node {
+pub struct Node {
   /// What the last look found at the path. While the node is held: the look before that.
   pub kind: Kind,
 
@@ -126,7 +126,7 @@ impl Node {
 
 /// What the tree has at a path.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Kind {
+pub enum Kind {
   /// Nothing, or nothing that counts.
   Missing,
   File(Fingerprint),
@@ -161,7 +161,7 @@ fn nanos(time: SystemTime) -> i64 {
 
 /// What the tree keeps for a directory that is on disk. All of it goes away with the directory.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Dir {
+pub struct Dir {
   /// Tells this directory from another one at the same path.
   pub id: DirId,
   /// The node tracks every entry that is not ignored. If not, it is partial: it tracks only
@@ -192,7 +192,7 @@ impl Dir {
 
 /// How changes in a directory are heard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Watch {
+pub enum Watch {
   /// The directory was just found, and the backend was not asked yet. Also the answer for a
   /// node that is no directory.
   None,
@@ -210,7 +210,7 @@ pub(crate) enum Watch {
 
 /// How far a scan goes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) enum Depth {
+pub enum Depth {
   /// Only the names are compared with a listing: a node that the listing names is as it was,
   /// and is not looked at. Where there is no listing, this is a shallow scan.
   Names,
@@ -223,7 +223,7 @@ pub(crate) enum Depth {
 
 /// What the running `watch` call did with a node. The end of the call sets it back to `No`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Added {
+pub enum Added {
   /// Nothing. Also: no call is running.
   No,
   /// The node led to a watched path before. The call made it a watched path itself.
@@ -235,7 +235,7 @@ pub(crate) enum Added {
 
 /// The arena of the nodes, the table that finds a child by its name, and the work that waits.
 #[derive(Debug)]
-pub(crate) struct Tree {
+pub struct Tree {
   slots: Vec<Slot>,
   free: Vec<u32>,
   names: Names,
@@ -634,7 +634,7 @@ pub(crate) fn emptied<T>(mut list: Vec<T>) -> Vec<T> {
 
 /// "Check this name at the next flush."
 #[derive(Clone, Copy, Default, Debug)]
-pub(crate) struct Mark {
+pub struct Mark {
   /// Something said that this very path changed. If a directory is there and it is still the
   /// same one, it is watched again and scanned deep: it can have been away and back.
   pub deep: bool,
@@ -863,7 +863,7 @@ fn can_be_one_name(a: &OsStr, b: &OsStr) -> bool {
 /// What the tree keeps for a file whose fingerprint cannot be trusted at its next check: the
 /// file was young when it was stored, or every content is compared.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Content {
+pub enum Content {
   /// This hash of the content decides.
   Hash(u64),
   /// There is no hash (the file is too big or not readable): an equal fingerprint counts as
@@ -874,7 +874,7 @@ pub(crate) enum Content {
 /// When a directory changed last, in nanoseconds since 1970. A rename of the directory itself moves `changed` alone; an
 /// entry that comes or goes in it moves both.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct DirTimes {
+pub struct DirTimes {
   /// The change time: of what the directory holds, and of the entry that it is.
   pub changed: i64,
   /// The modification time: of what it holds.
@@ -1022,4 +1022,92 @@ impl Tree {
 }
 
 #[cfg(all(test, unix))]
-mod tests;
+mod tests {
+  use std::{
+    ffi::OsStr,
+    path::Path,
+    time::{Duration, UNIX_EPOCH},
+  };
+
+  use super::{KEPT, Tree, can_be_one_name, emptied, nanos};
+  use crate::backend::DirKey;
+
+  /// The names are in one buffer. When many nodes go, the buffer is packed, and every node that
+  /// stays still has its name and is still found by it.
+  #[test]
+  fn the_names_are_packed_when_many_nodes_go() {
+    let mut tree = Tree::new();
+    let top = tree.insert_child(Tree::ROOT, OsStr::new("/"));
+    let name = |i: usize| format!("module-{i:04}.js");
+    let keys: Vec<DirKey> =
+      (0..1000).map(|i| tree.insert_child(top, OsStr::new(&name(i)))).collect();
+    let full = tree.names.len();
+    assert_eq!(full, 1 + 1000 * name(0).len());
+
+    // Three of four nodes go: a node with nothing at its path that nothing needs is freed.
+    let stays = |i: usize| i.is_multiple_of(4);
+    for (i, key) in keys.iter().enumerate() {
+      if !stays(i) {
+        tree.prune(*key);
+      }
+    }
+    assert!(tree.names.len() <= full / 2, "{} of {full} bytes", tree.names.len());
+    tree.check_links().unwrap();
+    for (i, key) in keys.iter().enumerate() {
+      let found = tree.child(top, OsStr::new(&name(i)));
+      if stays(i) {
+        assert_eq!(found, Some(*key));
+        assert_eq!(tree.name(*key), OsStr::new(&name(i)));
+        assert_eq!(tree.path(*key), Path::new("/").join(name(i)));
+      } else {
+        assert_eq!(found, None);
+      }
+    }
+
+    // New names go on behind the packed ones.
+    let new = tree.insert_child(top, OsStr::new("new.js"));
+    assert_eq!(tree.name(new), OsStr::new("new.js"));
+    assert_eq!(tree.name(top), OsStr::new("/"));
+    tree.check_links().unwrap();
+  }
+
+  #[test]
+  fn two_names_that_can_be_one_name() {
+    let same = |a: &str, b: &str| can_be_one_name(OsStr::new(a), OsStr::new(b));
+    assert!(same("App.js", "App.js"));
+    assert!(same("App.js", "aPP.JS"));
+    assert!(!same("App.js", "App.jsx"));
+    assert!(!same("App.js", "Abb.js"));
+    assert!(!same("a-b", "a_b"));
+    // Letters outside ASCII: the rules of the disk are not known, so any two such names can
+    // be one. `e` with an accent as one character and as two, and in upper case.
+    assert!(same("caf\u{e9}.js", "cafe\u{301}.js"));
+    assert!(same("caf\u{e9}.js", "CAF\u{c9}.JS"));
+    assert!(same("\u{e9}", "\u{4e2d}"));
+    // One of the two is plain ASCII: the bytes decide.
+    assert!(!same("cafe.js", "caf\u{e9}.js"));
+    assert!(!same("caf\u{e9}.js", "cafe.js"));
+  }
+
+  /// A time is kept as one number of nanoseconds. A time that the number cannot hold becomes
+  /// the nearest one that it can.
+  #[test]
+  fn a_time_as_one_number() {
+    assert_eq!(nanos(UNIX_EPOCH), 0);
+    assert_eq!(nanos(UNIX_EPOCH + Duration::new(2, 3)), 2_000_000_003);
+    assert_eq!(nanos(UNIX_EPOCH - Duration::new(2, 3)), -2_000_000_003);
+    // The year 2262 is the last one that fits.
+    let far = Duration::from_secs(400 * 365 * 24 * 3600);
+    assert_eq!(nanos(UNIX_EPOCH + far), i64::MAX);
+    assert_eq!(nanos(UNIX_EPOCH - far), -i64::MAX);
+  }
+
+  /// A list that is used again keeps its memory, but not when it is long.
+  #[test]
+  fn a_long_list_is_given_back() {
+    let short = emptied(vec![1; KEPT]);
+    assert!(short.is_empty() && short.capacity() == KEPT);
+    let long = emptied(vec![1; KEPT + 1]);
+    assert_eq!(long.capacity(), 0);
+  }
+}

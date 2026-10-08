@@ -127,7 +127,7 @@ impl Node {
     self.flags.contains(Flags::MARKED)
   }
 
-  pub(super) fn mark(&self) -> Option<Mark> {
+  pub fn mark(&self) -> Option<Mark> {
     self.is_marked().then(|| Mark {
       deep: self.flags.contains(Flags::MARK_DEEP),
       written: self.flags.contains(Flags::MARK_WRITTEN),

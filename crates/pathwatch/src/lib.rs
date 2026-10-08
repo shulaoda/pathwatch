@@ -95,7 +95,8 @@ pub mod engine;
 pub mod fs;
 #[doc(hidden)]
 pub mod path;
-mod tree;
+#[doc(hidden)]
+pub mod tree;
 
 // The backends, one file each. `windows` is compiled on every target: only the part of it that
 // calls Windows is behind `cfg(windows)`, and the rest is tested on the other systems.

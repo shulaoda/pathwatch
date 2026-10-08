@@ -29,11 +29,11 @@ impl DirKey {
     Self { index, generation }
   }
 
-  pub(crate) fn index(self) -> u32 {
+  pub fn index(self) -> u32 {
     self.index
   }
 
-  pub(crate) fn generation(self) -> u32 {
+  pub fn generation(self) -> u32 {
     self.generation
   }
 }

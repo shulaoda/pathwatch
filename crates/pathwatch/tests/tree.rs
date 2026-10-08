@@ -1,4 +1,7 @@
-//! The arena, the table and the way from a hint to a mark. The paths are Unix paths.
+//! The tree alone: the arena, the table and the way from a hint to a mark. The paths are Unix
+//! paths.
+
+#![cfg(unix)]
 
 use std::{
   ffi::OsStr,
@@ -7,13 +10,10 @@ use std::{
   time::{Duration, Instant},
 };
 
-use super::{
-  Content, Depth, Dir, DirTimes, Fingerprint, KEPT, Kind, Mark, Node, Slot, Tree, Watch,
-  can_be_one_name, emptied, nanos,
-};
-use crate::{
+use pathwatch::{
   backend::{DirKey, Hint, Want},
   fs::DirId,
+  tree::{Content, Depth, Dir, DirTimes, Fingerprint, Kind, Mark, Tree, Watch},
 };
 
 fn child(tree: &mut Tree, parent: DirKey, name: &str) -> DirKey {
@@ -160,10 +160,12 @@ fn children_come_and_go() {
   let mut tree = Tree::new();
   let top = child(&mut tree, Tree::ROOT, "/");
   let mut live: Vec<(String, DirKey)> = Vec::new();
+  let mut highest = top.index();
   for round in 0..4 {
     for number in 0..500 {
       let name = format!("{round}-{number}");
       let key = child(&mut tree, top, &name);
+      highest = highest.max(key.index());
       live.push((name, key));
     }
     // Every third node goes, also the newest and the oldest.
@@ -187,8 +189,8 @@ fn children_come_and_go() {
       assert_eq!(tree.name(*key), OsStr::new(name));
     }
   }
-  // No slot is lost: the arena is not bigger than the most nodes that lived at one time.
-  assert!(tree.slots.len() <= 2 + 500 + 500 * 2 / 3 + 500 * 4 / 9 + 500 * 8 / 27 + 4);
+  // No slot is lost: no key is beyond the most nodes that lived at one time.
+  assert!(highest < 2 + 500 + 500 * 2 / 3 + 500 * 4 / 9 + 500 * 8 / 27 + 4);
 }
 
 /// A node is kept while it is registered, while something is at its path, and while a mark
@@ -582,24 +584,6 @@ fn a_name_that_can_be_another_spelling() {
 }
 
 #[test]
-fn two_names_that_can_be_one_name() {
-  let same = |a: &str, b: &str| can_be_one_name(OsStr::new(a), OsStr::new(b));
-  assert!(same("App.js", "App.js"));
-  assert!(same("App.js", "aPP.JS"));
-  assert!(!same("App.js", "App.jsx"));
-  assert!(!same("App.js", "Abb.js"));
-  assert!(!same("a-b", "a_b"));
-  // Letters outside ASCII: the rules of the disk are not known, so any two such names can
-  // be one. `e` with an accent as one character and as two, and in upper case.
-  assert!(same("caf\u{e9}.js", "cafe\u{301}.js"));
-  assert!(same("caf\u{e9}.js", "CAF\u{c9}.JS"));
-  assert!(same("\u{e9}", "\u{4e2d}"));
-  // One of the two is plain ASCII: the bytes decide.
-  assert!(!same("cafe.js", "caf\u{e9}.js"));
-  assert!(!same("caf\u{e9}.js", "cafe.js"));
-}
-
-#[test]
 fn the_times_of_a_directory() {
   let Fixture { mut tree, r, sub, .. } = fixture();
   let at = |seconds: i64| seconds * 1_000_000_000;
@@ -750,67 +734,6 @@ fn from_hint_to_mark() {
   assert_eq!(mark_list(&tree), [" / deep"]);
 }
 
-/// The names are in one buffer. When many nodes go, the buffer is packed, and every node that
-/// stays still has its name and is still found by it.
-#[test]
-fn the_names_are_packed_when_many_nodes_go() {
-  let mut tree = Tree::new();
-  let top = child(&mut tree, Tree::ROOT, "/");
-  let name = |i: usize| format!("module-{i:04}.js");
-  let keys: Vec<DirKey> = (0..1000).map(|i| child(&mut tree, top, &name(i))).collect();
-  let full = tree.names.len();
-  assert_eq!(full, 1 + 1000 * name(0).len());
-
-  // Three of four nodes go: a node with nothing at its path that nothing needs is freed.
-  let stays = |i: usize| i.is_multiple_of(4);
-  for (i, key) in keys.iter().enumerate() {
-    if !stays(i) {
-      tree.prune(*key);
-    }
-  }
-  assert!(tree.names.len() <= full / 2, "{} of {full} bytes", tree.names.len());
-  tree.check_links().unwrap();
-  for (i, key) in keys.iter().enumerate() {
-    let found = tree.child(top, OsStr::new(&name(i)));
-    if stays(i) {
-      assert_eq!(found, Some(*key));
-      assert_eq!(tree.name(*key), OsStr::new(&name(i)));
-      assert_eq!(tree.path(*key), Path::new("/").join(name(i)));
-    } else {
-      assert_eq!(found, None);
-    }
-  }
-
-  // New names go on behind the packed ones.
-  let new = child(&mut tree, top, "new.js");
-  assert_eq!(tree.name(new), OsStr::new("new.js"));
-  assert_eq!(tree.name(top), OsStr::new("/"));
-  tree.check_links().unwrap();
-}
-
-/// One slot for each path the tree knows: it has to stay small.
-#[test]
-#[cfg(target_pointer_width = "64")]
-fn a_node_stays_small() {
-  assert_eq!(mem::size_of::<Node>(), 64);
-  assert_eq!(mem::size_of::<Slot>(), 64);
-}
-
-/// A time is kept as one number of nanoseconds. A time that the number cannot hold becomes the
-/// nearest one that it can.
-#[test]
-fn a_time_as_one_number() {
-  use std::time::UNIX_EPOCH;
-
-  assert_eq!(nanos(UNIX_EPOCH), 0);
-  assert_eq!(nanos(UNIX_EPOCH + Duration::new(2, 3)), 2_000_000_003);
-  assert_eq!(nanos(UNIX_EPOCH - Duration::new(2, 3)), -2_000_000_003);
-  // The year 2262 is the last one that fits.
-  let far = Duration::from_secs(400 * 365 * 24 * 3600);
-  assert_eq!(nanos(UNIX_EPOCH + far), i64::MAX);
-  assert_eq!(nanos(UNIX_EPOCH - far), -i64::MAX);
-}
-
 /// The list of the timer: a directory goes on it when its watch or its error is written, and
 /// `tidy_polled` leaves each directory that the timer has to look at once, in the order of the
 /// arena. The root is always one of them.
@@ -879,13 +802,4 @@ fn the_marks_in_the_order_of_their_checks() {
   assert_eq!(marks, [(2, f.top, f.p), (3, f.p, f.f), (4, f.r, a), (4, f.r, c), (5, f.sub, b)]);
   // The marks stay on the nodes. Only the list is empty.
   assert!(f.tree.marked.is_empty() && f.tree[a].is_marked());
-}
-
-/// A list that is used again keeps its memory, but not when it is long.
-#[test]
-fn a_long_list_is_given_back() {
-  let short = emptied(vec![1; KEPT]);
-  assert!(short.is_empty() && short.capacity() == KEPT);
-  let long = emptied(vec![1; KEPT + 1]);
-  assert_eq!(long.capacity(), 0);
 }
