@@ -60,26 +60,26 @@ pub enum Hint<'a> {
 }
 
 pub struct Sink<R> {
-  deliver: Arc<dyn Fn(Signal<R>) + Send + Sync>,
+  inner: Arc<dyn Fn(Signal<R>) + Send + Sync>,
 }
 
 impl<R> Sink<R> {
   pub fn new(deliver: impl Fn(Signal<R>) + Send + Sync + 'static) -> Self {
-    Self { deliver: Arc::new(deliver) }
+    Self { inner: Arc::new(deliver) }
   }
 
   pub fn raw(&self, raw: R) {
-    (self.deliver)(Signal::Raw(raw));
+    (self.inner)(Signal::Raw(raw));
   }
 
   pub fn failed(&self, error: io::Error) {
-    (self.deliver)(Signal::Failed(error));
+    (self.inner)(Signal::Failed(error));
   }
 }
 
 impl<R> Clone for Sink<R> {
   fn clone(&self) -> Self {
-    Self { deliver: Arc::clone(&self.deliver) }
+    Self { inner: Arc::clone(&self.inner) }
   }
 }
 
