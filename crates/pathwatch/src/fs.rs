@@ -258,8 +258,43 @@ fn name_on_disk(path: &Path) -> io::Result<OsString> {
   Ok(OsString::from_wide(&found.cFileName[..len]))
 }
 
+/// No call gives the name of one entry here, so the listing of its directory is read: 1.8 ms
+/// for 2,000 entries of a folder that a Mac shares. The engine asks only in a directory that
+/// takes two spellings of a name for one (a folder of another system, a FAT or SMB disk, a
+/// directory with the casefold flag), and there only for a name that it is not sure of.
+///
+/// The entry is the one with the very name, or else one that differs in the case of ASCII
+/// letters, or else one with the same inode number (another Unicode form). If the listing has
+/// none of these, the directory has no such entry, whatever `lstat` said: on a folder that a
+/// Mac shares, Linux still finds a name that was renamed away through another spelling
+/// (measured: the kernel keeps what it knew about each spelling).
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn name_on_disk(path: &Path) -> io::Result<OsString> {
+  use std::os::unix::fs::{DirEntryExt, MetadataExt};
+
+  let inode = fs::symlink_metadata(path)?.ino();
+  let (Some(given), Some(dir)) = (path.file_name(), path.parent()) else {
+    return Err(io::ErrorKind::InvalidInput.into());
+  };
+  // A listing that cannot be read says nothing against the name.
+  let Ok(entries) = fs::read_dir(dir) else { return Ok(given.to_owned()) };
+  let (mut other_case, mut same_inode) = (None, None);
+  for entry in entries.flatten() {
+    let name = entry.file_name();
+    if name == given {
+      return Ok(name);
+    }
+    if name.eq_ignore_ascii_case(given) {
+      other_case = Some(name);
+    } else if entry.ino() == inode {
+      same_inode = Some(name);
+    }
+  }
+  other_case.or(same_inode).ok_or_else(|| io::ErrorKind::NotFound.into())
+}
+
 /// Everywhere else a name has one spelling: the one of the path.
-#[cfg(not(any(target_vendor = "apple", windows)))]
+#[cfg(not(any(unix, windows)))]
 fn name_on_disk(path: &Path) -> io::Result<OsString> {
   fs::symlink_metadata(path)?;
   path.file_name().map(OsStr::to_owned).ok_or_else(|| io::ErrorKind::InvalidInput.into())

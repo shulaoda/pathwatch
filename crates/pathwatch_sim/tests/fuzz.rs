@@ -187,14 +187,18 @@ struct Config {
   debounce: Duration,
   delete_delay: Duration,
   poll_interval: Duration,
-  /// The engine takes the disk for one that knows a name under two spellings. On a disk that
-  /// is not such a disk, the rule for it only costs looks: it must do no harm.
+  /// The engine takes every disk for one that knows a name under two spellings (macOS,
+  /// Windows). On a disk that is not such a disk, the rule for it only costs looks: it must
+  /// do no harm. Without it, the engine finds out for each directory.
   loose_spelling: bool,
-  /// The disk is such a disk, and the engine knows it. Then some changes name an entry in
-  /// upper case: the entry is the same, and the OS tells about a name that is gone in the
-  /// spelling of the change. Some watched paths have a name in upper case too: a watched path
-  /// is the path that its caller gave, and an entry that a change makes at it gets that name.
+  /// The disk is such a disk, whatever the engine takes it for. Then some changes name an
+  /// entry in upper case: the entry is the same, and the OS tells about a name that is gone
+  /// in the spelling of the change. Some watched paths have a name in upper case too: a
+  /// watched path is the path that its caller gave, and an entry that a change makes at it
+  /// gets that name.
   ignore_case: bool,
+  /// The directory `/b` is another disk, with the other rule (`SimFs::set_mount`).
+  mount: bool,
   disk: DiskConfig,
   /// The shortest watched path, in names. With 3, the directories at the top only lead to
   /// watched paths, and a backend that watches whole trees does not watch them.
@@ -234,10 +238,16 @@ impl Config {
       steps,
       checks: if random.chance(50) { 2 } else { 0 },
       loose_spelling: random.chance(25),
-      ignore_case: random.chance(50),
+      ignore_case: random.chance(25),
+      mount: false,
     };
-    config.ignore_case &= config.loose_spelling;
+    config.mount = random.chance(15);
     config
+  }
+
+  /// Whether a part of the disk takes two spellings of a name for one.
+  fn folds(&self) -> bool {
+    self.ignore_case || self.mount
   }
 
   fn options(&self) -> Options {
@@ -658,8 +668,8 @@ struct Shared {
   /// Set by a change that only a poll can see with the prefix backend.
   moved_unseen: AtomicBool,
   watch_moves: bool,
-  /// `Config::ignore_case`.
-  ignore_case: bool,
+  /// `Config::folds`.
+  folds: bool,
   /// How many operations of the run were started.
   reached: AtomicUsize,
 }
@@ -683,12 +693,8 @@ impl Shared {
     let line = change();
     if let Some(before) = before {
       let after = ways(fs, &lock(&self.watched));
-      // On a disk that takes two spellings of a name for one, a directory can come back
-      // under another spelling, and a watch by path does not hear that: every move is one
-      // that only a poll can see.
       let moved = after.iter().any(|(path, (object, polled))| {
-        let unseen = |was_polled: &bool| *polled || *was_polled || self.ignore_case;
-        before.get(path).is_some_and(|(was, was_polled)| was != object && unseen(was_polled))
+        before.get(path).is_some_and(|(was, was_polled)| was != object && (*polled || *was_polled))
       });
       if moved {
         self.moved_unseen.store(true, Ordering::Relaxed);
@@ -712,7 +718,7 @@ fn change_disk(fs: &SimFs, change: &Disk, shared: &Shared) -> String {
     let (dir, name) = path.rsplit_once('/').unwrap_or(("", &path));
     let is_there =
       fs.read(&path).is_some() || fs.read_link(&path).is_some() || fs.dir_object(&path).is_some();
-    if shared.ignore_case && serial.is_multiple_of(3) && is_there {
+    if shared.folds && serial.is_multiple_of(3) && is_there {
       format!("{dir}/{}", name.to_ascii_uppercase())
     } else {
       path
@@ -827,6 +833,9 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     fs.set_reuse_inode_numbers(config.disk.reuse_inode_numbers);
     fs.set_listing_kinds(config.disk.listing_kinds);
     fs.set_ignore_case(config.ignore_case);
+    if config.mount {
+      fs.set_mount("b");
+    }
     Self {
       config: config.clone(),
       engine: Engine::new(backend, fs.clone(), config.options()),
@@ -970,8 +979,12 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
         }
         ToWatch::Bad(path) => ((*path).to_owned(), false),
       };
-      let text =
-        if valid && self.config.ignore_case { self.in_the_way_of_a_caller(&text) } else { text };
+      // Not with the backend that watches by path. A change at a watched path in upper case
+      // can give a directory at or above it another spelling, and such a watch does not hear
+      // that: a known hole (`docs/design.md` 9). The tests on the real disk cover watched
+      // paths in another spelling for FSEvents.
+      let respell = valid && self.config.folds() && !self.shared.watch_moves;
+      let text = if respell { self.in_the_way_of_a_caller(&text) } else { text };
       // A path that the filter ignores for both kinds does not become a watched path.
       let filter = self.config.filter;
       if valid && can_be_watched(&|path, kind| ignored(filter, path, kind), Path::new(&text)) {
@@ -1069,7 +1082,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     // whose `Delete` waits.
     let (filter, watched) = (self.config.filter, &self.watched);
     self.known.retain(|path, _| covered(filter, watched, path));
-    if self.config.ignore_case {
+    if self.config.folds() {
       // Where only the disk says whether a watched directory covers a name, the engine is
       // believed: it kept the answer of its last look, and `Engine::check_spellings` holds
       // that answer to the disk. A `Create` in the same call is for a file that was forgotten.
@@ -1467,7 +1480,7 @@ fn play(config: &Config, ops: &[Op]) -> Result<(), Failure> {
     serial: AtomicU64::new(0),
     moved_unseen: AtomicBool::new(false),
     watch_moves: config.backend == Target::Sim(Mode::Prefix),
-    ignore_case: config.ignore_case,
+    folds: config.folds(),
     reached: AtomicUsize::new(0),
   });
   QUIET_PANICS.set(true);

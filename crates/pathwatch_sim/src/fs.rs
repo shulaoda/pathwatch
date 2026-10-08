@@ -15,7 +15,7 @@ use pathwatch::{
   backend::{DirKey, Want},
   fs::{DirId, FileType, Fs, Meta},
 };
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::backend::{Act, Kernel, Mode, SimRaw, WatchCall, lost_notices};
 
@@ -52,6 +52,8 @@ impl SimFs {
       step: 1,
       listing_kinds: true,
       ignore_case: false,
+      mount: None,
+      other_rule: FxHashSet::default(),
       offline: None,
       calls: Calls::default(),
       watch_calls: Vec::new(),
@@ -306,6 +308,13 @@ impl SimFs {
     self.lock().ignore_case = ignore_case;
   }
 
+  /// Another disk is mounted at `/name`: a directory that is made there takes names the other
+  /// way than `set_ignore_case` says, and so does every directory that is made in it. Set it
+  /// before the directory is made.
+  pub fn set_mount(&self, name: &str) {
+    self.lock().mount = Some(name.into());
+  }
+
   /// The backend makes no more than this many OS watches.
   pub fn set_watch_limit(&self, limit: Option<usize>) {
     self.lock().kernel.limit = limit;
@@ -555,6 +564,10 @@ pub(crate) struct State {
   listing_kinds: bool,
   /// Names that differ only in the case of ASCII letters are one name.
   ignore_case: bool,
+  /// `SimFs::set_mount`.
+  mount: Option<OsString>,
+  /// The directories that take names the other way than `ignore_case` says.
+  other_rule: FxHashSet<u64>,
   /// Every read of the disk fails with this error.
   offline: Option<io::ErrorKind>,
   pub(crate) calls: Calls,
@@ -592,10 +605,10 @@ impl State {
   /// The entry `name` of the directory `dir`: the name as the disk spells it, and the inode.
   fn entry(&self, dir: u64, name: &OsStr) -> Option<(&OsString, u64)> {
     let entries = self.entries(dir).ok()?;
-    let found = if self.ignore_case {
-      entries.iter().find(|(spelled, _)| spelled.eq_ignore_ascii_case(name))
-    } else {
+    let found = if self.ignore_case == self.other_rule.contains(&dir) {
       entries.get_key_value(name)
+    } else {
+      entries.iter().find(|(spelled, _)| spelled.eq_ignore_ascii_case(name))
     };
     found.map(|(spelled, id)| (spelled, *id))
   }
@@ -701,6 +714,10 @@ impl State {
       self.next_number
     });
     let is_dir = matches!(content, Content::Dir(_));
+    let is_mount = dir == ROOT && self.mount.as_deref() == Some(name);
+    if is_dir && (is_mount || self.other_rule.contains(&dir)) {
+      self.other_rule.insert(id);
+    }
     let now = self.stamp();
     self.inodes.insert(
       id,
@@ -766,6 +783,7 @@ impl State {
     let is_dir = matches!(inode.content, Content::Dir(_));
     if is_dir {
       self.kernel.gone(id);
+      self.other_rule.remove(&id);
     }
     is_dir
   }

@@ -2,11 +2,11 @@
 
 use std::{collections::BTreeSet, iter, path::PathBuf, time::Instant};
 
-use super::Engine;
+use super::{Engine, check::swap_case};
 use crate::{
   backend::{Backend, DirKey, Want},
   fs::Fs,
-  tree::{Added, Fingerprint, Kind, Node, Tree, Watch},
+  tree::{Added, Fingerprint, Kind, Node, Spelling, Tree, Watch},
 };
 
 impl<B: Backend, F: Fs> Engine<B, F> {
@@ -58,14 +58,36 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// Checks `Node::is_unlisted` against the disk, when the tree has caught up with it. The
-  /// flag is an answer of the disk that the tree keeps: for a registered name in a complete
-  /// node whose entry is on the disk, it says whether the disk has the entry under another
-  /// name.
+  /// Checks `Node::is_unlisted` and `Spelling::Strict` against the disk, when the tree has caught
+  /// up with it. Both are answers of the disk that the tree keeps. The first says, for a
+  /// registered name in a complete node whose entry is on the disk, whether the disk has the
+  /// entry under another name. The second says that a directory tells two spellings of a
+  /// name apart: then no entry of it is found in the other case of its letters.
   pub fn check_spellings(&self) -> Result<(), String> {
     for (key, node) in self.tree.nodes() {
-      let in_complete = self.tree.parent(key).is_some_and(|parent| self.tree[parent].is_complete());
-      if !(self.options.loose_spelling && node.is_registered() && in_complete) {
+      if node.dir().is_some_and(|dir| dir.spelling == Spelling::Strict) {
+        for child in self.tree.children(key) {
+          let path = self.tree.path(child);
+          let other: Option<String> = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.chars().map(swap_case).collect());
+          let (Ok(meta), Some(other)) = (self.fs.lstat(&path), other) else { continue };
+          let folded = self.fs.lstat(&path.with_file_name(&other)).is_ok_and(|found| {
+            found.file_id == meta.file_id
+              && path.file_name().is_some_and(|name| name != other.as_str())
+          });
+          if folded {
+            return Err(format!(
+              "{}: the tree says strict, the disk finds {other}",
+              path.display()
+            ));
+          }
+        }
+      }
+      let Some(parent) = self.tree.parent(key) else { continue };
+      let in_complete = self.tree[parent].is_complete() && self.tree.is_loose(parent);
+      if !(node.is_registered() && in_complete) {
         continue;
       }
       let path = self.tree.path(key);

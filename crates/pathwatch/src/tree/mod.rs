@@ -195,12 +195,30 @@ pub struct Dir {
   pub has_error: bool,
   /// The node is queued for a scan.
   pub scan: Option<Depth>,
+  /// What the looks found out about the disk under this directory ([`Tree::is_loose`]).
+  pub spelling: Spelling,
+}
+
+/// Whether two spellings of a name are one name in a directory, as far as the looks at it
+/// found out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Spelling {
+  /// Nothing was found out yet. The directory counts as loose, and a listing is asked to
+  /// decide when a look cannot.
+  Unknown,
+  /// They are two names: a look proved it.
+  Strict,
+  /// They are one name: a look found one entry under both. Or nothing in the directory can
+  /// be tried.
+  Loose,
 }
 
 impl Dir {
   /// A directory that was just found. The backend was not asked yet.
   pub fn new(id: DirId, complete: bool) -> Self {
-    Self { id, complete, asked: None, watch: Watch::None, has_error: false, scan: None }
+    let (asked, scan) = (None, None);
+    let spelling = Spelling::Unknown;
+    Self { id, complete, asked, watch: Watch::None, has_error: false, scan, spelling }
   }
 
   /// Whether the timer has to look at the directory: no OS watch tells about it, or it had an
@@ -289,7 +307,7 @@ pub struct Tree {
   pub polled: Vec<DirKey>,
   /// Notifications were lost: everything has to be scanned. The engine says when.
   pub lost: bool,
-  /// The disk takes two spellings of a name for one (`Options::loose_spelling`).
+  /// Every disk takes two spellings of a name for one (`Options::loose_spelling`).
   pub loose_spelling: bool,
 }
 
@@ -822,13 +840,14 @@ impl Tree {
       let (child, has_other) = self.spellings(at, name);
       let below = child.map(|child| linked(&self.slots, child));
       let is_dir = below.is_some_and(Node::is_dir);
-      let is_complete = linked(&self.slots, at).is_complete();
+      let parent = linked(&self.slots, at);
+      let is_complete = parent.is_complete();
       // Whether a watched path sees an entry of this name in the directory.
       let is_seen = below.is_some_and(Node::is_registered) || is_complete;
       // The table found the other spellings of a plain name. It does not find those of any
       // other name: the registered ones are on a list, and a listing shows the others when
       // the name is not an entry that the directory is known to have.
-      let not_in_table = self.loose_spelling
+      let not_in_table = self.is_loose_dir(parent)
         && (!self.not_plain.is_empty() || (is_complete && !below.is_some_and(Node::is_entry)));
       if has_other || (not_in_table && !is_plain(name)) {
         found |= self.mark_others(at, name, child, &parts);
@@ -871,7 +890,7 @@ impl Tree {
     let mut found = false;
     let parent = linked(&self.slots, at);
     let is_entry = exact.is_some_and(|exact| linked(&self.slots, exact).is_entry());
-    if self.loose_spelling && parent.is_complete() && !is_entry && !is_plain(name) {
+    if self.is_loose_dir(parent) && parent.is_complete() && !is_entry && !is_plain(name) {
       // The name can be another spelling of each child that is not plain, and the table
       // says nothing about them: the names are compared with a listing.
       self.queue_scan(self.key(at), Depth::Names);
@@ -1024,12 +1043,16 @@ impl Tree {
   ///   the two names apart, the look finds what is at its own name. With loose spelling, a
   ///   name that is not plain can also be every registered child that is not plain: how the
   ///   disk folds their letters is not known here.
-  /// - With loose spelling, an entry of a complete node has one spelling on the disk, and
-  ///   the OS names an entry that is gone as the caller spelled it. So each child that
-  ///   differs only in the case of ASCII letters is meant. (For a name that is not plain,
-  ///   `mark_others` asks for a listing.)
+  /// - In a complete node, each child that differs only in the case of ASCII letters is
+  ///   meant. Where two spellings are one name, an entry has one of them on the disk, and
+  ///   the OS can name it in another one when it is gone. Where they are two names, this is
+  ///   one look at a file that did not change; and if the directory was taken for such a
+  ///   disk by mistake, this look is where the mistake shows (`Engine::other_spelling`).
+  ///   (For a name that is not plain, `mark_others` asks for a listing.)
   fn others_meant(&self, at: u32, name: &OsStr, exact: Option<u32>) -> Vec<u32> {
-    let any_child = self.loose_spelling && linked(&self.slots, at).is_complete();
+    let parent = linked(&self.slots, at);
+    let loose = self.is_loose_dir(parent);
+    let any_child = parent.is_complete();
     let is_meant = |&child: &u32| {
       let node = linked(&self.slots, child);
       Some(child) != exact
@@ -1039,7 +1062,7 @@ impl Tree {
     };
     if is_plain(name) {
       self.index.iter_hash(child_hash(at, name)).copied().filter(is_meant).collect()
-    } else if self.loose_spelling {
+    } else if loose {
       let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
       listed.iter().copied().filter(|&child| Some(child) != exact).collect()
     } else {
@@ -1047,20 +1070,68 @@ impl Tree {
     }
   }
 
+  /// Whether the directory at the node `key` counts as one where two spellings of a name are
+  /// one name. That is a matter of the disk under the directory, and one system has disks of
+  /// both kinds. Taking a strict disk for a loose one only costs looks, and the other way
+  /// round gives wrong events. So a directory counts as loose until a look proved that it is
+  /// strict (`Dir::spelling`), and with `loose_spelling` always. The proof is taken back when
+  /// a name comes that differs from a name of the directory only in the case of its letters,
+  /// and the disk has one entry for the two (`Engine::other_spelling`).
+  pub fn is_loose(&self, key: DirKey) -> bool {
+    self.is_loose_dir(&self[key])
+  }
+
+  fn is_loose_dir(&self, node: &Node) -> bool {
+    self.loose_spelling || !node.dir().is_some_and(|dir| dir.spelling == Spelling::Strict)
+  }
+
+  /// Whether the name of the node `key` has more than one spelling at all: it has an ASCII
+  /// letter, or it is not plain.
+  pub fn has_spellings(&self, key: DirKey) -> bool {
+    let name = self.name(key);
+    !is_plain(name) || name.as_encoded_bytes().iter().any(u8::is_ascii_alphabetic)
+  }
+
   /// Whether the tree cannot say that the node `key` has its name as the disk spells it, on a
-  /// disk that takes two spellings of a name for one: another node of the same directory has
-  /// the name in another case of its ASCII letters, so one of the two is not on the disk. Or
-  /// the name is not plain: then the table does not find such a node.
+  /// disk that takes two spellings of a name for one: another node of the same directory can
+  /// be the same name (`has_twin`), so one of the two is not on the disk. Or the name is not
+  /// plain: then the table does not find such a node.
   pub fn has_other_spelling(&self, key: DirKey) -> bool {
-    let Some(node) = self.get(key) else { return false };
-    let name = name_of(&self.names, node);
-    let is_other = |&other: &u32| {
+    !is_plain(self.name(key)) || self.has_twin(key)
+  }
+
+  /// Whether the table has another node of the same directory that can be the same name as
+  /// the node `key`.
+  pub fn has_twin(&self, key: DirKey) -> bool {
+    self.twins(key).next().is_some()
+  }
+
+  /// The same, for a name that differs only in the case of ASCII letters. That is what the
+  /// proof of a strict directory is about (`Spelling::Strict`).
+  pub fn has_case_twin(&self, key: DirKey) -> bool {
+    let name = self.name(key);
+    self
+      .twins(key)
+      .any(|twin| name_of(&self.names, linked(&self.slots, twin)).eq_ignore_ascii_case(name))
+  }
+
+  /// The nodes that `has_twin` speaks of, if they have a mark.
+  pub fn marked_twins(&self, key: DirKey) -> Vec<DirKey> {
+    let marked = self.twins(key).filter(|&twin| linked(&self.slots, twin).is_marked());
+    marked.map(|twin| self.key(twin)).collect()
+  }
+
+  fn twins(&self, key: DirKey) -> impl Iterator<Item = u32> + '_ {
+    let node = self.get(key);
+    let hash = node.map_or(0, |node| child_hash(node.parent, name_of(&self.names, node)));
+    self.index.iter_hash(hash).copied().filter(move |&other| {
       let other_node = linked(&self.slots, other);
-      other != key.index()
-        && other_node.parent == node.parent
-        && can_be_one_name(name_of(&self.names, other_node), name)
-    };
-    !is_plain(name) || self.index.iter_hash(child_hash(node.parent, name)).any(is_other)
+      node.is_some_and(|node| {
+        other != key.index()
+          && other_node.parent == node.parent
+          && can_be_one_name(name_of(&self.names, other_node), name_of(&self.names, node))
+      })
+    })
   }
 }
 

@@ -47,7 +47,8 @@ A path that does not exist is fine. A path that cannot be watched or read right 
 registered, the handler gets the error, and the path is polled.
 
 Not options: the delete delay is 100 ms, and with a native backend the poll of what the OS
-does not watch runs once a second. `Config` turns `loose_spelling` on for macOS and Windows
+does not watch runs once a second. `Config` turns `loose_spelling` on for macOS and Windows:
+there every disk takes two spellings of a name for one. Elsewhere each directory is asked
 (5.2).
 
 ## 3. The contract
@@ -248,8 +249,8 @@ Two marks for one node become one. `Lost` sets a flag: the next flush that the p
 A hint that was dropped moves nothing.
 
 **Another spelling.** The usual disks of macOS and Windows find `App.js` when the entry is
-`app.js`, and the same for two Unicode forms of a name. `Config` says so for these two
-systems (`Options::loose_spelling`). One rule decides everything here:
+`app.js`, and the same for two Unicode forms of a name. Such a disk is called loose here, and
+one that tells the two apart strict. One rule decides everything here:
 
 > pathwatch reports what a program would see that asks the OS about each watched path by
 > itself, again and again: `lstat` for a watched file, the listing for a watched directory.
@@ -279,7 +280,63 @@ Three facts are behind the mechanics, the first two measured with FSEvents on AP
 - The OS names an entry that is gone (removed, or renamed away) as the caller spelled it.
 - `lstat` finds an entry under every spelling of its name. The disk can say how it spells the
   name of one entry (`Fs::name_on_disk`: `getattrlist` on macOS, 2 µs; `FindFirstFileW` on
-  Windows), and a listing names each entry in that one way.
+  Windows; the listing of the directory on Linux, which has no such call), and a listing
+  names each entry in that one way.
+
+**Which directory is loose** (`Tree::is_loose`). That is a matter of the disk under the
+directory, not of the system: a Linux machine has its own strict disk and, next to it, a
+folder of a Mac (measured with OrbStack: `lstat` finds `APP.JS` for `app.js`, and no flag
+says so), a FAT or SMB disk, or a directory with the casefold flag. The two mistakes are not
+alike. A strict disk that is taken for a loose one costs looks, and the events are right. A
+loose disk that is taken for a strict one gives wrong events. Measured with the Linux build
+on that folder, before this rule: a write through another spelling gave a `Create` for a
+name that the disk does not have, a removal through another spelling gave nothing, and a
+rename that changed only the case left the old name behind, with polling too. So:
+
+- With `Options::loose_spelling` (macOS, Windows) every directory is loose, and no disk is
+  asked. A case-sensitive APFS volume still takes two Unicode forms of a name for one
+  (measured), so what `pathconf` says about the case proves nothing.
+- Without it, each directory has an answer of its own (`Dir::spelling`): nothing is known
+  at first, and the directory counts as loose; then the looks find out that it is strict, or
+  that it is loose.
+- The proof (`Engine::tells_spellings_apart`): an entry is tried in the other case of its
+  ASCII letters. The same entry is there: loose. Nothing is there, or another inode, and a
+  third look finds the entry itself as it was: strict. The third look is there so that a
+  change of the disk between the first two does not pass for a proof.
+- The entry that is tried must be there, and `lstat` alone does not say that. Measured on
+  the shared folder: after a rename away through another spelling, Linux still finds the
+  old name with `lstat` (its kernel keeps what it knew about each spelling), and nothing in
+  the other case, as on a strict disk. So two things can make the proof. A look at a new
+  name with no second spelling in the tree (`Engine::other_spelling`): such a name is there
+  because something made it. That is the first new file of a watched directory, and it
+  costs two looks and no listing. And a listing: each listing of a directory whose nodes
+  the tree knows tries one of the names that it gave (`Engine::ask_for_the_rule`). A look
+  that is not sure, cannot tell, and finds nothing known asks for such a listing, once.
+  The first listing of a directory tries nothing: watching a tree costs no call more than
+  before.
+- A proof is taken back. By such a listing, when the other spelling finds the very entry:
+  the directory can be another one by now, which the tree cannot tell from the old one (the
+  same inode number, no birth time). And by a look: in a strict directory a look asks the
+  disk for the name when the tree has a second name in another case of its ASCII letters
+  (`Tree::has_case_twin`). That is how a loose disk shows to an engine that takes it for a
+  strict one (a write through another spelling, a rename of the case). If the disk gives
+  another name, the directory is loose, and its names are compared with one listing: the
+  looks before took it for a strict one.
+- A directory that is replaced by another one (another id) starts again.
+
+A second name is evidence only while its node is there. So when a look leaves nothing at a
+name (the filter ignores it, or it is gone) and the node goes, the marked nodes that can be
+the same name are looked at first, as names that no listing gave (`Engine::check`). The order
+of two looks in one flush must not decide.
+
+On a strict disk this costs two looks, once for each watched directory, at its first new
+file; or one listing and three looks, when the first look that is not sure is at a known name
+that is not plain. Each later listing costs two looks. A name with a real twin (`Makefile`
+next to `makefile`) costs a question at each of its looks. A directory in which no name has
+an ASCII letter cannot be proved: a name of it that is not plain costs a question at each
+look. On Linux a question for a name is a listing (1.8 ms for 2,000 entries of the shared
+folder). In a loose directory it is asked for a new name and for a name with a twin, not for
+the edit of a file that the tree knows.
 
 **A hint is for every name that it can mean** (`Tree::others_meant`). The walk of step 4
 follows the child with the very name of the hint, and also
@@ -288,8 +345,10 @@ follows the child with the very name of the hint, and also
   in the case of ASCII letters: where the disk tells the two apart, the look finds what is at
   its own name, and an engine that takes a loose disk for a strict one (a folder that Linux
   shares with macOS) still follows its watched paths;
-- with loose spelling, in a complete directory, each child that can be the same name: an
-  entry has one spelling there, and the OS can name it in another one when it is gone.
+- in a complete directory, each child that differs only in the case of ASCII letters. In a
+  loose directory an entry has one spelling, and the OS can name it in another one when it
+  is gone. In a strict one this is one look at a file that did not change, and it is where
+  a wrong proof shows.
 
 The walk goes on below each of them when the hint has more names, and the marks at the end
 are deep. If no child can be the name, the hint costs no look at the disk.
@@ -304,17 +363,20 @@ be one name.
 A plain name is found through the table: its hash leaves out the case of ASCII letters
 (`child_hash`), so the children that differ only in that are filed under one hash. Such a
 hint costs one lookup more, however many children the directory has: 18 ns next to 20,000
-registered ones, where comparing with each child took 53 µs. The registered names that are
-not plain are on a list for each directory (`Tree::not_plain`), and a hint with such a name
-marks all of them: one look for each. The other children of a complete directory are on no
-list, and there can be many. So when a hint names a name that is not plain, and the tree does
+registered ones, where comparing with each child took 53 µs. The rest is for loose
+directories only. The registered names that are not plain are on a list for each directory
+(`Tree::not_plain`), and a hint with such a name marks all of them: one look for each. The
+other children of a complete directory are on no list, and there can be many. So when a hint
+names a name that is not plain, and the tree does
 not have it as an entry (`Node::is_entry`), the flush compares the names of the directory
 with one listing (`Depth::Names`): a node that the listing names is not looked at, and one
 that it does not name is. An edit of a file that the tree knows costs no listing.
 
 **A look asks for the spelling when it is not sure** (`Engine::spelling_is_unsure`). In a
-partial directory a look asks nothing: a registered name is whatever `lstat` finds. In a
-complete directory, a look that found an entry asks the disk for the name of that entry when
+partial directory a look asks nothing: a registered name is whatever `lstat` finds. A name
+with one spelling only is never asked about: one with no ASCII letter that is plain
+(`Tree::has_spellings`). In a complete directory that is loose, a look that found an entry
+asks the disk for the name of that entry when
 
 - the node was no entry of the directory at the last look (`Node::is_entry`): the tree had
   nothing there, the node is held, or the directory had the entry under another name. Such a
@@ -1192,6 +1254,18 @@ uses polling).
 
 Known holes of the engine:
 
+- macOS: a directory above a watched path is renamed to another case of its letters, and in
+  the same second an entry comes or goes directly in it. A stream of FSEvents does not
+  follow the new spelling, and it says nothing about a directory above its path (measured).
+  The poll finds such a rename by the change time that moved alone (5.10), and here the
+  modification time moved too. Nothing below that directory is heard any more. The same
+  when the directory is removed and made again in another case, and the new one has the
+  inode number of the old one. (The fuzzer keeps watched paths in upper case away from the
+  backend that watches by path for this reason.)
+- Linux: a disk that takes two Unicode forms of a name for one and tells the case of letters
+  apart (a case-sensitive volume of a Mac in a Linux machine) is proved strict. And a
+  casefold flag that is changed on a watched directory while it is empty is noticed only at
+  the next listing of that directory.
 - A hint with a plain name never finds a registered name that is not plain, and the other
   way round (5.2). APFS takes a few characters for plain ones (measured): `ß` for `ss`, the
   long s for `s`, the Kelvin sign for `k`, a ligature like `ﬁ` for its letters, and each of

@@ -5,12 +5,12 @@ use std::path::PathBuf;
 
 use super::{
   Engine,
-  check::{Found, Listed, is_missing},
+  check::{Found, Listed, is_missing, swap_case},
 };
 use crate::{
   backend::{Backend, DirKey},
   fs::{DirId, Fs},
-  tree::{Depth, Dir, Kind, Mark, Watch},
+  tree::{Depth, Dir, Kind, Mark, Spelling, Watch},
 };
 
 /// One node to check in a scan, with what the listing said about it.
@@ -35,6 +35,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.tree.frozen(key) {
       return;
     }
+    // The names were to be compared because the directory counted as loose. A look proved
+    // meanwhile that it is strict: there is nothing to compare.
+    if depth == Depth::Names && !self.tree.is_loose(key) {
+      return;
+    }
     self.tree.path_into(key, path);
     self.scan_had_error = false;
     names.clear();
@@ -46,9 +51,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if listing == Listing::Stop {
       return;
     }
-    // With loose spelling, a listing of the whole directory tells how the disk spells each
-    // name: a node of the tree is one of them, or the disk has no entry under its name.
-    let names_are_known = listing == Listing::Whole && self.options.loose_spelling;
+    // The listing kept the names of the known nodes if the directory counted as loose.
+    let kept_names = self.tree.is_loose(key);
+    if listing == Listing::Whole && known > 0 && !self.options.loose_spelling {
+      self.ask_for_the_rule(key, path, names);
+    }
+    // In a directory that counts as loose, a listing of all of it tells how the disk spells
+    // each name: a node of the tree is one of them, or the disk has no entry under its name.
+    let names_are_known = listing == Listing::Whole && kept_names;
     let names_only = depth == Depth::Names && names_are_known;
 
     let why = if depth == Depth::Deep { Mark::DEEP } else { Mark::default() };
@@ -76,20 +86,19 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Lists the directory `key` and adds to `names` a new node for each entry that the tree
   /// does not know yet. The check of such a node frees it again if the entry does not count.
-  /// With loose spelling, `Engine::listed` gets every node that the listing named.
+  /// In a directory that counts as loose, `Engine::listed` gets every node that the tree
+  /// knew and that the listing named.
   fn list_new(&mut self, key: DirKey, path: &mut PathBuf, names: &mut Vec<ScanEntry>) -> Listing {
     let known = names.len();
     let tree = &mut self.tree;
-    let mut listed = self.options.loose_spelling.then_some(&mut self.listed);
-    let result = self.fs.read_dir(path, &mut |name, kind| {
-      let node = tree.child(key, name).unwrap_or_else(|| {
-        let new = tree.insert_child(key, name);
-        names.push((new, Listed::Named(kind)));
-        new
-      });
-      if let Some(listed) = &mut listed {
-        listed.insert(node);
+    let mut listed = tree.is_loose(key).then_some(&mut self.listed);
+    let result = self.fs.read_dir(path, &mut |name, kind| match tree.child(key, name) {
+      Some(node) => {
+        if let Some(listed) = &mut listed {
+          listed.insert(node);
+        }
       }
+      None => names.push((tree.insert_child(key, name), Listed::Named(kind))),
     });
     let Err(error) = result else { return Listing::Whole };
 
@@ -111,6 +120,53 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     // Permission denied: nothing in here can be read, so every node is checked as missing.
     Listing::None
+  }
+
+  /// Asks the disk whether the directory `key`, which was just listed, tells two spellings of
+  /// a name apart (`Tree::is_loose`), with one of its names in the other case of its letters.
+  /// The listing gave the name, so its entry is there. (`lstat` alone can find a name that is
+  /// gone: see `other_spelling`.)
+  ///
+  /// A directory that was proved strict is strict no more if that other spelling finds the
+  /// very entry: the directory can be another one by now, with the same id.
+  fn ask_for_the_rule(&mut self, key: DirKey, path: &mut PathBuf, names: &[ScanEntry]) {
+    let was_strict = !self.tree.is_loose(key);
+    let swap = |name: &str| -> Option<String> {
+      let has_letter = name.bytes().any(|byte| byte.is_ascii_alphabetic());
+      has_letter.then(|| name.chars().map(swap_case).collect())
+    };
+    // A name that the listing gave, with no second name in the tree that can be the same
+    // name. A listing of a strict directory keeps no names: there every child is tried.
+    let is_listed = |&&(child, listed): &&ScanEntry| {
+      let named = was_strict || matches!(listed, Listed::Named(_)) || self.listed.contains(&child);
+      named && !self.tree.has_twin(child)
+    };
+    let tried = names.iter().filter(is_listed).find_map(|&(child, _)| {
+      let name = self.tree.name(child);
+      Some((name.to_owned(), name.to_str().and_then(swap)?))
+    });
+    let Some((name, other)) = tried else {
+      // No name to try: the looks must not ask for a listing again and again.
+      if !was_strict {
+        self.set_spelling(key, Spelling::Loose);
+      }
+      return;
+    };
+    path.push(&name);
+    let found = match self.fs.lstat(path) {
+      Ok(entry) if was_strict => {
+        let other = self.fs.lstat(&path.with_file_name(other));
+        other.is_ok_and(|other| other.file_id == entry.file_id).then_some(false)
+      }
+      Ok(entry) => self.tells_spellings_apart(path, &entry),
+      Err(_) => None,
+    };
+    path.pop();
+    match found {
+      Some(true) => self.set_spelling(key, Spelling::Strict),
+      Some(false) => self.set_spelling(key, Spelling::Loose),
+      None => {}
+    }
   }
 
   /// The directory `key` is gone. Its parent finds out what is at its path now.

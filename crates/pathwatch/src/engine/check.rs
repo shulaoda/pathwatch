@@ -2,9 +2,9 @@
 //! changes the node. The `match` in `apply` is the heart of the engine.
 
 use std::{
-  ffi::OsString,
+  ffi::{OsStr, OsString},
   hash::{Hash, Hasher},
-  io,
+  io, mem,
   path::{Path, PathBuf},
   time::{Duration, SystemTime},
 };
@@ -17,7 +17,7 @@ use crate::{
   config::EntryKind,
   error::ErrorKind,
   fs::{DirId, FileType, Fs, Meta},
-  tree::{Added, Content, Depth, DirTimes, Fingerprint, Kind, Mark, Tree, Watch},
+  tree::{Added, Content, Depth, DirTimes, Fingerprint, Kind, Mark, Spelling, Tree, Watch},
 };
 
 /// How long a file is young: two writes inside this time can leave the same modification time.
@@ -109,7 +109,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // A registered name with a file or nothing at it makes its directory want the contents: a
     // file can come there, or a directory with all that is below it at once.
     let wants_more = below_names_only && !self.tree[key].is_dir();
+    // The node goes if nothing is at it and nothing needs it. A marked node that can be the
+    // same name was unsure of its spelling because the tree had this one too
+    // (`Tree::has_twin`): its look must not come after this node is gone.
+    let can_go = !registered && matches!(self.tree[key].kind, Kind::Missing);
+    let twins = if can_go { self.tree.marked_twins(key) } else { Vec::new() };
     self.tree.prune(key);
+    let twins = if self.tree.get(key).is_none() { twins } else { Vec::new() };
     // `pop` does not take a top directory (`/`, `C:\\`) away.
     if !path.pop() {
       path.clear();
@@ -126,6 +132,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     {
       let node = self.tree.insert_child(parent, &name);
       self.check(node, path, Listed::NotAsked, Mark::DEEP);
+    }
+    for twin in twins {
+      if let Some(mark) = self.tree.take_mark(twin) {
+        self.check(twin, path, Listed::NotNamed, mark);
+      }
     }
   }
 
@@ -173,7 +184,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         if id != old
           && let Some(dir) = self.tree[key].dir_mut()
         {
-          dir.id = id;
+          // Another directory, and maybe on another disk.
+          (dir.id, dir.spelling) = (id, Spelling::Unknown);
         }
         if complete && !was_complete {
           self.make_complete(key, relinked);
@@ -213,6 +225,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let node = &self.tree[key];
     let (registered, is_ancestor, is_path) =
       (node.is_registered(), node.is_ancestor(), node.is_path());
+    let is_new = matches!(listed, Listed::NotAsked) && matches!(node.kind, Kind::Missing);
     let in_complete = self.tree[parent].is_complete();
 
     if !registered {
@@ -233,7 +246,15 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       Ok(meta) => meta,
       Err(error) => return self.disk_error(parent, path, error),
     };
-    let unsure = self.options.loose_spelling && in_complete && self.spelling_is_unsure(key, listed);
+    // In a directory that was proved strict, only a second name in another case of its
+    // letters puts the proof in doubt: one that the tree has now, or one that it had when
+    // this look was asked for (`check` gives `NotNamed` then).
+    let unsure = in_complete
+      && if self.tree.is_loose(parent) {
+        self.spelling_is_unsure(key, listed)
+      } else {
+        self.tree.has_case_twin(key) || matches!(listed, Listed::NotNamed)
+      };
     // A registered name is the path that its caller gave. It is also an entry of the complete
     // directory above only if that directory lists it under this very name. That is asked
     // about the entry itself, so before a link is followed.
@@ -241,7 +262,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut relinked = false;
     if registered {
       if unsure {
-        other = match self.other_spelling(key, path) {
+        other = match self.other_spelling(parent, key, path, &meta, is_new) {
           Ok(other) => other,
           Err(error) => return self.disk_error(parent, path, error),
         };
@@ -287,7 +308,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // A name that is not registered is asked after the filter: an ignored entry costs no
     // question.
     if !registered && unsure {
-      match self.other_spelling(key, path) {
+      match self.other_spelling(parent, key, path, &meta, is_new) {
         Ok(None) => {}
         Ok(Some(name)) => return Found::OtherSpelling(name),
         Err(error) => return self.disk_error(parent, path, error),
@@ -297,32 +318,104 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// The name that the disk has for the entry at `path`, when it is not the name of the node
-  /// `key`.
-  fn other_spelling(&self, key: DirKey, path: &Path) -> io::Result<Option<OsString>> {
+  /// `key`. `meta` is what `lstat` found there. `is_new`: the tree had nothing at the name,
+  /// and no listing was asked about it.
+  ///
+  /// Where a directory can be strict, the look tries to find that out first
+  /// (`Tree::is_loose`). Only a look at a new name with no second spelling in the tree can:
+  /// such a name is there because something made it. A name that the tree knew can be there
+  /// for `lstat` alone. Measured on a folder that a Mac shares with Linux: after a rename
+  /// away through another spelling, `lstat` still finds the old name, and nothing in the
+  /// other case, as on a strict disk. When this look cannot tell and nothing is known, a
+  /// listing of the directory is asked (`ask_for_the_rule`).
+  fn other_spelling(
+    &mut self,
+    parent: DirKey,
+    key: DirKey,
+    path: &Path,
+    meta: &Meta,
+    is_new: bool,
+  ) -> io::Result<Option<OsString>> {
+    let can_be_strict = !self.options.loose_spelling;
+    if can_be_strict {
+      let can_tell = is_new && !self.tree.has_twin(key);
+      match can_tell.then(|| self.tells_spellings_apart(path, meta)).flatten() {
+        Some(true) => {
+          self.set_spelling(parent, Spelling::Strict);
+          return Ok(None);
+        }
+        Some(false) => self.set_spelling(parent, Spelling::Loose),
+        None if self.tree[parent].dir().is_some_and(|dir| dir.spelling == Spelling::Unknown) => {
+          self.tree.queue_scan(parent, Depth::Names);
+        }
+        None => {}
+      }
+    }
     let name = self.fs.name_on_disk(path)?;
-    Ok(Some(name).filter(|name| name != self.tree.name(key)))
+    let other = Some(name).filter(|name| name != self.tree.name(key));
+    if can_be_strict && other.is_some() {
+      self.set_spelling(parent, Spelling::Loose);
+    }
+    Ok(other)
+  }
+
+  /// Keeps what a look found out about the directory `dir`. When a proof is taken back, the
+  /// looks before this one took the disk for a strict one: the names of the directory are
+  /// compared with one listing.
+  pub(super) fn set_spelling(&mut self, dir: DirKey, spelling: Spelling) {
+    let Some(kept) = self.tree[dir].dir_mut() else { return };
+    let was = mem::replace(&mut kept.spelling, spelling);
+    if was == Spelling::Strict && spelling == Spelling::Loose {
+      self.tree.queue_scan(dir, Depth::Names);
+    }
+  }
+
+  /// Whether the directory of `path` tells two spellings of a name apart. `meta` is the entry
+  /// at `path`. The name of that entry is tried with the other case of its ASCII letters.
+  /// `Some(false)`: the same entry is there. `Some(true)`: no entry, or another one, and the
+  /// entry at `path` is still as it was at one more look (a change of the disk between the
+  /// looks must not pass for a proof). `None`: nothing could be tried, or the disk changed.
+  pub(super) fn tells_spellings_apart(&self, path: &Path, meta: &Meta) -> Option<bool> {
+    let name = path.file_name().and_then(OsStr::to_str)?;
+    if !name.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+      return None;
+    }
+    let other: String = name.chars().map(swap_case).collect();
+    match self.fs.lstat(&path.with_file_name(other)) {
+      Ok(found) if found.file_id == meta.file_id => return Some(false),
+      Ok(_) => {}
+      Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+      Err(_) => return None,
+    }
+    let same = |again: Meta| {
+      (again.kind, again.file_id, again.modified, again.changed, again.size)
+        == (meta.kind, meta.file_id, meta.modified, meta.changed, meta.size)
+    };
+    self.fs.lstat(path).is_ok_and(same).then_some(true)
   }
 
   /// Whether the disk has to say how it spells the name of the node `key`, where `lstat` just
-  /// found an entry in a complete directory, on a disk with loose spelling.
+  /// found an entry in a complete directory that counts as loose (`Tree::is_loose`).
   ///
   /// On such a disk `lstat` finds an entry under every spelling of its name, and the OS names
   /// an entry that is gone as the caller spelled it. So an entry that was found is under this
   /// name only if the disk spells it so, and that is not sure for a name that was no entry
   /// of the directory at the last look (`Node::is_entry`), and while the tree has two
   /// spellings of the name. A listing names an entry as the disk spells it: a node that it
-  /// named is sure, and one that it did not name is not.
+  /// named is sure, and one that it did not name is not. A name with one spelling only
+  /// (`Tree::has_spellings`) is always sure.
   ///
   /// An entry of the directory that is spelled in another way is not there under this name
   /// (`Found::OtherSpelling`). A registered name is the path of its caller and is there all
   /// the same, but then the directory above does not cover it (`Node::is_unlisted`).
   fn spelling_is_unsure(&self, key: DirKey, listed: Listed) -> bool {
     let node = &self.tree[key];
-    match listed {
-      Listed::Named(_) => false,
-      Listed::NotNamed => true,
-      Listed::NotAsked => !node.is_entry() || self.tree.has_other_spelling(key),
-    }
+    let was_entry = match listed {
+      Listed::Named(_) => return false,
+      Listed::NotNamed => false,
+      Listed::NotAsked => node.is_entry(),
+    };
+    self.tree.has_spellings(key) && (!was_entry || self.tree.has_other_spelling(key))
   }
 
   /// A number for the real path behind the link at `path`.
@@ -474,6 +567,15 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let watch = self.tree.parent(key).map_or(Watch::None, |parent| self.tree[parent].watch());
     !matches!(watch, Watch::Watched | Watch::WatchedTree | Watch::FromAbove)
       || self.tree.link(key).is_some()
+  }
+}
+
+/// The letter in the other case, if it is an ASCII letter.
+pub(super) fn swap_case(letter: char) -> char {
+  if letter.is_ascii_lowercase() {
+    letter.to_ascii_uppercase()
+  } else {
+    letter.to_ascii_lowercase()
   }
 }
 

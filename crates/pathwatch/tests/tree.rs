@@ -13,7 +13,7 @@ use std::{
 use pathwatch::{
   backend::{DirKey, Hint, Want},
   fs::DirId,
-  tree::{Content, Depth, Dir, DirTimes, Fingerprint, Kind, Mark, Tree, Watch},
+  tree::{Content, Depth, Dir, DirTimes, Fingerprint, Kind, Mark, Spelling, Tree, Watch},
 };
 
 fn child(tree: &mut Tree, parent: DirKey, name: &str) -> DirKey {
@@ -564,15 +564,18 @@ fn a_name_that_can_be_another_spelling() {
   assert!(f.tree.hint(changed(f.p, "R/sub/a.js", true)));
   assert_eq!(marks(&f.tree), ["/p/r/sub|a.js|d"]);
   clear_marks(&mut f.tree);
-  // A name with an accent is no other spelling of anything on a strict disk.
+  // A name with an accent is no other spelling of anything in a directory that a look proved
+  // strict. A directory with no such proof counts as loose.
+  f.tree[f.p].dir_mut().unwrap().spelling = Spelling::Strict;
+  assert!(!f.tree.is_loose(f.p) && f.tree.is_loose(f.r));
   let accent = child(&mut f.tree, f.p, "\u{e9}.js");
   assert!(f.tree.make_path(accent));
   assert!(!f.tree.hint(changed(f.p, "\u{c9}.js", true)));
   assert!(!f.tree.has_work());
 
   f.tree.loose_spelling = true;
-  // With loose spelling it can be every registered name that is not plain. A name of
-  // ideographs is plain: it is only itself.
+  // With loose spelling no directory is strict. The name can be every registered name that
+  // is not plain. A name of ideographs is plain: it is only itself.
   assert!(f.tree.hint(changed(f.p, "\u{c9}.js", true)));
   assert!(f.tree.hint(changed(f.p, "\u{444}", false)));
   assert!(!f.tree.hint(changed(f.p, "\u{4e2d}", false)));

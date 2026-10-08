@@ -61,8 +61,9 @@ pub struct Options {
   pub delete_delay: Duration,
   /// The shortest time between two polls of what no OS watch covers.
   pub poll_interval: Duration,
-  /// The disk takes two spellings of a name for one: another case of the letters, or another
-  /// Unicode form (the usual disks of macOS and Windows).
+  /// Every disk takes two spellings of a name for one: another Unicode form at least (macOS
+  /// and Windows). Without it, a directory counts as such a disk until a look proves that it
+  /// tells two spellings apart (`Tree::is_loose`).
   pub loose_spelling: bool,
 }
 

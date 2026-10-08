@@ -6,7 +6,9 @@
 
 #![cfg(unix)]
 
-use pathwatch::engine::Options;
+use std::sync::Arc;
+
+use pathwatch::engine::{Ignored, Options};
 use pathwatch_sim::{
   Driver, Mode, NONE, RECURSIVE, caught_up, on_all, on_modes, settled, taken, window,
 };
@@ -298,6 +300,158 @@ fn watched_paths_through_another_spelling_of_a_directory_inside_a_watched_direct
   });
 }
 
+// ---- the rule belongs to the directory ----
+//
+// Whether two spellings are one name is a matter of the disk under a directory, and one system
+// has disks of both kinds: a Linux machine with a folder of a Mac in it. Taking a strict disk
+// for a loose one only costs looks, and the other way round gives wrong events. So a directory
+// counts as loose until a look proves that it is strict.
+
+/// The first new name of a watched directory is looked at in the other case of its letters
+/// too, and then once more as it is. On a disk that tells the two apart, that is the proof: no
+/// later look in this directory asks anything. Only a second name in another case of its
+/// letters puts the proof in doubt: then the disk is asked for the name.
+#[test]
+fn a_directory_proves_that_it_is_strict() {
+  let mut d = Driver::sim(Mode::Inode, Options::default());
+  d.fs.mkdir_all("/p/R").unwrap();
+  d.fs.write("/p/R/app.js", "1").unwrap();
+  d.watch(&["/p/R"]);
+  // The looks, the listings and the questions for a name so far.
+  let calls = |d: &Driver<_>| {
+    let calls = d.fs.calls();
+    (calls.lstat, calls.read_dir, calls.name_on_disk)
+  };
+  let (looks, listings, _) = calls(&d);
+
+  d.fs.write("/p/R/new.js", "1").unwrap();
+  assert_eq!(window(&mut d), ["C /p/R/new.js"]);
+  assert_eq!(calls(&d), (looks + 3, listings, 0));
+
+  // Also a name with a letter outside ASCII costs one look now.
+  d.fs.write("/p/R/caf\u{e9}.js", "1").unwrap();
+  d.fs.write("/p/R/app.js", "22").unwrap();
+  assert_eq!(window(&mut d), ["U /p/R/app.js", "C /p/R/caf\u{e9}.js"]);
+  assert_eq!(calls(&d), (looks + 5, listings, 0));
+
+  // `APP.js` next to `app.js`: both names are looked at, and each look asks the disk for its
+  // name. Both are entries, so the proof stands.
+  d.fs.write("/p/R/APP.js", "1").unwrap();
+  assert_eq!(window(&mut d), ["C /p/R/APP.js"]);
+  assert_eq!(calls(&d), (looks + 7, listings, 2));
+  caught_up(&mut d);
+}
+
+/// Names that the proof cannot be made with, on a strict disk. `Привет` and `привет` are two
+/// files there, with one hash in the tree, and no ASCII letter to try in another case. The
+/// look at one of them asks the disk for the name, once, and asks for a listing: that makes
+/// the proof with another name of the directory. The proof is about ASCII letters, so such a
+/// pair never puts it in doubt.
+#[test]
+fn names_with_no_ascii_letter_on_a_strict_disk() {
+  let mut d = Driver::sim(Mode::Inode, Options::default());
+  d.fs.mkdir_all("/p/R").unwrap();
+  for name in [
+    "app.js",
+    "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}",
+    "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}",
+  ] {
+    d.fs.write(format!("/p/R/{name}"), "1").unwrap();
+  }
+  d.watch(&["/p/R"]);
+  let calls = |d: &Driver<_>| {
+    let calls = d.fs.calls();
+    (calls.lstat, calls.read_dir, calls.name_on_disk)
+  };
+  let (looks, listings, _) = calls(&d);
+
+  // The look at the name, and three for the proof with `app.js`.
+  d.fs.write("/p/R/\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}", "22").unwrap();
+  assert_eq!(window(&mut d), ["U /p/R/\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}"]);
+  assert_eq!(calls(&d), (looks + 4, listings + 1, 1));
+  d.fs.write("/p/R/\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}", "333").unwrap();
+  assert_eq!(window(&mut d), ["U /p/R/\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}"]);
+  assert_eq!(calls(&d), (looks + 5, listings + 1, 1));
+  caught_up(&mut d);
+}
+
+/// The first new name of a directory has a letter outside ASCII. The hint asks for a listing
+/// of the names, because the directory counts as loose. The look at the name proves that it
+/// is strict, and then there is nothing to compare: the many names in it cost nothing.
+#[test]
+fn the_first_new_name_is_not_plain() {
+  let mut d = Driver::sim(Mode::Inode, Options::default());
+  d.fs.mkdir_all("/p/R").unwrap();
+  for file in 0..50 {
+    d.fs.write(format!("/p/R/f{file}.js"), "1").unwrap();
+  }
+  d.watch(&["/p/R"]);
+  let before = d.fs.calls();
+  d.fs.write("/p/R/caf\u{e9}.js", "1").unwrap();
+  assert_eq!(window(&mut d), ["C /p/R/caf\u{e9}.js"]);
+  let after = d.fs.calls();
+  assert_eq!((after.lstat - before.lstat, after.read_dir - before.read_dir), (3, 0));
+  assert_eq!(after.name_on_disk, 0);
+  caught_up(&mut d);
+}
+
+/// A directory that was proved strict is replaced by one from a loose disk, and the tree
+/// cannot tell the two apart (the new one got the inode number of the old one). Each listing
+/// of a directory whose nodes the tree knows asks for the rule again.
+#[test]
+fn a_strict_directory_is_replaced_by_a_loose_one() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().set_reuse_inode_numbers(true);
+    d.fs().set_mount("mnt");
+    d.fs().mkdir_all("/p/R").unwrap();
+    d.fs().mkdir_all("/mnt").unwrap();
+    d.fs().write("/p/R/app.js", "1").unwrap();
+    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
+    d.fs().write("/p/R/new.js", "1").unwrap();
+    assert_eq!(d.settled(), ["C /p/R/new.js"], "{on}");
+
+    d.fs().rename("/p/R", "/p/old").unwrap();
+    d.fs().remove_all("/p/old").unwrap();
+    d.fs().mkdir("/mnt/y").unwrap();
+    d.fs().write("/mnt/y/app.js", "22").unwrap();
+    d.fs().write("/mnt/y/new.js", "22").unwrap();
+    d.fs().rename("/mnt/y", "/p/R").unwrap();
+    d.settled();
+    d.fs().rename("/p/R/app.js", "/p/R/App.js").unwrap();
+    assert_eq!(d.settled(), ["C /p/R/App.js", "D /p/R/app.js"], "{on}");
+    d.caught_up();
+  });
+}
+
+/// One tree with both kinds of disk: `/mnt` takes two spellings of a name for one, and the
+/// rest does not. The engine is told nothing about it.
+#[test]
+fn a_loose_disk_inside_a_strict_one() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().set_mount("mnt");
+    for dir in ["/p/R", "/mnt/R"] {
+      d.fs().mkdir_all(dir).unwrap();
+      d.fs().write(format!("{dir}/app.js"), "1").unwrap();
+      d.fs().write(format!("{dir}/Other.js"), "1").unwrap();
+    }
+    assert_eq!(d.watch(&["/p/R", "/mnt/R", "/mnt/R/APP.JS"]), NONE, "{on}");
+    assert_eq!(d.known().len(), 5, "{on}");
+
+    // On the strict disk the other case is another file, or nothing.
+    d.fs().write("/p/R/App.js", "1").unwrap();
+    assert!(d.fs().remove("/p/R/OTHER.JS").is_err(), "{on}");
+    assert_eq!(d.settled(), ["C /p/R/App.js"], "{on}");
+
+    // On the loose disk it is the same file.
+    d.fs().write("/mnt/R/App.js", "22").unwrap();
+    d.fs().remove("/mnt/R/OTHER.JS").unwrap();
+    assert_eq!(d.settled(), ["U /mnt/R/APP.JS", "U /mnt/R/app.js", "D /mnt/R/Other.js"], "{on}");
+    d.fs().rename("/mnt/R/app.js", "/mnt/R/App.js").unwrap();
+    assert_eq!(d.settled(), ["C /mnt/R/App.js", "D /mnt/R/app.js"], "{on}");
+    d.caught_up();
+  });
+}
+
 // ---- an entry below a watched directory gets another spelling ----
 //
 // `lstat` finds the entry under the old name too. So the disk is asked how it spells a name
@@ -325,6 +479,29 @@ fn a_file_is_renamed_to_another_letter_case() {
     assert_eq!(d.window(), ["U /p/R/App.js"], "{on}");
     d.fs().remove("/p/R/App.js").unwrap();
     assert_eq!(d.settled(), ["D /p/R/App.js"], "{on}");
+    d.caught_up();
+  });
+}
+
+/// A file is renamed to another case of its name, and the filter ignores the new name. The
+/// look at the new name finds nothing that counts, and its node goes. The old name was only
+/// unsure of its spelling because the tree had the new one too: its look still asks the disk,
+/// whichever of the two is looked at first.
+#[test]
+fn a_file_is_renamed_to_a_spelling_that_the_filter_ignores() {
+  let ignored: Ignored = Arc::new(|path, _| path.file_name().is_some_and(|name| name == "c"));
+  on_all(&Options { ignored: Some(ignored), ..loose() }, |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().mkdir_all("/p/R").unwrap();
+    d.fs().write("/p/R/A.txt", "1").unwrap();
+    d.fs().write("/p/R/C", "1").unwrap();
+    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
+    // The node of `A.txt` is free for the next new name: that one is looked at before `C`.
+    d.fs().remove("/p/R/A.txt").unwrap();
+    assert_eq!(d.settled(), ["D /p/R/A.txt"], "{on}");
+
+    d.fs().rename("/p/R/C", "/p/R/c").unwrap();
+    assert_eq!(d.settled(), ["D /p/R/C"], "{on}");
     d.caught_up();
   });
 }

@@ -136,9 +136,10 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
     and its events carry the spelling you gave. A link inside a watched directory is a file: it
     is not followed.
 13. **Spelling.** On a disk that takes two spellings of a name for one (letter case, Unicode
-    form: the usual disks of macOS and Windows), a watched path is the text you gave: what is
-    at it is what the OS finds there, and its events carry your spelling. A name below a
-    watched directory is spelled as on the disk. Every watched path is a question of its own.
+    form: the usual disks of macOS and Windows, and on Linux a folder of such a system, a FAT
+    or SMB disk, a directory with the casefold flag), a watched path is the text you gave:
+    what is at it is what the OS finds there, and its events carry your spelling. A name below
+    a watched directory is spelled as on the disk. Every watched path is a question of its own.
     Two watched paths that are two spellings of one file both get their events. So does a
     watched path in another spelling inside a directory that you watch too: the directory
     reports the file under the name of the disk, and the path under its own.
@@ -162,11 +163,19 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   a ligature like `ﬁ` for `fi`, a CJK compatibility ideograph for its ideograph. The disks of
   macOS take these for one name. Such a path gets no events on macOS and Windows. With polling
   it works.
+- **Linux: a disk that takes two Unicode forms of a name for one, and tells the case of
+  letters apart** (a case-sensitive volume of a Mac, shared into a Linux machine): it is taken
+  for a disk that tells every spelling apart. A name below a watched directory that is renamed
+  to its other Unicode form can stay known under the old one.
 - **A young file above 16 MiB, or one that cannot be read, under polling:** it gets one
   `Update` when it is 2 s old, also when nothing changed, and also when it was written just
   before `watch`.
 - **The link of a watched path changes** (it points somewhere else now): found by a poll,
   within a second, or within the poll interval when polling is on.
+- **macOS: a directory above a watched path is renamed to another case of its letters**
+  (`src` to `Src`), and in the same second a file comes or goes directly in it: nothing below
+  that directory is reported any more. Without the second change, the rename is found within
+  a second.
 - **macOS, Windows: the directories above a watched path** are polled once a second. When
   they are removed, or removed and made again, the events can come up to a second late. On
   macOS, when such a directory is renamed away, changed and renamed back between two polls,
