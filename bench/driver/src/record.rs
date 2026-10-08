@@ -43,12 +43,19 @@ pub struct Settings {
   pub scale: f64,
   /// How long a quiet phase is, in seconds.
   pub quiet_secs: f64,
+  /// How often each scenario ran with each adapter. The tables show the middle run.
+  #[serde(default = "once")]
+  pub repeat: usize,
   pub tmp: String,
   /// S3: the noise is written next to the project and not inside it.
   pub noise_outside: bool,
   /// Linux: the adapters ran with the huge pages of malloc (the default of the system). When
   /// false, they ran with `GLIBC_TUNABLES=glibc.malloc.hugetlb=0`.
   pub keep_huge_pages: bool,
+}
+
+fn once() -> usize {
+  1
 }
 
 /// An adapter that watches nothing.
@@ -63,7 +70,7 @@ pub struct Base {
 }
 
 /// One scenario with one adapter.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Run {
   pub scenario: String,
   pub adapter: String,
@@ -95,7 +102,7 @@ pub struct Run {
 }
 
 /// One step of a scenario: some changes, and what the adapter printed for them.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Phase {
   pub name: String,
   /// How many paths changed. Each of them should get at least one event.

@@ -83,6 +83,11 @@ Full sizes. `--scale` multiplies them, `--quick` is `--scale 0.05` with a quiet 
 | S4 ignored directory | 5,000 files in `src`, and `node_modules` | the project directory, with a rule that ignores `node_modules` | 30,000 files are written into `node_modules`, then one edit in `src` right after; 20 single edits |
 | S5 polling | as S1 | as S1, with the polling mode of each library at 100 ms | first edit; quiet; 50 single edits |
 | S6 missing paths | an empty directory | 1,000 paths that do not exist, in directories that do not exist | quiet; all paths are made; 20 single edits of them |
+| S7 big directory | 20,000 files in one directory | the one directory | first edit; 100 single edits; 100 single new files; a burst of 2,000 new files; 100 files removed one by one |
+
+S7 is there for a watcher that lists a directory when something in it changes: it pays for
+every entry of the directory. pathwatch does that for a new file on a disk that takes two
+spellings of a name for one (macOS, Windows).
 
 ## How to run it
 
@@ -97,13 +102,14 @@ cargo build --release
 `cargo build` builds the driver and the Rust adapters. (`cargo run` alone builds only the
 driver; the driver says which adapter is missing.)
 
-A quick run on macOS (about 5 minutes), and the full run:
+A quick run on macOS (about 5 minutes), and the full run (about 20 minutes for each of the
+three rounds):
 
 ```sh
 ./target/release/bench --quick --out results/quick-macos.json
 ./target/release/report results/quick-macos.json > results/quick-macos.md
 
-./target/release/bench --out results/macos.json
+./target/release/bench --repeat 3 --out results/macos.json
 ./target/release/report results/macos.json > results/macos.md
 ```
 
@@ -123,7 +129,7 @@ orb bash -c 'cd /path/to/pathwatch/bench && B=$HOME/pathwatch-bench-target/relea
   && $B/report results/quick-linux.json > results/quick-linux.md'
 
 orb bash -c 'cd /path/to/pathwatch/bench && B=$HOME/pathwatch-bench-target/release \
-  && $B/bench --tmp /tmp --js $HOME/pathwatch-bench-js --out results/linux.json \
+  && $B/bench --repeat 3 --tmp /tmp --js $HOME/pathwatch-bench-js --out results/linux.json \
   && $B/report results/linux.json > results/linux.md'
 ```
 
@@ -134,6 +140,7 @@ All flags: `./target/release/bench --help`. The useful ones:
 
 - `--scenarios s1,s3` and `--adapters pathwatch,chokidar` (or `rust` for the four Rust ones)
 - `--scale 0.25`, `--quiet-secs 10`
+- `--repeat 3`: every scenario runs three times with every adapter, one round after the other
 - `--tmp <dir>`, `--js <dir>`
 
 **Run the full sizes on a quiet machine.** The driver prints a warning when the load average is
@@ -151,8 +158,24 @@ and of the extra paths of each phase. The types are in `driver/src/record.rs`.
 
 ## The tables
 
-`report` prints, for each scenario, one table "Setup and memory" and one table for each phase.
-Times are milliseconds, memory is MiB.
+`report` prints the summary "Where pathwatch is behind", and then, for each scenario, one
+table "Setup and memory" and one table for each phase. Times are milliseconds, memory is MiB.
+
+With `--repeat`, a time or a size in the tables is the middle one of the runs (of two runs:
+the lower one), and a count (missed, extra, dir events, repeats, errors) is the worst one. A
+run that failed is left out when another one did not fail, and a note says so.
+
+Where pathwatch is behind:
+
+| Part | Meaning |
+| --- | --- |
+| which numbers | The time and the CPU time of the setup, the memory above the base (the footprint, or the resident size where there is no footprint), and for each phase the p50, the max and the CPU time. Lower is better in each. |
+| who is compared | `pathwatch` and `pathwatch-0` with the best of the other libraries in that number. A library counts in a phase only when it missed no change there and did not stop early. |
+| behind | More than 10% above the best other, and by more than 1 ms or 0.5 MiB. |
+| the three tables | Behind with both settings; behind only with the default settings (what the 50 ms wait costs); behind only without the wait. |
+| `middle (lowest to highest)` | With more runs than one: the middle run, and how far the runs are apart. Two numbers whose ranges overlap are not apart. |
+| times | `pathwatch-0` divided by the best other (`pathwatch` where `pathwatch-0` has no number). |
+| below the tables | In how many numbers each setting is the best or near it, and every phase in which pathwatch missed a change, gave an event too many, or printed an error. |
 
 Setup and memory:
 
@@ -215,7 +238,8 @@ The rules of the driver:
   50 ms.
 - **The word of an event is not checked.** `first word` shows it, and that is all. On macOS
   notify says `create` for many edits, because FSEvents repeats old flags of a path.
-- **One run, no repeats.** There is no spread in the tables. Run it three times and compare.
+- **Three runs are few.** `--repeat 3` shows whether two numbers are apart, not how a number
+  is spread. Without `--repeat` there is one run and no spread at all.
 - **Memory of Node moves with its garbage collector.** It can go down between `ready` and the
   end. The resident size on macOS counts shared pages of the system libraries (about 6 MiB for
   a Rust program that does nothing): read the footprint.
@@ -224,5 +248,17 @@ The rules of the driver:
   table.
 - **Polling is not the same thing in every library.** pathwatch spends at most about a tenth
   of a core on polling, so on a big set its round is longer than the 100 ms that were asked.
+  The single edits come one after the other, each right after the event of the one before,
+  so each waits about one whole round: the p50 of that phase is the time of a round.
+- **S5: the tree is young.** It is 1.5 s old when the watcher starts. Under polling pathwatch
+  takes a file that changed less than 2 s ago for young and reads it (a second write can leave
+  its time as it is), so its setup reads all 20,000 files. The first edit comes right after
+  `ready`, and a round can look at the file between the cut and the write: then pathwatch
+  reports two states, and the second one is counted as an event of the quiet phase.
+- **S7 on macOS: FSEvents is late.** A new stream gets the events of the 20,000 files that were
+  made seconds before it started, over the first seconds. A library that hands on what the OS
+  says prints them (`extra` in the single edits), and every library on FSEvents is slow in the
+  first two phases. pathwatch checks each of them against the disk: that is the CPU time
+  there.
 - **Linux in a VM is not Linux on a machine**, and a `tmpfs` is not a disk.
 - **Windows is not supported** by the driver (it reads `/proc` and `proc_pid_rusage`).

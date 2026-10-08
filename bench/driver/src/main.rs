@@ -1,8 +1,9 @@
 //! `bench`: runs the scenarios with the adapters and writes one JSON file.
 //!
 //! ```text
-//! bench [--quick] [--scale <n>] [--quiet-secs <n>] [--scenarios s1,s2] [--adapters a,b]
-//!       [--tmp <dir>] [--js <dir>] [--noise-outside] [--keep-huge-pages] [--out <file.json>]
+//! bench [--quick] [--scale <n>] [--quiet-secs <n>] [--repeat <n>] [--scenarios s1,s2]
+//!       [--adapters a,b] [--tmp <dir>] [--js <dir>] [--noise-outside] [--keep-huge-pages]
+//!       [--out <file.json>]
 //! ```
 
 use std::{
@@ -26,7 +27,9 @@ bench [flags]
   --quick              small sizes for a try: the same as --scale 0.05 --quiet-secs 2
   --scale <n>          multiply every size by n (default 1: the full sizes)
   --quiet-secs <n>     how long the quiet phase is (default 10)
-  --scenarios <list>   s1,s2,s3,s4,s5,s6 (default: all)
+  --repeat <n>         run each scenario n times with each adapter (default 1); the tables
+                       show the middle run, and how far the runs are apart
+  --scenarios <list>   s1,s2,s3,s4,s5,s6,s7 (default: all)
   --adapters <list>    pathwatch,pathwatch-0,notify,notify-fork,chokidar,parcel,fs-watch
                        (default: all), or `rust` for the first four
   --tmp <dir>          where the trees are made (default: the temporary directory of the system)
@@ -40,6 +43,7 @@ bench [flags]
 struct Flags {
   scale: f64,
   quiet_secs: f64,
+  repeat: usize,
   scenarios: Option<Vec<String>>,
   adapters: Option<Vec<String>>,
   tmp: PathBuf,
@@ -53,6 +57,7 @@ fn flags(bench: &Path) -> Flags {
   let mut flags = Flags {
     scale: 1.0,
     quiet_secs: 10.0,
+    repeat: 1,
     scenarios: None,
     adapters: None,
     tmp: env::temp_dir(),
@@ -70,6 +75,9 @@ fn flags(bench: &Path) -> Flags {
       "--scale" => flags.scale = value().parse().unwrap_or_else(|_| fail("--scale <number>")),
       "--quiet-secs" => {
         flags.quiet_secs = value().parse().unwrap_or_else(|_| fail("--quiet-secs <number>"));
+      }
+      "--repeat" => {
+        flags.repeat = value().parse().unwrap_or_else(|_| fail("--repeat <number>"));
       }
       "--scenarios" => flags.scenarios = Some(list(value())),
       "--adapters" => flags.adapters = Some(list(value())),
@@ -150,12 +158,16 @@ fn main() {
 
   let mut runs = Vec::new();
   for scenario in &scenarios {
-    for adapter in &adapters {
-      eprint!("{} {:<12} ", scenario.name, adapter.name);
-      let start = Instant::now();
-      let run = scenarios::run(&settings, scenario, adapter);
-      eprintln!("{} ({:.1} s)", run.status, start.elapsed().as_secs_f64());
-      runs.push(run);
+    // One round is every adapter once: what disturbs the machine for a while hits a round of
+    // all adapters, not every run of one.
+    for round in 1..=flags.repeat.max(1) {
+      for adapter in &adapters {
+        eprint!("{} {:<12} {round}/{} ", scenario.name, adapter.name, flags.repeat.max(1));
+        let start = Instant::now();
+        let run = scenarios::run(&settings, scenario, adapter);
+        eprintln!("{} ({:.1} s)", run.status, start.elapsed().as_secs_f64());
+        runs.push(run);
+      }
     }
   }
   let _ = fs::remove_dir_all(&tmp);
@@ -167,6 +179,7 @@ fn main() {
     settings: record::Settings {
       scale: flags.scale,
       quiet_secs: flags.quiet_secs,
+      repeat: flags.repeat.max(1),
       tmp: flags.tmp.display().to_string(),
       noise_outside: flags.noise_outside,
       keep_huge_pages: flags.keep_huge_pages,

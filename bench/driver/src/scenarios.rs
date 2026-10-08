@@ -1,4 +1,4 @@
-//! The six scenarios. Each one makes its tree, starts the adapter and runs its phases.
+//! The seven scenarios. Each one makes its tree, starts the adapter and runs its phases.
 
 use std::{
   collections::BTreeMap,
@@ -59,6 +59,7 @@ pub const SCENARIOS: &[Scenario] = &[
   Scenario { name: "s4", title: "ignored directory: writes into node_modules", run: s4 },
   Scenario { name: "s5", title: "polling: module files, polled every 100 ms", run: s5 },
   Scenario { name: "s6", title: "missing paths: watched before they exist", run: s6 },
+  Scenario { name: "s7", title: "big directory: one watched directory holds every file", run: s7 },
 ];
 
 /// Runs one scenario with one adapter, in a fresh directory that is removed at the end.
@@ -386,5 +387,35 @@ fn s6(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
     write_all(&files).expect("the driver can write its own files");
   });
   session.single_edits("single edits after", &spread(&files, settings.size(20, 5)), PATIENCE);
+  session.end()
+}
+
+/// S7 "big directory": one watched directory that holds 20,000 files itself, like the output
+/// of a build or a big package. A watcher that lists the directory for a change pays for
+/// every entry in it.
+fn s7(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run {
+  let project = root.join("project");
+  let named = |name: &str, count: usize| -> Vec<PathBuf> {
+    (0..count).map(|file| project.join(format!("{name}{file:05}.js"))).collect()
+  };
+  let files = named("m", settings.size(20_000, 500));
+  write_all(&files).expect("the tree can be made");
+  sizes(&mut run, &[("files", files.len()), ("dirs", 1), ("watched", 1)]);
+  thread::sleep(SETTLE);
+
+  let job = Job { paths: vec![project.clone()], ..Job::default() };
+  let mut session = match Session::start(adapter, settings.places, &job, root, run) {
+    Ok(session) => session,
+    Err(run) => return *run,
+  };
+  session.single_edits("first edit, right after ready", &files[..1], PATIENCE);
+  session.single_edits("single edits", &spread(&files, settings.size(100, 10)), PATIENCE);
+  session.single_edits("single new files", &named("new", settings.size(100, 10)), PATIENCE);
+  let burst = named("burst", settings.size(2000, 50));
+  session.burst("burst of new files", &burst, || {
+    write_all(&burst).expect("the driver can write its own files");
+  });
+  let removed = spread(&files[1..], settings.size(100, 10));
+  session.single_changes("single files removed", &removed, PATIENCE, |file| fs::remove_file(file));
   session.end()
 }
