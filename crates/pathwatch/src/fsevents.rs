@@ -14,10 +14,11 @@ use rustc_hash::FxHashMap;
 use self::ffi::{Queue, Stream};
 use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want};
 
-pub const MAX_STREAMS: usize = 8;
+pub const MAX_STREAMS: usize = 64;
+pub const MAX_NEW_STREAMS: usize = 8;
 pub const MAX_STREAM_PATHS: usize = 64;
 pub const MAX_PATHS_PER_STREAM: usize = 4096;
-const MAX_RETIRING_STREAMS: usize = 64;
+const MAX_RETIRING_STREAMS: usize = MAX_STREAMS + MAX_NEW_STREAMS;
 const RETIRING_TIMEOUT: Duration = Duration::from_millis(500);
 const EXPECTED_PATH_BYTES: usize = 128;
 
@@ -163,21 +164,17 @@ impl Backend for FsEventsBackend {
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     self.streams.stop_retired();
     let covers = &self.covers.by_dir;
+    let mut lost_places = Vec::new();
     for (path, flags) in raw.records() {
       if flags & flag::HISTORY_DONE != 0 {
         continue;
       }
       if flags & flag::RECORDS_LOST != 0 {
         let names_a_place = flags & flag::MUST_SCAN_SUB_DIRS != 0 && path != Path::new("/");
-        if !names_a_place {
+        if names_a_place {
+          lost_places.push(path);
+        } else {
           hint(Hint::Lost);
-          continue;
-        }
-        let holders = covers.holders(path).map(|(keys, _)| keys);
-        for keys in holders.chain(covers.below(path)) {
-          for &key in keys {
-            hint(Hint::Changed { dir: key, rel: Path::new("") });
-          }
         }
         continue;
       }
@@ -189,6 +186,12 @@ impl Backend for FsEventsBackend {
         for &key in keys {
           hint(Hint::Changed { dir: key, rel });
         }
+      }
+    }
+    let holders = lost_places.iter().flat_map(|path| covers.holders(path)).map(|(keys, _)| keys);
+    for keys in holders.chain(covers.below(&lost_places)) {
+      for &key in keys {
+        hint(Hint::Changed { dir: key, rel: Path::new("") });
       }
     }
   }
@@ -288,19 +291,22 @@ struct Retiring {
 impl Streams {
   fn start_pending(&mut self, covers: &Covers) -> io::Result<()> {
     let new = top_most(self.pending.drain().collect());
-    let lies_above_a_stream = |path: &PathBuf| self.paths.below(path).next().is_some();
     let replace = self.running.len() >= MAX_STREAMS
       || self.paths.len() + new.len() > self.path_limit
-      || new.iter().any(lies_above_a_stream);
+      || !self.paths.below(&new).is_empty();
     let paths = if replace {
       place(covers.dir_of.values().cloned().collect(), MAX_STREAM_PATHS)
     } else {
       new
     };
-    let streams: Vec<Stream> = paths
-      .chunks(MAX_PATHS_PER_STREAM)
-      .map(|chunk| Stream::start(&self.queue, &self.sink, chunk))
-      .collect::<io::Result<_>>()?;
+    let stream_count =
+      MAX_NEW_STREAMS.min(paths.len()).max(paths.len().div_ceil(MAX_PATHS_PER_STREAM));
+    let streams = (0..stream_count)
+      .map(|first| {
+        let every_nth = paths.iter().skip(first).step_by(stream_count);
+        Stream::start(&self.queue, &self.sink, every_nth)
+      })
+      .collect::<io::Result<Vec<Stream>>>()?;
     if replace {
       let replaced = mem::take(&mut self.running);
       if !replaced.is_empty() {
@@ -363,28 +369,40 @@ pub fn is_too_high(dir: &Path) -> bool {
 }
 
 fn place(covers: Vec<PathBuf>, max: usize) -> Vec<PathBuf> {
-  let mut paths = top_most(covers);
-  let mut joins: Vec<Option<usize>> = paths
+  let paths = top_most(covers);
+  let too_many = paths.len().saturating_sub(max);
+  if too_many == 0 {
+    return paths;
+  }
+  let joins: Vec<usize> = paths
     .windows(2)
     .map(|pair| {
       let shared = pair[0].components().zip(pair[1].components()).take_while(|(a, b)| a == b);
-      Some(shared.count())
+      let depth = shared.count();
+      let dir: PathBuf = pair[0].components().take(depth).collect();
+      if is_too_high(&dir) { 0 } else { depth }
     })
     .collect();
-  while paths.len() > max {
-    let Some(depth) = joins.iter().flatten().copied().max() else { break };
-    let Some(first) = joins.iter().position(|&join| join == Some(depth)) else { break };
-    let dir: PathBuf = paths[first].components().take(depth).collect();
-    let below = paths[first..].iter().take_while(|path| path.starts_with(&dir)).count();
-    let joins_below = first..first + below - 1;
-    if is_too_high(&dir) {
-      joins[joins_below].fill(None);
+  let mut deepest_first: Vec<usize> = joins.iter().copied().filter(|&depth| depth > 0).collect();
+  deepest_first.sort_unstable_by(|a, b| b.cmp(a));
+  let level = deepest_first.get(too_many - 1).copied().unwrap_or(1);
+  let mut left = paths.len() - deepest_first.iter().take_while(|&&depth| depth > level).count();
+  let mut placed = Vec::new();
+  let mut kept = usize::MAX;
+  let mut takes_level = None;
+  for (path, join) in paths.into_iter().zip(joins.into_iter().chain([0])) {
+    if join < level {
+      takes_level = None;
+    }
+    if join > level || join == level && *takes_level.get_or_insert(left > max) {
+      left -= usize::from(join == level);
+      kept = kept.min(join);
     } else {
-      paths.splice(first..first + below, [dir]);
-      joins.drain(joins_below);
+      placed.push(path.components().take(kept).collect());
+      kept = usize::MAX;
     }
   }
-  paths
+  placed
 }
 
 fn top_most(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -469,11 +487,24 @@ impl<T> Dirs<T> {
       })
   }
 
-  fn below(&self, path: &Path) -> impl Iterator<Item = &T> {
-    let is_below = |(dir, _): &(&PathBuf, &T)| dir.starts_with(path) && dir.as_path() != path;
-    let mut below: Vec<(&PathBuf, &T)> = self.by_path.iter().filter(is_below).collect();
-    below.sort_unstable_by_key(|(dir, _)| dir.as_path());
-    below.into_iter().map(|(_, value)| value)
+  fn below(&self, paths: &[impl AsRef<Path>]) -> Vec<&T> {
+    if paths.is_empty() {
+      return Vec::new();
+    }
+    let mut sorted: Vec<(&[u8], &T)> =
+      self.by_path.iter().map(|(dir, value)| (dir.as_os_str().as_bytes(), value)).collect();
+    sorted.sort_unstable_by_key(|(dir, _)| *dir);
+    let mut below = Vec::new();
+    for path in paths {
+      let mut prefix = path.as_ref().components().as_path().as_os_str().as_bytes().to_vec();
+      if prefix.last() != Some(&b'/') {
+        prefix.push(b'/');
+      }
+      let start = sorted.partition_point(|(dir, _)| *dir <= prefix.as_slice());
+      let dirs = sorted[start..].iter().take_while(|(dir, _)| dir.starts_with(&prefix));
+      below.extend(dirs.map(|(_, value)| *value));
+    }
+    below
   }
 }
 
@@ -529,10 +560,10 @@ mod ffi {
   unsafe impl Send for Stream {}
 
   impl Stream {
-    pub(super) fn start(
+    pub(super) fn start<'a>(
       queue: &Queue,
       sink: &Arc<Sink<Raw>>,
-      paths: &[PathBuf],
+      paths: impl Iterator<Item = &'a PathBuf>,
     ) -> io::Result<Self> {
       let array = path_array(paths)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, ERROR_PATH_NOT_UTF8))?;
@@ -662,9 +693,8 @@ mod ffi {
     }
   }
 
-  fn path_array(paths: &[PathBuf]) -> Option<Cf> {
+  fn path_array<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Option<Cf> {
     let strings = paths
-      .iter()
       .map(|path| {
         let bytes = path.as_os_str().as_bytes();
         let string = unsafe {
@@ -913,7 +943,8 @@ mod tests {
         assert_eq!(found, expected, "the covers that hold {}, step {step}", path.display());
         assert_eq!(covers.holds(path), !expected.is_empty());
 
-        let found: Vec<&Path> = covers.below(path).copied().collect();
+        let mut found: Vec<&Path> = covers.below(&[path]).into_iter().copied().collect();
+        found.sort_unstable();
         let lies_below = |cover: &&&PathBuf| **cover != path && cover.starts_with(path);
         let expected: Vec<&Path> =
           picked.iter().filter(lies_below).map(|cover| cover.as_path()).collect();

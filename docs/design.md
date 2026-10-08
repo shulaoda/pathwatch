@@ -790,6 +790,22 @@ Facts from probes on macOS (APFS):
   runs, also with a synchronous flush before the stop. A new stream that was started from the
   event id of that moment (`sinceWhen`), with a flush and no overlap: 8 of 30 runs. With 500 ms
   of overlap: none in 40. With a loss report at the stop: none in 40, also with no overlap.
+- Records are lost with a word when files come to one stream faster than it hands them over.
+  A callback call of a stream brings at most 32 records. The flood of the probe: 20,000 new
+  files from 4 threads, about 50,000 a second, in turn into 8 or more directories. A stream
+  for the directory above them, or one stream with these directories as its paths, says
+  `UserDropped` and `MustScanSubDirs` for each of its paths in 4 of 14 floods (with 64 paths:
+  in 12 of 12, 1 to 15 times in a flood), and names 87 to 99 % of the files. With the same
+  paths in 8 streams: in none of 72 floods. With 2 streams: in 1 of 10. No loss either with
+  26,000 files a second, or with all files in one directory. A program with the bare API and
+  a callback that only counts gets what the backend gets (a loss report in 7 of 15 floods
+  each): the callback is not the cause. The latency of the stream (0 to 0.2 s) changes
+  nothing. So the paths are spread over several streams, and a loss report that still comes
+  (a flood below one path) has to be cheap to act on.
+- A stream takes longer to start, the more files lie next to the program of the process: under
+  1 ms next to few files, 0.1 to 0.2 s next to 100,000, 0.3 to 0.9 s next to 360,000 (a
+  `target/debug/deps` that was never cleaned). The same program is fast again from a copy in
+  another directory.
 - Limits: 512 started streams for a process, 4,096 paths for a stream.
 - A write to a file that stays open, and a write through `mmap`, is not reported before close.
 - Many stream paths lose nothing, but they are slow while other programs write a lot. Time
@@ -815,17 +831,34 @@ As built:
   directory that is too high (`is_too_high`): `/`, a directory in `/`, one more name down (a
   home, the top of a volume, `/private/tmp`), and the temporary directory of a user with the
   directories above it. Where only such a directory would do, the paths stay apart. A cover
-  below a running stream path needs no new stream.
+  below a running stream path needs no new stream. `place` sorts the covers and walks them
+  once: it finds the depth of the last directory that has to be taken, takes every common
+  directory below that depth, and at that depth one after the other while too many paths are
+  left. For 20,000 covers in a deep tree that is 13 ms, for 100,000 it is 69 ms (38 ms and
+  724 ms with a pass over all paths for every directory that was taken).
 - **The real path** of a directory that is asked for its contents is made of the real path of
   its parent, which is kept until the next commit, and of its own name as the disk spells it
   (one `getattrlist` call). A link, and a name that differs by more than the case of ASCII
   letters, are left to the OS (`realpath`).
-- **Streams are only added.** `commit` starts one stream for the new paths (one for every 4,096).
-  Old streams keep running, so nothing is ever in a gap. With 8 streams running, with too many
+- **Streams are only added.** `commit` starts streams for the new paths. Old streams keep
+  running, so nothing is ever in a gap. With 64 streams running (`MAX_STREAMS`), with too many
   stream paths, or when a new path lies above a running one, `commit` starts new streams for
   all covers in their place: so no stream path lies below another, and no record comes twice
   for long. If the streams cannot start, `commit` returns the watch limit error and the old
   streams keep running.
+- **Up to 8 streams for a commit** (`MAX_NEW_STREAMS`; more only where a stream would get more
+  than 4,096 paths). The paths of a commit go to its streams in turn: so neighbours in the
+  tree have different streams, and a flood over many watched directories is shared by all of
+  them. One stream for 64 directories reported a loss in
+  every flood of the probe, 8 streams in none; 40 directories of a second `watch` call in one
+  stream reported a loss in 10 of 12 floods, in 8 streams in none. A loss report makes the
+  engine read all covers of the stream again. The 8 streams take 3 ms longer to start than
+  the one. Two streams keep no order between their records: the engine needs none. The limit
+  of 64 running streams is high so that the streams are replaced seldom: one `watch` call for
+  each of 20,000 files took 540 ms with a limit of 16, 420 ms with 32 and 350 ms with 64
+  (390 ms before, with one stream for all covers and a limit of 8). What stays: covers that
+  share one stream path (more than 64 directories with one directory above them, or a watched
+  tree) have one stream, and a flood below it can still end in a loss report.
 - **An old stream that stops.** A replaced stream runs on for 500 ms next to the new ones. When
   it is stopped, the backend puts one loss report into the queue (`MustScanSubDirs` for `/`,
   so `Lost`), and the engine reads everything again: a stream that stops takes with it what it
@@ -833,9 +866,10 @@ As built:
   the probe). Streams that stop at the same time share one report, and the scans of loss
   reports are paced (5.13). The stop is made by the first `commit` or `translate` after the
   500 ms: the poll of the directories above the covers brings a `commit` every second, so an
-  old stream does not wait for the next change. At most 64 old streams run on (`MAX_RETIRING_STREAMS`): with more,
-  the oldest are stopped at once, in the same way, so that commits that come fast do not use
-  up the 512 streams.
+  old stream does not wait for the next change. At most 72 old streams run on
+  (`MAX_RETIRING_STREAMS`: as many as can run at a time, so the streams of one replacement
+  always keep their 500 ms). With more, the oldest are stopped at once, in the same way, so
+  that commits that come fast do not use up the 512 streams.
 - **Hints.** A record becomes one `Changed` for each key of each cover that holds its path;
   the rest of the path is `rel`. The covers are found by one table lookup for each directory
   above the path that can be a cover. A record under no cover is dropped: a stream path on a
@@ -844,7 +878,13 @@ As built:
 - **Lost records.** A record with `MustScanSubDirs` for a path other than `/` → `Changed` with
   an empty `rel` for each key of every cover that holds the path, and of every cover below the
   path. If there is no such cover, no hint: no key can see that place. A record for `/`, and
-  one with only `UserDropped` or `KernelDropped` → `Lost`.
+  one with only `UserDropped` or `KernelDropped` → `Lost`. These hints come after the other
+  hints of the callback call: the covers below the lost paths are found in a list of all
+  covers in the order of their paths, which is made once for a call that has such a record
+  (`Dirs::below`). A call with a loss record for each of 8 stream paths takes 0.15 ms with
+  2,000 covers and 1.5 ms with 20,000. (A look at every cover for every record, with a
+  comparison of path components, took 3.6 ms and 38 ms, and 5 to 10 s for 4,100 records and
+  4,100 covers in one call.)
 - `unwatch(key)` forgets the key. The path stays in its stream until the streams are replaced.
 
 Known hole, mostly closed by the engine (5.10, "A directory that was renamed away and back"): a
@@ -938,12 +978,19 @@ The test files of the simulator:
 - Private functions (a `mod tests` at the end of the file; for the tree, `tree/tests.rs`):
   `tree/mod.rs`, `path.rs`, `fs.rs`, `engine/events.rs`, and helpers of the backends.
 - Each backend alone (`tests/inotify.rs`, `fsevents.rs`, `windows.rs`, each on its OS). The
-  Windows file has never run. `windows_parts.rs` runs on every OS.
+  Windows file has never run. `windows_parts.rs` runs on every OS. In `fsevents.rs` a test
+  that makes many changes runs alone, and after the others where it can (`Turn`): a flood
+  makes FSEvents report losses, and a test next to it was seen to get one too. No test there
+  starts when more than 50,000 files lie next to the test program (the probe in 7.2).
 - The watcher thread (`tests/watcher.rs`): `watch`, `unwatch`, `close` and `drop` from every
   side, relative paths, a bad path, the queue bound, a backend that cannot start.
 - The real disk (`tests/disk`), each test once with the backend of the OS and once with
-  polling: `contract` (the rows of section 3), `projects` (what editors and big projects do),
-  `promises` (the promises of the README; its first lines say which test proves which).
+  polling, both at the same time: `contract` (the rows of section 3), `projects` (what editors
+  and big projects do), `promises` (the promises of the README; its first lines say which test
+  proves which). These tests wait, they do not compute. Measured on macOS, each test alone: of
+  56 s, 34 s are the quiet time of 300 ms after each `expect`, 17 s the wait for the events
+  (the debounce, the delete delay, the poll of a link once a second, and about 10 ms of the
+  OS), 4 s the changes that the tests make, and 0.2 s the `watch` calls.
 
 How to run them (the README has the commands for the other platforms and the lints):
 

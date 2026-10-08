@@ -1,7 +1,8 @@
 //! The watcher on the real disk. [`each_backend`] runs a test twice: with the watch API of this
-//! system and with polling. A path in a test is relative to a new temporary directory. No test
-//! sleeps: [`Watch::expect`] waits until the events since the last `expect` are the expected
-//! ones, and then for a short quiet time in which nothing else may come.
+//! system and with polling, both at the same time. A path in a test is relative to a new
+//! temporary directory. No test sleeps: [`Watch::expect`] waits until the events since the last
+//! `expect` are the expected ones, and then for a short quiet time in which nothing else may
+//! come.
 
 mod contract;
 mod projects;
@@ -15,6 +16,7 @@ use std::{
     Arc, Weak,
     mpsc::{self, Receiver, RecvTimeoutError},
   },
+  thread,
   time::{Duration, Instant},
 };
 
@@ -29,7 +31,7 @@ const QUIET: Duration = Duration::from_millis(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Runs `test` with the default settings on each backend.
-fn each_backend(test: impl Fn(&mut Watch)) {
+fn each_backend(test: impl Fn(&mut Watch) + Sync) {
   each_backend_with(&Config::default(), test);
 }
 
@@ -38,22 +40,38 @@ fn each_backend(test: impl Fn(&mut Watch)) {
 type Inside = fn(&Watcher, &[Event]);
 
 /// Runs `test` twice: with the backend for the watch API of this system, and with polling.
-fn each_backend_with(config: &Config, test: impl Fn(&mut Watch)) {
+fn each_backend_with(config: &Config, test: impl Fn(&mut Watch) + Sync) {
   run_each_backend(config, None, test);
 }
 
 /// Runs `test` on each backend. The handler calls `inside` for every batch.
-fn each_backend_inside(inside: Inside, test: impl Fn(&mut Watch)) {
+fn each_backend_inside(inside: Inside, test: impl Fn(&mut Watch) + Sync) {
   run_each_backend(&Config::default(), Some(inside), test);
 }
 
-fn run_each_backend(config: &Config, inside: Option<Inside>, test: impl Fn(&mut Watch)) {
-  for polling in [false, true] {
+fn run_each_backend(config: &Config, inside: Option<Inside>, test: impl Fn(&mut Watch) + Sync) {
+  side_by_side(|polling| {
     let config = config.clone().with_polling(polling).with_poll_interval(POLL_INTERVAL);
-    let mut watch = Watch::start(config, inside, if polling { "polling" } else { "native" });
+    let mut watch = Watch::start(config, inside, backend_name(polling));
     test(&mut watch);
     assert!(watch.events.is_empty(), "{}: a test ends with `expect`", watch.backend);
-  }
+  });
+}
+
+/// Runs `run` for the native backend (`false`) and for polling (`true`) at the same time. The
+/// two runs share nothing, and a test waits most of its time, so this halves the time of a
+/// test.
+fn side_by_side(run: impl Fn(bool) + Sync) {
+  thread::scope(|scope| {
+    for polling in [false, true] {
+      let run = &run;
+      scope.spawn(move || run(polling));
+    }
+  });
+}
+
+fn backend_name(polling: bool) -> &'static str {
+  if polling { "polling" } else { "native" }
 }
 
 /// A watcher and a temporary directory for it.

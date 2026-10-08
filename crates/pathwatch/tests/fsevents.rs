@@ -13,7 +13,7 @@ use std::{
   },
   path::{Path, PathBuf},
   sync::{
-    Arc, Mutex, MutexGuard, PoisonError,
+    Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, Receiver, TryRecvError},
   },
@@ -26,7 +26,8 @@ use pathwatch::{
   engine::{Engine, Options, Output},
   fs::{FileType, Fs, Meta, StdFs},
   fsevents::{
-    FsEventsBackend, MAX_PATHS_PER_STREAM, MAX_STREAM_PATHS, MAX_STREAMS, Raw, flag, is_too_high,
+    FsEventsBackend, MAX_NEW_STREAMS, MAX_PATHS_PER_STREAM, MAX_STREAM_PATHS, MAX_STREAMS, Raw,
+    flag, is_too_high,
   },
 };
 use tempfile::TempDir;
@@ -36,11 +37,67 @@ use tempfile::TempDir;
 /// back for up to 45 seconds.
 const TIMEOUT: Duration = Duration::from_secs(90);
 
-/// The tests that make many changes run one after the other, so that together they do not push
-/// FSEvents into holding records back.
-fn one_heavy_test_at_a_time() -> MutexGuard<'static, ()> {
-  static HEAVY: Mutex<()> = Mutex::new(());
-  HEAVY.lock().unwrap_or_else(PoisonError::into_inner)
+/// When a test may run. A test that makes many changes runs alone: FSEvents answers a flood
+/// with late records and with loss reports, and not only for the stream of the flood. A test
+/// that runs next to it gets them too, and fails for a reason that is not its own. All other
+/// tests run side by side, and before the floods where they can: a flood waits while one of
+/// them runs.
+struct Turn {
+  alone: bool,
+}
+
+/// How many tests run side by side, and whether a flood runs.
+static TURNS: Mutex<(usize, bool)> = Mutex::new((0, false));
+static TURN_IS_OVER: Condvar = Condvar::new();
+
+impl Turn {
+  fn take(alone: bool) -> Self {
+    assert_few_files_next_to_the_test_program();
+    let mut turns = Self::turns();
+    while turns.1 || (alone && turns.0 > 0) {
+      turns = TURN_IS_OVER.wait(turns).unwrap_or_else(PoisonError::into_inner);
+    }
+    if alone {
+      turns.1 = true;
+    } else {
+      turns.0 += 1;
+    }
+    Self { alone }
+  }
+
+  fn turns() -> MutexGuard<'static, (usize, bool)> {
+    TURNS.lock().unwrap_or_else(PoisonError::into_inner)
+  }
+}
+
+impl Drop for Turn {
+  fn drop(&mut self) {
+    let mut turns = Self::turns();
+    if self.alone {
+      turns.1 = false;
+    } else {
+      turns.0 -= 1;
+    }
+    TURN_IS_OVER.notify_all();
+  }
+}
+
+/// FSEvents starts a stream in under a millisecond for a program that lies next to few files,
+/// and it takes 0.1 s and more for every 100,000 files next to the program. A build directory
+/// that was never cleaned holds that many old object files. Then each test here takes many
+/// times as long, so none of them starts: the time would look like a fault of the backend.
+fn assert_few_files_next_to_the_test_program() {
+  static FILES: OnceLock<usize> = OnceLock::new();
+  let files = *FILES.get_or_init(|| {
+    let program = std::env::current_exe().unwrap();
+    fs::read_dir(program.parent().unwrap()).map_or(0, Iterator::count)
+  });
+  assert!(
+    files <= 50_000,
+    "{files} files lie next to the test program, and FSEvents is slow for such a program: a \
+     stream takes 0.1 s and more to start for every 100,000 of them. `cargo clean` removes \
+     the old object files of the build directory."
+  );
 }
 
 const NO_PATHS: [&Path; 0] = [];
@@ -90,15 +147,26 @@ struct Harness {
   sentinels: u32,
   /// Every record that came in, for the tests that have to read flags.
   records: Vec<(PathBuf, u32)>,
+  /// Given back last, when the streams are stopped and the playground is removed.
+  _turn: Turn,
 }
 
 impl Harness {
   fn new() -> Self {
-    Self::with_slow_callback(Duration::ZERO)
+    Self::start(Turn::take(false), Duration::ZERO)
+  }
+
+  /// For a test that makes many changes (see [`Turn`]).
+  fn alone() -> Self {
+    Self::start(Turn::take(true), Duration::ZERO)
   }
 
   /// A callback that takes `delay` for each call makes FSEvents drop records.
-  fn with_slow_callback(delay: Duration) -> Self {
+  fn alone_with_slow_callback(delay: Duration) -> Self {
+    Self::start(Turn::take(true), delay)
+  }
+
+  fn start(turn: Turn, delay: Duration) -> Self {
     let (sender, signals) = mpsc::channel();
     let sink = Sink::new(move |signal| {
       let _ = sender.send((Instant::now(), signal));
@@ -109,7 +177,8 @@ impl Harness {
     let backend = FsEventsBackend::new(sink).unwrap();
     let dir = tempfile::tempdir().unwrap();
     assert_ne!(dir.path(), fs::canonicalize(dir.path()).unwrap(), "no symlink on the way");
-    Self { backend, signals, dir, watched: Vec::new(), sentinels: 0, records: Vec::new() }
+    let (watched, records) = (Vec::new(), Vec::new());
+    Self { backend, signals, dir, watched, sentinels: 0, records, _turn: turn }
   }
 
   /// `""` is the playground itself.
@@ -184,10 +253,26 @@ impl Harness {
     seen
   }
 
-  /// Every hint for what the test did up to now.
+  /// Receives and translates until a record for `path` has come in, with or without a hint for
+  /// it. The answer is all hints up to there.
+  fn hints_until_record(&mut self, path: &Path) -> Vec<Seen> {
+    let deadline = Instant::now() + TIMEOUT;
+    let known = self.records.len();
+    let mut seen = Vec::new();
+    while !self.records[known..].iter().any(|(record, _)| record == path) {
+      let Some((_, hints)) = self.next(deadline) else {
+        panic!("no record for {}, only {seen:?}", path.display());
+      };
+      seen.extend(hints);
+    }
+    seen
+  }
+
+  /// Every hint for what the test did up to now below the stream path of `key`.
   ///
   /// A stream delivers its records in the order of the changes. So everything is in front of
-  /// the record for a new file in the directory of `key`.
+  /// the record for a new file in the directory of `key`. Two directories that were watched
+  /// with one commit can have a stream each, and two streams keep no order.
   fn sync(&mut self, key: DirKey) -> Vec<Seen> {
     self.sentinels += 1;
     let name = format!(".sync-{}", self.sentinels);
@@ -258,6 +343,8 @@ impl Reported {
 struct Writer {
   stop: Arc<AtomicBool>,
   made: Arc<AtomicUsize>,
+  /// From this many files on, the writer makes one file a millisecond.
+  fast_until: Arc<AtomicUsize>,
   thread: Option<JoinHandle<Vec<Instant>>>,
 }
 
@@ -265,8 +352,9 @@ struct Writer {
 fn spawn_writer(dir: PathBuf, names: usize, pause: Duration) -> Writer {
   let stop = Arc::new(AtomicBool::new(false));
   let made = Arc::new(AtomicUsize::new(0));
+  let fast_until = Arc::new(AtomicUsize::new(usize::MAX));
   let thread = thread::spawn({
-    let (stop, made) = (Arc::clone(&stop), Arc::clone(&made));
+    let (stop, made, fast_until) = (Arc::clone(&stop), Arc::clone(&made), Arc::clone(&fast_until));
     move || {
       let mut started = Vec::new();
       while !stop.load(Ordering::Relaxed) {
@@ -274,19 +362,27 @@ fn spawn_writer(dir: PathBuf, names: usize, pause: Duration) -> Writer {
         started.push(Instant::now());
         fs::write(dir.join(name), "1").unwrap();
         made.fetch_add(1, Ordering::Relaxed);
-        if !pause.is_zero() {
+        if started.len() >= fast_until.load(Ordering::Relaxed) {
+          thread::sleep(Duration::from_millis(1));
+        } else if !pause.is_zero() {
           thread::sleep(pause);
         }
       }
       started
     }
   });
-  Writer { stop, made, thread: Some(thread) }
+  Writer { stop, made, fast_until, thread: Some(thread) }
 }
 
 impl Writer {
   fn made(&self) -> usize {
     self.made.load(Ordering::Relaxed)
+  }
+
+  /// Lets the writer make `files` more files at its speed, and then one file a millisecond.
+  /// So a step of the test that takes long does not leave more and more files behind it.
+  fn fast_for(&self, files: usize) {
+    self.fast_until.store(self.made() + files, Ordering::Relaxed);
   }
 
   /// The time right before each write.
@@ -417,8 +513,7 @@ fn directory_gives_one_hint_and_none_for_what_is_inside() {
 
 #[test]
 fn chmod_and_touch_of_a_directory_give_no_hint() {
-  let _heavy = one_heavy_test_at_a_time();
-  let mut h = Harness::new();
+  let mut h = Harness::alone();
   fs::create_dir(h.path("sub")).unwrap();
   let key = h.cover(1, "");
   let dirs = [h.real(""), h.real("sub")];
@@ -511,37 +606,41 @@ fn watch_is_live_when_commit_returns() {
 
 #[test]
 fn rebuild_opens_no_gap_for_an_old_cover() {
-  let _heavy = one_heavy_test_at_a_time();
-  let mut h = Harness::new();
+  let mut h = Harness::alone();
   fs::create_dir(h.path("old")).unwrap();
   let old = h.cover(1, "old");
   let writer = spawn_writer(h.path("old"), usize::MAX, Duration::ZERO);
   let mut reported = Reported::default();
 
   let deadline = Instant::now() + TIMEOUT;
-  let mut rebuilds = 0;
-  for index in 0..40 {
-    let dir = h.path(&format!("new-{index}"));
-    fs::create_dir(&dir).unwrap();
-    h.watch(100 + index, &dir, Want::Contents);
-    let streams = h.backend.stream_count();
-    h.commit();
-    if streams == MAX_STREAMS {
-      assert_eq!(h.backend.stream_count(), 1);
-      // A replaced stream that has nothing to deliver stays for the whole overlap time.
-      assert!(h.backend.retiring_count() >= MAX_STREAMS);
-      rebuilds += 1;
-    }
-    // The writer goes on for a while before the set of streams changes again.
-    let goal = writer.made() + 50;
-    while writer.made() < goal {
-      if let Some((at, hints)) = h.next(Instant::now() + Duration::from_millis(1)) {
-        reported.add(old, at, hints);
+  let mut index = 100;
+  for group in 0..5 {
+    // Four directories get a stream each. Then the directory above them is watched: all
+    // streams are replaced, and the old cover and each group have one stream.
+    let above = format!("group-{group}");
+    let below = (0..4).map(|dir| format!("{above}/{dir}"));
+    for dir in below.chain([above.clone()]) {
+      writer.fast_for(500);
+      fs::create_dir_all(h.path(&dir)).unwrap();
+      h.watch(index, &h.path(&dir), Want::Contents);
+      index += 1;
+      let streams = h.backend.stream_count();
+      h.commit();
+      if dir == above {
+        assert_eq!(h.backend.stream_count(), group + 2);
+        // A replaced stream stays for the whole overlap time.
+        assert!(h.backend.retiring_count() >= streams);
       }
-      assert!(Instant::now() < deadline);
+      // The writer goes on for a while before the set of streams changes again.
+      let goal = writer.made() + 80;
+      while writer.made() < goal {
+        if let Some((at, hints)) = h.next(Instant::now() + Duration::from_millis(1)) {
+          reported.add(old, at, hints);
+        }
+        assert!(Instant::now() < deadline);
+      }
     }
   }
-  assert_eq!(rebuilds, 5);
 
   let files = writer.finish().into_iter().enumerate();
   let files: Vec<_> = files.map(|(index, made)| (PathBuf::from(index.to_string()), made)).collect();
@@ -628,14 +727,14 @@ fn unwatch_stops_the_hints_of_that_key_only() {
 
   h.backend.unwatch(given);
   File::create(h.path("dir/a")).unwrap();
-  let hints = h.sync(other);
+  let hints = h.hints_until_record(&h.real("dir/a"));
   assert_eq!(rels(&hints, real), HashSet::from(["a"]));
   assert_eq!(rels(&hints, given), HashSet::new());
 
   // The cover has no key left. Its path stays in the stream, and its records are dropped.
   h.backend.unwatch(real);
   File::create(h.path("dir/b")).unwrap();
-  let hints = h.sync(other);
+  let hints = h.hints_until_record(&h.real("dir/b"));
   assert_eq!(rels(&hints, real), HashSet::new());
   assert_eq!(rels(&hints, given), HashSet::new());
   assert!(h.backend.streamed().contains(&h.real("dir").as_path()));
@@ -755,7 +854,7 @@ fn lost_records_are_hints_for_the_covers_of_their_place() {
     assert_eq!(h.translate(raw(&[(&h.real("other"), flags)])), [Seen::Lost], "{flags:#x}");
   }
 
-  // The other records of the same call keep their hints.
+  // The other records of the same call keep their hints. The ones of the loss come last.
   let file = flag::CREATED | 0x1_0000;
   let hints = h.translate(raw(&[
     (&h.real("up/cover/a"), file),
@@ -765,11 +864,11 @@ fn lost_records_are_hints_for_the_covers_of_their_place() {
   let expected = [
     changed(cover, "a"),
     changed(twin, "a"),
+    changed(cover, "b"),
+    changed(twin, "b"),
     all_of(cover),
     all_of(twin),
     all_of(below),
-    changed(cover, "b"),
-    changed(twin, "b"),
   ];
   assert_eq!(hints, expected);
 
@@ -894,8 +993,7 @@ fn flags_decide_only_about_directories() {
 /// on: each one lies right in the temporary directory of the user, which is too high.
 #[test]
 fn more_covers_than_one_stream_can_hold() {
-  let _heavy = one_heavy_test_at_a_time();
-  let mut h = Harness::new();
+  let mut h = Harness::alone();
   let top = fs::canonicalize(std::env::temp_dir()).unwrap();
   assert!(is_too_high(&top), "the test needs a temporary directory that is too high: {top:?}");
   let count = u32::try_from(MAX_PATHS_PER_STREAM).unwrap() + 4;
@@ -904,7 +1002,7 @@ fn more_covers_than_one_stream_can_hold() {
     h.watch(index, dir.path(), Want::Contents);
   }
   h.commit();
-  assert_eq!(h.backend.stream_count(), 2);
+  assert_eq!(h.backend.stream_count(), MAX_NEW_STREAMS);
   // The paths stay apart, as the covers are.
   assert_eq!(h.backend.streamed().len(), dirs.len());
 
@@ -947,8 +1045,7 @@ fn more_covers_than_one_stream_can_hold() {
 /// have in common, and each key still gets its hints below its own directory.
 #[test]
 fn many_covers_share_stream_paths_on_common_directories() {
-  let _heavy = one_heavy_test_at_a_time();
-  let mut h = Harness::new();
+  let mut h = Harness::alone();
   let per_group = u32::try_from(MAX_STREAM_PATHS).unwrap() / 2;
   let mut keys = Vec::new();
   for group in 0..4 {
@@ -965,7 +1062,7 @@ fn many_covers_share_stream_paths_on_common_directories() {
   let coverage = h.backend.watch(group, &h.path("g0"), Want::Names);
   assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
   assert_eq!(h.commit(), [group]);
-  assert_eq!(h.backend.stream_count(), 1);
+  assert_eq!(h.backend.stream_count(), MAX_NEW_STREAMS);
   // The groups go up one after the other, in path order, until the paths fit: three groups
   // are one path each, and the directories of the last one keep their own.
   let mut expected: Vec<PathBuf> =
@@ -981,7 +1078,7 @@ fn many_covers_share_stream_paths_on_common_directories() {
   let coverage = h.backend.watch(DirKey::new(1001, 0), &h.path(""), Want::Names);
   assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
   assert_eq!(h.commit(), []);
-  assert_eq!(h.backend.stream_count(), 1);
+  assert_eq!(h.backend.stream_count(), MAX_NEW_STREAMS);
 
   // Each key gets the path below its own directory, also where a path is shared.
   for (_, rel) in &keys {
@@ -1004,7 +1101,7 @@ fn many_covers_share_stream_paths_on_common_directories() {
   let new = h.watch(2000, &h.path("g0/apart"), Want::Contents);
   assert_eq!(h.backend.pending(), NO_PATHS);
   assert_eq!(h.commit(), []);
-  assert_eq!(h.backend.stream_count(), 1);
+  assert_eq!(h.backend.stream_count(), MAX_NEW_STREAMS);
   File::create(h.path("g0/apart/new")).unwrap();
   h.hints_until(&[changed(new, "new"), changed(group, "apart/new")]);
 }
@@ -1032,9 +1129,9 @@ fn real_path_is_the_one_of_the_os_for_every_directory_of_one_parent() {
 
 #[test]
 fn drop_while_a_writer_is_active() {
-  let _heavy = one_heavy_test_at_a_time();
+  let _alone = Turn::take(true);
   let dir = tempfile::tempdir().unwrap();
-  let covers = u32::try_from(MAX_STREAMS).unwrap() + 1;
+  let covers = u32::try_from(MAX_NEW_STREAMS).unwrap();
   for index in 0..covers {
     fs::create_dir(dir.path().join(format!("dir-{index}"))).unwrap();
   }
@@ -1053,14 +1150,21 @@ fn drop_while_a_writer_is_active() {
       }
     });
     let mut backend = FsEventsBackend::new(sink).unwrap();
-    // Every second round also drops streams that a rebuild has just replaced.
-    for index in 0..if round % 2 == 0 { 1 } else { covers } {
+    let rebuild = round % 2 == 1;
+    for index in 0..if rebuild { covers } else { 1 } {
       let dir = dir.path().join(format!("dir-{index}"));
       let coverage = backend.watch(DirKey::new(index, 0), &dir, Want::Contents);
       assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
+    }
+    backend.commit().unwrap();
+    // Every second round also drops streams that a rebuild has just replaced: each directory
+    // has a stream, and the one for the directory above them takes their place.
+    if rebuild {
+      let coverage = backend.watch(DirKey::new(covers, 0), dir.path(), Want::Contents);
+      assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
       backend.commit().unwrap();
     }
-    assert_eq!(backend.retiring_count(), if round % 2 == 0 { 0 } else { MAX_STREAMS });
+    assert_eq!(backend.retiring_count(), if rebuild { MAX_NEW_STREAMS } else { 0 });
     assert!(matches!(signals.recv_timeout(TIMEOUT), Ok(Signal::Raw(_))), "no callback yet");
 
     drop(backend);
@@ -1091,16 +1195,14 @@ fn drop_while_a_writer_is_active() {
 
 #[test]
 fn burst_is_reported() {
-  let _heavy = one_heavy_test_at_a_time();
-  let mut h = Harness::new();
+  let mut h = Harness::alone();
   burst(&mut h);
 }
 
 #[test]
 fn burst_with_lost_records_is_reported_as_lost() {
-  let _heavy = one_heavy_test_at_a_time();
   // The sink of the watcher never blocks. This one does, to make FSEvents drop records for real.
-  let mut h = Harness::with_slow_callback(Duration::from_millis(20));
+  let mut h = Harness::alone_with_slow_callback(Duration::from_millis(20));
   let reported = burst(&mut h);
   assert!(reported.last_lost.is_some(), "FSEvents dropped nothing");
 
@@ -1188,6 +1290,7 @@ fn failed_start_is_reported_and_the_old_streams_stay() {
     }
     assert!(Instant::now() < deadline, "no stream can start");
   };
+  // More covers than stream paths now: they share one path, the directory above them.
   assert_eq!(h.backend.stream_count(), 1);
   assert_eq!(h.backend.retiring_count(), MAX_STREAMS);
   File::create(last.join("file")).unwrap();

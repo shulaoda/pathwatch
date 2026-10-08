@@ -89,12 +89,16 @@ fn an_editor_saves_a_file() {
 
 #[test]
 fn mkdir_p_and_a_file_at_once() {
-  each_backend(|w| {
+  // Every round waits for one quiet time, so it is a short one. And with polling, the pause
+  // after a round of the poll grows with what is watched: twice the rounds take four times as
+  // long.
+  let config = Config::default().with_debounce(Duration::from_millis(5));
+  each_backend_with(&config, |w| {
     w.mkdir("r");
     w.watch(&["r"]);
 
     let mut files = Vec::new();
-    for round in 0..100 {
+    for round in 0..50 {
       // One file below a watched directory, and one that is a watched path itself. Both get
       // their directories and their content with nothing in between.
       let in_dir = format!("r/{round}/a/b/f.txt");

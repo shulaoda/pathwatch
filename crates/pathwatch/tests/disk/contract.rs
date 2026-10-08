@@ -23,7 +23,7 @@ use pathwatch::{
   poll::PollBackend,
 };
 
-use crate::{POLL_INTERVAL, Watch, each_backend, each_backend_with};
+use crate::{POLL_INTERVAL, Watch, backend_name, each_backend, each_backend_with, side_by_side};
 
 #[test]
 fn s1_a_write_in_place() {
@@ -73,7 +73,7 @@ fn s3_deleted_and_created_again_inside_the_delete_delay() {
   // the delay: the watchers are built like the ones of `each_backend`, by hand.
   const DELETE_DELAY: Duration = Duration::from_secs(2);
 
-  for polling in [false, true] {
+  side_by_side(|polling| {
     let options = Options {
       quiet_time: Duration::from_millis(50),
       delete_delay: DELETE_DELAY,
@@ -97,7 +97,7 @@ fn s3_deleted_and_created_again_inside_the_delete_delay() {
       dir: tempfile::tempdir().unwrap(),
       events: Vec::new(),
       passing: Vec::new(),
-      backend: if polling { "polling" } else { "native" },
+      backend: backend_name(polling),
     };
 
     w.write("r.txt", "1");
@@ -108,7 +108,7 @@ fn s3_deleted_and_created_again_inside_the_delete_delay() {
     w.expect(&[(Update, "r.txt")]);
     // A `Delete` that still waited would come when the delay is over.
     assert!(!w.receive(DELETE_DELAY), "{}: {:?}", w.backend, w.events);
-  }
+  });
 }
 
 #[test]
