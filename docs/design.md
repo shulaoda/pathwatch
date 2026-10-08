@@ -181,6 +181,13 @@ hold what only a few nodes have: the link of a registered name (5.14), the conte
 young file (5.8), the time of a hold (5.9), and the times of a directory that only the poll
 looks at (5.10).
 
+A tree that gets smaller gives its memory back (`Tree::give_back`). A node never moves,
+because its key is its place. So only the end of the arena can go, as far as no node lives
+there: one node that was made late keeps the arena as long as it is, and then only the names
+and the table get smaller. Measured with a million nodes (94 bytes each, 91 MiB): when all of
+them go, nothing stays; when the node that was made last stays, 71 MiB stay. A tree that goes
+and comes back pays for its memory again, as the first time (54 ns for a node, not 12).
+
 **`complete` is a rule.** A directory node is complete when its path is a watched path that the
 filter does not ignore, or when its parent is complete and the filter does not ignore it. Every
 check that finds the directory on disk works it out. The tree can be behind the rule for a
@@ -253,6 +260,12 @@ child of `X` that can be the name `c` (`can_be_one_name`):
 The mark is deep, because the names below can be spelled in another way too. If no child can
 be the name, the hint is dropped and costs no look at the disk. The events carry the
 registered spelling.
+
+A name of ASCII letters is found through the table: its hash leaves out the case of ASCII
+letters (`child_hash`), so the children that differ only in that are filed under one hash. Such
+a hint costs one lookup more, however many registered children the directory has: 18 ns
+next to 20,000 of them, where comparing with each child took 53 µs. A name with a byte
+outside ASCII is still compared with every child.
 
 **The listing tells the spelling.** On such a disk `lstat` finds an entry under every spelling
 of its name, so after a rename from `app.js` to `App.js` both names look alive. A listing names

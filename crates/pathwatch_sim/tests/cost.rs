@@ -769,8 +769,8 @@ fn i_a_name_nobody_watches_on_a_disk_with_loose_spelling() {
   const HINTS: u32 = 100_000;
   let _serial = serial();
   // The setting of case c with one watch for the tree, on a disk that takes two spellings of
-  // a name for one. A hint for a name that is not registered is compared with the registered
-  // names of its directory: the hint costs more, but it leaves no work, and the disk is not
+  // a name for one. A hint for a name that is not registered is looked up once more, under
+  // every case of its letters: the hint costs more, but it leaves no work, and the disk is not
   // looked at. A hint for another spelling of a registered name makes that one name be checked.
   let (mut unrelated, mut related) = (0, 0);
   let [hint, flush] = best(|| {

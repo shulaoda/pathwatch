@@ -10,7 +10,6 @@ mod names;
 
 use std::{
   ffi::OsStr,
-  hash::{Hash, Hasher},
   iter, mem,
   ops::{Index, IndexMut},
   path::{Component, Path, PathBuf},
@@ -18,7 +17,7 @@ use std::{
 };
 
 use hashbrown::HashTable;
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::FxHashMap;
 
 use self::{flags::Flags, names::Names};
 use crate::{
@@ -121,6 +120,18 @@ impl Node {
   /// partial node, and it stays while nothing is at its path.
   pub fn is_registered(&self) -> bool {
     self.is_path() || self.is_ancestor()
+  }
+
+  /// Adds a mark to the node. Two marks for one node become one. `true`: it had none.
+  fn add_mark(&mut self, mark: Mark) -> bool {
+    let old = self.mark();
+    self.set_mark(Some(old.map_or(mark, |old| Mark {
+      deep: old.deep || mark.deep,
+      written: old.written || mark.written,
+      // A check that anything else asked for does not wait with the loss reports.
+      lost: old.lost && mark.lost,
+    })));
+    old.is_none()
   }
 }
 
@@ -236,8 +247,13 @@ pub enum Added {
 /// The arena of the nodes, the table that finds a child by its name, and the work that waits.
 #[derive(Debug)]
 pub struct Tree {
+  /// The arena. Its last slot is never free: a free end is cut off ([`Tree::give_back`]).
   slots: Vec<Slot>,
+  /// The free slots. An index can be stale: its slot was cut off the end of the arena.
   free: Vec<u32>,
+  /// The generation of a node in a new slot: above the generation of every slot that was cut
+  /// off, so that an old key for such a slot never names a node again.
+  first_generation: u32,
   names: Names,
   /// Every node but the root, filed under its parent and its name.
   index: HashTable<u32>,
@@ -278,6 +294,7 @@ impl Tree {
     Self {
       slots: vec![Slot::Live(root)],
       free: Vec::new(),
+      first_generation: 0,
       names,
       index: HashTable::new(),
       links: FxHashMap::default(),
@@ -348,7 +365,9 @@ impl Tree {
     let parent = parent.index();
     debug_assert!(self.find(parent, name).is_none(), "the child is there already");
     let name_at = self.names.add(name);
-    let index = if let Some(index) = self.free.pop() {
+    let slots = self.slots.len();
+    let free = iter::from_fn(|| self.free.pop()).find(|&index| (index as usize) < slots);
+    let index = if let Some(index) = free {
       let slot = &mut self.slots[index as usize];
       let Slot::Free { generation } = *slot else { unreachable!("the slot is on the free list") };
       *slot = Slot::Live(Node::new(generation, parent, name_at));
@@ -360,7 +379,7 @@ impl Tree {
         // its size as a `Vec` does by itself, so that at most a ninth of it is unused.
         self.slots.reserve_exact(self.slots.len() / 8 + 16);
       }
-      self.slots.push(Slot::Live(Node::new(0, parent, name_at)));
+      self.slots.push(Slot::Live(Node::new(self.first_generation, parent, name_at)));
       index
     };
 
@@ -372,10 +391,7 @@ impl Tree {
     }
 
     let Self { slots, names, index: table, .. } = self;
-    table.insert_unique(child_hash(parent, name), index, |&other| {
-      let node = linked(slots, other);
-      child_hash(node.parent, name_of(names, node))
-    });
+    table.insert_unique(child_hash(parent, name), index, |&other| hash_of(slots, names, other));
     self.key(index)
   }
 
@@ -520,10 +536,37 @@ impl Tree {
     self.holds.remove(&key);
     self.times.remove(&key);
 
+    self.give_back();
     self.names.free(node.name_len);
     if self.names.is_half_dead(self.slots.len()) {
       let used = self.slots.iter_mut().filter_map(Slot::node_mut);
       self.names.pack(used.map(|node| (&mut node.name_at, node.name_len)));
+    }
+  }
+
+  /// Gives back the memory that a tree needs no more after many of its nodes are gone.
+  ///
+  /// A key is an index into the arena, so a node never moves: only the end of the arena can
+  /// go, as far as no node lives there. A block is made smaller only when less than half of it
+  /// is in use, so that a tree that grows and shrinks by a little moves no memory. The table
+  /// waits until an eighth is in use: it hashes every name it keeps once more.
+  fn give_back(&mut self) {
+    while let Some(&Slot::Free { generation }) = self.slots.last() {
+      self.first_generation = self.first_generation.max(generation);
+      self.slots.pop();
+    }
+    let slots = self.slots.len();
+    if self.slots.capacity() > 2 * slots + 16 {
+      self.slots.shrink_to(slots + slots / 8 + 16);
+    }
+    // More than half of the list is stale then.
+    if self.free.len() > 2 * slots + 16 {
+      self.free.retain(|&index| (index as usize) < slots);
+      self.free.shrink_to(slots);
+    }
+    if self.index.capacity() > 8 * self.index.len() + 16 {
+      let Self { slots, names, index, .. } = self;
+      index.shrink_to(2 * index.len(), |&other| hash_of(slots, names, other));
     }
   }
 
@@ -614,11 +657,51 @@ fn name_of<'a>(names: &'a Names, node: &Node) -> &'a OsStr {
   names.get(node.name_at, node.name_len)
 }
 
+/// The hash under which the table files the live node in the slot `index`.
+fn hash_of(slots: &[Slot], names: &Names, index: u32) -> u64 {
+  let node = linked(slots, index);
+  child_hash(node.parent, name_of(names, node))
+}
+
 /// The hash under which the table files the child `name` of the node `parent`.
+///
+/// The case of ASCII letters is left out of it: two names that differ in nothing else have one
+/// hash, and so [`Tree::other_spelling`] finds them in the table. No ready hasher does that
+/// without a copy of the name, so the bytes are mixed here: 16 at a time, as two numbers that
+/// are multiplied, and the two halves of the product are folded into one.
+#[expect(clippy::cast_possible_truncation, reason = "the two halves of a product are taken")]
 fn child_hash(parent: u32, name: &OsStr) -> u64 {
-  let mut hasher = FxHasher::default();
-  (parent, name).hash(&mut hasher);
-  hasher.finish()
+  // The one bit that tells `a` from `A`, set in every byte. Bytes that are no letters change
+  // too, which only means that a few more names share a hash.
+  const CASE: u64 = u64::from_ne_bytes([0x20; 8]);
+  // Digits of pi: two numbers with no pattern.
+  const SEEDS: [u64; 2] = [0x243f_6a88_85a3_08d3, 0x1319_8a2e_0370_7344];
+  let mix = |a: u64, b: u64| {
+    let product = u128::from(a) * u128::from(b);
+    (product as u64) ^ ((product >> 64) as u64)
+  };
+  let word = |bytes: &[u8]| u64::from_ne_bytes(*bytes.first_chunk().expect("eight bytes")) | CASE;
+  let half =
+    |bytes: &[u8]| u64::from(u32::from_ne_bytes(*bytes.first_chunk().expect("four bytes"))) | CASE;
+
+  let mut rest = name.as_encoded_bytes();
+  let mut hash = SEEDS[0] ^ u64::from(parent) ^ ((rest.len() as u64) << 32);
+  while rest.len() > 16 {
+    hash = mix(hash ^ word(rest), SEEDS[1] ^ word(&rest[8..]));
+    rest = &rest[16..];
+  }
+  // What is left, 16 bytes at most, as two numbers. With fewer bytes the two overlap.
+  let (first, last) = match *rest {
+    [] => (0, 0),
+    [one] => (u64::from(one) | CASE, 0),
+    [one, two] => (u64::from(one) | CASE, u64::from(two) | CASE),
+    [one, two, three] => {
+      (u64::from(one) | CASE, u64::from(u16::from_ne_bytes([two, three])) | CASE)
+    }
+    _ if rest.len() < 8 => (half(rest), half(&rest[rest.len() - 4..])),
+    _ => (word(rest), word(&rest[rest.len() - 8..])),
+  };
+  mix(hash ^ first, SEEDS[1] ^ last)
 }
 
 /// The longest list that is kept for its memory between two uses.
@@ -714,18 +797,9 @@ impl Tree {
 
   /// Adds a mark to a node. Two marks for one node become one.
   pub fn mark(&mut self, key: DirKey, mark: Mark) {
-    let node = &mut self[key];
-    let Some(old) = node.mark() else {
-      node.set_mark(Some(mark));
+    if self[key].add_mark(mark) {
       self.marked.push(key);
-      return;
-    };
-    node.set_mark(Some(Mark {
-      deep: old.deep || mark.deep,
-      written: old.written || mark.written,
-      // A check that anything else asked for does not wait with the loss reports.
-      lost: old.lost && mark.lost,
-    }));
+    }
   }
 
   /// Takes the mark off a node. `None`: it has none, or the key names no node.
@@ -837,16 +911,35 @@ impl Tree {
     if !self.loose_spelling {
       return false;
     }
+    let first_child = linked(&self.slots, at).first_child;
+    let Self { slots, names, index, marked, .. } = self;
     let mut found = false;
-    let mut child = linked(&self.slots, at).first_child;
-    while child != NONE {
-      let node = linked(&self.slots, child);
-      let next = node.next;
-      if node.is_registered() && can_be_one_name(name_of(&self.names, node), name) {
-        self.mark(self.key(child), Mark::DEEP);
+    // Marks the node in the slot `child` if it can be the entry. Gives the child after it.
+    let mut mark_if_it_can_be = |child: u32| {
+      let node = slots[child as usize].node_mut().expect("a link points to a live node");
+      let can_be =
+        node.parent == at && node.is_registered() && can_be_one_name(name_of(names, node), name);
+      if can_be {
         found = true;
+        if node.add_mark(Mark::DEEP) {
+          marked.push(DirKey::new(child, node.generation));
+        }
       }
-      child = next;
+      node.next
+    };
+    if name.is_ascii() {
+      // Only the same letters in another case can be this name, and the table files those
+      // under the hash of this name. So a flood of names that nobody watches costs one more
+      // lookup for each, however many registered children the node has.
+      for &child in index.iter_hash(child_hash(at, name)) {
+        mark_if_it_can_be(child);
+      }
+    } else {
+      // Every name with a byte outside ASCII can be this name: each child is looked at.
+      let mut child = first_child;
+      while child != NONE {
+        child = mark_if_it_can_be(child);
+      }
     }
     found
   }
@@ -1013,9 +1106,15 @@ impl Tree {
     if !self.contents.keys().all(|key| matches!(self[*key].kind, Kind::File(_))) {
       return Err("the content of a file is kept for a node that has no file".to_owned());
     }
-    let live = self.slots.len() - self.free.len();
+    let live = self.nodes().count();
     if reached != live || self.index.len() + 1 != live {
       return Err("a node is in no list of children, or not in the table".to_owned());
+    }
+    let free = self.free.iter().filter(|&&index| (index as usize) < self.slots.len()).count();
+    if free + live != self.slots.len()
+      || self.slots.last().is_some_and(|last| last.node().is_none())
+    {
+      return Err("a free slot is not on the list once, or the arena ends with one".to_owned());
     }
     Ok(())
   }
@@ -1029,7 +1128,7 @@ mod tests {
     time::{Duration, UNIX_EPOCH},
   };
 
-  use super::{KEPT, Tree, can_be_one_name, emptied, nanos};
+  use super::{KEPT, Tree, can_be_one_name, child_hash, emptied, nanos};
   use crate::backend::DirKey;
 
   /// The names are in one buffer. When many nodes go, the buffer is packed, and every node that
@@ -1069,6 +1168,55 @@ mod tests {
     assert_eq!(tree.name(new), OsStr::new("new.js"));
     assert_eq!(tree.name(top), OsStr::new("/"));
     tree.check_links().unwrap();
+  }
+
+  /// When the nodes go, the arena, the list of free slots and the table get small again, and
+  /// an old key does not name a node that comes later.
+  #[test]
+  fn the_memory_is_given_back_when_the_nodes_go() {
+    let mut tree = Tree::new();
+    let top = tree.insert_child(Tree::ROOT, OsStr::new("/"));
+    let keys: Vec<DirKey> =
+      (0..10_000).map(|i| tree.insert_child(top, OsStr::new(&i.to_string()))).collect();
+    let (last, others) = keys.split_last().unwrap();
+    let table = tree.index.capacity();
+
+    // A node lives at the end of the arena: no slot can be cut off, and each free one is listed.
+    for key in others {
+      tree.prune(*key);
+    }
+    assert_eq!((tree.slots.len(), tree.free.len()), (keys.len() + 2, others.len()));
+    assert!(tree.index.capacity() < table / 100);
+    tree.check_links().unwrap();
+
+    // The end is free now, and so is everything down to the top directory.
+    tree.prune(*last);
+    assert_eq!((tree.slots.len(), tree.free.len()), (2, 0));
+    assert!(tree.slots.capacity() < 100 && tree.free.capacity() < 100);
+    tree.check_links().unwrap();
+
+    // A new node gets the first slot that was cut off, under a generation it never had.
+    let new = tree.insert_child(top, OsStr::new("new"));
+    assert_eq!(new.index(), keys[0].index());
+    assert!(keys.iter().all(|key| tree.get(*key).is_none()));
+    tree.check_links().unwrap();
+  }
+
+  /// The table finds a name under every case of its letters, whatever its length.
+  #[test]
+  fn the_case_of_letters_is_left_out_of_the_hash() {
+    let name = "aBcDeFgHiJkLmNoPqRsTuVwXyZ-0123456789.Js";
+    let mut hashes = Vec::new();
+    for len in 0..=name.len() {
+      let (lower, upper) = (name[..len].to_ascii_lowercase(), name[..len].to_ascii_uppercase());
+      let hash = child_hash(7, OsStr::new(&lower));
+      assert_eq!(hash, child_hash(7, OsStr::new(&upper)), "{len} bytes");
+      hashes.extend([hash, child_hash(8, OsStr::new(&lower))]);
+    }
+    // Another name, or another parent, is another hash.
+    hashes.sort_unstable();
+    hashes.dedup();
+    assert_eq!(hashes.len(), 2 * (name.len() + 1));
   }
 
   #[test]
