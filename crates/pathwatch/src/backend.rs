@@ -1,23 +1,38 @@
+//! The `Backend` trait: what the engine asks of an OS watch API, and the types that go between
+//! the two. The twelve rules that a backend keeps are in `docs/design.md`, section 6; the engine
+//! names a rule by its number.
+
 use std::{error, fmt, io, path::Path, sync::Arc};
 
+/// An OS watch API as the engine sees it. Every method runs on the watcher thread.
 pub trait Backend: Send + 'static {
+  /// One raw notification, as the thread of the backend copies it into the [`Sink`].
   type Raw: Send + 'static;
 
+  /// Asks for a watch on the directory `dir` under `key`. The watch is live after the next
+  /// [`commit`](Backend::commit).
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage;
 
+  /// Takes the watch of `key` back.
   fn unwatch(&mut self, key: DirKey);
 
+  /// Makes the watches asked for since the last commit live. Gives the keys that were answered
+  /// `NotWatched` before and that an OS watch reports now.
   fn commit(&mut self) -> io::Result<Vec<DirKey>> {
     Ok(Vec::new())
   }
 
+  /// Turns a raw notification into hints: one call of `hint` for each.
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>));
 
+  /// How many bytes `raw` counts for in the queue of the watcher.
   fn raw_bytes(_raw: &Self::Raw) -> usize {
     0
   }
 }
 
+/// The name of a directory between the engine and a backend: the slot of its node in the tree,
+/// and a generation that tells it from an earlier node in the same slot.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct DirKey {
   index: u32,
@@ -38,27 +53,41 @@ impl DirKey {
   }
 }
 
+/// What a directory asks to hear about.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Want {
+  /// Entries that come and go. Enough for a directory on the way to a watched path.
   Names,
+  /// Also writes to the files in it.
   Contents,
 }
 
+/// The answer to [`Backend::watch`]: which changes make hints from now on.
 #[derive(Debug)]
 pub enum Coverage {
+  /// This directory alone.
   Watched,
+  /// This directory and every real directory below it.
   WatchedTree,
+  /// Nothing. The engine polls the directory.
   NotWatched,
+  /// Nothing, because the OS refused. The engine polls the directory and asks again later.
   Failed(io::Error),
 }
 
+/// Where to look. A hint never says what happened.
 #[derive(Clone, Copy, Debug)]
 pub enum Hint<'a> {
+  /// Something at `rel` below the directory `dir` changed. An empty `rel`: the directory
+  /// itself, or its watch, and the engine scans everything below it.
   Changed { dir: DirKey, rel: &'a Path },
+  /// The file at `rel` below `dir` was written: an `Update`, also with an equal fingerprint.
   Written { dir: DirKey, rel: &'a Path },
+  /// Notifications were lost, and the backend cannot say where.
   Lost,
 }
 
+/// The way from a thread of the backend into the engine. It never blocks.
 pub struct Sink<R> {
   inner: Arc<dyn Fn(Signal<R>) + Send + Sync>,
 }

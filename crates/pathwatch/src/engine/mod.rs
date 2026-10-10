@@ -3,6 +3,9 @@
 //!
 //! The way of one change of one file: `signal` makes a mark, `tick` runs `flush` (a `check` for
 //! each mark, then the scans), and `finish` reads the events off the tree.
+//!
+//! The words of this code (look, mark, told, held, complete, loose, and the rest) are explained
+//! in `docs/design.md`, section 10.
 
 mod check; // one entry: the disk against the tree
 mod events; // the events of one flush, and the delete delay
@@ -56,6 +59,10 @@ const LONGEST_FLUSH: Duration = Duration::from_secs(60);
 pub type Ignored = Arc<dyn Fn(&Path, EntryKind) -> bool + Send + Sync>;
 
 /// The settings of an [`Engine`].
+///
+/// `Options::default()` is for the tests: a quiet time of 10 ms and a poll each second. The
+/// defaults of the API are those of `Config` (50 ms, 100 ms), which makes the `Options` of a
+/// watcher.
 #[derive(Clone)]
 pub struct Options {
   pub ignored: Option<Ignored>,

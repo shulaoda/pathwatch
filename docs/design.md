@@ -9,7 +9,8 @@ It is built for rolldown (`this.addWatchFile`, module files, dev and build watch
 files, some directories, and paths that do not exist yet. The model follows chokidar: keep a
 tree in memory, do not trust what the OS says happened, ask the disk.
 
-The contract is section 3. What is left out is section 9.
+The contract is section 3. What is left out is section 9. The words that the code uses are
+section 10.
 
 ## 2. Public API (`pathwatch`)
 
@@ -1499,3 +1500,66 @@ Known holes of the engine:
 
 Known holes of the backends are in 7.1 to 7.3. The Windows backend has only run on Windows 11 with NTFS.
 Android was never built.
+
+## 10. Words
+
+The code names things in plain words, and uses each word for one thing. This is the list, in
+the order in which a change meets them.
+
+- **Watched path.** A path given to `watch` and not taken back. Its node `is_path`.
+- **Registered.** A node that is a watched path or leads to one (`is_ancestor`). A registered
+  node stays in the tree while nothing is at its path.
+- **Key.** A `DirKey`: the slot of a node in the arena and a generation. The backend knows a
+  directory by its key and never by its path, so the two sides need not agree on a spelling.
+- **Complete, partial.** A directory node that tracks every entry of its directory, or only its
+  registered children. A watched directory is complete; a directory on the way to a watched path
+  is partial.
+- **Want.** What a directory asks the backend to hear about: `Names` (entries that come and go)
+  or `Contents` (also writes). For one key the want only goes up, until `unwatch`.
+- **Arm, narrow.** To ask the backend for the watch of a directory because it wants more than was
+  asked, or because the watch may be gone; and to give a watch back because the directory wants
+  less after an `unwatch`.
+- **Cover.** A watch above covers a directory below it (`Watch::FromAbove`). In the FSEvents
+  backend, the real directory that a key stands for.
+- **Place.** Where the OS watches are put when there are more directories than the OS lets a
+  process watch at once: the deepest directories that the paths have in common.
+- **Guard.** FSEvents: one open file for each directory above a stream path, so that a rename or
+  a removal above the path is heard at once.
+- **Hint.** What a backend says about a raw notification: where to look (`Changed`, `Written`),
+  or that notifications were lost. A hint never says what happened.
+- **Mark.** "Check this name at the next flush." A hint leaves one, and so does the engine when it
+  has to look again. A mark says whether a directory is to be scanned deep, whether the file was
+  written, and whether only a loss report asked for it.
+- **Flush.** The pass that checks every mark and then runs the scans, round after round, until
+  nothing is queued. `finish` reads the events off the tree when it is over.
+- **Look.** One read of the disk for one path: an `lstat`, a `stat`, or a listing.
+- **Check.** The look at one node and what the engine does with what it found: the table of 5.4.
+- **Scan.** The check of every node of one directory, with a listing when the node is complete.
+  `Names`, `Shallow` or `Deep`: 5.5.
+- **Appear, still there, vanish.** A directory is found where the tree had none; is still the
+  same directory; is gone, with everything below it.
+- **Anchor.** In `register`: the deepest node on the way to a new watched path that has only
+  directories above it on disk. The first look is made there.
+- **Told.** The handler believes that a file is at the node. What was told and what the tree has
+  decide the event at the end of a flush.
+- **Baseline.** What a `watch` call finds: known to the handler without an event.
+- **Young.** A file whose modification time is so recent that another write could leave it as it
+  is. Its content, or the version number of the disk, is kept to compare at the next look.
+- **Fingerprint.** The modification time, the size and the id of a file: what tells one state of
+  it from the next without reading it.
+- **Held.** A look found nothing where the tree has a file or a directory. The node waits for a
+  second look, one delete delay later, and only that look decides.
+- **Frozen.** A node below a held node. Nothing is done there before the second look above.
+- **Uncover, let go.** A node is no watched path any more and no watched directory covers it:
+  what the tree has there is forgotten. A node that is not registered any more is an entry like
+  any other, or is freed.
+- **Loose, strict.** A directory where two spellings of a name are one name (letter case,
+  Unicode form), or two names. A directory counts as loose until a look proves it strict.
+- **Plain.** A name of ASCII characters and Han ideographs only, so that its other spellings are
+  only the case of its ASCII letters, and the table of the tree finds all of them.
+- **Twin.** Another node of the same directory that can be the same name as this one.
+- **Unlisted.** A registered node whose entry the directory above lists under another spelling.
+  It is the path of its caller, and no entry of that directory.
+- **Rest.** After a poll, or after the scans that a loss report asked for, took a time `t`, such
+  work waits `9 × t` before it runs again.
+- **Settle** (tests). Deliver every notification and run every deadline until nothing is left.
