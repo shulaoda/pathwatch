@@ -55,15 +55,25 @@ fn a_file_is_anything_that_is_not_a_directory() {
 
   each_backend(|w| {
     w.mkdir("r");
+    // Two sockets, and a link that points to nothing. macOS (26) says nothing when a socket is
+    // made: there the sockets exist before the watch, and only their removal is heard.
+    let bind = || {
+      (
+        UnixListener::bind(w.path("r/socket")).unwrap(),
+        UnixListener::bind(w.path("socket")).unwrap(),
+      )
+    };
+    let before = cfg!(target_os = "macos").then(&bind);
     w.watch(&["r", "socket"]);
-
-    // Two sockets, and a link that points to nothing.
-    let below = UnixListener::bind(w.path("r/socket")).unwrap();
-    let watched = UnixListener::bind(w.path("socket")).unwrap();
+    let sockets = before.unwrap_or_else(bind);
     symlink("nowhere", w.path("r/link")).unwrap();
-    w.expect(&[(Create, "r/socket"), (Create, "socket"), (Create, "r/link")]);
+    if cfg!(target_os = "macos") {
+      w.expect(&[(Create, "r/link")]);
+    } else {
+      w.expect(&[(Create, "r/socket"), (Create, "socket"), (Create, "r/link")]);
+    }
 
-    drop((below, watched));
+    drop(sockets);
     w.remove("r/socket");
     w.remove("socket");
     w.remove("r/link");

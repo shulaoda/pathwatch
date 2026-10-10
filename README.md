@@ -153,6 +153,9 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   when the file is closed (measured on NTFS); whether the write is reported before that was
   not checked.
 - **A write through another hard link** of a watched file is not reported.
+- **macOS: a socket or a FIFO that is made** is not reported (macOS 26; macOS 27 reports it).
+  It is found when something else makes the watcher look at its directory. Its removal is
+  reported.
 - **A rewrite of the same size that puts the old modification time back** is not reported on
   macOS and with polling. Linux reports it.
 - **A mount over a watched directory** is not noticed until something else makes the watcher
