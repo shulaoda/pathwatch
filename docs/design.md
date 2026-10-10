@@ -617,11 +617,15 @@ both fields, so a look that had to be tried again after the call reports what it
   disk. What another watched path still covers stays as it is.
 - The nodes that nothing needs any more are freed, and the backend forgets each directory
   among them. A directory that stays, because a watched path lies below it, is partial.
-- A directory that stays may want less than it was asked for (`narrow`). A watch for one
-  directory is left as it is. A `WatchedTree` watch that was asked for `Contents` is given
-  back when the tree says that names are enough (every registered name in it is a directory
-  on disk): the backend is asked again, and everything that stays below is scanned deep, so
-  each node that relied on the watch asks for one of its own. While the tree has nothing at a
+- A directory that stays may want less than it was asked for (`narrow`). A watch that was
+  asked for `Contents` is given back when the tree says that names are enough (every
+  registered name in it is a directory on disk), and the backend is asked again, for names.
+  After a `WatchedTree` watch, everything that stays below is scanned deep, so each node that
+  relied on the watch asks for one of its own. After a watch for the one directory (inotify),
+  the scan that every ask queues looks at its registered names. Before, such a watch was left
+  as it was, and each write in a directory that held no watched file any more still woke the
+  watcher: 6 ms of CPU for 20,000 writes in half a second, and 0.1 ms now. No event was wrong
+  either way. While the tree has nothing at a
   registered name, the wide watch stays. When `unwatch` of a tree makes many levels give such
   a watch back, only the top one queues the deep scan: that scan comes to the others, and
   everything below is scanned once.

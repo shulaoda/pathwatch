@@ -12,7 +12,7 @@ use crate::{
   config::EntryKind,
   error::{ErrorKind, context},
   fs::{FileType, Fs},
-  tree::{Depth, Dir, Kind, Mark, Node, Tree, Watch},
+  tree::{Depth, Kind, Mark, Node, Tree, Watch},
 };
 
 /// Asking the backend. A watch is live only after the next commit, so every ask queues a scan
@@ -97,20 +97,23 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// The directory `key` may want less than the backend was asked for: `unwatch` took a
   /// watched path away.
   ///
-  /// A watch for one directory stays as it is: for one key the want only goes up. A watch for
-  /// a whole tree that was asked for the contents is given back, and the backend is asked
-  /// again, for names. Then everything below is scanned deep: the nodes that relied on the
-  /// watch ask for their own.
+  /// For one key the want only goes up, so a watch that was asked for the contents is given
+  /// back, and the backend is asked again, for names: a directory that holds no watched file
+  /// any more must not wake the watcher for every write in it. After a watch for a whole
+  /// tree, everything below is scanned deep: the nodes that relied on the watch ask for their
+  /// own.
   ///
   /// `scan_comes`: a directory above gave its watch back in this call, and its deep scan comes
   /// here too. That scan asks the backend and scans everything below, so nothing more is done
   /// here: a tree in which many levels give a watch back is scanned once, not once for each
-  /// level. Says whether the watch was given back.
+  /// level. Says whether a watch for a whole tree was given back.
   pub(super) fn narrow(&mut self, key: DirKey, scan_comes: bool) -> bool {
-    let is_wide = |dir: &Dir| (dir.watch, dir.asked) == (Watch::WatchedTree, Some(Want::Contents));
-    if !self.tree.get(key).and_then(Node::dir).is_some_and(is_wide) {
-      return false;
-    }
+    let Some(dir) = self.tree.get(key).and_then(Node::dir) else { return false };
+    let covers_a_tree = match (dir.watch, dir.asked) {
+      (Watch::WatchedTree, Some(Want::Contents)) => true,
+      (Watch::Watched, Some(Want::Contents)) => false,
+      _ => return false,
+    };
     // Only when the tree knows that names are enough: where it has nothing at a registered
     // name, the watch stays as it is.
     if self.tree.want(key) != Some(Want::Names) {
@@ -124,11 +127,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       // Until that scan, no OS watch covers the directory.
       self.set_state(key, Watch::Polled);
     } else {
+      // The ask queues a scan of the directory, for what came while it had no watch.
       let mut path = self.tree.path(key);
       self.arm(key, &mut path, true);
-      self.tree.queue_scan(key, Depth::Deep);
+      if covers_a_tree {
+        self.tree.queue_scan(key, Depth::Deep);
+      }
     }
-    true
+    covers_a_tree
   }
 
   /// Whether the backend was asked to tell names only for the directory `key`.
