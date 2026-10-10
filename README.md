@@ -198,7 +198,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   macOS stays where it is until the streams are replaced. Nothing is missed.
 - **The Windows backend is young.** Its tests pass on Windows 11 with NTFS, and nothing else
   was tried: no network share, no ReFS, no older Windows. See `docs/windows-open-points.md`.
-- **Android was never built.** It is set to use the same code as Linux.
+- **Android was never run.** It is set to use the same code as Linux, and only type-checked.
 
 ## Timing
 
@@ -301,7 +301,7 @@ This runs, on the machine it is called on:
 | macOS | `cargo test --workspace` |
 | Linux | `cargo test --workspace`. From macOS with OrbStack: `orb bash -c 'source $HOME/.cargo/env; cd <this directory> && CARGO_TARGET_DIR=$HOME/pathwatch-target-inotify cargo test --workspace'`. The tests use the temporary directory of the VM, because inotify does not see changes that macOS makes on the shared folder. |
 | Windows | `cargo test --workspace` on a Windows machine. Done on Windows 11 with NTFS; `docs/windows-open-points.md` says what was not tried. From another OS only a type check is possible: `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` |
-| Android | Nothing. It was never built. |
+| Android | Only a type check, as on CI: `cargo clippy -p pathwatch --all-targets --target aarch64-linux-android` |
 | WASI | Only a type check: `cargo check -p pathwatch --target wasm32-wasip1-threads` |
 
 The fuzzer (`crates/pathwatch_sim/tests/fuzz.rs`):
