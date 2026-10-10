@@ -27,8 +27,8 @@ const DATA_VOLUME: &str = "/System/Volumes/Data";
 const ERROR_PATH_NOT_UTF8: &str = "FSEvents cannot watch a path that is not UTF-8";
 const ERROR_QUEUE_CREATE: &str = "dispatch_queue_create failed";
 const ERROR_STREAM_CREATE: &str = "FSEventStreamCreate failed";
-const ERROR_STREAM_START: &str =
-  "FSEvents cannot start one more stream (one process can run 512 streams)";
+const ERROR_STREAM_START: &str = "FSEvents did not start a stream: the process may run its 512 \
+                                  streams already, or FSEvents is not available here";
 const ERROR_NAME_ON_DISK: &str = "getattrlist gave no name";
 const ERROR_NO_GUARD: &str = "no open file is left for the directories above a watched path \
                               (raise the limit of open files, ulimit -n)";
@@ -245,8 +245,10 @@ impl Backend for FsEventsBackend {
   }
 
   fn raw_bytes(raw: &Self::Raw) -> usize {
-    let records = size_of_val(raw.records.as_slice());
-    raw.paths.len() + records + size_of_val(raw.moved.as_slice()) + size_of_val(raw.lost.as_slice())
+    raw.paths.capacity()
+      + raw.records.capacity() * size_of::<(usize, u32)>()
+      + raw.moved.capacity() * size_of::<usize>()
+      + raw.lost.capacity() * size_of::<DirKey>()
   }
 }
 
