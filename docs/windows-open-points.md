@@ -135,6 +135,13 @@ the real disk, with this backend and with polling.
 - **A renamed ancestor.** Expected: Windows refuses to rename a directory above an open handle,
   so this cannot happen while a handle is open. Not checked on ReFS, on network shares and for
   renames made from WSL.
+- **The directory of a handle that is renamed.** Windows allows that (the handle is opened with
+  `FILE_SHARE_DELETE`). The handle follows its directory, not its path: it goes on reporting
+  under the old key, and no record says that the directory moved. The backend cannot tell, so
+  rule 10 of the backends is not kept here: the engine finds out by the poll of the directory
+  above, within a second, or by a shared handle above. Until then the hints make the engine
+  look at paths where nothing is, and a new directory made at the old path gets a handle only
+  with the next `watch` of it.
 - **How the directory is opened.** `port` opens it with `std::fs::OpenOptions`: access mode
   `FILE_LIST_DIRECTORY`, share mode `READ | WRITE | DELETE`, custom flags `BACKUP_SEMANTICS |
   OVERLAPPED`. Expected: std passes these to `CreateFileW` as they are, and `File::metadata`
