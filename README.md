@@ -149,7 +149,9 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
 What is not reported, or reported wrongly. All of these are known and not fixed.
 
 - **A writer that keeps a file open.** macOS reports nothing until the file is closed; the
-  same for a write through `mmap`. Windows is expected to do the same (not checked).
+  same for a write through `mmap`. On Windows the directory lists the new size and time only
+  when the file is closed (measured on NTFS); whether the write is reported before that was
+  not checked.
 - **A write through another hard link** of a watched file is not reported.
 - **A rewrite of the same size that puts the old modification time back** is not reported on
   macOS and with polling. Linux reports it.
@@ -233,7 +235,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 |---|---|---|
 | Linux, Android | inotify | One kernel watch for each directory, so a big tree needs a high `fs.inotify.max_user_watches`. At the limit the handler gets `WatchLimit` and the directory is polled once a second. When inotify cannot start at all, the handler is told once and the watcher polls everything. Changes made on another machine (NFS, a folder shared with a VM) are not reported: use polling there. |
 | macOS | FSEvents | See "Holes". A process can run 512 streams; one watcher keeps about 8. It also keeps one file open for each directory at and above a place that a stream watches (about ten for a project, at most 64 such places), and stops at half of what the process may open: beyond that the handler gets `WatchLimit` and the directories are polled once a second. |
-| Windows | `ReadDirectoryChangesW` | Not run yet. At most 64 handles; more directories share a handle on a directory above them. No handle is put on `C:\`, `C:\Users` or `C:\Users\<name>`: what could only be watched from there is polled. |
+| Windows | `ReadDirectoryChangesW` | Tested on Windows 11 with NTFS only (`docs/windows-open-points.md`). At most 64 handles; more directories share a handle on a directory above them. No handle is put on `C:\`, `C:\Users` or `C:\Users\<name>`: what could only be watched from there is polled. |
 | every other target | none: always polling | The cost grows with the number of watched files. |
 
 Rust 1.88 or newer.
@@ -256,7 +258,7 @@ crates/
       watcher.rs             the thread
       tree.rs                the tree of the engine, alone
       inotify.rs  fsevents.rs  windows.rs     each backend alone, on its OS
-      windows_parts.rs       the parts of the Windows backend that call no Windows
+      windows_parts.rs       the parts of the Windows backend that call no Windows (on Windows only)
     examples/                watch.rs, dev_server.rs
   pathwatch_sim/             fixtures for tests, not published
     src/                     a disk and backends in memory
@@ -282,7 +284,8 @@ This runs, on the machine it is called on:
 - the backend of this OS against the real watch API (`crates/pathwatch/tests/inotify.rs`,
   `fsevents.rs` or `windows.rs`),
 - the watcher thread (`tests/watcher.rs`),
-- the parts of the Windows backend that call no Windows (`tests/windows_parts.rs`),
+- on Windows, also the parts of its backend that call no Windows (`tests/windows_parts.rs`):
+  the backend is compiled there only,
 - the promises on the real disk, each once with the backend of this OS and once with polling
   (`tests/disk`).
 
@@ -290,7 +293,7 @@ This runs, on the machine it is called on:
 |---|---|
 | macOS | `cargo test --workspace` |
 | Linux | `cargo test --workspace`. From macOS with OrbStack: `orb bash -c 'source $HOME/.cargo/env; cd <this directory> && CARGO_TARGET_DIR=$HOME/pathwatch-target-inotify cargo test --workspace'`. The tests use the temporary directory of the VM, because inotify does not see changes that macOS makes on the shared folder. |
-| Windows | `cargo test --workspace` on a Windows machine. **This has not been done yet.** From another OS only a type check is possible: `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` |
+| Windows | `cargo test --workspace` on a Windows machine. Done on Windows 11 with NTFS; `docs/windows-open-points.md` says what was not tried. From another OS only a type check is possible: `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` |
 | Android | Nothing. It was never built. |
 | WASI | Only a type check: `cargo check -p pathwatch --target wasm32-wasip1-threads` |
 

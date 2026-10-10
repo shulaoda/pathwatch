@@ -20,7 +20,9 @@ it is in `fs.rs` now (`told` and `stat`):
   deletes it closes its handle. So does a directory that is opened as a file. The engine took
   that for a file that cannot be read: it reported `PermissionDenied`, or an `Update` right
   before the `Delete`. Only the status of the kernel (`RtlGetLastNtStatus`) tells the two
-  apart, and such an answer is "not found" now.
+  apart, and such an answer is "not found" now. That call is an export of `ntdll.dll` that
+  Microsoft does not document: should a Windows drop it, such an entry looks unreadable
+  again, as before.
 - **The creation time is no identity.** A new entry gets the creation time of the one that
   was removed under its name less than 15 seconds ago, and the clock of the time stamps
   moves in steps of 1 to 16 ms. A file that was removed and written again with the same
@@ -228,8 +230,8 @@ change makes its hint, the rules of `Handles` hold with real handles, and `drop`
 
 ## Known gaps
 
-These are known from reading. The limits of the backend are in the comments of `windows.rs`, at
-the code that they are about (`Handle`, `Handles`, `Handles::route`, `may_hold_a_handle`).
+These are known from reading. `windows.rs` has no comments: what the backend does, and where
+its limits are, is in `docs/design.md` 7.3.
 
 1. **A directory behind a link below a handle is polled.** A handle does not report what is
    behind a junction or a directory link below it, so the backend looks at each name between
