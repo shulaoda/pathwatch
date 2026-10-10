@@ -1068,7 +1068,9 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   KB stay and not 6.1 MB.
 - Hints: `MODIFY`, and `CREATE` or `MOVED_TO` of a non-directory → `Written` (the name holds
   other content now). Every other event of an entry → `Changed`. `ATTRIB` of a directory is
-  dropped. `Q_OVERFLOW` → `Lost`.
+  dropped. `Q_OVERFLOW` → `Lost`. A full queue drops `IGNORED` and `DELETE_SELF` too, so a
+  watch that the kernel gave up can stay in the table: the scans after `Lost` ask for every
+  directory again, a new `wd` comes for such a one, and the old entry goes with it.
 - The watched directory itself. `MOVE_SELF` → `Changed` with an empty `rel` for each key; the
   watch and its keys stay, and the next `watch` of the engine moves the key to the directory
   that is at the path now. `DELETE_SELF`, `IGNORED` and `UNMOUNT` → forget the watch, `Changed`
