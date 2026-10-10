@@ -7,10 +7,10 @@ What was done:
 
 - The whole backend, with its tests, is type-checked for `x86_64-pc-windows-msvc` by cross
   compilation.
-- The parts that make no Windows call (`place`, `Handles`, `Records`, `translate`) are tested on
-  other systems, by `crates/pathwatch/tests/windows_parts.rs`.
+- The parts that make no Windows call (`place`, `Handles`, `Records`, `translate`) have tests of
+  their own, in `crates/pathwatch/tests/windows_parts.rs`. They run on Windows only.
 
-What was not done: the part of the file behind `cfg(windows)` (`WindowsBackend` and `port`) and
+What was not done: the part of the file that calls Windows (`WindowsBackend` and `port`) and
 `crates/pathwatch/tests/windows.rs` have never opened a handle. The points below come from the
 Windows documents and from the source of other watchers. Each one has to be checked on a real
 machine before this backend is trusted. `pathwatch` uses it on Windows all the same:
@@ -21,7 +21,6 @@ machine before this backend is trusted. `pathwatch` uses it on Windows all the s
 On macOS or Linux, with a toolchain that has the Windows target:
 
 ```
-cargo test -p pathwatch --test windows_parts
 cargo check  --workspace --all-targets --target x86_64-pc-windows-msvc
 cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 ```

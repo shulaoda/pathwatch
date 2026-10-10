@@ -1,6 +1,8 @@
 //! The parts of the Windows backend that are plain code: where the handles go (`place`), keeping
 //! them there (`handles`), parsing the bytes of one read (`records`), and turning them into hints
-//! (`translate`). They make no Windows call, so these tests run on every system.
+//! (`translate`). They make no Windows call.
+
+#![cfg(target_os = "windows")]
 
 use std::path::PathBuf;
 
@@ -36,9 +38,9 @@ fn index(of: DirKey) -> u32 {
   (0..10_000).find(|&index| key(index) == of).expect("a key that the test did not make")
 }
 
-/// An absolute path on the system that runs the test, from text with `/`.
+/// An absolute path, from text with `/`.
 fn dir(path: &str) -> PathBuf {
-  if cfg!(windows) { format!("C:{}", path.replace('/', "\\")).into() } else { path.into() }
+  format!("C:{}", path.replace('/', "\\")).into()
 }
 
 mod place {

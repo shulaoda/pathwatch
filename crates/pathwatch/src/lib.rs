@@ -98,8 +98,7 @@ pub mod path;
 #[doc(hidden)]
 pub mod tree;
 
-// The backends, one file each. `windows` is compiled on every target: only the part of it that
-// calls Windows is behind `cfg(windows)`, and the rest is tested on the other systems.
+// The backends, one file each.
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub mod fsevents;
@@ -108,6 +107,7 @@ pub mod fsevents;
 pub mod inotify;
 #[doc(hidden)]
 pub mod poll;
+#[cfg(target_os = "windows")]
 #[doc(hidden)]
 pub mod windows;
 

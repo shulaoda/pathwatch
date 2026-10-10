@@ -2,8 +2,8 @@
 //!
 //! [`place`] decides which directories get a handle, [`Handles`] keeps the handles there,
 //! [`Records`] reads the bytes of a read and [`translate`] turns them into hints. These parts make
-//! no Windows call: they are compiled on every target, and `tests/windows_parts.rs` runs them on
-//! every system. Every call to Windows is in `port`, at the end of this file.
+//! no Windows call, and `tests/windows_parts.rs` tests them alone. Every call to Windows is in
+//! `port`, at the end of this file.
 //!
 //! One open directory handle has three types, and each is another thing:
 //! - [`WatchId`] is the number that names the handle. The parts and the threads pass it around.
@@ -24,9 +24,7 @@ use std::{
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-#[cfg(windows)]
-use crate::backend::{Backend, Sink};
-use crate::backend::{Coverage, DirKey, Hint, Want, watch_limit};
+use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want, watch_limit};
 
 /// Each handle costs 64 KiB here and 64 KiB in the kernel, and pins the directories above it.
 pub const MAX_HANDLES: usize = 64;
@@ -40,7 +38,6 @@ const FILE_NAME: usize = 12;
 /// The content, the size or a time of the entry changed.
 const FILE_ACTION_MODIFIED: u32 = 3;
 
-#[cfg(windows)]
 const _: () = {
   use std::mem::offset_of;
 
@@ -502,7 +499,6 @@ fn lower_case(path: &Path) -> PathBuf {
 
 /// The ReadDirectoryChangesW backend. `Handles` decides which directories get a handle, and
 /// `Port` opens and closes them on its thread.
-#[cfg(windows)]
 #[derive(Debug)]
 pub struct WindowsBackend {
   handles: Handles,
@@ -511,14 +507,12 @@ pub struct WindowsBackend {
   sink: Sink<Raw>,
 }
 
-#[cfg(windows)]
 impl WindowsBackend {
   pub fn new(sink: Sink<Raw>) -> io::Result<Self> {
     Ok(Self { handles: Handles::default(), port: port::Port::new(sink.clone())?, sink })
   }
 }
 
-#[cfg(windows)]
 impl Backend for WindowsBackend {
   type Raw = Raw;
 
@@ -547,7 +541,6 @@ impl Backend for WindowsBackend {
   }
 }
 
-#[cfg(windows)]
 impl WindowsBackend {
   /// The new handles are live. Only now the old ones are closed, and then the keys that moved
   /// are told.
@@ -757,15 +750,8 @@ fn looks_short(part: &[u16]) -> bool {
     && !extension[extension.len().min(1)..].contains(&DOT)
 }
 
-#[cfg(windows)]
 fn os_string(name: &[u16]) -> OsString {
   std::os::windows::ffi::OsStringExt::from_wide(name)
-}
-
-/// Only Windows makes these names. This form is here so that the tests run on every system.
-#[cfg(not(windows))]
-fn os_string(name: &[u16]) -> OsString {
-  String::from_utf16_lossy(name).into()
 }
 
 // ---- The port and its thread ----
@@ -781,7 +767,6 @@ fn os_string(name: &[u16]) -> OsString {
 /// completes. So these two blocks are only freed when no read is pending: after the packet of the
 /// read was taken from the port, or when the call that should have queued the read failed. If
 /// neither happens they are leaked: the `Drop` of `Watch` does that.
-#[cfg(windows)]
 mod port {
   use std::{
     fs::{File, OpenOptions},

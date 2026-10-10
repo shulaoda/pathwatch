@@ -1324,8 +1324,8 @@ What stays open:
 ### 7.3 ReadDirectoryChangesW (`windows.rs`)
 
 **This backend has not run on Windows yet.** It is type-checked for the Windows target, and its
-parts that make no Windows call (`place`, `Handles`, `Records`, `translate`) are tested on other
-systems (`tests/windows_parts.rs`). What has to be checked on a real machine is in
+parts that make no Windows call (`place`, `Handles`, `Records`, `translate`) have tests of their
+own (`tests/windows_parts.rs`). What has to be checked on a real machine is in
 `docs/windows-open-points.md`.
 
 - One thread owns one I/O completion port and every directory handle (`port`). A handle is live
@@ -1411,7 +1411,7 @@ The test files of the simulator:
   `engine/events.rs`, and helpers of the backends.
 - The tree alone (`tests/tree.rs`): the arena, the table, and the way from a hint to a mark.
 - Each backend alone (`tests/inotify.rs`, `fsevents.rs`, `windows.rs`, each on its OS). The
-  Windows file has never run. `windows_parts.rs` runs on every OS. In `fsevents.rs` a test
+  Windows file has never run. `windows_parts.rs` runs on Windows only. In `fsevents.rs` a test
   that makes many changes runs alone, and after the others where it can (`Turn`): a flood
   makes FSEvents report losses, and a test next to it was seen to get one too. No test there
   starts when more than 50,000 files lie next to the test program (the probe in 7.2).
