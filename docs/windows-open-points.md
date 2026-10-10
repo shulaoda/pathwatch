@@ -146,17 +146,21 @@ the real disk, with this backend and with polling.
   given in `\\?\` form. This is the same for the backend and for the engine, so such a directory
   can only be watched under its `\\?\` spelling.
 - **Short (8.3) names.** Windows may report a change under the short name of a file. A name that
-  looks like one (`LONGFI~1.TXT`) becomes a `Changed` hint for the directory that holds it. Not
-  checked: which parts of a reported path can be short names, and how often real long names look
-  like one.
+  looks like one (`LONGFI~1.TXT`) becomes a `Changed` hint for the directory that holds it. A
+  name with a lower-case letter (`v1~1.txt`) is never taken for one: Windows makes short names
+  in upper case only. Not checked: which parts of a reported path can be short names, and how
+  often real long names look like one.
 - **Junctions and directory symlinks.** A handle opened through a link watches the target. A
   handle does not report changes that happen behind a link below it: they are reported under the
   real path, and only if that path is below a handle too.
 - **Closing a handle.** Expected: after `CancelIoEx` and `CloseHandle` the pending read completes
   and its packet reaches the port. Until then the buffer is kept. If the packet does not come
   within two seconds at shutdown, the buffer is leaked.
-- **A read that cannot be queued.** Expected: when `ReadDirectoryChangesW` returns `FALSE`, no
-  packet comes for that call.
+- **A read that cannot be queued.** When `ReadDirectoryChangesW` returns `FALSE`, the read is
+  over and the kernel is done with the buffer. A completion packet can still come for it, under
+  the key of the handle, when a file system driver failed the request. So a handle takes no
+  further read after such a failure: the fall back from the longer records opens a new handle
+  with a key of its own (`Worker::open`), and a packet for the old one finds no watch.
 - **Network shares.** A server that cannot notify makes the first read fail. The answer is
   `Failed`, and the engine polls the directory.
 

@@ -132,6 +132,7 @@ const BACKSLASH: u16 = 0x5C;
 const DOT: u16 = 0x2E;
 const TILDE: u16 = 0x7E;
 const DIGITS: std::ops::RangeInclusive<u16> = 0x30..=0x39;
+const LOWER_CASE: std::ops::RangeInclusive<u16> = 0x61..=0x7A;
 
 fn before_short_name(name: &[u16]) -> Option<&[u16]> {
   let mut start = 0_usize;
@@ -149,11 +150,13 @@ fn looks_short(part: &[u16]) -> bool {
   let (base, extension) = part.split_at(dot);
   let digits = base.iter().rev().take_while(|unit| DIGITS.contains(unit)).count();
   let tilde = base.len().checked_sub(digits + 1).filter(|&at| at > 0 && base[at] == TILDE);
+  // Windows makes a short name in upper case: `v1~1.txt` is a long name.
   digits > 0
     && tilde.is_some()
     && base.len() <= 8
     && extension.len() <= 4
     && !extension[extension.len().min(1)..].contains(&DOT)
+    && !part.iter().any(|unit| LOWER_CASE.contains(unit))
 }
 
 mod place {
@@ -701,9 +704,9 @@ mod port {
     },
     Storage::FileSystem::{
       FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
-      FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-      FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
-      FILE_SHARE_WRITE, ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation,
+      FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+      FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+      ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation,
     },
     System::{
       IO::{
@@ -720,11 +723,11 @@ mod port {
     fs::{FileType, Fs, StdFs, Unknown, kernel32},
   };
 
+  // No creation time: a tool that only sets it would make a `Written` hint, and so an `Update`.
   const FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
     | FILE_NOTIFY_CHANGE_DIR_NAME
     | FILE_NOTIFY_CHANGE_SIZE
-    | FILE_NOTIFY_CHANGE_LAST_WRITE
-    | FILE_NOTIFY_CHANGE_CREATION;
+    | FILE_NOTIFY_CHANGE_LAST_WRITE;
 
   const BUFFER_BYTES: u32 = 64 * 1024;
   const BUFFER_WORDS: usize = BUFFER_BYTES as usize / size_of::<u64>();
@@ -772,7 +775,10 @@ mod port {
       let (commands, receiver) = mpsc::channel();
       let worker = thread::Builder::new().name("pathwatch-windows".to_owned()).spawn({
         let iocp = Arc::clone(&iocp);
-        move || Worker { iocp, commands: receiver, sink, watches: FxHashMap::default() }.run()
+        move || {
+          let watches = FxHashMap::default();
+          Worker { iocp, commands: receiver, sink, watches, next_token: 0 }.run();
+        }
       })?;
       Ok(Self { iocp, commands, worker: Some(worker) })
     }
@@ -821,11 +827,15 @@ mod port {
     Stop,
   }
 
+  /// The handles live here. Each is known to the port by a token of its own, never by the id
+  /// of the watch: a read that fails at once can still bring a packet under the token of its
+  /// handle, and such a handle is given up, so the packet finds no watch.
   struct Worker {
     iocp: Arc<Iocp>,
     commands: mpsc::Receiver<Command>,
     sink: Sink<Raw>,
-    watches: FxHashMap<WatchId, Watch>,
+    watches: FxHashMap<usize, Watch>,
+    next_token: usize,
   }
 
   impl Worker {
@@ -837,7 +847,7 @@ mod port {
               break;
             }
           }
-          Packet::Completed { id, result } => self.completed(id, result),
+          Packet::Completed { token, result } => self.completed(token, result),
           Packet::Nothing(error) => {
             self.sink.failed(error);
             break;
@@ -851,7 +861,7 @@ mod port {
       loop {
         match self.commands.try_recv() {
           Ok(Command::Open { id, dir, reply }) => {
-            let _ = reply.send(self.open(id, dir));
+            let _ = reply.send(self.open(id, &dir));
           }
           Ok(Command::Close { id }) => self.close(id),
           Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return false,
@@ -860,31 +870,44 @@ mod port {
       }
     }
 
-    fn open(&mut self, id: WatchId, path: PathBuf) -> io::Result<()> {
-      let dir = open_dir(&path)?;
-      self.iocp.attach(&dir, id)?;
-      let mut watch = Watch::new(dir, path);
-      watch.read()?;
-      self.watches.insert(id, watch);
-      Ok(())
-    }
-
-    fn close(&mut self, id: WatchId) {
-      let Some(watch) = self.watches.get_mut(&id) else { return };
-      watch.close();
-      if !watch.pending {
-        self.watches.remove(&id);
+    fn open(&mut self, id: WatchId, path: &Path) -> io::Result<()> {
+      let mut extended = read_extended().is_some();
+      loop {
+        let dir = open_dir(path)?;
+        let token = self.next_token;
+        self.next_token += 1;
+        self.iocp.attach(&dir, token)?;
+        let mut watch = Watch::new(id, dir, path.to_path_buf(), extended);
+        match watch.read() {
+          Ok(()) => {
+            self.watches.insert(token, watch);
+            return Ok(());
+          }
+          // The disk does not know the longer records. The handle is dropped with the watch:
+          // a packet for the read that failed must not be taken for one of the next read.
+          Err(error) if extended && not_supported(&error) => extended = false,
+          Err(error) => return Err(error),
+        }
       }
     }
 
-    fn completed(&mut self, id: WatchId, result: io::Result<u32>) {
-      let Some(watch) = self.watches.get_mut(&id) else { return };
+    fn close(&mut self, id: WatchId) {
+      let found = self.watches.iter_mut().find(|(_, watch)| watch.id == id);
+      let Some((&token, watch)) = found else { return };
+      watch.close();
+      if !watch.pending {
+        self.watches.remove(&token);
+      }
+    }
+
+    fn completed(&mut self, token: usize, result: io::Result<u32>) {
+      let Some(watch) = self.watches.get_mut(&token) else { return };
       watch.pending = false;
       if watch.dir.is_none() {
         if let Ok(len) = result {
-          self.sink.raw(watch.raw(id, Ok(watch.records(len))));
+          self.sink.raw(watch.raw(Ok(watch.records(len))));
         }
-        self.watches.remove(&id);
+        self.watches.remove(&token);
         return;
       }
       let records = match result {
@@ -893,31 +916,32 @@ mod port {
           Vec::new()
         }
         Err(error) => {
+          // The read is over: the handle can take the next one.
           if watch.extended && not_supported(&error) {
             watch.extended = false;
             if watch.read().is_ok() {
               return;
             }
           }
-          self.died(id, error);
+          self.died(token, error);
           return;
         }
       };
       watch.empty_reads = if records.is_empty() { watch.empty_reads + 1 } else { 0 };
-      self.sink.raw(watch.raw(id, Ok(records)));
+      self.sink.raw(watch.raw(Ok(records)));
       let next = if watch.empty_reads < MAX_EMPTY_READS {
         watch.read()
       } else {
         Err(io::Error::other("every read of the handle comes back with no bytes"))
       };
       if let Err(error) = next {
-        self.died(id, error);
+        self.died(token, error);
       }
     }
 
-    fn died(&mut self, id: WatchId, error: io::Error) {
-      if let Some(watch) = self.watches.remove(&id) {
-        self.sink.raw(watch.raw(id, Err(error)));
+    fn died(&mut self, token: usize, error: io::Error) {
+      if let Some(watch) = self.watches.remove(&token) {
+        self.sink.raw(watch.raw(Err(error)));
       }
     }
 
@@ -928,8 +952,8 @@ mod port {
       self.watches.retain(|_, watch| watch.pending);
       while !self.watches.is_empty() {
         match self.iocp.wait(STOP_WAIT_MS) {
-          Packet::Completed { id, .. } => {
-            if let Some(mut watch) = self.watches.remove(&id) {
+          Packet::Completed { token, .. } => {
+            if let Some(mut watch) = self.watches.remove(&token) {
               watch.pending = false;
             }
           }
@@ -941,6 +965,7 @@ mod port {
   }
 
   struct Watch {
+    id: WatchId,
     dir: Option<File>,
     path: PathBuf,
     overlapped: Box<OVERLAPPED>,
@@ -951,28 +976,22 @@ mod port {
   }
 
   impl Watch {
-    fn new(dir: File, path: PathBuf) -> Self {
+    fn new(id: WatchId, dir: File, path: PathBuf, extended: bool) -> Self {
       Self {
+        id,
         dir: Some(dir),
         path,
         overlapped: Box::default(),
         buffer: vec![0; BUFFER_WORDS].into_boxed_slice(),
         pending: false,
         empty_reads: 0,
-        extended: read_extended().is_some(),
+        extended,
       }
     }
 
+    /// Queues one read. When it fails, no read is pending, and the kernel is done with the
+    /// blocks: a packet can still come for it, under the token of the handle.
     fn read(&mut self) -> io::Result<()> {
-      let queued = self.queue();
-      if self.extended && queued.as_ref().is_err_and(not_supported) {
-        self.extended = false;
-        return self.queue();
-      }
-      queued
-    }
-
-    fn queue(&mut self) -> io::Result<()> {
       let Some(dir) = &self.dir else { return Err(io::Error::other("the handle is closed")) };
       *self.overlapped = OVERLAPPED::default();
       let (handle, buffer) = (dir.as_raw_handle(), self.buffer.as_mut_ptr().cast());
@@ -1002,8 +1021,8 @@ mod port {
       Ok(())
     }
 
-    fn raw(&self, id: WatchId, result: io::Result<Vec<u8>>) -> Raw {
-      Raw::Read { watch: id, dir: self.path.clone(), extended: self.extended, result }
+    fn raw(&self, result: io::Result<Vec<u8>>) -> Raw {
+      Raw::Read { watch: self.id, dir: self.path.clone(), extended: self.extended, result }
     }
 
     fn records(&self, len: u32) -> Vec<u8> {
@@ -1051,10 +1070,10 @@ mod port {
       Ok(Self(unsafe { OwnedHandle::from_raw_handle(port) }))
     }
 
-    fn attach(&self, dir: &File, id: WatchId) -> io::Result<()> {
+    fn attach(&self, dir: &File, token: usize) -> io::Result<()> {
       // SAFETY: both handles are open, and the call reads no memory of ours.
       let port =
-        unsafe { CreateIoCompletionPort(dir.as_raw_handle(), self.0.as_raw_handle(), id.0, 0) };
+        unsafe { CreateIoCompletionPort(dir.as_raw_handle(), self.0.as_raw_handle(), token, 0) };
       if port.is_null() { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 
@@ -1080,7 +1099,7 @@ mod port {
       };
       let result = if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(bytes) };
       match (overlapped.is_null(), result) {
-        (false, result) => Packet::Completed { id: WatchId(key), result },
+        (false, result) => Packet::Completed { token: key, result },
         (true, Ok(_)) => Packet::Wake,
         (true, Err(error)) => Packet::Nothing(error),
       }
@@ -1089,7 +1108,7 @@ mod port {
 
   enum Packet {
     Wake,
-    Completed { id: WatchId, result: io::Result<u32> },
+    Completed { token: usize, result: io::Result<u32> },
     Nothing(io::Error),
   }
 
@@ -1128,6 +1147,9 @@ mod tests {
       "file.txt~1",
       "a~1.json",
       "a~1.b.c",
+      "v1~1.txt",
+      "a~1.c",
+      "api~2.md",
       "toolongna~1.txt",
       "backup~",
       "~$doc.docx",

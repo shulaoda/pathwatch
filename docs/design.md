@@ -1368,7 +1368,7 @@ What was not checked, and what is known to be missing, is in `docs/windows-open-
   (`ERROR_OPERATION_ABORTED`), so it is not taken for lost records. If one open fails,
   nothing changes. A `watch` for the very directory of a handle puts a new handle there: the
   old one may be on a directory that was renamed away.
-- Filter: `FILE_NAME | DIR_NAME | SIZE | LAST_WRITE | CREATION`. 64 KiB buffer. The bytes of a
+- Filter: `FILE_NAME | DIR_NAME | SIZE | LAST_WRITE`. 64 KiB buffer. The bytes of a
   completed read are read on the watcher thread (`Records`, `translate`). The reads ask for
   the longer records (`ReadDirectoryChangesExW`, Windows 10 1709 and later) where Windows
   and the disk have them: they tell whether an entry is a directory.
