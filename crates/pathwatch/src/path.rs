@@ -11,7 +11,7 @@ use std::{
 ///
 /// `None` when the path is relative, has `..` or a NUL, or names a top directory (`/`, `C:\`,
 /// `\\server\share\`), which has no parent to watch it from. Also when one of its names is longer
-/// than [`MAX_NAME`].
+/// than `MAX_NAME`.
 ///
 /// A path that is in this form already is given back as it is: nothing is copied. So a path can
 /// be cleaned at every door (the watcher, then the engine) and the work is done once.
@@ -220,6 +220,7 @@ fn push_names<U: Unit>(
 
 /// Whether `text`, what comes after a top directory, is clean: names with one separator between
 /// two of them, and nothing else.
+#[cfg(any(unix, windows, test))]
 fn names_are_clean<U: Unit>(text: &[U], separator: impl Fn(U) -> bool) -> bool {
   text.split(|&unit| separator(unit)).all(|name| matches!(part_of(name), Part::Name))
 }
