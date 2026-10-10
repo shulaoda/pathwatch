@@ -1442,7 +1442,7 @@ mod tests {
     assert_eq!(nanos(UNIX_EPOCH + Duration::new(2, 3)), 2_000_000_003);
     assert_eq!(nanos(UNIX_EPOCH - Duration::new(2, 3)), -2_000_000_003);
     // The year 2262 is the last one that fits.
-    let far = Duration::from_secs(400 * 365 * 24 * 3600);
+    let far = Duration::from_hours(400 * 365 * 24);
     assert_eq!(nanos(UNIX_EPOCH + far), i64::MAX);
     assert_eq!(nanos(UNIX_EPOCH - far), -i64::MAX);
   }
