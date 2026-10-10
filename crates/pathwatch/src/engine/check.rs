@@ -489,11 +489,18 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       _ => None,
     };
     let young = kind != FileType::Other && self.is_young(key, fingerprint.modified);
-    // A stored hash is compared one last time when the file is not young any more.
-    let compare = old.is_some_and(|(old, content)| {
-      old == fingerprint && matches!(content, Some(Content::Hash(_)))
-    });
-    let hash = if young || compare {
+    // What was kept to compare with, if the fingerprint is the same. It is compared one last
+    // time when the file is not young any more.
+    let kept = old.and_then(|(old, content)| content.filter(|_| old == fingerprint));
+    let compare = matches!(kept, Some(Content::Hash(_)));
+    // Where an OS watch tells about writes, the number that the disk keeps for the file
+    // stands in for the hash, and the file is not opened. Not where the file is only polled:
+    // the number also changes with what is no write, and there nothing else tells.
+    let asks_version = kind == FileType::File
+      && (young || matches!(kept, Some(Content::Version(_))))
+      && !self.only_polled(key);
+    let version = if asks_version { self.fs.version(path) } else { None };
+    let hash = if (young && version.is_none()) || compare {
       match self.content_hash(path, kind, fingerprint.size) {
         Ok(hash) => hash,
         // The entry went away after the `lstat`, or it is of another kind now. This check
@@ -517,6 +524,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         || match content {
           None => false,
           Some(Content::Hash(old)) => hash != Some(old),
+          Some(Content::Version(old)) => version != Some(old),
           Some(Content::Unknown) => !update_waits,
         }
     } else {
@@ -539,10 +547,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if node.is_held() {
       self.tree.unhold(key);
     }
-    let content = match hash {
-      Some(hash) if young => Some(Content::Hash(hash)),
-      None if young => Some(Content::Unknown),
-      _ => None,
+    let content = match (version, hash) {
+      _ if !young => None,
+      (Some(version), _) => Some(Content::Version(version)),
+      (None, Some(hash)) => Some(Content::Hash(hash)),
+      (None, None) => Some(Content::Unknown),
     };
     self.tree.set_content(key, content);
   }

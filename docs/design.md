@@ -665,6 +665,18 @@ Two guards:
      sure to come there, and a write that leaves the time stamp as it is can only come while
      the file is young.
 
+   **A version in place of the hash** (`Fs::version`, Windows). NTFS keeps a number for each
+   file that moves with every change of it (the place of its last record in the change
+   journal). Where an OS watch covers a young file, the engine stores that number and not a
+   hash, and the same number at the next look says that nothing was written. The file is not
+   opened for reading: on Windows that waits for the virus scanner when the file was just
+   written (2 ms, and 14 ms for one in ten, measured; the number takes 0.04 ms). The number
+   also moves when the file is renamed, gets other attributes, or is closed by its writer,
+   and each of these counts as a change at that look: more `Update` events, never fewer. So
+   it is not asked where only the poll looks at a file: there nothing else tells a write from
+   a `chmod`, and the hash decides as before. A disk without a journal has no number, and the
+   hash is taken.
+
 | The modification time | Young for |
 |---|---|
 | has a part of a second in it, and an OS watch covers the file | 20 ms |

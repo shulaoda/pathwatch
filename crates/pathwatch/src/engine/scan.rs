@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
   backend::{Backend, DirKey},
-  fs::{DirId, Fs},
+  fs::{DirId, Entry, FileType, Fs},
   tree::{Depth, Dir, Kind, Mark, Spelling, Watch},
 };
 
@@ -93,15 +93,26 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// knew and that the listing named.
   fn list_new(&mut self, key: DirKey, path: &mut PathBuf, names: &mut Vec<ScanEntry>) -> Listing {
     let known = names.len();
+    // A listing that can be behind for a file that is being written is taken for the file
+    // only where an OS watch reports the write. A directory that is polled asks each file.
+    let heard =
+      matches!(self.tree[key].watch(), Watch::Watched | Watch::WatchedTree | Watch::FromAbove);
+    let lags = self.fs.listing_lags() && !heard;
     let tree = &mut self.tree;
     let mut listed = tree.is_loose(key).then_some(&mut self.listed);
-    let result = self.fs.read_dir(path, &mut |name, entry| match tree.child(key, name) {
-      Some(node) => {
-        if let Some(listed) = &mut listed {
-          listed.insert(node, entry.into());
+    let result = self.fs.read_dir(path, &mut |name, entry| {
+      let entry = match entry {
+        Entry::File { .. } if lags => Entry::Kind(FileType::File),
+        entry => entry,
+      };
+      match tree.child(key, name) {
+        Some(node) => {
+          if let Some(listed) = &mut listed {
+            listed.insert(node, entry.into());
+          }
         }
+        None => names.push((tree.insert_child(key, name), entry.into())),
       }
-      None => names.push((tree.insert_child(key, name), entry.into())),
     });
     let Err(error) = result else { return Listing::Whole };
 

@@ -40,6 +40,29 @@ backend:
   back the watches of the directories below, but only a key that wants the contents holds a
   handle: the handle went away with them, and all of them asked again, without end.
 
+Then the two numbers in which the backend was far behind (`bench/results/windows.md`):
+
+- **Setup.** One `lstat` of std opens the entry, asks, and closes it: 10 us. Two faster ways,
+  both in `fs.rs`:
+  - `GetFileInformationByName` (Windows 11 24H2 and later; looked up at run time) tells the
+    same in one call that opens nothing: 3.5 us. It takes the path as it is, so a path of
+    260 units or more goes the old way.
+  - A listing with `FileIdBothDirectoryInfo` gives name, kind, time, size and file index of
+    some hundred entries in one call: 0.35 us for each. It is taken for a regular file on
+    NTFS only, where it was measured to tell what `lstat` tells. It is behind for a file that
+    a writer has open, until the writer closes it, and for a hard link whose file was written
+    through another name. So the engine takes it only in a directory that an OS watch covers
+    (`Fs::listing_lags`): there the close of the writer makes a record. A directory that is
+    polled asks each file by itself, as before.
+- **The time from a write to its event.** A young file was opened and hashed, and on Windows
+  an open for reading waits for the virus scanner when the file was just written. The engine
+  takes the number that NTFS keeps for the file in its place (`Fs::version`, design 5.8).
+
+What is left of the difference: a watcher that keeps no list of the files (notify, parcel,
+`fs.watch`) is ready as soon as its one handle is open, and pathwatch reads the tree first.
+That is what lets it tell a new file from a changed one and report a tree that is moved in
+or out.
+
 What was not tried: a network share, ReFS, a FAT disk, an older Windows, Wine, and a rename
 made from WSL. A point below that has no test is still only known from documents.
 

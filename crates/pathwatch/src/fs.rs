@@ -27,6 +27,16 @@ pub trait Fs {
   /// A hash of the content of a regular file.
   fn hash(&self, path: &Path) -> io::Result<u64>;
 
+  /// A number that the disk keeps for the regular file at `path` and changes with every
+  /// change of it: a write, and also a rename or other attributes. `None`: the disk has no
+  /// such number, or the file cannot be asked.
+  ///
+  /// Where an OS watch tells about writes, the engine takes it in place of the hash: the same
+  /// number at the next look says that nothing was written, and the file is not opened.
+  fn version(&self, _path: &Path) -> Option<u64> {
+    None
+  }
+
   /// Where the symbolic link at `path` points: the text that is stored in the link.
   fn link_target(&self, path: &Path) -> io::Result<PathBuf>;
 
@@ -42,6 +52,14 @@ pub trait Fs {
 
   /// The clock that the modification times come from.
   fn now(&self) -> SystemTime;
+
+  /// Whether a listing can be behind `lstat` for a file that its writer still has open
+  /// (NTFS: the directory gets the new size and time when the file is closed). Then the
+  /// engine takes a file from a listing only where an OS watch reports the write, and asks
+  /// about each file itself in a directory that it polls.
+  fn listing_lags(&self) -> bool {
+    false
+  }
 }
 
 /// What one `lstat` or `stat` tells about an entry.
@@ -113,6 +131,12 @@ impl Fs for StdFs {
         return apple::read_dir(dir, volume, each);
       }
     }
+    #[cfg(windows)]
+    {
+      if windows::read_dir(dir, each)? {
+        return Ok(());
+      }
+    }
     for entry in fs::read_dir(dir).map_err(told)? {
       let entry = entry.map_err(told)?;
       let kind = entry.file_type().ok().map(|file_type| {
@@ -168,41 +192,519 @@ impl Fs for StdFs {
   fn now(&self) -> SystemTime {
     SystemTime::now()
   }
+
+  fn listing_lags(&self) -> bool {
+    cfg!(windows)
+  }
+
+  #[cfg(windows)]
+  fn version(&self, path: &Path) -> Option<u64> {
+    windows::version(path).ok().flatten()
+  }
 }
 
-/// What a failed call tells, when Windows says less: "access denied" is also its answer for an
-/// entry that is being deleted (until the one who deletes it closes its handle), and for a
-/// directory that is opened as a file. Both mean that the file the engine asked about is not
-/// there, and only the status of the kernel tells them from an entry that may not be read.
-///
-/// Call it right after the call that failed, on the same thread: the status is the one of
-/// the last call that failed there.
+/// Windows. What the calls of std do not tell, and what they cost too much for.
 #[cfg(windows)]
-fn told(error: io::Error) -> io::Error {
-  use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, NTSTATUS, STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY,
-    STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+mod windows {
+  use std::{
+    ffi::{OsStr, OsString, c_void},
+    fs::{self, OpenOptions},
+    io, mem,
+    os::windows::{
+      ffi::{OsStrExt, OsStringExt},
+      fs::{MetadataExt, OpenOptionsExt},
+      io::AsRawHandle,
+    },
+    path::Path,
+    sync::OnceLock,
+    time::{Duration, SystemTime},
   };
 
-  #[link(name = "ntdll")]
-  unsafe extern "system" {
-    safe fn RtlGetLastNtStatus() -> NTSTATUS;
+  use windows_sys::Win32::{
+    Foundation::{
+      ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION,
+      MAX_PATH, NTSTATUS, STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE,
+      STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+    },
+    Storage::FileSystem::{
+      BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+      FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO,
+      FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+      FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, GetFileInformationByHandle,
+      GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+    },
+    System::{
+      IO::DeviceIoControl,
+      Ioctl::{FSCTL_READ_FILE_USN_DATA, USN_RECORD_V2, USN_RECORD_V3},
+      LibraryLoader::{GetModuleHandleW, GetProcAddress},
+    },
+  };
+
+  use super::{DirId, Entry, FileType, Meta, meta};
+
+  /// Other programs may still rename, delete and write what is looked at.
+  const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+  /// From 1601 to 1970, in the steps of 100 ns that Windows counts time in.
+  const TO_1970: u64 = 116_444_736_000_000_000;
+  /// A reparse point with this bit in its tag stands for another name: a junction, a link.
+  /// The rule of std for "is a symbolic link".
+  const NAME_SURROGATE: u32 = 0x2000_0000;
+
+  /// A time before 1970 is no time a watcher has to tell from another one.
+  fn time(since_1601: u64) -> SystemTime {
+    let steps = since_1601.saturating_sub(TO_1970);
+    SystemTime::UNIX_EPOCH + Duration::from_nanos(steps.saturating_mul(100))
   }
 
-  if error.raw_os_error() != Some(ERROR_ACCESS_DENIED.cast_signed()) {
-    return error;
+  /// What `lstat` tells of an entry, from the numbers that each of the calls below gives.
+  fn entry(attributes: u32, tag: u32, written: u64, size: u64, index: u64, dir_id: DirId) -> Meta {
+    let kind = if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && tag & NAME_SURROGATE != 0 {
+      FileType::Symlink
+    } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+      FileType::Dir
+    } else {
+      FileType::File
+    };
+    let modified = time(written);
+    // No change time: the modification time stands in for it, as with std.
+    Meta { kind, modified, changed: modified, size, file_id: index, dir_id }
   }
-  match RtlGetLastNtStatus() {
-    // std asks the listing of the directory when the entry cannot be opened, so the status
-    // can also be the one of that second call: the entry is gone by then.
-    STATUS_DELETE_PENDING
-    | STATUS_FILE_IS_A_DIRECTORY
-    | STATUS_NO_SUCH_FILE
-    | STATUS_OBJECT_NAME_NOT_FOUND
-    | STATUS_OBJECT_PATH_NOT_FOUND => io::ErrorKind::NotFound.into(),
-    _ => error,
+
+  /// What a failed call tells, when Windows says less: "access denied" is also its answer for
+  /// an entry that is being deleted (until the one who deletes it closes its handle), and for
+  /// a directory that is opened as a file. Both mean that the file the engine asked about is
+  /// not there, and only the status of the kernel tells them from an entry that may not be
+  /// read.
+  ///
+  /// Call it right after the call that failed, on the same thread: the status is the one of
+  /// the last call that failed there.
+  pub fn told(error: io::Error) -> io::Error {
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+      safe fn RtlGetLastNtStatus() -> NTSTATUS;
+    }
+
+    if error.raw_os_error() != Some(ERROR_ACCESS_DENIED.cast_signed()) {
+      return error;
+    }
+    match RtlGetLastNtStatus() {
+      // std asks the listing of the directory when the entry cannot be opened, so the status
+      // can also be the one of that second call: the entry is gone by then.
+      STATUS_DELETE_PENDING
+      | STATUS_FILE_IS_A_DIRECTORY
+      | STATUS_NO_SUCH_FILE
+      | STATUS_OBJECT_NAME_NOT_FOUND
+      | STATUS_OBJECT_PATH_NOT_FOUND => io::ErrorKind::NotFound.into(),
+      _ => error,
+    }
+  }
+
+  /// `lstat`, or `stat` with `follow`.
+  ///
+  /// std gives no file index and no volume, and both are needed: Windows gives a new entry
+  /// the creation time of the one that was removed under its name a moment ago, and the clock
+  /// of the time stamps moves in steps of up to 16 ms. So a file that is removed and written
+  /// again can have every time and the size of the old one, and only the file index tells
+  /// that it is another file.
+  ///
+  /// One call by name where Windows has it (3.5 us for a file, measured). Else the entry is
+  /// opened, the way std opens it, and the handle is asked (10 us).
+  pub fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
+    match by_name(path) {
+      // What is behind a link is only found through a handle.
+      Some(Ok(found)) if follow && found.kind == FileType::Symlink => {}
+      Some(result) => return result,
+      None => {}
+    }
+    by_handle(path, follow)
+  }
+
+  /// `FILE_STAT_BASIC_INFORMATION`, the answer of `GetFileInformationByName`.
+  #[repr(C)]
+  #[derive(Default)]
+  struct StatBasic {
+    file_id: u64,
+    creation_time: u64,
+    last_access_time: u64,
+    last_write_time: u64,
+    change_time: u64,
+    allocation_size: u64,
+    end_of_file: u64,
+    file_attributes: u32,
+    reparse_tag: u32,
+    number_of_links: u32,
+    device_type: u32,
+    device_characteristics: u32,
+    reserved: u32,
+    volume_serial_number: u64,
+    file_id_128: [u8; 16],
+  }
+
+  /// `GetFileInformationByName(name, class, answer, size)`.
+  type ByName = unsafe extern "system" fn(*const u16, i32, *mut c_void, u32) -> i32;
+  /// `FileStatBasicByNameInfo`.
+  const STAT_BASIC: i32 = 3;
+
+  /// The call, where this Windows has it (Windows 11 24H2 and later). It is looked up by its
+  /// name: a program that imports it does not start on an older Windows.
+  fn by_name_call() -> Option<ByName> {
+    static CALL: OnceLock<Option<ByName>> = OnceLock::new();
+    *CALL.get_or_init(|| {
+      let kernel32: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+      // SAFETY: both names end with a NUL. `kernel32.dll` is loaded in every process and is
+      // never unloaded, so the address stays good.
+      let found = unsafe {
+        let module = GetModuleHandleW(kernel32.as_ptr());
+        GetProcAddress(module, c"GetFileInformationByName".as_ptr().cast())
+      };
+      // SAFETY: the function with this name has this signature.
+      found
+        .map(|call| unsafe { mem::transmute::<unsafe extern "system" fn() -> isize, ByName>(call) })
+    })
+  }
+
+  /// `lstat` in one call that opens nothing. `None`: this call cannot say, and the handle is
+  /// asked. Only an entry and "nothing is there" are taken from it: every other error (a disk
+  /// that does not know the call, an entry that may not be read) is left to the open.
+  fn by_name(path: &Path) -> Option<io::Result<Meta>> {
+    let call = by_name_call()?;
+    // The call takes the path as it is. A longer one needs the `\\?\` form that std makes.
+    let mut wide = [0_u16; MAX_PATH as usize];
+    for (at, unit) in path.as_os_str().encode_wide().enumerate() {
+      // The last unit stays zero: the end of the text.
+      if unit == 0 || at + 1 == wide.len() {
+        return None;
+      }
+      wide[at] = unit;
+    }
+    let mut info = StatBasic::default();
+    let size = u32::try_from(size_of::<StatBasic>()).ok()?;
+    // SAFETY: `wide` ends with a NUL, and the call writes at most `size` bytes into `info`.
+    if unsafe { call(wide.as_ptr(), STAT_BASIC, (&raw mut info).cast(), size) } == 0 {
+      let error = told(io::Error::last_os_error());
+      return (error.kind() == io::ErrorKind::NotFound).then_some(Err(error));
+    }
+    // The low half is the number that a handle gives: both ways must name a volume alike.
+    let volume = info.volume_serial_number & u64::from(u32::MAX);
+    let dir_id = DirId { volume, inode: info.file_id, birth: info.creation_time };
+    Some(Ok(entry(
+      info.file_attributes,
+      info.reparse_tag,
+      info.last_write_time,
+      info.end_of_file,
+      info.file_id,
+      dir_id,
+    )))
+  }
+
+  fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
+    let link = if follow { 0 } else { FILE_FLAG_OPEN_REPARSE_POINT };
+    let opened = OpenOptions::new()
+      // No access to the content: only what the entry is.
+      .access_mode(0)
+      .share_mode(SHARE_ALL)
+      .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | link)
+      .open(path);
+    let file = match opened.map_err(told) {
+      Ok(file) => file,
+      Err(error) => {
+        // An entry that cannot be opened (a system file that is in use) can still be read
+        // from the listing of its directory: std does that. It has no index then.
+        let code = error.raw_os_error().map(i32::cast_unsigned);
+        if !matches!(code, Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)) {
+          return Err(error);
+        }
+        let metadata = if follow { fs::metadata(path) } else { fs::symlink_metadata(path) };
+        let metadata = metadata.map_err(told)?;
+        let created = metadata.creation_time();
+        return Ok(meta(&metadata, (created, DirId { volume: 0, inode: 0, birth: created })));
+      }
+    };
+    // SAFETY: all zeros is a valid value of this plain struct of numbers.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { mem::zeroed() };
+    // SAFETY: the handle is open, and the call writes one whole struct into `info`.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) } == 0 {
+      return Err(io::Error::last_os_error());
+    }
+    let index = wide(info.nFileIndexHigh, info.nFileIndexLow);
+    let birth = wide(info.ftCreationTime.dwHighDateTime, info.ftCreationTime.dwLowDateTime);
+    let dir_id = DirId { volume: u64::from(info.dwVolumeSerialNumber), inode: index, birth };
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+      // Only some of these are links, and this answer has no tag to tell: std asks for it.
+      return Ok(meta(&file.metadata()?, (index, dir_id)));
+    }
+    let written = wide(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime);
+    let size = wide(info.nFileSizeHigh, info.nFileSizeLow);
+    Ok(entry(info.dwFileAttributes, 0, written, size, index, dir_id))
+  }
+
+  fn wide(high: u32, low: u32) -> u64 {
+    (u64::from(high) << 32) | u64::from(low)
+  }
+
+  /// The room for one answer of the system. The records in it start at multiples of eight.
+  #[repr(C, align(8))]
+  struct Records<const N: usize>([u8; N]);
+
+  /// A number that changes with each change of the file at `path`: the place of the last
+  /// record about the file in the change journal of its disk. `None`: the disk keeps no
+  /// journal, and the content has to be read.
+  ///
+  /// It stands in for a hash of the content, which costs much more here: a program that opens
+  /// a file to read it, right after the file was written, waits for the virus scanner (2 ms,
+  /// and 14 ms for one in ten, measured). This call opens the file without access to its
+  /// content and waits for nothing (0.04 ms). It also changes when the file is renamed or
+  /// gets other attributes, and when a writer closes the file.
+  pub fn version(path: &Path) -> io::Result<Option<u64>> {
+    // A directory cannot be opened in this way: it is no file to compare (see `told`).
+    let file = OpenOptions::new().access_mode(0).share_mode(SHARE_ALL).open(path).map_err(told)?;
+    // The longest record: its fixed part and a name of 255 units.
+    let mut record = Records([0; 1024]);
+    let size = u32::try_from(record.0.len()).unwrap_or(u32::MAX);
+    let mut filled = 0;
+    // SAFETY: the handle is open. The call reads no input, writes at most `size` bytes into
+    // `record`, and their count into `filled`.
+    let read = unsafe {
+      let (no_input, wait) = (std::ptr::null(), std::ptr::null_mut());
+      let (answer, filled) = ((&raw mut record).cast(), &raw mut filled);
+      let handle = file.as_raw_handle();
+      DeviceIoControl(handle, FSCTL_READ_FILE_USN_DATA, no_input, 0, answer, size, filled, wait)
+    };
+    if read == 0 {
+      return Ok(None);
+    }
+    let bytes = record.0.get(..filled as usize).unwrap_or_default();
+    let major = bytes.get(mem::offset_of!(USN_RECORD_V2, MajorVersion)..);
+    let at =
+      match major.and_then(|major| major.first_chunk()).map(|major| u16::from_ne_bytes(*major)) {
+        Some(2) => mem::offset_of!(USN_RECORD_V2, Usn),
+        Some(3) => mem::offset_of!(USN_RECORD_V3, Usn),
+        _ => return Ok(None),
+      };
+    let usn = bytes.get(at..).and_then(|usn| usn.first_chunk());
+    Ok(usn.map(|usn| u64::from_ne_bytes(*usn)))
+  }
+
+  // Where the fields of a `FILE_ID_BOTH_DIR_INFO` record are. They are read from the bytes,
+  // not through a pointer: every offset and length is checked against the answer.
+  const NEXT: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, NextEntryOffset);
+  const WRITTEN: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, LastWriteTime);
+  const SIZE: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, EndOfFile);
+  const ATTRIBUTES: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileAttributes);
+  const NAME_BYTES: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength);
+  /// For a reparse point this field holds its tag.
+  const TAG: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, EaSize);
+  const INDEX: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileId);
+  const NAME: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+
+  /// Lists `dir` with what `lstat` tells of each regular file: one call for some hundred
+  /// entries, 0.35 us for each (measured), where an `lstat` for each takes ten times as long
+  /// or more. `Ok(false)`: the disk is not NTFS, and nothing was listed. Only there it was
+  /// measured that the listing and `lstat` give the same numbers.
+  ///
+  /// The listing is behind in two cases, both measured: for a file that a writer has open (it
+  /// is right again when the writer closes the file), and for a hard link whose file was
+  /// written through another name. The engine knows the first (`Fs::listing_lags`).
+  pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<bool> {
+    let dir = OpenOptions::new()
+      .access_mode(FILE_LIST_DIRECTORY)
+      .share_mode(SHARE_ALL)
+      // Without it a directory cannot be opened at all.
+      .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+      .open(dir)
+      .map_err(told)?;
+    let handle = dir.as_raw_handle();
+    let mut file_system = [0_u16; 8];
+    // SAFETY: the handle is open. The call writes at most eight units into `file_system`,
+    // and nothing through the null pointers.
+    let known = unsafe {
+      let (no_name, none) = (std::ptr::null_mut(), std::ptr::null_mut());
+      let name = file_system.as_mut_ptr();
+      GetVolumeInformationByHandleW(handle, no_name, 0, none, none, none, name, 8)
+    };
+    if known == 0 || !"NTFS\0".encode_utf16().eq(file_system[..5].iter().copied()) {
+      return Ok(false);
+    }
+
+    let mut records = Records([0; 16 * 1024]);
+    let size = u32::try_from(records.0.len()).unwrap_or(u32::MAX);
+    let mut name = Vec::new();
+    let mut class = FileIdBothDirectoryRestartInfo;
+    loop {
+      // SAFETY: the handle is open, and the call writes at most `size` bytes into `records`.
+      let filled =
+        unsafe { GetFileInformationByHandleEx(handle, class, (&raw mut records).cast(), size) };
+      if filled == 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error().map(i32::cast_unsigned) {
+          Some(ERROR_NO_MORE_FILES) => Ok(true),
+          // The answer for a handle that is open on a file.
+          Some(ERROR_INVALID_PARAMETER) => Err(io::ErrorKind::NotADirectory.into()),
+          _ => Err(told(error)),
+        };
+      }
+      class = FileIdBothDirectoryInfo;
+      let mut rest = &records.0[..];
+      loop {
+        let read = record(rest, &mut name);
+        let (next, told) = read.ok_or_else(|| io::Error::other("a listing gave no entry"))?;
+        let own = OsString::from_wide(&name);
+        if own != "." && own != ".." {
+          each(&own, told);
+        }
+        match next {
+          0 => break,
+          next => rest = &rest[next..],
+        }
+      }
+    }
+  }
+
+  /// The record at the start of `bytes`: where the next one starts (zero: none), and what it
+  /// tells. Its name is put into `name`. `None`: the record does not fit into the bytes.
+  fn record(bytes: &[u8], name: &mut Vec<u16>) -> Option<(usize, Entry)> {
+    let u32_at = |at: usize| Some(u32::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
+    let u64_at = |at: usize| Some(u64::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
+    let next = usize::try_from(u32_at(NEXT)?).ok()?;
+    let name_bytes = bytes.get(NAME..)?.get(..usize::try_from(u32_at(NAME_BYTES)?).ok()?)?;
+    // The next record is inside the bytes, and after this one.
+    if next != 0 && (next < NAME + name_bytes.len() || next >= bytes.len()) {
+      return None;
+    }
+    name.clear();
+    name.extend(name_bytes.as_chunks().0.iter().map(|&unit| u16::from_ne_bytes(unit)));
+    let (attributes, index) = (u32_at(ATTRIBUTES)?, u64_at(INDEX)?);
+    let found =
+      entry(attributes, u32_at(TAG)?, u64_at(WRITTEN)?, u64_at(SIZE)?, index, DirId::default());
+    let told = match found.kind {
+      // A reparse point that is no link (a file in a cloud) is left to `lstat`: not measured.
+      FileType::File if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 => {
+        Entry::File { modified: found.modified, size: found.size, file_id: index }
+      }
+      kind => Entry::Kind(kind),
+    };
+    Some((next, told))
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use std::{
+      fs,
+      io::{self, Write},
+      path::Path,
+      process::Command,
+    };
+
+    use super::{by_handle, by_name, read_dir, stat, version};
+    use crate::fs::{Entry, FileType, Meta};
+
+    fn same(a: &Meta, b: &Meta) -> bool {
+      (a.kind, a.modified, a.changed, a.size, a.file_id, a.dir_id)
+        == (b.kind, b.modified, b.changed, b.size, b.file_id, b.dir_id)
+    }
+
+    fn junction(link: &Path, target: &Path) {
+      let made = Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output();
+      assert!(made.is_ok_and(|output| output.status.success()), "mklink /J failed");
+    }
+
+    /// The call by name and the handle tell the same of a file, a directory and a junction,
+    /// and both say "not found" for what is not there.
+    #[test]
+    fn the_call_by_name_tells_what_the_handle_tells() {
+      let top = tempfile::tempdir().unwrap();
+      let (file, dir, link) =
+        (top.path().join("file"), top.path().join("dir"), top.path().join("link"));
+      fs::write(&file, "written").unwrap();
+      fs::create_dir(&dir).unwrap();
+      junction(&link, &dir);
+      // An older Windows has no call by name: there is nothing to compare.
+      if by_name(&file).is_none() {
+        return;
+      }
+      for (path, kind) in
+        [(&file, FileType::File), (&dir, FileType::Dir), (&link, FileType::Symlink)]
+      {
+        let named = by_name(path).unwrap().unwrap();
+        let opened = by_handle(path, false).unwrap();
+        assert!(same(&named, &opened), "{}: {named:?} and {opened:?}", path.display());
+        assert_eq!(named.kind, kind);
+      }
+      // A link is followed through a handle, and the directory behind it is the same one.
+      assert_eq!(stat(&link, true).unwrap().dir_id, stat(&dir, false).unwrap().dir_id);
+      for missing in [top.path().join("none"), file.join("below a file")] {
+        assert_eq!(stat(&missing, false).unwrap_err().kind(), io::ErrorKind::NotFound);
+      }
+    }
+
+    /// On NTFS the listing tells of a regular file what `lstat` tells, and of a directory and
+    /// a junction the kind. It is behind while a writer has the file open.
+    #[test]
+    fn the_listing_tells_of_a_file_what_lstat_tells() {
+      let top = tempfile::tempdir().unwrap();
+      fs::create_dir(top.path().join("dir")).unwrap();
+      junction(&top.path().join("link"), &top.path().join("dir"));
+      fs::write(top.path().join("file"), "written").unwrap();
+      let list = || {
+        let mut seen = Vec::new();
+        let listed = read_dir(top.path(), &mut |name, entry| seen.push((name.to_owned(), entry)));
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        listed.unwrap().then_some(seen)
+      };
+      // Another file system: the listing of std is used there.
+      let Some(seen) = list() else { return };
+      let [
+        (_, Entry::Kind(FileType::Dir)),
+        (_, Entry::File { modified, size, file_id }),
+        (_, Entry::Kind(FileType::Symlink)),
+      ] = seen[..]
+      else {
+        panic!("{seen:?}");
+      };
+      let meta = stat(&top.path().join("file"), false).unwrap();
+      assert_eq!((modified, size, file_id), (meta.modified, meta.size, meta.file_id));
+
+      // A file is no directory.
+      let error = read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap_err();
+      assert_eq!(error.kind(), io::ErrorKind::NotADirectory, "{error:?}");
+
+      let mut writer = fs::OpenOptions::new().append(true).open(top.path().join("file")).unwrap();
+      writer.write_all(b" and more").unwrap();
+      let size = || match list().as_deref() {
+        Some([_, (_, Entry::File { size, .. }), _]) => *size,
+        seen => panic!("{seen:?}"),
+      };
+      assert_eq!(size(), 7, "the listing knows the new size before the writer closed the file");
+      drop(writer);
+      assert_eq!(size(), 16);
+    }
+
+    /// The version of a file changes with each write, and with nothing that only reads.
+    #[test]
+    fn the_version_changes_with_a_write() {
+      let top = tempfile::tempdir().unwrap();
+      let file = top.path().join("file");
+      fs::write(&file, "one").unwrap();
+      // A disk without a change journal: the content is hashed there.
+      let Some(first) = version(&file).unwrap() else { return };
+      assert_eq!(fs::read(&file).unwrap(), b"one");
+      assert_eq!(stat(&file, false).unwrap().size, 3);
+      assert_eq!(version(&file).unwrap(), Some(first));
+
+      // The same size, and most often the same time stamp.
+      fs::write(&file, "two").unwrap();
+      assert_ne!(version(&file).unwrap(), Some(first));
+
+      // Neither a directory nor nothing is a file to compare.
+      for path in [top.path().to_owned(), top.path().join("none")] {
+        assert_eq!(version(&path).unwrap_err().kind(), io::ErrorKind::NotFound);
+      }
+    }
   }
 }
+
+#[cfg(windows)]
+use self::windows::{stat, told};
 
 #[cfg(not(windows))]
 fn told(error: io::Error) -> io::Error {
@@ -554,89 +1056,6 @@ fn name_on_disk(path: &Path) -> io::Result<OsString> {
 fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
   let metadata = if follow { fs::metadata(path) } else { fs::symlink_metadata(path) }?;
   Ok(meta(&metadata, ids(&metadata)))
-}
-
-/// Windows: std gives the file index and the volume only on nightly, so the entry is opened
-/// here, the way std opens it for `symlink_metadata`, and the handle is asked for them.
-///
-/// They are needed: Windows gives a new entry the creation time of the one that was removed
-/// under its name a moment ago, and the clock of the time stamps moves in steps of up to
-/// 16 ms. So a file that is removed and written again can have every time and the size of the
-/// old one, and only the file index tells that it is another file.
-#[cfg(windows)]
-fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
-  use std::{
-    fs::OpenOptions,
-    mem,
-    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
-    time::Duration,
-  };
-
-  use windows_sys::Win32::{
-    Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION},
-    Storage::FileSystem::{
-      BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-      FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-      FILE_SHARE_WRITE, GetFileInformationByHandle,
-    },
-  };
-
-  /// From 1601 to 1970, in the steps of 100 ns that a `FILETIME` counts.
-  const TO_1970: u64 = 116_444_736_000_000_000;
-
-  let link = if follow { 0 } else { FILE_FLAG_OPEN_REPARSE_POINT };
-  let opened = OpenOptions::new()
-    // No access to the content: only what the entry is.
-    .access_mode(0)
-    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | link)
-    .open(path);
-  let file = match opened.map_err(told) {
-    Ok(file) => file,
-    Err(error) => {
-      // An entry that cannot be opened (a system file that is in use) can still be read from
-      // the listing of its directory: std does that. It has no index then.
-      let code = error.raw_os_error().map(i32::cast_unsigned);
-      if !matches!(code, Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)) {
-        return Err(error);
-      }
-      let metadata = if follow { fs::metadata(path) } else { fs::symlink_metadata(path) };
-      let metadata = metadata.map_err(told)?;
-      let created = std::os::windows::fs::MetadataExt::creation_time(&metadata);
-      return Ok(meta(&metadata, (created, DirId { volume: 0, inode: 0, birth: created })));
-    }
-  };
-  // SAFETY: all zeros is a valid value of this plain struct of numbers.
-  let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { mem::zeroed() };
-  // SAFETY: the handle is open, and the call writes one whole struct into `info`.
-  if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) } == 0 {
-    return Err(io::Error::last_os_error());
-  }
-  let wide = |high: u32, low: u32| (u64::from(high) << 32) | u64::from(low);
-  let index = wide(info.nFileIndexHigh, info.nFileIndexLow);
-  let birth = wide(info.ftCreationTime.dwHighDateTime, info.ftCreationTime.dwLowDateTime);
-  let written = wide(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime);
-  let dir_id = DirId { volume: u64::from(info.dwVolumeSerialNumber), inode: index, birth };
-  let kind = if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-    // Only some of these are links (a junction, a symbolic link), and std knows which: one
-    // more question, for the few entries of this kind.
-    return Ok(meta(&file.metadata()?, (index, dir_id)));
-  } else if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-    FileType::Dir
-  } else {
-    FileType::File
-  };
-  // A time before 1970 is no time a watcher has to tell from another one.
-  let modified =
-    SystemTime::UNIX_EPOCH + Duration::from_nanos(written.saturating_sub(TO_1970) * 100);
-  Ok(Meta {
-    kind,
-    modified,
-    changed: modified,
-    size: wide(info.nFileSizeHigh, info.nFileSizeLow),
-    file_id: index,
-    dir_id,
-  })
 }
 
 fn meta(metadata: &Metadata, (file_id, dir_id): (u64, DirId)) -> Meta {
