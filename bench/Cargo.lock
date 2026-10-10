@@ -208,7 +208,7 @@ dependencies = [
 [[package]]
 name = "rolldown-notify"
 version = "11.0.0"
-source = "git+https://github.com/rolldown/notify#3a1cde091855ee031e1a6ebc662c63c37fa4f091"
+source = "git+https://github.com/rolldown/notify?rev=3a1cde091855ee031e1a6ebc662c63c37fa4f091#3a1cde091855ee031e1a6ebc662c63c37fa4f091"
 dependencies = [
  "bitflags",
  "inotify",
@@ -227,7 +227,7 @@ dependencies = [
 [[package]]
 name = "rolldown-notify-types"
 version = "2.0.3"
-source = "git+https://github.com/rolldown/notify#3a1cde091855ee031e1a6ebc662c63c37fa4f091"
+source = "git+https://github.com/rolldown/notify?rev=3a1cde091855ee031e1a6ebc662c63c37fa4f091#3a1cde091855ee031e1a6ebc662c63c37fa4f091"
 
 [[package]]
 name = "rustc-hash"

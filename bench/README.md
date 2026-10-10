@@ -246,6 +246,10 @@ The rules of the driver:
   so these libraries give one event and the table shows every file below it as missed.
   A program that needs the files must list the directory itself. The table shows how much
   work is left to the program, not that the library is broken.
+- **notify on macOS reports nothing in S1 and S3**, with no error. Its FSEvents backend puts
+  every path into one stream, with `watch` for each path as with `paths_mut()`, and a stream
+  takes at most 4,096 paths: for 20,000 single files the stream cannot start, and notify says
+  nothing about it. The table shows that as `missed`.
 - **rolldown's own code is not measured.** rolldown puts a layer on top of the fork (a check
   of every event against the disk, and a walk of each new directory). `notify-fork` here is
   the library alone, so its `missed` is higher and its CPU lower than what rolldown has today.
