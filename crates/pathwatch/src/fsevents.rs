@@ -13,7 +13,10 @@ use std::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::ffi::{Guard, Queue, Stream};
-use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want};
+use crate::{
+  backend::{Backend, Coverage, DirKey, Hint, Sink, Want},
+  fs::{FileType, name_and_kind},
+};
 
 pub const MAX_STREAMS: usize = 64;
 pub const MAX_NEW_STREAMS: usize = 8;
@@ -29,7 +32,6 @@ const ERROR_QUEUE_CREATE: &str = "dispatch_queue_create failed";
 const ERROR_STREAM_CREATE: &str = "FSEventStreamCreate failed";
 const ERROR_STREAM_START: &str = "FSEvents did not start a stream: the process may run its 512 \
                                   streams already, or FSEvents is not available here";
-const ERROR_NAME_ON_DISK: &str = "getattrlist gave no name";
 const ERROR_NO_GUARD: &str = "no open file is left for the directories above a watched path \
                               (raise the limit of open files, ulimit -n)";
 
@@ -111,8 +113,12 @@ impl FsEventsBackend {
           _ => RealParent { asked: parent.to_owned(), real: short_way(fs::canonicalize(parent)?) },
         };
         let real_parent = &self.last_parent.insert(last).real;
-        match ffi::name_on_disk(dir)? {
-          Some(on_disk) if on_disk.eq_ignore_ascii_case(name) => real_parent.join(on_disk),
+        // A link, and a name that differs by more than the case of ASCII letters, are left to
+        // the OS.
+        match name_and_kind(dir)? {
+          (on_disk, kind) if kind != FileType::Symlink && on_disk.eq_ignore_ascii_case(name) => {
+            real_parent.join(on_disk)
+          }
           _ => fs::canonicalize(dir)?,
         }
       }
@@ -434,8 +440,11 @@ impl Streams {
       }
       let mut spelled = path.as_path();
       for (cover, keys) in covers.by_dir.below(slice::from_ref(path)) {
-        let is_spelled =
-          |dir: &Path| ffi::name_on_disk(dir).is_ok_and(|name| name.as_deref() == dir.file_name());
+        let is_spelled = |dir: &Path| {
+          name_and_kind(dir).is_ok_and(|(name, kind)| {
+            kind != FileType::Symlink && Some(name.as_os_str()) == dir.file_name()
+          })
+        };
         if cover.ancestors().take_while(|dir| !spelled.starts_with(dir)).all(is_spelled) {
           spelled = cover;
         } else {
@@ -671,9 +680,9 @@ impl<T> Dirs<T> {
 
 mod ffi {
   use std::{
-    ffi::{CStr, CString, OsStr, OsString, c_char, c_void},
+    ffi::{CStr, c_char, c_void},
     fs::{File, OpenOptions},
-    io, mem,
+    io,
     os::{
       fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
       unix::{ffi::OsStrExt, fs::OpenOptionsExt},
@@ -690,8 +699,8 @@ mod ffi {
   use rustc_hash::FxHashMap;
 
   use super::{
-    ERROR_NAME_ON_DISK, ERROR_NO_GUARD, ERROR_PATH_NOT_UTF8, ERROR_QUEUE_CREATE,
-    ERROR_STREAM_CREATE, ERROR_STREAM_START, EXPECTED_PATH_BYTES, Raw,
+    ERROR_NO_GUARD, ERROR_PATH_NOT_UTF8, ERROR_QUEUE_CREATE, ERROR_STREAM_CREATE,
+    ERROR_STREAM_START, EXPECTED_PATH_BYTES, Raw,
   };
   use crate::backend::{Sink, watch_limit};
 
@@ -950,52 +959,6 @@ mod ffi {
     }
   }
 
-  pub(super) fn name_on_disk(path: &Path) -> io::Result<Option<OsString>> {
-    let c_path = CString::new(path.as_os_str().as_bytes())?;
-    let wanted = AttrList {
-      bitmap_count: ATTR_BIT_MAP_COUNT,
-      reserved: 0,
-      common: ATTR_CMN_NAME | ATTR_CMN_OBJTYPE,
-      volume: 0,
-      dir: 0,
-      file: 0,
-      fork: 0,
-    };
-    let mut found = NameAndType {
-      length: 0,
-      name: AttrReference { offset: 0, length: 0 },
-      object_type: 0,
-      name_bytes: [0; MAX_NAME_BYTES],
-    };
-    // SAFETY: `c_path` ends with a NUL, `wanted` is a whole `attrlist` that the call only reads,
-    // and the call writes at most `size_of::<NameAndType>()` bytes into `found`.
-    let result = unsafe {
-      getattrlist(
-        c_path.as_ptr(),
-        (&raw const wanted).cast_mut().cast(),
-        (&raw mut found).cast(),
-        size_of::<NameAndType>(),
-        FSOPT_NOFOLLOW,
-      )
-    };
-    if result != 0 {
-      return Err(io::Error::last_os_error());
-    }
-    if found.object_type == VLNK {
-      return Ok(None);
-    }
-    let start = usize::try_from(found.name.offset).ok().and_then(|offset_from_reference| {
-      (mem::offset_of!(NameAndType, name) + offset_from_reference)
-        .checked_sub(mem::offset_of!(NameAndType, name_bytes))
-    });
-    let len_without_nul =
-      usize::try_from(found.name.length).ok().and_then(|len| len.checked_sub(1));
-    let name =
-      start.zip(len_without_nul).and_then(|(start, len)| found.name_bytes.get(start..start + len));
-    let name = name.ok_or_else(|| io::Error::other(ERROR_NAME_ON_DISK))?;
-    Ok(Some(OsStr::from_bytes(name).to_owned()))
-  }
-
   extern "C" fn callback(
     _stream: FSEventStreamRef,
     info: *mut c_void,
@@ -1093,13 +1056,6 @@ mod ffi {
   const O_EVTONLY: i32 = 0x8000;
   const O_SEARCH: i32 = 0x4010_0000;
 
-  const ATTR_BIT_MAP_COUNT: u16 = 5;
-  const ATTR_CMN_NAME: u32 = 0x1;
-  const ATTR_CMN_OBJTYPE: u32 = 0x8;
-  const FSOPT_NOFOLLOW: u32 = 0x1;
-  const VLNK: u32 = 5;
-  const MAX_NAME_BYTES: usize = 768;
-
   type CFTypeRef = *const c_void;
   type FSEventStreamRef = *mut c_void;
   type DispatchQueue = *mut c_void;
@@ -1136,31 +1092,6 @@ mod ffi {
     fflags: u32,
     data: isize,
     udata: *mut c_void,
-  }
-
-  #[repr(C)]
-  struct AttrList {
-    bitmap_count: u16,
-    reserved: u16,
-    common: u32,
-    volume: u32,
-    dir: u32,
-    file: u32,
-    fork: u32,
-  }
-
-  #[repr(C)]
-  struct NameAndType {
-    length: u32,
-    name: AttrReference,
-    object_type: u32,
-    name_bytes: [u8; MAX_NAME_BYTES],
-  }
-
-  #[repr(C)]
-  struct AttrReference {
-    offset: i32,
-    length: u32,
   }
 
   #[link(name = "CoreServices", kind = "framework")]
@@ -1209,13 +1140,6 @@ mod ffi {
       context: *mut c_void,
       work: extern "C" fn(*mut c_void),
     );
-    fn getattrlist(
-      path: *const c_char,
-      wanted: *mut c_void,
-      buffer: *mut c_void,
-      size: usize,
-      options: u32,
-    ) -> i32;
     fn getdtablesize() -> i32;
     fn kqueue() -> i32;
     fn kevent(

@@ -146,13 +146,7 @@ fn read(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   let name = OsStr::from_bytes(entry.get(start..end)?);
   let device = if has(ATTR_CMN_DEVID) { Some(fields.i32()?) } else { None };
   let kind = if has(ATTR_CMN_OBJTYPE) { Some(fields.u32()?) } else { None };
-  let kind = match kind {
-    None => return Some((name, Entry::Name)),
-    Some(VREG) => FileType::File,
-    Some(VDIR) => FileType::Dir,
-    Some(VLNK) => FileType::Symlink,
-    Some(_) => FileType::Other,
-  };
+  let Some(kind) = kind.map(file_type) else { return Some((name, Entry::Name)) };
   let whole = common & FILE == FILE && file & ATTR_FILE_DATALENGTH != 0;
   if failed || kind != FileType::File || !whole || device != Some(volume) {
     return Some((name, Entry::Kind(kind)));
@@ -200,16 +194,27 @@ impl Fields<'_> {
   }
 }
 
-/// macOS: `getattrlist` gives the name that the directory holds for the entry, in one call.
-#[cfg(target_vendor = "apple")]
-pub(super) fn name_on_disk(path: &Path) -> io::Result<OsString> {
-  /// The answer for the name alone: the length of all of it, where the name starts, counted
-  /// from the field `name_offset`, how long it is with its NUL, and then its bytes.
+/// The kind of an entry, from its object type.
+fn file_type(object_type: u32) -> FileType {
+  match object_type {
+    VREG => FileType::File,
+    VDIR => FileType::Dir,
+    VLNK => FileType::Symlink,
+    _ => FileType::Other,
+  }
+}
+
+/// `getattrlist` in one call: the name that the directory holds for the entry at `path`, and
+/// the kind of the entry. A link at the end of the path is not followed.
+pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
+  /// The answer: the length of all of it, where the name starts, counted from the field
+  /// `name_offset`, how long it is with its NUL, the object type, and then the bytes.
   #[repr(C)]
   struct Answer {
     length: u32,
     name_offset: i32,
     name_length: u32,
+    object_type: u32,
     bytes: [u8; NAME_BYTES],
   }
   const FSOPT_NOFOLLOW: u32 = 0x1;
@@ -229,13 +234,14 @@ pub(super) fn name_on_disk(path: &Path) -> io::Result<OsString> {
   let wanted = AttrList {
     bitmap_count: ATTR_BIT_MAP_COUNT,
     reserved: 0,
-    common: ATTR_CMN_NAME,
+    common: ATTR_CMN_NAME | ATTR_CMN_OBJTYPE,
     volume: 0,
     dir: 0,
     file: 0,
     fork: 0,
   };
-  let mut answer = Answer { length: 0, name_offset: 0, name_length: 0, bytes: [0; NAME_BYTES] };
+  let mut answer =
+    Answer { length: 0, name_offset: 0, name_length: 0, object_type: 0, bytes: [0; NAME_BYTES] };
   // SAFETY: `c_path` ends with a NUL, `wanted` is a whole `attrlist` that the call only reads,
   // and the call writes at most `size_of::<Answer>()` bytes into `answer`.
   let result = unsafe {
@@ -257,5 +263,9 @@ pub(super) fn name_on_disk(path: &Path) -> io::Result<OsString> {
   let len = usize::try_from(answer.name_length).ok().and_then(|with_nul| with_nul.checked_sub(1));
   let name = start.zip(len).and_then(|(start, len)| answer.bytes.get(start..start + len));
   let name = name.ok_or_else(|| io::Error::other("getattrlist gave no name"))?;
-  Ok(OsStr::from_bytes(name).to_owned())
+  Ok((OsStr::from_bytes(name).to_owned(), file_type(answer.object_type)))
+}
+
+pub(super) fn name_on_disk(path: &Path) -> io::Result<OsString> {
+  name_and_kind(path).map(|(name, _)| name)
 }

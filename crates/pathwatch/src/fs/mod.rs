@@ -229,6 +229,8 @@ fn told(error: io::Error) -> io::Error {
 #[cfg(target_vendor = "apple")]
 mod apple;
 #[cfg(target_vendor = "apple")]
+pub(crate) use self::apple::name_and_kind;
+#[cfg(target_vendor = "apple")]
 use self::apple::name_on_disk;
 
 /// No call gives the name of one entry here, so the listing of its directory is read: 1.8 ms

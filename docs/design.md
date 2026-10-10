@@ -119,7 +119,7 @@ The table is these rules in examples. `R` is a watched path.
 | `config`, `error`, `event`, `watcher` | The API. `watcher.rs` has the one thread and its queue, and picks the backend. |
 | `engine/`, `tree`, `fs`, `path` | The engine, the tree, the disk as the engine sees it (`Fs`), path cleaning. No thread, no clock, no OS watch API. |
 | `backend` | The `Backend` trait and its types. |
-| `inotify`, `fsevents`, `windows`, `poll` | One backend each, in one file. Of the crate they use only `backend`. |
+| `inotify`, `fsevents`, `windows`, `poll` | One backend each, in one file. Of the crate they use `backend`, and the calls of the system in `fs` that the engine makes too. |
 
 The modules that are not the API are `pub` but hidden from the docs: the tests need them. A
 second crate, `pathwatch_sim`, is not published: the fixtures and the tests of the engine
