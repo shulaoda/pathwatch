@@ -63,7 +63,7 @@ fn a_file_is_anything_that_is_not_a_directory() {
         UnixListener::bind(w.path("socket")).unwrap(),
       )
     };
-    let before = cfg!(target_os = "macos").then(&bind);
+    let before = cfg!(target_os = "macos").then(bind);
     w.watch(&["r", "socket"]);
     let sockets = before.unwrap_or_else(bind);
     symlink("nowhere", w.path("r/link")).unwrap();
