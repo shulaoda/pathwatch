@@ -189,9 +189,8 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   events.
 - **Where the OS watches are put depends on what was watched and unwatched before.** A stream of
   macOS stays where it is until the streams are replaced. Nothing is missed.
-- **The Windows backend has not run on Windows yet.** It is type-checked, and its parts that
-  call no Windows have tests of their own. See `docs/windows-open-points.md`. Until it is
-  checked, `with_polling(true)` is the safe choice on Windows.
+- **The Windows backend is young.** Its tests pass on Windows 11 with NTFS, and nothing else
+  was tried: no network share, no ReFS, no older Windows. See `docs/windows-open-points.md`.
 - **Android was never built.** It is set to use the same code as Linux.
 
 ## Timing

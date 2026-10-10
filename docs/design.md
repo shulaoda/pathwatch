@@ -1323,10 +1323,9 @@ What stays open:
 
 ### 7.3 ReadDirectoryChangesW (`windows.rs`)
 
-**This backend has not run on Windows yet.** It is type-checked for the Windows target, and its
-parts that make no Windows call (`place`, `Handles`, `Records`, `translate`) have tests of their
-own (`tests/windows_parts.rs`). What has to be checked on a real machine is in
-`docs/windows-open-points.md`.
+The tests of this backend (`tests/windows.rs`, and `tests/windows_parts.rs` for the parts that
+make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Windows 11 with NTFS.
+What was not checked, and what is known to be missing, is in `docs/windows-open-points.md`.
 
 - One thread owns one I/O completion port and every directory handle (`port`). A handle is live
   when `watch` returns. It reports its directory and everything below it.
@@ -1410,8 +1409,7 @@ The test files of the simulator:
 - Private functions (a `mod tests` at the end of the file): `tree/mod.rs`, `path.rs`, `fs.rs`,
   `engine/events.rs`, and helpers of the backends.
 - The tree alone (`tests/tree.rs`): the arena, the table, and the way from a hint to a mark.
-- Each backend alone (`tests/inotify.rs`, `fsevents.rs`, `windows.rs`, each on its OS). The
-  Windows file has never run. `windows_parts.rs` runs on Windows only. In `fsevents.rs` a test
+- Each backend alone (`tests/inotify.rs`, `fsevents.rs`, `windows.rs`, each on its OS). `windows_parts.rs` runs on Windows only. In `fsevents.rs` a test
   that makes many changes runs alone, and after the others where it can (`Turn`): a flood
   makes FSEvents report losses, and a test next to it was seen to get one too. No test there
   starts when more than 50,000 files lie next to the test program (the probe in 7.2).
@@ -1470,5 +1468,5 @@ Known holes of the engine:
 - Where the OS watches are put depends on what was watched and unwatched before: a stream stays
   where it is until the streams are replaced. Nothing is missed.
 
-Known holes of the backends are in 7.1 to 7.3. The Windows backend has not run on Windows.
+Known holes of the backends are in 7.1 to 7.3. The Windows backend has only run on Windows 11 with NTFS.
 Android was never built.

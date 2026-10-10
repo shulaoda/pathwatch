@@ -11,8 +11,7 @@
 //! - `port::Watch` is the handle itself, on the worker thread: the open directory and the
 //!   memory of its reads.
 //!
-//! **This backend has not run on Windows yet.** It is type-checked for the Windows target, but
-//! it has never opened a handle. What to check on a real machine is in
+//! What is known to be missing, and what was not checked on a real machine, is in
 //! `docs/windows-open-points.md`.
 
 use std::{

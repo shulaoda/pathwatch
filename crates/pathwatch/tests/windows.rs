@@ -1,6 +1,6 @@
-//! The Windows backend alone, against a real Windows file system. These tests were written
-//! without a Windows machine and have never run. A test whose name starts with `open_point_`
-//! checks something that is only known from documents; see `docs/windows-open-points.md`.
+//! The Windows backend alone, against a real Windows file system. A test whose name
+//! starts with `open_point_` checks something that was only known from documents when the
+//! backend was written; see `docs/windows-open-points.md`.
 #![cfg(windows)]
 
 use std::{

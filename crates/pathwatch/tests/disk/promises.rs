@@ -793,6 +793,10 @@ fn a_directory_above_a_watched_path_is_renamed_to_another_letter_case() {
     if !w.path("R").exists() {
       return;
     }
+    // Windows refuses to rename a directory above an open directory handle.
+    if cfg!(windows) && w.backend == "native" {
+      return;
+    }
     w.watch(&["r/x/a"]);
 
     w.rename("r/x", "r/X");

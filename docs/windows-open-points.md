@@ -1,20 +1,20 @@
 # The Windows backend: open points
 
-The Windows backend (`crates/pathwatch/src/windows.rs`) was written without a Windows machine.
-**It has never run.**
+The Windows backend (`crates/pathwatch/src/windows.rs`) was written without a Windows machine,
+from the Windows documents and from the source of other watchers.
 
-What was done:
+It first ran on 2026-10-10, on Windows 11 Pro (build 26200) with NTFS on a local disk:
 
-- The whole backend, with its tests, is type-checked for `x86_64-pc-windows-msvc` by cross
-  compilation.
-- The parts that make no Windows call (`place`, `Handles`, `Records`, `translate`) have tests of
-  their own, in `crates/pathwatch/tests/windows_parts.rs`. They run on Windows only.
+- `crates/pathwatch/tests/windows.rs` (the backend with real handles): all 25 tests pass, 15
+  runs in a row. So each point below that has a test there holds on that system.
+- `crates/pathwatch/tests/windows_parts.rs` (the parts that make no Windows call: `place`,
+  `Handles`, `Records`, `translate`): all 60 tests pass.
+- `crates/pathwatch/tests/disk` with this backend: every test passes, but one cannot run:
+  `a_directory_above_a_watched_path_is_renamed_to_another_letter_case` renames a directory
+  above an open handle, and Windows refuses that. It is skipped for this backend.
 
-What was not done: the part of the file that calls Windows (`WindowsBackend` and `port`) and
-`crates/pathwatch/tests/windows.rs` have never opened a handle. The points below come from the
-Windows documents and from the source of other watchers. Each one has to be checked on a real
-machine before this backend is trusted. `pathwatch` uses it on Windows all the same:
-`Config::with_polling(true)` is the way around it until then.
+What was not tried: a network share, ReFS, a FAT disk, an older Windows, Wine, and a rename
+made from WSL. A point below that has no test is still only known from documents.
 
 ## How to check
 
@@ -135,10 +135,11 @@ Numbers from macOS (plain code only, release build, 2,000 directories that share
 handles): all `watch` calls together take 12 to 28 ms, one `unwatch` takes 0.5 to 1 ms (each
 one works out the whole placement again), and one record takes 0.7 us to find its key.
 
-## Tests to run on Windows first
+## The tests that settle these points
 
 `crates/pathwatch/tests/windows.rs` compiles only on Windows. These tests settle the points
-above. When one fails, the point and the code behind it have to be read again:
+above. When one fails on another system, the point and the code behind it have to be read
+again:
 
 - `open_point_lost_records_become_a_hint_for_each_key_of_the_handle`
 - `open_point_a_save_becomes_a_written_hint`
@@ -159,7 +160,7 @@ above. When one fails, the point and the code behind it have to be read again:
 The other tests check the backend itself: a watch is live when `watch` returns, each kind of
 change makes its hint, the rules of `Handles` hold with real handles, and `drop` ends the thread.
 
-## Known gaps to close when it first runs
+## Known gaps
 
 These are known from reading. The limits of the backend are in the comments of `windows.rs`, at
 the code that they are about (`Handle`, `Handles`, `Handles::route`, `may_hold_a_handle`).
