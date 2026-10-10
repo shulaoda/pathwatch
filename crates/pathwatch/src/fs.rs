@@ -88,6 +88,11 @@ pub enum Entry {
     size: u64,
     file_id: u64,
   },
+  /// A directory that is no link, with the identity that an `lstat` would tell: the engine
+  /// asks none then.
+  Dir {
+    id: DirId,
+  },
 }
 
 /// What kind of entry is at a path.
@@ -492,6 +497,7 @@ mod windows {
   // Where the fields of a `FILE_ID_BOTH_DIR_INFO` record are. They are read from the bytes,
   // not through a pointer: every offset and length is checked against the answer.
   const NEXT: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, NextEntryOffset);
+  const CREATED: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, CreationTime);
   const WRITTEN: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, LastWriteTime);
   const SIZE: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, EndOfFile);
   const ATTRIBUTES: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileAttributes);
@@ -519,12 +525,13 @@ mod windows {
       .map_err(told)?;
     let handle = dir.as_raw_handle();
     let mut file_system = [0_u16; 8];
-    // SAFETY: the handle is open. The call writes at most eight units into `file_system`,
-    // and nothing through the null pointers.
+    let mut serial = 0_u32;
+    // SAFETY: the handle is open. The call writes at most eight units into `file_system`, one
+    // number into `serial`, and nothing through the null pointers.
     let known = unsafe {
       let (no_name, none) = (std::ptr::null_mut(), std::ptr::null_mut());
-      let name = file_system.as_mut_ptr();
-      GetVolumeInformationByHandleW(handle, no_name, 0, none, none, none, name, 8)
+      let (name, serial) = (file_system.as_mut_ptr(), &raw mut serial);
+      GetVolumeInformationByHandleW(handle, no_name, 0, serial, none, none, name, 8)
     };
     if known == 0 || !"NTFS\0".encode_utf16().eq(file_system[..5].iter().copied()) {
       return Ok(false);
@@ -550,7 +557,7 @@ mod windows {
       class = FileIdBothDirectoryInfo;
       let mut rest = &records.0[..];
       loop {
-        let read = record(rest, &mut name);
+        let read = record(rest, u64::from(serial), &mut name);
         let (next, told) = read.ok_or_else(|| io::Error::other("a listing gave no entry"))?;
         let own = OsString::from_wide(&name);
         if own != "." && own != ".." {
@@ -566,7 +573,9 @@ mod windows {
 
   /// The record at the start of `bytes`: where the next one starts (zero: none), and what it
   /// tells. Its name is put into `name`. `None`: the record does not fit into the bytes.
-  fn record(bytes: &[u8], name: &mut Vec<u16>) -> Option<(usize, Entry)> {
+  /// `volume` is the one of the directory that is listed: an entry that is no reparse point is
+  /// on it too.
+  fn record(bytes: &[u8], volume: u64, name: &mut Vec<u16>) -> Option<(usize, Entry)> {
     let u32_at = |at: usize| Some(u32::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
     let u64_at = |at: usize| Some(u64::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
     let next = usize::try_from(u32_at(NEXT)?).ok()?;
@@ -580,10 +589,16 @@ mod windows {
     let (attributes, index) = (u32_at(ATTRIBUTES)?, u64_at(INDEX)?);
     let found =
       entry(attributes, u32_at(TAG)?, u64_at(WRITTEN)?, u64_at(SIZE)?, index, DirId::default());
+    let plain = attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
     let told = match found.kind {
-      // A reparse point that is no link (a file in a cloud) is left to `lstat`: not measured.
-      FileType::File if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 => {
+      // A reparse point that is no link (a file in a cloud, a mounted disk) is left to
+      // `lstat`: not measured.
+      FileType::File if plain => {
         Entry::File { modified: found.modified, size: found.size, file_id: index }
+      }
+      // The identity as `stat` tells it. It is never behind: it does not change.
+      FileType::Dir if plain => {
+        Entry::Dir { id: DirId { volume, inode: index, birth: u64_at(CREATED)? } }
       }
       kind => Entry::Kind(kind),
     };
@@ -658,7 +673,7 @@ mod windows {
       // Another file system: the listing of std is used there.
       let Some(seen) = list() else { return };
       let [
-        (_, Entry::Kind(FileType::Dir)),
+        (_, Entry::Dir { id }),
         (_, Entry::File { modified, size, file_id }),
         (_, Entry::Kind(FileType::Symlink)),
       ] = seen[..]
@@ -667,6 +682,10 @@ mod windows {
       };
       let meta = stat(&top.path().join("file"), false).unwrap();
       assert_eq!((modified, size, file_id), (meta.modified, meta.size, meta.file_id));
+      // Both ways of `stat` give the identity that the listing gave.
+      let dir = top.path().join("dir");
+      assert_eq!(id, stat(&dir, false).unwrap().dir_id);
+      assert_eq!(id, by_handle(&dir, false).unwrap().dir_id);
 
       // A file is no directory.
       let error = read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap_err();

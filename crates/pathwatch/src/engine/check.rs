@@ -57,13 +57,15 @@ pub(super) enum Listed {
   Named(Option<FileType>),
   /// The listing named the entry, a regular file, with all that a look at it reads.
   File(Fingerprint),
+  /// The listing named the entry, a directory that is no link, with its identity.
+  Dir(DirId),
   /// The whole directory was listed, and the entry was not named.
   NotNamed,
 }
 
 impl Listed {
   pub(super) fn is_named(self) -> bool {
-    matches!(self, Self::Named(_) | Self::File(_))
+    matches!(self, Self::Named(_) | Self::File(_) | Self::Dir(_))
   }
 }
 
@@ -75,6 +77,7 @@ impl From<Entry> for Listed {
       Entry::File { modified, size, file_id } => {
         Self::File(Fingerprint { modified: nanos(modified), size, id: file_id })
       }
+      Entry::Dir { id } => Self::Dir(id),
     }
   }
 }
@@ -255,6 +258,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let kind = match listed {
         Listed::Named(kind) => kind,
         Listed::File(_) => Some(FileType::File),
+        Listed::Dir(_) => Some(FileType::Dir),
         Listed::NotAsked | Listed::NotNamed => None,
       };
       if kind.is_some_and(|kind| self.ignores(key, path, entry_kind(kind))) {
@@ -277,6 +281,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       && !unsure
     {
       return Found::File(FileType::File, file);
+    }
+    // The same for a directory. The filter was asked above, and it does not ignore it.
+    if let Listed::Dir(id) = listed
+      && !registered
+      && !unsure
+    {
+      return Found::Dir { id, complete: true, relinked: false };
     }
     let mut meta = match self.fs.lstat(path) {
       Ok(meta) => meta,
@@ -437,7 +448,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   fn spelling_is_unsure(&self, key: DirKey, listed: Listed) -> bool {
     let node = &self.tree[key];
     let was_entry = match listed {
-      Listed::Named(_) | Listed::File(_) => return false,
+      Listed::Named(_) | Listed::File(_) | Listed::Dir(_) => return false,
       Listed::NotNamed => false,
       Listed::NotAsked => node.is_entry(),
     };
