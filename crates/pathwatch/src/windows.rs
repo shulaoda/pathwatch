@@ -17,13 +17,16 @@
 use std::{
   borrow::Cow,
   ffi::OsString,
-  fs, io, mem,
+  io, mem,
   path::{Component, Path, PathBuf},
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want, watch_limit};
+use crate::{
+  backend::{Backend, Coverage, DirKey, Hint, Sink, Want, watch_limit},
+  fs::{FileType, Fs, StdFs},
+};
 
 /// Each handle costs 64 KiB here and 64 KiB in the kernel, and pins the directories above it.
 pub const MAX_HANDLES: usize = 64;
@@ -47,7 +50,36 @@ const _: () = {
   assert!(offset_of!(os::FILE_NOTIFY_INFORMATION, FileNameLength) == FILE_NAME_LENGTH);
   assert!(offset_of!(os::FILE_NOTIFY_INFORMATION, FileName) == FILE_NAME);
   assert!(os::FILE_ACTION_MODIFIED == FILE_ACTION_MODIFIED);
+  // The longer form of a record starts like the short one.
+  assert!(offset_of!(os::FILE_NOTIFY_EXTENDED_INFORMATION, NextEntryOffset) == NEXT_ENTRY_OFFSET);
+  assert!(offset_of!(os::FILE_NOTIFY_EXTENDED_INFORMATION, Action) == ACTION);
 };
+
+/// Where the fields are that the two forms of a record have at different places.
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+  name_length: usize,
+  name: usize,
+  /// Only the longer form tells the attributes of the entry.
+  attributes: Option<usize>,
+}
+
+/// `FILE_NOTIFY_INFORMATION`.
+const SHORT: Layout = Layout { name_length: FILE_NAME_LENGTH, name: FILE_NAME, attributes: None };
+/// `FILE_NOTIFY_EXTENDED_INFORMATION`.
+const EXTENDED: Layout = {
+  use std::mem::offset_of;
+
+  use windows_sys::Win32::Storage::FileSystem::FILE_NOTIFY_EXTENDED_INFORMATION as Record;
+
+  Layout {
+    name_length: offset_of!(Record, FileNameLength),
+    name: offset_of!(Record, FileName),
+    attributes: Some(offset_of!(Record, FileAttributes)),
+  }
+};
+/// `FILE_ATTRIBUTE_DIRECTORY`.
+const DIRECTORY: u32 = 0x10;
 
 // UTF-16 units. See `looks_short`.
 const BACKSLASH: u16 = 0x5C;
@@ -212,8 +244,13 @@ fn may_hold_a_handle(dir: &Path) -> bool {
 /// - The handles are where [`place`] puts them for the keys of now. So they move when a key
 ///   comes or goes: up to a common directory when there are more than [`MAX_HANDLES`], and
 ///   down again when there is room. A handle cannot be moved, so new handles are opened
-///   first. Then the old ones are closed, and each key that got another handle is told
-///   ([`Change`]). If one of the new handles cannot be opened, nothing changes.
+///   first, and then the old ones are closed. A key that got another handle is not told:
+///   the new handle reported before the old one stopped, and the last read of the old one
+///   is still translated (see `Worker::completed`). A key that is left without a handle is
+///   told ([`Change`]). If one of the new handles cannot be opened, nothing changes.
+/// - A request that needs a new handle is answered `WatchedTree` at once, and the handle is
+///   opened by the next `commit`, for all such requests together. A key that gets none then
+///   (no room, or the open failed) is told, asks again, and gets the reason.
 /// - A request for a directory at or below a handle opens nothing: that handle serves the key.
 /// - A request for the very directory of a handle puts a new handle there. The old one may be
 ///   on a directory that was renamed away, and Windows gives no notice of that. This is also
@@ -241,6 +278,13 @@ pub struct Handles {
   /// The keys that were answered `NotWatched`, with their directories. When a handle comes to
   /// stand at or above one of them, the engine is told ([`Change::covered`]) and asks again.
   waiting: FxHashMap<DirKey, PathBuf>,
+  /// Where each key is in `keys`.
+  dirs: FxHashMap<DirKey, PathBuf>,
+  /// A key waits for its handle: the next `commit` asks [`place`].
+  unsettled: bool,
+  /// The keys that a commit left without a handle. The engine is told and asks again, and
+  /// that request is answered at once, with the reason.
+  refused: FxHashSet<DirKey>,
 }
 
 impl Handles {
@@ -254,6 +298,7 @@ impl Handles {
   ) -> (Coverage, Change) {
     let mut change = Change::default();
     self.waiting.remove(&key);
+    let refused = self.refused.remove(&key);
     // For one key the want only goes up (rule 5).
     let want = self.served(key).map_or(want, |served| served.want.max(want));
 
@@ -285,15 +330,53 @@ impl Handles {
     }
 
     self.remember(key, dir, want, None);
-    let coverage = match self.settle(open, &mut change) {
+    if !refused {
+      // The handle is opened by the next `commit`, which asks `place` once for all the
+      // directories of a flush: the engine reads none of them before that (rule 2). Asking
+      // `place` for each one is work that grows with the square of their number: 350 ms for
+      // 2,000 directories (measured).
+      self.unsettled = true;
+      return (Coverage::WatchedTree, change);
+    }
+    // A commit could not give this key a handle. Now it is tried for the key alone, and the
+    // answer says why not.
+    let settled = self.settle(open, &mut change);
+    self.refused.remove(&key);
+    change.moved.retain(|&told| told != key);
+    let coverage = match settled {
       Ok(()) if self.served(key).is_some() => Coverage::WatchedTree,
       Ok(()) => Coverage::Failed(watch_limit("the limit of open directory handles is reached")),
-      Err(error) => {
-        self.forget(key);
-        Coverage::Failed(error)
-      }
+      Err(error) => Coverage::Failed(error),
     };
     (coverage, change)
+  }
+
+  /// Opens the handles for the keys that wait since the last call. When this returns, each of
+  /// them has a handle that is live, or is told ([`Change::moved`]).
+  pub fn commit(&mut self, open: Open<'_>) -> Change {
+    let mut change = Change::default();
+    if self.unsettled {
+      let _ = self.settle(open, &mut change);
+    }
+    change
+  }
+
+  /// Whether a handle serves `key`.
+  pub fn serves(&self, key: DirKey) -> bool {
+    self.served(key).is_some_and(|served| served.handle.is_some())
+  }
+
+  /// The directory of the handle that serves `key`, and the directory of the key.
+  pub fn span(&self, key: DirKey) -> Option<(&Path, &Path)> {
+    let served = self.served(key)?;
+    let handle = self.open.iter().find(|handle| Some(handle.id) == served.handle)?;
+    Some((&handle.dir, &served.dir))
+  }
+
+  /// Notes the keys that got no handle before and that a new handle on `dir` reports.
+  fn cover(&self, dir: &Path, change: &mut Change) {
+    let waiting = self.waiting.iter().filter(|(_, below)| below.starts_with(dir));
+    change.covered.extend(waiting.map(|(&key, _)| key));
   }
 
   /// The directory of the handle that is at or above `dir`, by the text of the paths.
@@ -305,6 +388,7 @@ impl Handles {
   pub fn unwatch(&mut self, key: DirKey, open: Open<'_>) -> Change {
     let mut change = Change::default();
     self.waiting.remove(&key);
+    self.refused.remove(&key);
     // A key that wants names only has no say in where the handles are.
     if self.forget(key).is_some_and(|gone| gone.want == Want::Contents) {
       // On an error the handles stay where they are. They still report all that the other
@@ -319,23 +403,32 @@ impl Handles {
   pub fn closed(&mut self, id: WatchId) -> Vec<DirKey> {
     let Some(at) = self.open.iter().position(|handle| handle.id == id) else { return Vec::new() };
     self.open.swap_remove(at);
-    let mut keys = Vec::new();
-    self.keys.retain(|_, served| {
-      served.retain(|served| {
-        let gone = served.handle == Some(id);
-        if gone {
-          keys.push(served.key);
-        }
-        !gone
-      });
-      !served.is_empty()
-    });
+    let served = self.keys.values().flatten().filter(|served| served.handle == Some(id));
+    let keys: Vec<DirKey> = served.map(|served| served.key).collect();
+    for &key in &keys {
+      self.forget(key);
+    }
     keys
   }
 
   /// Puts the handles where [`place`] wants them for the keys of now. On an error no key has
   /// another handle than before.
   fn settle(&mut self, open: Open<'_>, change: &mut Change) -> io::Result<()> {
+    self.unsettled = false;
+    let placed = self.place_handles(open, change);
+    // A key without a handle is not watched: `place` had no room for it, or the handles
+    // could not be opened and the key had none before. It is told.
+    let left = self.keys.values().flatten().filter(|served| served.handle.is_none());
+    let left: Vec<DirKey> = left.map(|served| served.key).collect();
+    for key in left {
+      self.forget(key);
+      self.refused.insert(key);
+      change.moved.push(key);
+    }
+    placed
+  }
+
+  fn place_handles(&mut self, open: Open<'_>, change: &mut Change) -> io::Result<()> {
     let wanted: Vec<(DirKey, &Path, Want)> =
       self.keys.values().flatten().map(|served| (served.key, &*served.dir, served.want)).collect();
     let places = place(&wanted, MAX_HANDLES);
@@ -364,12 +457,12 @@ impl Handles {
       }
     }
     // A handle that moved up can stand above a directory that had none before.
-    let covered = |dir: &PathBuf| new.iter().any(|handle| dir.starts_with(&handle.dir));
-    let waiting = self.waiting.iter().filter(|(_, dir)| covered(dir));
-    change.covered.extend(waiting.map(|(&key, _)| key));
+    for handle in &new {
+      self.cover(&handle.dir, change);
+    }
     self.open.extend(new);
 
-    // Each key gets the handle of its place. A key that had another one before is told.
+    // Each key gets the handle of its place.
     let mut handle_of = FxHashMap::default();
     for place in &places {
       let Some(handle) = self.open.iter().find(|handle| handle.dir == place.dir) else { continue };
@@ -377,16 +470,11 @@ impl Handles {
     }
     for served in self.keys.values_mut().flatten() {
       let handle = handle_of.get(&served.key).copied();
-      if served.handle.is_some() && served.handle != handle {
-        change.moved.push(served.key);
+      if handle.is_some() && served.handle != handle {
+        change.switched.push(served.key);
       }
       served.handle = handle;
     }
-    // A key without a place is not watched any more.
-    self.keys.retain(|_, served| {
-      served.retain(|served| served.handle.is_some());
-      !served.is_empty()
-    });
     Ok(())
   }
 
@@ -426,17 +514,19 @@ impl Handles {
   }
 
   fn served(&self, key: DirKey) -> Option<&Served> {
-    self.keys.values().flatten().find(|served| served.key == key)
+    self.keys.get(self.dirs.get(&key)?)?.iter().find(|served| served.key == key)
   }
 
   fn remember(&mut self, key: DirKey, dir: &Path, want: Want, handle: Option<WatchId>) {
     self.forget(key);
+    let lower = lower_case(dir);
+    self.dirs.insert(key, lower.clone());
     let served = Served { key, dir: dir.to_owned(), want, handle };
-    self.keys.entry(lower_case(dir)).or_default().push(served);
+    self.keys.entry(lower).or_default().push(served);
   }
 
   fn forget(&mut self, key: DirKey) -> Option<Served> {
-    let dir = lower_case(&self.served(key)?.dir);
+    let dir = self.dirs.remove(&key)?;
     let served = self.keys.get_mut(&dir)?;
     let gone = served.swap_remove(served.iter().position(|served| served.key == key)?);
     if served.is_empty() {
@@ -499,13 +589,15 @@ struct Served {
 pub struct Change {
   /// Close these handles.
   pub close: Vec<WatchId>,
-  /// Then send `Changed` with an empty `rel` for each of these keys. Another handle serves
-  /// them now, and what waited in the closed one is lost (rule 11). Or no handle serves them
+  /// Then send `Changed` with an empty `rel` for each of these keys: no handle serves them
   /// any more (rule 10). The engine asks again for each of them.
   pub moved: Vec<DirKey>,
   /// The keys that were answered `NotWatched` and that a new handle reports now. The next
   /// `commit` gives them to the engine, and the engine asks again for each (rule 4).
   pub covered: Vec<DirKey>,
+  /// The keys that got a handle, or another one than before. They are not told, but one that
+  /// is behind a link below its new handle is (`leads_through_a_link`).
+  pub switched: Vec<DirKey>,
 }
 
 /// Opens a handle with this id on this directory. After `Ok` the handle is live.
@@ -530,7 +622,7 @@ fn lower_case(path: &Path) -> PathBuf {
 pub struct WindowsBackend {
   handles: Handles,
   port: port::Port,
-  /// For the keys that moved to another handle: only `translate` can make a hint.
+  /// For the keys that lost their handle: only `translate` can make a hint.
   sink: Sink<Raw>,
   /// What the next `commit` returns: see [`Change::covered`].
   covered: Vec<DirKey>,
@@ -565,8 +657,12 @@ impl Backend for WindowsBackend {
     self.finish(change);
   }
 
-  /// A handle is live when `watch` returns, so nothing is left to start here.
+  /// Opens the handles for the requests since the last commit. A key that gets none is told
+  /// by a hint, not by an error here: the others have their handles.
   fn commit(&mut self) -> io::Result<Vec<DirKey>> {
+    let port = &self.port;
+    let change = self.handles.commit(&mut |id, dir| port.open(id, dir));
+    self.finish(change);
     Ok(mem::take(&mut self.covered))
   }
 
@@ -583,16 +679,29 @@ impl Backend for WindowsBackend {
 }
 
 impl WindowsBackend {
-  /// The new handles are live. Only now the old ones are closed, and then the keys that moved
-  /// are told.
+  /// The new handles are live. Only now the old ones are closed, and then the keys that are
+  /// left without a handle are told.
   fn finish(&mut self, change: Change) {
     for id in change.close {
       self.port.close(id);
     }
     self.covered.extend(change.covered);
-    if !change.moved.is_empty() {
-      self.sink.raw(Raw::Moved(change.moved));
+    let mut told = change.moved;
+    // A handle higher up reports nothing for a key behind a link. The engine asks again for
+    // such a key, and `watch` gives it up.
+    let behind_a_link = |key: &DirKey| {
+      let span = self.handles.span(*key);
+      span.is_some_and(|(top, dir)| top != dir && leads_through_a_link(top, dir))
+    };
+    told.extend(change.switched.into_iter().filter(behind_a_link));
+    if !told.is_empty() {
+      self.sink.raw(Raw::Moved(told));
     }
+  }
+
+  /// Whether a handle serves `key`. For the tests.
+  pub fn serves(&self, key: DirKey) -> bool {
+    self.handles.serves(key)
   }
 }
 
@@ -602,7 +711,8 @@ impl WindowsBackend {
 /// every directory below it.
 fn leads_through_a_link(top: &Path, dir: &Path) -> bool {
   let names = dir.strip_prefix(top).map_or(0, |below| below.components().count());
-  dir.ancestors().take(names).any(|path| fs::symlink_metadata(path).is_ok_and(|at| at.is_symlink()))
+  let is_link = |path: &Path| StdFs.lstat(path).is_ok_and(|at| at.kind == FileType::Symlink);
+  dir.ancestors().take(names).any(is_link)
 }
 
 /// What the backend hands to the engine.
@@ -614,13 +724,15 @@ pub enum Raw {
     /// The directory that the handle was opened on. It travels with the bytes, because a handle
     /// that was replaced is forgotten before its last reads are translated.
     dir: PathBuf,
+    /// The records are of the longer form, which tells whether an entry is a directory.
+    extended: bool,
     /// `Ok`: the records, and the handle reads on. No bytes at all means that the buffer of
     /// this handle was too small and the kernel dropped its records. `Err`: the read failed
     /// and the handle is closed.
     result: io::Result<Vec<u8>>,
   },
-  /// Another handle serves these keys from now on, or none does. What waited in the handle
-  /// that was closed for it is lost.
+  /// No handle serves these keys any more, or the handle that serves them now does not
+  /// report them.
   Moved(Vec<DirKey>),
 }
 
@@ -638,6 +750,10 @@ pub enum Raw {
 /// u16 FileName[]        relative to the directory of the handle, with no NUL at the end
 /// ```
 ///
+/// `ReadDirectoryChangesExW` gives the longer `FILE_NOTIFY_EXTENDED_INFORMATION` records
+/// ([`Records::extended`]): times, sizes and the attributes of the entry are between the action
+/// and the name. Only "is a directory" is read of them.
+///
 /// The bytes are copied out of a buffer that the kernel filled, sometimes with what a network
 /// server sent. Nothing in them is trusted: every offset and length is checked against the slice,
 /// and no field is read through a pointer, so the slice needs no alignment.
@@ -645,11 +761,17 @@ pub enum Raw {
 pub struct Records<'a> {
   /// From the start of the next record to the end of the buffer.
   rest: Option<&'a [u8]>,
+  layout: Layout,
 }
 
 impl<'a> Records<'a> {
   pub fn new(bytes: &'a [u8]) -> Self {
-    Self { rest: (!bytes.is_empty()).then_some(bytes) }
+    Self { rest: (!bytes.is_empty()).then_some(bytes), layout: SHORT }
+  }
+
+  /// The records of a read that asked for the longer form.
+  pub fn extended(bytes: &'a [u8]) -> Self {
+    Self { layout: EXTENDED, ..Self::new(bytes) }
   }
 }
 
@@ -658,7 +780,9 @@ impl<'a> Iterator for Records<'a> {
 
   fn next(&mut self) -> Option<Self::Item> {
     let bytes = self.rest.take()?;
-    let Some((record, rest)) = split_first(bytes) else { return Some(Err(Malformed)) };
+    let Some((record, rest)) = split_first(bytes, self.layout) else {
+      return Some(Err(Malformed));
+    };
     self.rest = rest;
     Some(Ok(record))
   }
@@ -668,6 +792,8 @@ impl<'a> Iterator for Records<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Record<'a> {
   pub action: u32,
+  /// Whether the entry is a directory, if the record tells.
+  pub is_dir: Option<bool>,
   name: &'a [u8],
 }
 
@@ -684,21 +810,25 @@ impl Record<'_> {
 pub struct Malformed;
 
 /// The record at the start of `bytes`, and the bytes from the next record on.
-fn split_first(bytes: &[u8]) -> Option<(Record<'_>, Option<&[u8]>)> {
+fn split_first(bytes: &[u8], layout: Layout) -> Option<(Record<'_>, Option<&[u8]>)> {
   let next = field(bytes, NEXT_ENTRY_OFFSET)?;
   let action = field(bytes, ACTION)?;
-  let name_len = usize::try_from(field(bytes, FILE_NAME_LENGTH)?).ok()?;
-  let name = bytes.get(FILE_NAME..)?.get(..name_len)?;
+  let name_len = usize::try_from(field(bytes, layout.name_length)?).ok()?;
+  let name = bytes.get(layout.name..)?.get(..name_len)?;
+  let is_dir = match layout.attributes {
+    Some(at) => Some(field(bytes, at)? & DIRECTORY != 0),
+    None => None,
+  };
   if name_len % 2 != 0 {
     return None;
   }
   let rest = match usize::try_from(next).ok()? {
     0 => None,
     // `name` is inside `bytes`, so the sum cannot overflow.
-    next if next >= FILE_NAME + name_len => Some(bytes.get(next..)?),
+    next if next >= layout.name + name_len => Some(bytes.get(next..)?),
     _ => return None,
   };
-  Some((Record { action, name }, rest))
+  Some((Record { action, is_dir, name }, rest))
 }
 
 fn field(bytes: &[u8], at: usize) -> Option<u32> {
@@ -716,8 +846,8 @@ fn field(bytes: &[u8], at: usize) -> Option<u32> {
 pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
   // The engine checks the directory, asks for it again and scans everything below it.
   let lost = |key| Hint::Changed { dir: key, rel: Path::new("") };
-  let (watch, dir, result) = match raw {
-    Raw::Read { watch, dir, result } => (watch, dir, result),
+  let (watch, dir, extended, result) = match raw {
+    Raw::Read { watch, dir, extended, result } => (watch, dir, extended, result),
     Raw::Moved(keys) => return keys.into_iter().for_each(|key| hint(lost(key))),
   };
   let Ok(bytes) = result else {
@@ -729,7 +859,8 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
     return handles.below(&dir).into_iter().for_each(|key| hint(lost(key)));
   }
   let mut name = Vec::new();
-  for record in Records::new(&bytes) {
+  let records = if extended { Records::extended(&bytes) } else { Records::new(&bytes) };
+  for record in records {
     let Ok(record) = record else {
       // The records after this one cannot be found.
       hint(Hint::Lost);
@@ -740,6 +871,11 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
     if name.is_empty() {
       // Some Windows versions send this when the directory of the handle is deleted.
       handles.below(&dir).into_iter().for_each(|key| hint(lost(key)));
+    } else if record.action == FILE_ACTION_MODIFIED && record.is_dir == Some(true) {
+      // Windows sends this record for a directory when an entry in it changes, and that
+      // entry has a record of its own. It says nothing that the engine can use (rule 8), and
+      // a look at the directory for each of them is not free: after a scan of 5,000
+      // directories, one such record came for each of them (measured).
     } else if let Some(parent) = before_short_name(&name) {
       let parent = dir.join(os_string(parent));
       let mut found = false;
@@ -820,6 +956,7 @@ fn os_string(name: &[u16]) -> OsString {
 /// neither happens they are leaked: the `Drop` of `Watch` does that.
 mod port {
   use std::{
+    ffi::c_void,
     fs::{File, OpenOptions},
     io, mem,
     os::windows::{
@@ -828,30 +965,36 @@ mod port {
     },
     path::{Path, PathBuf},
     ptr,
-    sync::{Arc, mpsc},
+    sync::{Arc, OnceLock, mpsc},
     thread,
   };
 
   use rustc_hash::FxHashMap;
   use windows_sys::Win32::{
-    Foundation::{ERROR_NOTIFY_ENUM_DIR, INVALID_HANDLE_VALUE},
+    Foundation::{
+      ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_NOTIFY_ENUM_DIR,
+      HANDLE, INVALID_HANDLE_VALUE,
+    },
     Storage::FileSystem::{
       FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
       FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
       FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
-      FILE_SHARE_WRITE, ReadDirectoryChangesW,
+      FILE_SHARE_WRITE, ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation,
     },
     System::{
       IO::{
-        CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
-        PostQueuedCompletionStatus,
+        CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus,
+        LPOVERLAPPED_COMPLETION_ROUTINE, OVERLAPPED, PostQueuedCompletionStatus,
       },
       Threading::INFINITE,
     },
   };
 
   use super::{Raw, WatchId};
-  use crate::backend::Sink;
+  use crate::{
+    backend::Sink,
+    fs::{Unknown, kernel32},
+  };
 
   /// No `LAST_ACCESS`: the stat and listing calls of the engine must not make records. No
   /// `ATTRIBUTES` and no `SECURITY`: tools that sync or scan files change them all the time.
@@ -863,9 +1006,39 @@ mod port {
 
   /// The largest size that a network share accepts.
   const BUFFER_BYTES: u32 = 64 * 1024;
-  /// The buffer is made of `u32` words because the call refuses one that is not aligned to four
-  /// bytes.
-  const BUFFER_WORDS: usize = BUFFER_BYTES as usize / size_of::<u32>();
+  /// The buffer is made of `u64` words because the call refuses one that is not aligned: to four
+  /// bytes for the short records, and the longer ones hold 64-bit numbers.
+  const BUFFER_WORDS: usize = BUFFER_BYTES as usize / size_of::<u64>();
+
+  /// `ReadDirectoryChangesExW`: `ReadDirectoryChangesW` with one more argument, the form of the
+  /// records.
+  type ReadExtended = unsafe extern "system" fn(
+    HANDLE,
+    *mut c_void,
+    u32,
+    i32,
+    u32,
+    *mut u32,
+    *mut OVERLAPPED,
+    LPOVERLAPPED_COMPLETION_ROUTINE,
+    i32,
+  ) -> i32;
+
+  /// The call, where this Windows has it (Windows 10 1709 and later).
+  fn read_extended() -> Option<ReadExtended> {
+    static CALL: OnceLock<Option<ReadExtended>> = OnceLock::new();
+    *CALL.get_or_init(|| {
+      let found = kernel32(c"ReadDirectoryChangesExW");
+      // SAFETY: the function with this name has this signature.
+      found.map(|call| unsafe { mem::transmute::<Unknown, ReadExtended>(call) })
+    })
+  }
+
+  /// Whether a read failed because the disk does not know the longer records.
+  fn not_supported(error: &io::Error) -> bool {
+    let code = error.raw_os_error().map(i32::cast_unsigned);
+    matches!(code, Some(ERROR_INVALID_FUNCTION | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED))
+  }
 
   /// The docs say that a read also comes back with no bytes when the kernel cannot get memory for
   /// its own buffer. Then every read does so at once and the worker would spin. After this many in
@@ -1000,13 +1173,16 @@ mod port {
     fn completed(&mut self, id: WatchId, result: io::Result<u32>) {
       let Some(watch) = self.watches.get_mut(&id) else { return };
       watch.pending = false;
-      // This test comes first: the read of a handle that we closed also ends with no bytes.
+      // This test comes first: the read of a handle that we closed ends with an error.
       if watch.dir.is_none() {
         // Records in the packet were written before the close. They can be the only notice of a
-        // change that was made while the handle that replaces this one was being opened.
-        if let Ok(len @ 1..) = result {
-          let result = Ok(watch.records(len));
-          self.sink.raw(Raw::Read { watch: id, dir: watch.path.clone(), result });
+        // change that was made while the handle that replaces this one was being opened. A
+        // read with no bytes says that records were dropped, here too. The read that the
+        // close cancelled is none of them: it fails (`ERROR_OPERATION_ABORTED`, measured).
+        if let Ok(len) = result {
+          let (dir, extended, result) =
+            (watch.path.clone(), watch.extended, Ok(watch.records(len)));
+          self.sink.raw(Raw::Read { watch: id, dir, extended, result });
         }
         self.watches.remove(&id);
         return;
@@ -1019,12 +1195,20 @@ mod port {
           Vec::new()
         }
         Err(error) => {
+          // The disk took the read and then refused the longer records: the short ones.
+          if watch.extended && not_supported(&error) {
+            watch.extended = false;
+            if watch.read().is_ok() {
+              return;
+            }
+          }
           self.died(id, error);
           return;
         }
       };
       watch.empty_reads = if records.is_empty() { watch.empty_reads + 1 } else { 0 };
-      self.sink.raw(Raw::Read { watch: id, dir: watch.path.clone(), result: Ok(records) });
+      let (dir, extended) = (watch.path.clone(), watch.extended);
+      self.sink.raw(Raw::Read { watch: id, dir, extended, result: Ok(records) });
       let next = if watch.empty_reads < MAX_EMPTY_READS {
         watch.read()
       } else {
@@ -1038,7 +1222,8 @@ mod port {
     /// No read is pending on the watch and none can be queued: close it and tell the engine.
     fn died(&mut self, id: WatchId, error: io::Error) {
       if let Some(watch) = self.watches.remove(&id) {
-        self.sink.raw(Raw::Read { watch: id, dir: watch.path.clone(), result: Err(error) });
+        let (dir, extended) = (watch.path.clone(), watch.extended);
+        self.sink.raw(Raw::Read { watch: id, dir, extended, result: Err(error) });
       }
     }
 
@@ -1073,10 +1258,12 @@ mod port {
     /// Blocks of their own on the heap, so that they keep their addresses while the kernel has
     /// them.
     overlapped: Box<OVERLAPPED>,
-    buffer: Box<[u32]>,
+    buffer: Box<[u64]>,
     /// A read is queued and its packet was not taken from the port yet.
     pending: bool,
     empty_reads: u8,
+    /// The reads ask for the longer records. Off when this Windows or the disk has none.
+    extended: bool,
   }
 
   impl Watch {
@@ -1088,29 +1275,42 @@ mod port {
         buffer: vec![0; BUFFER_WORDS].into_boxed_slice(),
         pending: false,
         empty_reads: 0,
+        extended: read_extended().is_some(),
       }
     }
 
     /// Queues the next read. Only called when no read is pending. After an error none is pending.
     fn read(&mut self) -> io::Result<()> {
+      let queued = self.queue();
+      if self.extended && queued.as_ref().is_err_and(not_supported) {
+        self.extended = false;
+        return self.queue();
+      }
+      queued
+    }
+
+    fn queue(&mut self) -> io::Result<()> {
       let Some(dir) = &self.dir else { return Err(io::Error::other("the handle is closed")) };
       *self.overlapped = OVERLAPPED::default();
+      let (handle, buffer) = (dir.as_raw_handle(), self.buffer.as_mut_ptr().cast());
+      let (subtree, overlapped) = (i32::from(true), &raw mut *self.overlapped);
+      let extended = read_extended().filter(|_| self.extended);
       // SAFETY: the handle is open. The kernel writes to `buffer`, which is `BUFFER_BYTES` long,
       // and to `overlapped` until the read completes. Both are heap blocks that do not move, and
       // they are freed only when `pending` is false again (see `Drop`). No read is pending now, so
       // the kernel does not use the blocks for another read: `Worker::open` calls this for a new
       // watch, and `Worker::completed` after it took the packet of the last read.
       let queued = unsafe {
-        ReadDirectoryChangesW(
-          dir.as_raw_handle(),
-          self.buffer.as_mut_ptr().cast(),
-          BUFFER_BYTES,
-          i32::from(true),
-          FILTER,
-          ptr::null_mut(),
-          &raw mut *self.overlapped,
-          None,
-        )
+        let (size, no_count) = (BUFFER_BYTES, ptr::null_mut());
+        match extended {
+          Some(read) => {
+            let class = ReadDirectoryNotifyExtendedInformation;
+            read(handle, buffer, size, subtree, FILTER, no_count, overlapped, None, class)
+          }
+          None => {
+            ReadDirectoryChangesW(handle, buffer, size, subtree, FILTER, no_count, overlapped, None)
+          }
+        }
       };
       if queued == 0 {
         return Err(io::Error::last_os_error());

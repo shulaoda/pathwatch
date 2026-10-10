@@ -207,7 +207,7 @@ impl Fs for StdFs {
 #[cfg(windows)]
 mod windows {
   use std::{
-    ffi::{OsStr, OsString, c_void},
+    ffi::{CStr, OsStr, OsString, c_void},
     fs::{self, OpenOptions},
     io, mem,
     os::windows::{
@@ -345,21 +345,25 @@ mod windows {
   /// `FileStatBasicByNameInfo`.
   const STAT_BASIC: i32 = 3;
 
-  /// The call, where this Windows has it (Windows 11 24H2 and later). It is looked up by its
-  /// name: a program that imports it does not start on an older Windows.
+  /// A function of `kernel32.dll` that not every Windows has, by its name. A program that
+  /// imports such a function does not start on a Windows without it.
+  pub fn kernel32(name: &CStr) -> Option<Unknown> {
+    let kernel32: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+    // SAFETY: both names end with a NUL. `kernel32.dll` is loaded in every process and is
+    // never unloaded, so the address stays good.
+    unsafe { GetProcAddress(GetModuleHandleW(kernel32.as_ptr()), name.as_ptr().cast()) }
+  }
+
+  /// A function whose signature only its name tells.
+  pub type Unknown = unsafe extern "system" fn() -> isize;
+
+  /// The call, where this Windows has it (Windows 11 24H2 and later).
   fn by_name_call() -> Option<ByName> {
     static CALL: OnceLock<Option<ByName>> = OnceLock::new();
     *CALL.get_or_init(|| {
-      let kernel32: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
-      // SAFETY: both names end with a NUL. `kernel32.dll` is loaded in every process and is
-      // never unloaded, so the address stays good.
-      let found = unsafe {
-        let module = GetModuleHandleW(kernel32.as_ptr());
-        GetProcAddress(module, c"GetFileInformationByName".as_ptr().cast())
-      };
+      let found = kernel32(c"GetFileInformationByName");
       // SAFETY: the function with this name has this signature.
-      found
-        .map(|call| unsafe { mem::transmute::<unsafe extern "system" fn() -> isize, ByName>(call) })
+      found.map(|call| unsafe { mem::transmute::<Unknown, ByName>(call) })
     })
   }
 
@@ -703,6 +707,8 @@ mod windows {
   }
 }
 
+#[cfg(windows)]
+pub(crate) use self::windows::{Unknown, kernel32};
 #[cfg(windows)]
 use self::windows::{stat, told};
 

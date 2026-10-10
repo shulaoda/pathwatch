@@ -29,6 +29,35 @@ fn encode(records: &[(u32, &str)]) -> Vec<u8> {
   bytes
 }
 
+/// Where the name starts in a record of the longer form.
+const EXTENDED_FILE_NAME: usize = 84;
+const DIRECTORY: u32 = 0x10;
+
+/// The same for the longer records of `ReadDirectoryChangesExW`: times, sizes, the attributes
+/// and two file ids are between the action and the length of the name. A record is padded to
+/// eight bytes there.
+fn encode_extended(records: &[(u32, &str, bool)]) -> Vec<u8> {
+  let mut bytes = Vec::new();
+  for (at, &(action, name, is_dir)) in records.iter().enumerate() {
+    let name: Vec<u8> = name.encode_utf16().flat_map(u16::to_ne_bytes).collect();
+    let last = at + 1 == records.len();
+    let next = if last { 0 } else { (EXTENDED_FILE_NAME + name.len()).next_multiple_of(8) };
+    bytes.extend(u32::try_from(next).unwrap().to_ne_bytes());
+    bytes.extend(action.to_ne_bytes());
+    // Four times and two sizes.
+    bytes.extend([0xAB; 48]);
+    bytes.extend((if is_dir { DIRECTORY | 0x2000 } else { 0x20 }).to_ne_bytes());
+    // The tag of a reparse point, and two file ids.
+    bytes.extend([0xCD; 20]);
+    bytes.extend(u32::try_from(name.len()).unwrap().to_ne_bytes());
+    bytes.extend(name);
+    if !last {
+      bytes.resize(bytes.len().next_multiple_of(8), 0);
+    }
+  }
+  bytes
+}
+
 fn key(index: u32) -> DirKey {
   DirKey::new(index, 0)
 }
@@ -221,7 +250,7 @@ mod handles {
 
   use pathwatch::{
     backend::{Coverage, Want, is_watch_limit},
-    windows::{Change, Handles, MAX_HANDLES, WatchId, place},
+    windows::{Change, Handles, MAX_HANDLES, Open, WatchId, place},
   };
 
   use super::{dir, index, key};
@@ -253,17 +282,37 @@ mod handles {
   }
 
   impl Fake {
-    fn watch(&mut self, index: u32, path: &str, want: Want) -> Answer {
+    /// One call of `Handles`, with an `open` that writes down what it is asked for.
+    fn call<T>(&mut self, call: impl FnOnce(&mut Handles, Open<'_>) -> T) -> T {
       let Self { handles, open, ids, broken, .. } = self;
-      let (coverage, change) = handles.watch(key(index), &dir(path), want, &mut |id, dir| {
+      call(handles, &mut |id, dir| {
         ids.push(id);
         if broken.as_deref() == Some(dir) {
           return Err(io::ErrorKind::PermissionDenied.into());
         }
         open.push((id, dir.to_owned()));
         Ok(())
-      });
+      })
+    }
+
+    fn watch(&mut self, index: u32, path: &str, want: Want) -> Answer {
+      let (key, dir) = (key(index), dir(path));
+      let (mut coverage, change) = self.call(|handles, open| handles.watch(key, &dir, want, open));
       self.finish(change);
+      // The engine commits after its calls of `watch`, and only then looks at the disk.
+      let mut settled = self.call(|handles, open| handles.commit(open));
+      // A key that the commit left without a handle is told. The engine asks again for it,
+      // and that answer says why.
+      let told = settled.moved.iter().position(|&told| told == key);
+      if let Some(at) = told {
+        settled.moved.swap_remove(at);
+      }
+      self.finish(settled);
+      if told.is_some() {
+        let (answer, change) = self.call(|handles, open| handles.watch(key, &dir, want, open));
+        coverage = answer;
+        self.finish(change);
+      }
       match coverage {
         Coverage::WatchedTree => Answer::Tree,
         Coverage::NotWatched => Answer::NotWatched,
@@ -280,12 +329,7 @@ mod handles {
     }
 
     fn unwatch(&mut self, index: u32) {
-      let Self { handles, open, ids, .. } = self;
-      let change = handles.unwatch(key(index), &mut |id, dir| {
-        ids.push(id);
-        open.push((id, dir.to_owned()));
-        Ok(())
-      });
+      let change = self.call(|handles, open| handles.unwatch(key(index), open));
       self.finish(change);
     }
 
@@ -433,8 +477,9 @@ mod handles {
     let high = fake.open(3, "/p");
     assert_eq!(fake.open, [(other, dir("/q")), (high, dir("/p"))]);
     assert!(![low, deep, other].contains(&high));
-    // The keys of the closed handles are told that another handle serves them.
-    assert_eq!(fake.moved(), [0, 1]);
+    // The keys of the closed handles are not told: the new handle reported before the old
+    // ones stopped.
+    assert_eq!(fake.moved(), []);
 
     // They are served by the new one, and no handle goes with them. The handle elsewhere still
     // stands.
@@ -447,7 +492,7 @@ mod handles {
     fake.unwatch(2);
     // The key below it is still there, so its handle only moves down.
     assert_eq!(fake.dirs(), dirs(["/p", "/q/x"]));
-    assert_eq!(fake.moved(), [4]);
+    assert_eq!(fake.moved(), []);
   }
 
   #[test]
@@ -493,8 +538,9 @@ mod handles {
       fake.open(round, "/p");
       fake.unwatch(round);
     }
+    // The open that fails is tried twice: by the commit, and again for the answer.
     let count = fake.ids.len();
-    assert_eq!(count, 9);
+    assert_eq!(count, 12);
     fake.ids.sort_by_key(|id| id.0);
     fake.ids.dedup();
     assert_eq!(fake.ids.len(), count);
@@ -523,7 +569,7 @@ mod handles {
     // for the key that asked. The other key keeps a handle, on its own directory now.
     assert_eq!(fake.watch(0, "/p", Want::Contents), Answer::Failed);
     assert_eq!(fake.dirs(), dirs(["/p/a"]));
-    assert_eq!(fake.moved(), [1]);
+    assert_eq!(fake.moved(), []);
     assert_eq!(fake.died(id), []);
   }
 
@@ -578,7 +624,7 @@ mod handles {
     // One more: all of them have `/p` in common. The directory elsewhere keeps its handle.
     assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Tree);
     assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
-    assert_eq!(fake.moved(), (0..count).collect::<Vec<_>>());
+    assert_eq!(fake.moved(), []);
     // More of them open nothing.
     assert_eq!(fake.watch(101, "/p/new", Want::Contents), Answer::Tree);
     assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
@@ -590,7 +636,7 @@ mod handles {
     fake.unwatch(100);
     assert_eq!(fake.open.len(), MAX_HANDLES);
     assert!(fake.dirs().contains(&dir("/p/5")));
-    assert_eq!(fake.moved(), (0..count).collect::<Vec<_>>());
+    assert_eq!(fake.moved(), []);
   }
 
   #[test]
@@ -606,14 +652,14 @@ mod handles {
     assert_eq!(fake.open.len(), MAX_HANDLES);
     let shared = fake.id("/p/x");
     assert_eq!(fake.id("/p/y"), other);
-    assert_eq!(fake.moved(), [70]);
+    assert_eq!(fake.moved(), []);
     assert_eq!(fake.died(first), []);
 
     // The 66th: now all three share.
     fake.open(63, "/d63");
     assert_eq!(fake.dirs().last(), Some(&dir("/p")));
     assert_eq!(fake.open.len(), MAX_HANDLES);
-    assert_eq!(fake.moved(), [70, 71, 72]);
+    assert_eq!(fake.moved(), []);
     assert_eq!(fake.died(shared), []);
   }
 
@@ -639,13 +685,13 @@ mod handles {
     let mut fake = Fake::default();
     fake.open(0, "/p/a");
     fake.open(1, "/p");
-    assert_eq!(fake.moved(), [0]);
+    assert_eq!(fake.moved(), []);
     assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::Names);
     // The handle goes down to the one directory that still wants the contents. The key that
     // only wanted names has no handle above it any more, and is told.
     fake.unwatch(1);
     assert_eq!(fake.dirs(), dirs(["/p/a"]));
-    assert_eq!(fake.moved(), [0, 2]);
+    assert_eq!(fake.moved(), [2]);
     assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::NotWatched);
     // A key that wants names only never moves a handle.
     assert_eq!(fake.watch(3, "/p/a/x", Want::Names), Answer::Names);
@@ -689,7 +735,7 @@ mod handles {
     // The key below is still watched: it gets a handle on its own directory.
     fake.unwatch(0);
     assert_eq!(fake.dirs(), dirs(["/p/a"]));
-    assert_eq!(fake.moved(), [1]);
+    assert_eq!(fake.moved(), []);
     fake.unwatch(0);
     fake.unwatch(1);
     assert_eq!(fake.dirs(), dirs([]));
@@ -704,12 +750,12 @@ mod handles {
     fake.open(2, "/q");
     assert_eq!(fake.watch(3, "/p/b", Want::Names), Answer::Names);
     assert_eq!(fake.watch(4, "/q/c", Want::Contents), Answer::Tree);
-    assert_eq!(fake.moved(), [0]);
+    assert_eq!(fake.moved(), []);
 
     fake.unwatch(1);
     assert_eq!(fake.dirs(), dirs(["/p/a", "/q"]));
     // The engine asks again for each key that is told.
-    assert_eq!(fake.moved(), [0, 3]);
+    assert_eq!(fake.moved(), [3]);
     assert_eq!(fake.watch(0, "/p/a", Want::Contents), Answer::Tree);
     assert_eq!(fake.watch(3, "/p/b", Want::Names), Answer::NotWatched);
     assert_eq!(fake.watch(4, "/q/c", Want::Contents), Answer::Tree);
@@ -822,6 +868,37 @@ mod records {
 
   fn named(action: u32, name: &str) -> (u32, String) {
     (action, name.to_owned())
+  }
+
+  #[test]
+  fn the_longer_records_tell_what_is_a_directory() {
+    let bytes = super::encode_extended(&[
+      (ADDED, "new.txt", false),
+      (MODIFIED, r"sub\deep", true),
+      (MODIFIED, "é and 日本.txt", false),
+    ]);
+    let seen: Vec<_> = Records::extended(&bytes)
+      .map(|record| {
+        let record = record.unwrap();
+        (
+          record.action,
+          String::from_utf16(&record.name().collect::<Vec<_>>()).unwrap(),
+          record.is_dir,
+        )
+      })
+      .collect();
+    let expected = [
+      (ADDED, "new.txt".to_owned(), Some(false)),
+      (MODIFIED, r"sub\deep".to_owned(), Some(true)),
+      (MODIFIED, "é and 日本.txt".to_owned(), Some(false)),
+    ];
+    assert_eq!(seen, expected);
+    // The short records tell nothing about it.
+    assert!(Records::new(&encode(&[(ADDED, "a")])).all(|record| record.unwrap().is_dir.is_none()));
+    // A record that is cut off, in the fixed part and in the name.
+    for len in [40, super::EXTENDED_FILE_NAME + 3] {
+      assert_eq!(Records::extended(&bytes[..len]).next(), Some(Err(Malformed)));
+    }
   }
 
   #[test]
@@ -968,12 +1045,15 @@ mod translate {
     want: Want,
   ) -> (Option<WatchId>, Vec<WatchId>) {
     let mut opened = None;
-    let (coverage, change) = handles.watch(key(index), &dir(path), want, &mut |id, _| {
+    let mut open = |id, _: &std::path::Path| {
       opened = Some(id);
       Ok(())
-    });
+    };
+    let (coverage, mut change) = handles.watch(key(index), &dir(path), want, &mut open);
+    // A new handle is opened by the commit.
+    change.close.extend(handles.commit(&mut open).close);
     let served = matches!(coverage, Coverage::WatchedTree | Coverage::Watched);
-    assert!(served, "{path}: {coverage:?}");
+    assert!(served && handles.serves(key(index)), "{path}: {coverage:?}");
     (opened, change.close)
   }
 
@@ -984,7 +1064,7 @@ mod translate {
 
   /// What a read on the handle `watch` on `path` gave.
   fn read(watch: WatchId, path: &str, result: io::Result<Vec<u8>>) -> Raw {
-    Raw::Read { watch, dir: dir(path), result }
+    Raw::Read { watch, dir: dir(path), extended: false, result }
   }
 
   /// A buffer of records whose names have `/` between their parts. Windows puts `\` there. On
@@ -1013,6 +1093,31 @@ mod translate {
   fn sorted(mut seen: Vec<Seen>) -> Vec<Seen> {
     seen.sort();
     seen
+  }
+
+  /// Windows sends `MODIFIED` for a directory when an entry in it changes. Where the record
+  /// says that it is a directory, it makes no hint: the entry has a record of its own.
+  #[test]
+  fn a_modified_record_of_a_directory_is_dropped() {
+    let mut handles = Handles::default();
+    let id = open(&mut handles, 7, "/p");
+    let bytes = super::encode_extended(&[
+      (MODIFIED, "sub", true),
+      (ADDED, r"sub\new.txt", false),
+      (MODIFIED, r"sub\new.txt", false),
+      (ADDED, "made", true),
+      (REMOVED, "gone", true),
+    ]);
+    let raw = Raw::Read { watch: id, dir: dir("/p"), extended: true, result: Ok(bytes) };
+    assert_eq!(
+      hints(&mut handles, raw),
+      [
+        changed(7, r"sub\new.txt"),
+        written(7, r"sub\new.txt"),
+        changed(7, "made"),
+        changed(7, "gone"),
+      ]
+    );
   }
 
   #[test]

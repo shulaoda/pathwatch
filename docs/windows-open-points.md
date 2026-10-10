@@ -58,6 +58,23 @@ Then the two numbers in which the backend was far behind (`bench/results/windows
   an open for reading waits for the virus scanner when the file was just written. The engine
   takes the number that NTFS keeps for the file in its place (`Fs::version`, design 5.8).
 
+And three more, from a look at where the time of a setup goes:
+
+- **The handles are opened by `commit`.** A request that needs a new handle asked `place`
+  for every directory again: with 20,000 watched files in 2,000 directories that was 390 of
+  the 520 ms of the setup. Now `watch` only notes the key, and the next `commit` asks `place`
+  once (rule 2: the engine reads no directory before it). A key that gets no handle then is
+  told and asks again.
+- **A key that only got another handle is not told.** It was told, the engine asked again
+  and scanned its directory again: 2,000 of these after such a setup. Nothing is lost when
+  the handles move, so nothing is said (design 7.3). A key behind a link below its new
+  handle is the exception: it is told, and the next `watch` gives it up.
+- **`MODIFIED` for a directory is dropped in the backend.** After a scan of 5,000 directories
+  Windows sent one such record for each of them (it brings the entry of the directory in its
+  parent up to date when a handle on it is closed), and the engine looked at each one: the
+  first change after a `watch` took 25 ms. The longer records of `ReadDirectoryChangesExW`
+  say what is a directory.
+
 What is left of the difference: a watcher that keeps no list of the files (notify, parcel,
 `fs.watch`) is ready as soon as its one handle is open, and pathwatch reads the tree first.
 That is what lets it tell a new file from a changed one and report a tree that is moved in
@@ -160,10 +177,9 @@ them (`place` in `windows.rs`). All of this is new and has only run as plain cod
   changes, and is dropped. If Windows sends `MODIFIED` and nothing else for a directory that
   was replaced, the replacement is only found when the engine looks.
 - **Moving the handles.** When a directory comes or goes, handles can move up to a common
-  directory or down again. The new handles are opened first, then the old ones are closed, then
-  each key that got another handle gets a `Changed` with an empty `rel`. Expected: no change is
-  missed in between, and a change that both handles report only costs the engine a second
-  look. Not checked: how long opening and closing some dozens of handles takes.
+  directory or down again. The new handles are opened first, then the old ones are closed. No
+  change is missed in between, and a change that both handles report only costs the engine a
+  second look. One open takes about 40 us (measured).
 - **A shared handle that Windows does not let us open.** A common directory can refuse
   `FILE_LIST_DIRECTORY` where the directories below it allow it. Then the request that needed
   the shared handle is answered `Failed` with that error, the handles stay where they were, and
@@ -233,20 +249,12 @@ the code that they are about (`Handle`, `Handles`, `Handles::route`, `may_hold_a
    can be worse: when no key is at or above the directory that holds the short name, the short
    name can be a directory on the way to any key below, so each of these keys gets that hint.
 
-4. **Lost records in the last read of a closed handle.** The last read of a handle that the
-   backend closed is expected to end with no bytes, and lost records look the same. So the worker
-   passes on the last read only when it holds records. When the handles move, each key that got
-   another handle is told, so nothing is missed there. One case is left: a `watch` call for the
-   very directory of a handle replaces that handle, and the other keys of the handle are not
-   told. The engine made that call and scans the directory after it, but only as deep as it
-   decided to.
+4. **Lost records in the last read of a closed handle.** Settled: the read that a close
+   cancels fails with `ERROR_OPERATION_ABORTED` (118 of 118 closes, measured), so a last read
+   that ends with no bytes is lost records, and it is passed on like every other one.
 
-5. **A key at the directory of a handle is asked again after it moved.** A key that gets
-   another handle is told with `Changed` and an empty `rel`, and the engine then calls `watch`
-   for it. If the new handle is on the directory of that key, this call opens one more handle
-   there and closes the one that was just opened. It is correct, but one open and one close
-   too many for each such key. The backend cannot tell this call from the one that the engine
-   makes when it finds another directory at the path.
+5. **A key at the directory of a handle is asked again after it moved.** Settled: a key that
+   gets another handle is not told any more.
 
 6. **Above the limit, path order decides.** When more than 64 handles are needed and the
    directories have only a top directory or a home directory in common, the last directories in

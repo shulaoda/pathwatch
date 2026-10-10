@@ -1341,34 +1341,49 @@ The tests of this backend (`tests/windows.rs`, and `tests/windows_parts.rs` for 
 make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Windows 11 with NTFS.
 What was not checked, and what is known to be missing, is in `docs/windows-open-points.md`.
 
-- One thread owns one I/O completion port and every directory handle (`port`). A handle is live
-  when `watch` returns. It reports its directory and everything below it.
+- One thread owns one I/O completion port and every directory handle (`port`). A handle
+  reports its directory and everything below it. A request that needs a new handle is
+  answered at once, and the handle is opened by the next `commit`, for all the requests of a
+  flush together: `place` is asked once, not once for each directory (2,000 directories:
+  350 ms the one way, 10 ms the other, measured).
 - **Where the handles go** (`place`): each directory that wants `Contents`, with no other such
   directory above it, gets a handle. It serves every key at or below its directory. With more
   than 64 handles, handles go up to a directory that they have in common and become one: the
   deepest common directory first, until at most 64 are left. No handle goes on `C:\`,
   `C:\Users` or `C:\Users\<name>`.
-- **Answers.** A key that a handle serves: `WatchedTree`. A `Names` request that no handle
-  covers, and a directory that could only be watched from one of those three directories:
-  `NotWatched`. No room, and no allowed directory in common: `Failed` with the watch limit
-  error; the engine polls the directory and asks again at each poll.
+- **Answers.** A key that wants the contents and that a handle serves: `WatchedTree`. A key
+  that wants names only and that a handle serves: `Watched` (after `WatchedTree` the engine
+  would take back the watches of the directories below, and only a key that wants the
+  contents holds a handle). A `Names` request that no handle covers, and a directory that
+  could only be watched from one of those three directories: `NotWatched`; when a handle
+  comes to stand at or above such a directory later, `commit` returns its key. A key that the
+  commit can give no handle (no room and no allowed directory in common, or the open fails)
+  gets `Changed` with an empty `rel`, the engine asks again, and that request is answered
+  `Failed` with the reason.
 - `Handles` keeps every served key. When a key comes or goes, the handles move to where `place`
-  puts them: new handles are opened first, then old ones are closed, then each key that got
-  another handle gets `Changed` with an empty `rel` (`Raw::Moved`). If one open fails, nothing
-  changes. A `watch` for the very directory of a handle puts a new handle there: the old one
-  may be on a directory that was renamed away.
+  puts them: new handles are opened first, then old ones are closed. A key that got another
+  handle is not told: the new handle reported before the old one stopped, the last read of
+  the old one is still translated, and the read that the close cancels fails
+  (`ERROR_OPERATION_ABORTED`), so it is not taken for lost records. If one open fails,
+  nothing changes. A `watch` for the very directory of a handle puts a new handle there: the
+  old one may be on a directory that was renamed away.
 - Filter: `FILE_NAME | DIR_NAME | SIZE | LAST_WRITE | CREATION`. 64 KiB buffer. The bytes of a
-  completed read are read on the watcher thread (`Records`, `translate`).
+  completed read are read on the watcher thread (`Records`, `translate`). The reads ask for
+  the longer records (`ReadDirectoryChangesExW`, Windows 10 1709 and later) where Windows
+  and the disk have them: they tell whether an entry is a directory.
 - **Hints.** A record goes to the deepest key whose directory holds its path; if no key
   matches by exact text, ASCII letters are compared without case. A record that no key holds
-  is dropped. `MODIFIED` → `Written`; it is dropped when it names the directory of the key
-  itself. Every other record → `Changed`. A read with no bytes, and a record with no name →
+  is dropped. `MODIFIED` → `Written`; it is dropped when it names a directory (the longer
+  records tell) or the directory of the key itself: Windows sends it whenever an entry in a
+  directory changes, and that entry has a record of its own. Every other record → `Changed`. A read with no bytes, and a record with no name →
   `Changed` with an empty `rel` for each key at or below the directory of the handle. Bytes
   that cannot be read → `Lost`. A read that fails → the handle is closed, `Changed` with an
   empty `rel` for each of its keys. A name that looks like a short (8.3) name → `Changed` for
   the directory that holds it.
-- Directories are compared by path text. So a junction or a directory link below a handle is
-  taken for covered, and changes behind it are not found.
+- Directories are compared by path text, and a handle reports nothing for what is behind a
+  junction or a directory link below it. So each name between a handle and a key that it
+  would serve is looked at (`leads_through_a_link`), and a key behind a link is answered
+  `NotWatched`: the engine polls it.
 
 ### 7.4 Poll (`poll.rs`)
 

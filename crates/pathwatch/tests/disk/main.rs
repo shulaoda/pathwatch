@@ -187,7 +187,8 @@ impl Watch {
   /// it does not hold, an `Update` or a `Delete` of one that it holds), and is applied to it.
   /// This waits until `known` is `on_disk`, and then it must stay so for a quiet time.
   fn expect_known(&mut self, known: &mut BTreeSet<PathBuf>, on_disk: &BTreeSet<PathBuf>) {
-    let mut end = Instant::now() + PATIENCE;
+    let patience = Instant::now() + PATIENCE;
+    let mut end = patience;
     let mut settled = false;
     loop {
       for event in self.events.drain(..) {
@@ -198,9 +199,13 @@ impl Watch {
         };
         assert!(fits, "{}: {event:?} does not fit what the handler knows", self.backend);
       }
-      if !settled && known == on_disk {
-        settled = true;
-        end = Instant::now() + QUIET;
+      // What the handler knew before can be what is on the disk now, while the events of the
+      // changes in between still wait: they take that away again, and the quiet time starts
+      // anew when the two are the same once more.
+      if known != on_disk {
+        (settled, end) = (false, patience);
+      } else if !settled {
+        (settled, end) = (true, Instant::now() + QUIET);
       }
       if !self.receive(end.saturating_duration_since(Instant::now())) {
         break;

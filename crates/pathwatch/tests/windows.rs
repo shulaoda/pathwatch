@@ -115,6 +115,13 @@ impl Harness {
   fn watch_again(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
     let coverage = self.backend.watch(key, dir, want);
     self.backend.commit().unwrap();
+    // A key that the commit left without a handle is told. The engine asks again for it, and
+    // that answer says why.
+    if matches!(coverage, Coverage::WatchedTree) && !self.backend.serves(key) {
+      let coverage = self.backend.watch(key, dir, want);
+      self.backend.commit().unwrap();
+      return coverage;
+    }
     coverage
   }
 
@@ -259,6 +266,25 @@ fn a_change_deep_below_is_reported_from_the_handle() {
   harness.hints_until(|hint| hint.names(key, r"a\b\f.txt"));
 }
 
+/// A new file in a directory below changes that directory, and Windows sends a record for the
+/// directory too. It says nothing, and it makes no hint.
+#[test]
+fn a_change_in_a_directory_below_makes_no_hint_for_that_directory() {
+  let temp = scratch();
+  let sub = make_dir(temp.path().join("sub"));
+  let mut harness = Harness::new();
+  let key = harness.handle(temp.path());
+
+  for name in ["one.txt", "two.txt", "last.txt"] {
+    fs::write(sub.join(name), "1").unwrap();
+  }
+  fs::remove_file(sub.join("one.txt")).unwrap();
+  fs::write(temp.path().join("end.txt"), "1").unwrap();
+  let seen = harness.hints_until(|hint| hint.names(key, "end.txt"));
+  assert!(seen.iter().any(|hint| hint.names(key, r"sub\last.txt")), "{seen:?}");
+  assert!(seen.iter().all(|hint| !hint.names(key, "sub")), "{seen:?}");
+}
+
 #[test]
 fn a_directory_below_a_handle_gets_no_handle_of_its_own() {
   let temp = scratch();
@@ -287,8 +313,7 @@ fn a_handle_above_takes_over_from_the_handle_below() {
   let low_key = harness.handle(&low);
   let key = harness.handle(temp.path());
 
-  // The key of the closed handle is told, and the handle above serves it from now on.
-  harness.hints_until(|hint| hint.names_the_directory(low_key));
+  // The handle above serves the key of the closed handle from now on.
   fs::write(low.join("f.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(low_key, "f.txt"));
 
@@ -374,7 +399,6 @@ fn more_directories_than_handles_share_a_handle() {
   // One more: all of them go to one handle, on the directory that they have in common.
   let one_more = make_dir(temp.path().join("one more"));
   let more_key = harness.handle(&one_more);
-  harness.hints_until(|hint| hint.names_the_directory(keys[0]));
 
   fs::write(one_more.join("f.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(more_key, "f.txt"));
@@ -390,9 +414,8 @@ fn more_directories_than_handles_share_a_handle() {
   assert!(seen.iter().all(|hint| !format!("{hint:?}").contains("nobody")), "{seen:?}");
   assert!(!seen.contains(&Seen::Lost), "{seen:?}");
 
-  // With room for all, each directory has its own handle again, and its key is told.
+  // With room for all, each directory has its own handle again.
   harness.backend.unwatch(more_key);
-  harness.hints_until(|hint| hint.names_the_directory(keys[0]));
   fs::write(temp.path().join("7").join("g.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(keys[7], "g.txt"));
 }
@@ -642,6 +665,31 @@ fn a_directory_behind_a_junction_below_a_handle_is_not_covered() {
   assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
   fs::write(plain.join("f.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(key, "f.txt"));
+}
+
+/// The same when both are asked for before one commit: the handle is opened by the commit, and
+/// only then it is known that it stands above the junction. The key is told and given up.
+#[test]
+fn a_directory_behind_a_junction_is_told_when_the_handle_above_comes_with_it() {
+  let temp = scratch();
+  let top = make_dir(temp.path().join("top"));
+  make_dir(temp.path().join("target").join("sub"));
+  junction(&top.join("link"), &temp.path().join("target"));
+  let behind = top.join("link").join("sub");
+  let mut harness = Harness::new();
+  let (top_key, key) = (DirKey::new(100, 0), DirKey::new(101, 0));
+
+  for (key, dir) in [(top_key, &top), (key, &behind)] {
+    let coverage = harness.backend.watch(key, dir, Want::Contents);
+    assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
+  }
+  harness.backend.commit().unwrap();
+  harness.hints_until(|hint| hint.names_the_directory(key));
+  let coverage = harness.watch_again(key, &behind, Want::Contents);
+  assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
+
+  fs::write(top.join("f.txt"), "1").unwrap();
+  harness.hints_until(|hint| hint.names(top_key, "f.txt"));
 }
 
 /// A key that a handle above served is behind a junction when the engine asks again: the
