@@ -1260,7 +1260,10 @@ As built:
   10 s for 4,100 records and 4,100 covers in one call. A sorted copy of all cover paths,
   made after each change of the covers and kept, was as fast as the map, and held every
   path once more.)
-- `unwatch(key)` forgets the key. The path stays in its stream until the streams are replaced.
+- `unwatch(key)` forgets the key. The path stays in its stream until the streams are replaced,
+  or until no path of that stream has a cover at or below it any more: then the stream is
+  stopped at the next commit and its guards are given back, with no loss report, since none of
+  its records would reach a key.
 - **A cover is a text.** A stream stands at the text of its path, and a record finds its
   cover by the text of the cover. Both hold only while every name in them is the one that the
   disk has. Each way for a name to change has one place that finds it, and all of them answer
@@ -1329,9 +1332,10 @@ What stays open:
 
 - A link on the way to a watched path that points somewhere else now is found by the poll
   (5.14), within a second.
-- A stream path that is trusted no more keeps its stream until the streams are replaced. When
-  its directory is back, that stream and the new one both report it, so a record comes
-  twice, which costs one more table lookup and nothing else.
+- A stream path that is trusted no more keeps its stream until the streams are replaced,
+  unless no path of that stream is trusted any more: then the stream is stopped at the next
+  commit. While it runs on and its directory is back, that stream and the new one both
+  report it, so a record comes twice, which costs one more table lookup and nothing else.
 - A directory inside a stream that gets another spelling of its name: each cover below it
   is scanned deep twice, once for the record of the rename and once because its real path
   is another one. The scans are paced, and only what differs is reported. The second report

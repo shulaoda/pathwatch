@@ -175,6 +175,7 @@ impl Backend for FsEventsBackend {
 
   fn commit(&mut self) -> io::Result<Vec<DirKey>> {
     self.streams.stop_retired();
+    self.streams.stop_idle(&self.covers);
     self.last_parent = None;
     if self.streams.pending.is_empty() {
       return Ok(Vec::new());
@@ -331,12 +332,19 @@ impl Covers {
 struct Streams {
   sink: Arc<Sink<Raw>>,
   queue: Queue,
-  running: Vec<Stream>,
+  running: Vec<Running>,
   paths: Dirs<()>,
   pending: Dirs<()>,
   path_limit: usize,
   retiring: VecDeque<Retiring>,
   guard: Guard,
+}
+
+/// A stream and the paths it was started for.
+#[derive(Debug)]
+struct Running {
+  stream: Stream,
+  paths: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -365,12 +373,13 @@ impl Streams {
       asked += 1;
       self.guard.hold(path).err().filter(|error| !is_gone(error))
     });
-    let start = |first| {
-      let every_nth = paths.iter().skip(first).step_by(stream_count);
-      Stream::start(&self.queue, &self.sink, every_nth)
+    let start = |first: usize| -> io::Result<Running> {
+      let every_nth = || paths.iter().skip(first).step_by(stream_count);
+      let stream = Stream::start(&self.queue, &self.sink, every_nth())?;
+      Ok(Running { stream, paths: every_nth().cloned().collect() })
     };
     let streams = no_guard
-      .map_or_else(|| (0..stream_count).map(start).collect::<io::Result<Vec<Stream>>>(), Err);
+      .map_or_else(|| (0..stream_count).map(start).collect::<io::Result<Vec<Running>>>(), Err);
     let streams = match streams {
       Ok(streams) => streams,
       Err(error) => {
@@ -381,7 +390,8 @@ impl Streams {
       }
     };
     if replace {
-      let replaced = mem::take(&mut self.running);
+      let replaced: Vec<Stream> =
+        mem::take(&mut self.running).into_iter().map(|running| running.stream).collect();
       if !replaced.is_empty() {
         let deadline = Instant::now() + RETIRING_TIMEOUT;
         self.retiring.push_back(Retiring { streams: replaced, deadline });
@@ -434,6 +444,31 @@ impl Streams {
       }
     }
     moved
+  }
+
+  /// Stops the streams whose records would reach no key: every path of the stream is trusted
+  /// no more, or has no cover at or below it. Nothing is lost with them, and their paths and
+  /// their guards are given back.
+  fn stop_idle(&mut self, covers: &Covers) {
+    let needed = |path: &PathBuf| {
+      self.paths.contains(path)
+        && (covers.by_dir.contains(path) || !covers.by_dir.below(slice::from_ref(path)).is_empty())
+    };
+    let is_idle = |running: &Running| !running.paths.iter().any(needed);
+    if !self.running.iter().any(is_idle) {
+      return;
+    }
+    let (idle, kept): (Vec<Running>, Vec<Running>) =
+      mem::take(&mut self.running).into_iter().partition(is_idle);
+    self.running = kept;
+    for path in idle.iter().flat_map(|running| &running.paths) {
+      if self.paths.contains(path) {
+        self.paths.remove(path);
+        self.guard.release(path);
+      }
+    }
+    let streams: Vec<Stream> = idle.into_iter().map(|running| running.stream).collect();
+    self.queue.sync(move || drop(streams));
   }
 
   fn stop_retired(&mut self) {

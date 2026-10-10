@@ -195,7 +195,8 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   another way than the disk (more than the case of ASCII letters, or a short 8.3 name) gets no
   events.
 - **Where the OS watches are put depends on what was watched and unwatched before.** A stream of
-  macOS stays where it is until the streams are replaced. Nothing is missed.
+  macOS stays where it is until the streams are replaced, or until nothing watched is left below
+  it. Nothing is missed.
 - **The Windows backend is young.** Its tests pass on Windows 11 with NTFS, and nothing else
   was tried: no network share, no ReFS, no older Windows. See `docs/windows-open-points.md`.
 - **Android was never run.** It is set to use the same code as Linux, and only type-checked.

@@ -611,6 +611,35 @@ fn a_cover_unwatched_before_the_commit_gets_no_stream() {
   h.hints_until(&[changed(below, "file")]);
 }
 
+/// A stream whose paths have no cover left is stopped at the next commit, and its guards are
+/// given back. A cover below one of its paths keeps it.
+#[test]
+fn a_stream_with_no_cover_left_is_stopped() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("one/below")).unwrap();
+  fs::create_dir(h.path("two")).unwrap();
+  let one = h.cover(1, "one");
+  let two = h.cover(2, "two");
+  let below = h.watch(3, &h.path("one/below"), Want::Contents);
+  h.commit();
+  assert_eq!(h.backend.stream_count(), 2);
+  let guarded = h.backend.guarded().len();
+
+  h.backend.unwatch(one);
+  h.commit();
+  assert_eq!(h.backend.stream_count(), 2);
+  File::create(h.path("one/below/file")).unwrap();
+  h.hints_until(&[changed(below, "file")]);
+
+  h.backend.unwatch(below);
+  h.commit();
+  assert_eq!(h.backend.stream_count(), 1);
+  assert_eq!(h.backend.streamed(), [h.real("two")]);
+  assert_eq!(h.backend.guarded().len(), guarded - 1);
+  File::create(h.path("two/file")).unwrap();
+  h.hints_until(&[changed(two, "file")]);
+}
+
 #[test]
 fn ancestor_is_not_watched_unless_a_stream_reports_it() {
   let mut h = Harness::new();
@@ -805,7 +834,9 @@ fn key_follows_its_path_to_another_directory() {
   h.watch(1, &h.path("link"), Want::Contents);
   h.commit();
   assert_eq!(h.backend.covers(), [h.real("two")]);
-  assert_eq!(h.backend.stream_count(), 2);
+  // The stream of the old directory serves no key any more: it is stopped.
+  assert_eq!(h.backend.stream_count(), 1);
+  assert_eq!(h.backend.streamed(), [h.real("two")]);
   // The key was at another real path, and nothing else said so: it is reported lost.
   h.hints_until(&[changed(key, "")]);
 
