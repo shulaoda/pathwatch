@@ -242,7 +242,6 @@ fn split_event(raw: &[u8]) -> Option<(Event<'_>, &[u8])> {
   Some((event, rest))
 }
 
-#[expect(clippy::undocumented_unsafe_blocks, reason = "this file has no comments")]
 mod ffi {
   use std::{
     ffi::CString,
@@ -256,15 +255,18 @@ mod ffi {
   };
 
   pub(super) fn inotify() -> io::Result<File> {
+    // SAFETY: the call takes no memory of ours.
     owned(unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) })
   }
 
   pub(super) fn eventfd() -> io::Result<File> {
+    // SAFETY: the call takes no memory of ours.
     owned(unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) })
   }
 
   pub(super) fn add_watch(inotify: &File, dir: &Path, mask: u32) -> io::Result<i32> {
     let path = CString::new(dir.as_os_str().as_bytes())?;
+    // SAFETY: `path` ends with a NUL, and the call only reads it.
     let wd = unsafe { libc::inotify_add_watch(inotify.as_raw_fd(), path.as_ptr(), mask) };
     if wd < 0 { Err(io::Error::last_os_error()) } else { Ok(wd) }
   }
@@ -272,12 +274,14 @@ mod ffi {
   pub(super) fn remove_watch(inotify: &File, wd: i32) {
     #[cfg(target_os = "android")]
     let wd = wd.cast_unsigned();
+    // SAFETY: the call takes no memory of ours.
     unsafe { libc::inotify_rm_watch(inotify.as_raw_fd(), wd) };
   }
 
   pub(super) fn wait_until_readable(files: [&File; 2]) -> io::Result<[bool; 2]> {
     let mut polled =
       files.map(|file| libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+    // SAFETY: `polled` holds two `pollfd`, and the call writes into these two only.
     if unsafe { libc::poll(polled.as_mut_ptr(), 2, -1) } < 0 {
       return Err(io::Error::last_os_error());
     }
@@ -288,6 +292,7 @@ mod ffi {
     if fd < 0 {
       return Err(io::Error::last_os_error());
     }
+    // SAFETY: `fd` was just opened by the caller, and nothing else owns it.
     Ok(unsafe { File::from_raw_fd(fd) })
   }
 }

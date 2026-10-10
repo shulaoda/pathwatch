@@ -616,7 +616,6 @@ impl<T> Dirs<T> {
   }
 }
 
-#[expect(clippy::undocumented_unsafe_blocks, reason = "this file has no comments")]
 mod ffi {
   use std::{
     ffi::{CStr, CString, OsStr, OsString, c_char, c_void},
@@ -646,28 +645,36 @@ mod ffi {
   #[derive(Debug)]
   pub(super) struct Queue(NonNull<c_void>);
 
+  // SAFETY: a dispatch queue may be used from any thread. The pointer is a reference that GCD
+  // counts, and `Drop` gives it back once.
   unsafe impl Send for Queue {}
 
   impl Queue {
     pub(super) fn new() -> io::Result<Self> {
+      // SAFETY: the label ends with a NUL, and a null attribute asks for a serial queue.
       let queue = unsafe { dispatch_queue_create(c"pathwatch.fsevents".as_ptr(), ptr::null()) };
       NonNull::new(queue).map(Self).ok_or_else(|| io::Error::other(ERROR_QUEUE_CREATE))
     }
 
     pub(super) fn sync<F: FnOnce() + Send>(&self, work: F) {
       extern "C" fn run<F: FnOnce() + Send>(context: *mut c_void) {
+        // SAFETY: `context` is the `&mut Option<F>` of `sync` below, which waits until this ran:
+        // the value is alive, and nothing else touches it meanwhile.
         let work = unsafe { &mut *context.cast::<Option<F>>() };
         if let Some(work) = work.take() {
           work();
         }
       }
       let mut work = Some(work);
+      // SAFETY: the queue is open, and the call returns only when `run` has run, so `work`
+      // lives long enough.
       unsafe { dispatch_sync_f(self.0.as_ptr(), (&raw mut work).cast(), run::<F>) };
     }
   }
 
   impl Drop for Queue {
     fn drop(&mut self) {
+      // SAFETY: the queue came from `dispatch_queue_create`, and this is its one release.
       unsafe { dispatch_release(self.0.as_ptr()) };
     }
   }
@@ -675,6 +682,8 @@ mod ffi {
   #[derive(Debug)]
   pub(super) struct Stream(NonNull<c_void>);
 
+  // SAFETY: the functions of a stream may be called from any thread. The watcher thread calls
+  // them, and a retired stream is dropped on its dispatch queue.
   unsafe impl Send for Stream {}
 
   impl Stream {
@@ -692,6 +701,9 @@ mod ffi {
         release: Some(release),
         copy_description: None,
       };
+      // SAFETY: `context` and `array` are whole values that the call reads and copies.
+      // `callback` has the signature of a stream callback, and `info` is the pointer of an
+      // `Arc<Sink<Raw>>` that `retain` and `release` count.
       let stream = unsafe {
         FSEventStreamCreate(
           ptr::null(),
@@ -704,6 +716,7 @@ mod ffi {
         )
       };
       let stream = NonNull::new(stream).ok_or_else(|| io::Error::other(ERROR_STREAM_CREATE))?;
+      // SAFETY: the stream was just created, and it is put on an open queue before it starts.
       let started = unsafe {
         FSEventStreamSetDispatchQueue(stream.as_ptr(), queue.0.as_ptr());
         FSEventStreamStart(stream.as_ptr()) != 0
@@ -711,6 +724,7 @@ mod ffi {
       if started {
         return Ok(Self(stream));
       }
+      // SAFETY: the stream did not start. It is taken off its queue and released once, here.
       unsafe {
         FSEventStreamInvalidate(stream.as_ptr());
         FSEventStreamRelease(stream.as_ptr());
@@ -721,6 +735,8 @@ mod ffi {
 
   impl Drop for Stream {
     fn drop(&mut self) {
+      // SAFETY: `start` started the stream on a queue. Stop, invalidate, release, in this order
+      // and once, is how a stream ends.
       unsafe {
         FSEventStreamStop(self.0.as_ptr());
         FSEventStreamInvalidate(self.0.as_ptr());
@@ -748,10 +764,12 @@ mod ffi {
 
   impl Guard {
     pub(super) fn new(sink: &Arc<Sink<Raw>>) -> io::Result<Self> {
+      // SAFETY: the call takes no memory of ours.
       let queue = unsafe { kqueue() };
       if queue < 0 {
         return Err(io::Error::last_os_error());
       }
+      // SAFETY: `queue` was just opened, and nothing else owns it.
       let queue = unsafe { OwnedFd::from_raw_fd(queue) };
       change(&queue, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0)?;
       let (fd, sink) = (queue.as_raw_fd(), Arc::clone(sink));
@@ -769,6 +787,7 @@ mod ffi {
     pub(super) fn hold(&mut self, path: &Path) -> io::Result<()> {
       let chain = || path.ancestors().filter(|dir| dir.parent().is_some());
       let missing: Vec<&Path> = chain().filter(|dir| !self.dirs.contains_key(*dir)).collect();
+      // SAFETY: the call takes no memory of ours.
       let room = usize::try_from(unsafe { getdtablesize() }).unwrap_or(0) / 2;
       let first_id = self.last_id + 1;
       let open = |(index, dir): (usize, &&Path)| {
@@ -846,6 +865,8 @@ mod ffi {
     let udata = ptr::without_provenance_mut(id);
     let change = KEvent { ident, filter, flags, fflags: notes, data: 0, udata };
     let nothing = ptr::null_mut();
+    // SAFETY: `change` is one whole `kevent`. The call reads that one and writes none, and a
+    // null timeout means no wait.
     let done = unsafe { kevent(queue.as_raw_fd(), &raw const change, 1, nothing, 0, ptr::null()) };
     if done < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
   }
@@ -855,6 +876,7 @@ mod ffi {
       let none =
         KEvent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: ptr::null_mut() };
       let mut events = [none; 32];
+      // SAFETY: `events` holds 32 `kevent`, and the call writes at most 32 of them.
       let count = unsafe { kevent(queue, ptr::null(), 0, events.as_mut_ptr(), 32, ptr::null()) };
       let Ok(count) = usize::try_from(count) else {
         let error = io::Error::last_os_error();
@@ -892,6 +914,8 @@ mod ffi {
       object_type: 0,
       name_bytes: [0; MAX_NAME_BYTES],
     };
+    // SAFETY: `c_path` ends with a NUL, `wanted` is a whole `attrlist` that the call only reads,
+    // and the call writes at most `size_of::<NameAndType>()` bytes into `found`.
     let result = unsafe {
       getattrlist(
         c_path.as_ptr(),
@@ -927,6 +951,8 @@ mod ffi {
     flags: *const u32,
     _ids: *const u64,
   ) {
+    // SAFETY: `info` is the pointer of the `Arc<Sink<Raw>>` given to `FSEventStreamCreate`,
+    // which `retain` keeps alive as long as the stream lives.
     let sink = unsafe { &*info.cast::<Sink<Raw>>() };
     let paths = paths.cast::<*const c_char>();
     let mut raw = Raw {
@@ -936,6 +962,8 @@ mod ffi {
       lost: Vec::new(),
     };
     for index in 0..count {
+      // SAFETY: FSEvents gives `count` C strings in `paths` and `count` flags, and `index` is
+      // below `count`.
       let (path, flags) = unsafe { (CStr::from_ptr(*paths.add(index)), *flags.add(index)) };
       raw.push(path.to_bytes(), flags);
     }
@@ -943,11 +971,14 @@ mod ffi {
   }
 
   extern "C" fn retain(info: *const c_void) -> *const c_void {
+    // SAFETY: `info` came from `Arc::as_ptr` on the `Arc<Sink<Raw>>` that `Streams` holds.
     unsafe { Arc::increment_strong_count(info.cast::<Sink<Raw>>()) };
     info
   }
 
   extern "C" fn release(info: *const c_void) {
+    // SAFETY: FSEvents calls this once for each `retain`, so the count stays above what
+    // `Streams` holds.
     unsafe { Arc::decrement_strong_count(info.cast::<Sink<Raw>>()) };
   }
 
@@ -955,6 +986,8 @@ mod ffi {
 
   impl Drop for Cf {
     fn drop(&mut self) {
+      // SAFETY: the object came from a `Create` call of Core Foundation, and this is its one
+      // release.
       unsafe { CFRelease(self.0.as_ptr()) };
     }
   }
@@ -963,6 +996,7 @@ mod ffi {
     let strings = paths
       .map(|path| {
         let bytes = path.as_os_str().as_bytes();
+        // SAFETY: the call reads `bytes.len()` bytes of `bytes` and keeps a copy.
         let string = unsafe {
           CFStringCreateWithBytes(
             ptr::null(),
@@ -977,6 +1011,8 @@ mod ffi {
       .collect::<Option<Vec<Cf>>>()?;
     let values: Vec<CFTypeRef> =
       strings.iter().map(|string| string.0.as_ptr().cast_const()).collect();
+    // SAFETY: `values` holds `values.len()` object pointers, the array retains each of them, and
+    // the callbacks are the standard ones.
     let array = unsafe {
       CFArrayCreate(
         ptr::null(),
