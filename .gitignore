@@ -1,5 +1,6 @@
 /target
 /target-*
+.claude/
 .DS_Store
 bench/target
 node_modules
