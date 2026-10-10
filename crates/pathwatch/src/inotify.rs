@@ -26,7 +26,10 @@ const NEW_CONTENT: u32 = libc::IN_MODIFY | libc::IN_CREATE | libc::IN_MOVED_TO;
 const READ_BUFFER_LEN: usize = 64 * 1024;
 const READ_INTERVAL: Duration = Duration::from_millis(1);
 
-const ERROR_WATCH_LIMIT: &str = "the inotify watch limit is reached (fs.inotify.max_user_watches)";
+const ERROR_WATCH_LIMIT: &str =
+  "inotify has no watch left for this user (raise fs.inotify.max_user_watches)";
+const ERROR_INSTANCE_LIMIT: &str = "inotify has no instance left for this user (raise \
+                                    fs.inotify.max_user_instances or the limit of open files)";
 
 #[derive(Debug)]
 pub struct InotifyBackend {
@@ -44,7 +47,12 @@ struct Fds {
 
 impl InotifyBackend {
   pub fn new(sink: Sink<Vec<u8>>) -> io::Result<Self> {
-    let fds = Arc::new(Fds { inotify: ffi::inotify()?, stop: ffi::eventfd()? });
+    let no_room = |error: io::Error| match error.raw_os_error() {
+      Some(libc::EMFILE | libc::ENFILE) => watch_limit(ERROR_INSTANCE_LIMIT),
+      _ => error,
+    };
+    let (inotify, stop) = (ffi::inotify().map_err(no_room)?, ffi::eventfd().map_err(no_room)?);
+    let fds = Arc::new(Fds { inotify, stop });
     let reader = thread::Builder::new().name("pathwatch-inotify".to_owned()).spawn({
       let fds = Arc::clone(&fds);
       move || forward(&fds, &sink)

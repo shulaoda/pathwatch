@@ -1,4 +1,4 @@
-use std::{fmt, io, path::Path, sync::Arc};
+use std::{error, fmt, io, path::Path, sync::Arc};
 
 pub trait Backend: Send + 'static {
   type Raw: Send + 'static;
@@ -95,10 +95,33 @@ pub enum Signal<R> {
   Failed(io::Error),
 }
 
+#[derive(Debug)]
+struct Limit(&'static str);
+
+impl fmt::Display for Limit {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(self.0)
+  }
+}
+
+impl error::Error for Limit {}
+
 pub fn watch_limit(message: &'static str) -> io::Error {
-  io::Error::new(io::ErrorKind::StorageFull, message)
+  io::Error::other(Limit(message))
 }
 
 pub fn is_watch_limit(error: &io::Error) -> bool {
-  error.kind() == io::ErrorKind::StorageFull
+  limit(error).is_some()
+}
+
+pub(crate) fn same(error: &io::Error) -> io::Error {
+  match (limit(error), error.raw_os_error()) {
+    (Some(message), _) => watch_limit(message),
+    (None, Some(code)) => io::Error::from_raw_os_error(code),
+    (None, None) => io::Error::new(error.kind(), error.to_string()),
+  }
+}
+
+fn limit(error: &io::Error) -> Option<&'static str> {
+  Some(error.get_ref()?.downcast_ref::<Limit>()?.0)
 }

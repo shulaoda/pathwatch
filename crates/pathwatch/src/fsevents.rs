@@ -28,10 +28,10 @@ const ERROR_PATH_NOT_UTF8: &str = "FSEvents cannot watch a path that is not UTF-
 const ERROR_QUEUE_CREATE: &str = "dispatch_queue_create failed";
 const ERROR_STREAM_CREATE: &str = "FSEventStreamCreate failed";
 const ERROR_STREAM_START: &str =
-  "FSEvents cannot start one more stream (512 streams, 4,096 paths each)";
+  "FSEvents cannot start one more stream (one process can run 512 streams)";
 const ERROR_NAME_ON_DISK: &str = "getattrlist gave no name";
-const ERROR_NO_GUARD: &str = "no room for an open file for each directory above a watched path \
-                              (ulimit -n)";
+const ERROR_NO_GUARD: &str = "no open file is left for the directories above a watched path \
+                              (raise the limit of open files, ulimit -n)";
 
 pub mod flag {
   pub const MUST_SCAN_SUB_DIRS: u32 = 0x1;
@@ -120,7 +120,7 @@ impl FsEventsBackend {
     };
     let real = short_way(real);
     if real.to_str().is_none() {
-      return Err(io::Error::new(io::ErrorKind::InvalidInput, ERROR_PATH_NOT_UTF8));
+      return Err(io::Error::new(io::ErrorKind::InvalidData, ERROR_PATH_NOT_UTF8));
     }
     Ok(real)
   }
@@ -684,7 +684,7 @@ mod ffi {
       paths: impl Iterator<Item = &'a PathBuf>,
     ) -> io::Result<Self> {
       let array = path_array(paths)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, ERROR_PATH_NOT_UTF8))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, ERROR_PATH_NOT_UTF8))?;
       let context = FSEventStreamContext {
         version: 0,
         info: Arc::as_ptr(sink).cast_mut().cast(),

@@ -31,7 +31,7 @@ watcher.close();
 | `close()` | Stops the backend and waits for the thread. After it the handler is not called again, and `watch` and `unwatch` return `Closed`. Dropping the watcher calls it. |
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
-| `Error` | `kind()`, `path()` (one path that shows the problem), `source()` (the error of the OS). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`. One error of a kind is handed over for a flush. |
+| `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
 | `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 50 ms (5.13); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. |
 
 `Watcher` is `Send + Sync`.
@@ -45,6 +45,20 @@ with the first such path, and the other paths of the batch are still watched.
 
 A path that does not exist is fine. A path that cannot be watched or read right now stays
 registered, the handler gets the error, and the path is polled.
+
+The text of an error is its kind, its path and its source, each said once:
+
+```text
+permission denied: /p/secret: Permission denied (os error 13)
+the OS has no room for one more watch, polling instead: /p/src: inotify has no watch left for this user (raise fs.inotify.max_user_watches)
+input or output error: the OS watcher stopped, so every path is polled: Bad file descriptor (os error 9)
+```
+
+The source of a limit is written by the backend that met it, so it names that very limit and
+what to raise. (Before, the kind named one limit for each OS, also when another one was met:
+on macOS the limit of streams, when the limit of open files had stopped the guard.) An error
+without a path is about the watcher: its backend did not start or has stopped, and the source
+says which, and that every path is polled now.
 
 Not options: the delete delay is 100 ms, and with a native backend the poll of what the OS
 does not watch runs once a second. `Config` turns `loose_spelling` on for macOS and Windows:
@@ -974,8 +988,10 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   `Signal`: `raw` a raw notification, for `translate` on the watcher thread, and `failed` the
   word that the backend cannot go on. From then on the engine polls everything.
 - `watch_limit(message)` makes the error for "the OS has no room for one more watch": an
-  `io::Error` of the kind `StorageFull`. `is_watch_limit` tells whether an error is one, and
-  the engine reports such an error as `ErrorKind::WatchLimit`.
+  `io::Error` with a mark of its own inside, so that no error of the OS is taken for one. (The
+  mark was the kind `StorageFull` before, which the OS gives too.) Its message names the limit
+  and what to raise. `is_watch_limit` tells whether an error is one, and the engine reports
+  such an error as `ErrorKind::WatchLimit`.
 
 **The rules for a backend.** Other files name a rule by its number.
 
@@ -1037,6 +1053,8 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   and the two threads wake up a thousand times a second at most (the probe below). The watcher
   thread adds and removes the kernel watches itself, so nothing needs a lock.
 - `ENOSPC` → `Failed` with the watch limit error. Every other error → `Failed` with that error.
+  `EMFILE` and `ENFILE` when the backend starts are the limit of inotify instances
+  (`fs.inotify.max_user_instances`) or of open files: the watch limit error too.
 
 Limits: `MOVE_SELF` comes only when the watched directory itself is renamed; a move of a
 directory above it is told by the watches on the way. Expected and not tested: a removed

@@ -466,18 +466,31 @@ fn watch_fails_when_the_thread_is_gone() {
   watcher.close();
 }
 
-/// A backend that cannot start does not fail the watcher: the handler is told once, and the
-/// watcher polls.
+/// A backend that cannot start does not fail the watcher: the handler is told once, with what
+/// happened and what the backend said, and the watcher polls. Only the error that a backend
+/// made for a limit counts as one: an error of the OS of any kind does not.
 #[test]
 fn a_backend_that_cannot_start_is_replaced_by_polling() {
   let cases = [
-    (io::Error::other("no watch API"), ErrorKind::Io),
-    (watch_limit("no room"), ErrorKind::WatchLimit),
+    (
+      io::Error::other("no watch API"),
+      ErrorKind::Io,
+      "input or output error: the OS watcher did not start, so every path is polled: no watch API",
+    ),
+    (
+      io::Error::new(io::ErrorKind::StorageFull, "disk full"),
+      ErrorKind::Io,
+      "input or output error: the OS watcher did not start, so every path is polled: disk full",
+    ),
+    (
+      watch_limit("no room"),
+      ErrorKind::WatchLimit,
+      "the OS has no room for one more watch, polling instead: no room",
+    ),
   ];
-  for (error, kind) in cases {
+  for (error, kind, text) in cases {
     let dir = tempfile::tempdir().unwrap();
     let (sender, results) = mpsc::channel();
-    let text = error.to_string();
     let watcher = Watcher::with_backend(
       quick(),
       move |result| {
@@ -488,21 +501,7 @@ fn a_backend_that_cannot_start_is_replaced_by_polling() {
     .unwrap();
     let told = results.recv_timeout(PATIENCE).expect("the handler is told").unwrap_err();
     assert_eq!((told.kind(), told.path()), (kind, None));
-    assert!(told.to_string().ends_with(&text), "{told}");
-    if kind == ErrorKind::WatchLimit {
-      let told = told.to_string();
-      // The text names the limit of this OS.
-      let limit = if cfg!(target_os = "linux") {
-        "fs.inotify.max_user_watches or fs.inotify.max_user_instances"
-      } else if cfg!(target_os = "macos") {
-        "FSEvents streams of one process"
-      } else if cfg!(windows) {
-        "handles of this watcher"
-      } else {
-        "a limit of the OS"
-      };
-      assert!(told.contains(limit) && told.contains("read on a timer until then"), "{told}");
-    }
+    assert_eq!(told.to_string(), text);
 
     let path = dir.path().join("a.txt");
     watcher.watch(&path).unwrap();

@@ -8,9 +8,9 @@ use std::{
 
 use super::{Engine, check::is_missing};
 use crate::{
-  backend::{Backend, Coverage, DirKey, Want, is_watch_limit},
+  backend::{Backend, Coverage, DirKey, Want, is_watch_limit, same},
   config::EntryKind,
-  error::ErrorKind,
+  error::{ErrorKind, context},
   fs::{FileType, Fs},
   tree::{Depth, Dir, Kind, Mark, Node, Tree, Watch},
 };
@@ -184,8 +184,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     for key in queued {
       if self.tree.get(key).is_some_and(asked) {
         let path = self.tree.path(key);
-        let error = io::Error::new(error.kind(), error.to_string());
-        self.set_watch(key, Coverage::Failed(error), &path);
+        self.set_watch(key, Coverage::Failed(same(&error)), &path);
       }
     }
     Vec::new()
@@ -358,11 +357,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// The backend cannot go on: one error, and from now on every node is polled.
-  pub(super) fn backend_died(&mut self, error: io::Error) {
+  pub(super) fn backend_died(&mut self, error: &io::Error) {
     if self.backend_failed {
       return;
     }
     self.backend_failed = true;
+    let error = context("the OS watcher stopped, so every path is polled", error);
     self.report(ErrorKind::Io, None, Some(error));
     self.tree.poll_all();
     // Its last notifications may be lost.

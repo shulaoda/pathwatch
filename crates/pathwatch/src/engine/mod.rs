@@ -237,7 +237,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
       Signal::Failed(error) => {
         left_work = !self.backend_failed;
-        self.backend_died(error);
+        self.backend_died(&error);
       }
     }
     if left_work {

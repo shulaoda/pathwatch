@@ -3,16 +3,6 @@ use std::{
   path::{Path, PathBuf},
 };
 
-const WATCH_LIMIT: &str = if cfg!(any(target_os = "linux", target_os = "android")) {
-  "raise fs.inotify.max_user_watches or fs.inotify.max_user_instances"
-} else if cfg!(target_os = "macos") {
-  "the limit of FSEvents streams of one process is reached"
-} else if cfg!(windows) {
-  "the limit of handles of this watcher is reached"
-} else {
-  "a limit of the OS is reached"
-};
-
 #[derive(Debug)]
 pub struct Error {
   kind: ErrorKind,
@@ -36,17 +26,13 @@ impl Error {
 
 impl fmt::Display for Error {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match self.kind {
-      ErrorKind::InvalidPath => f.write_str("the path cannot be watched"),
-      ErrorKind::WatchLimit => write!(
-        f,
-        "the OS has no room for more watches ({WATCH_LIMIT}); the directory is read on a timer \
-         until then"
-      ),
-      ErrorKind::PermissionDenied => f.write_str("permission denied"),
-      ErrorKind::Io => f.write_str("input or output error"),
-      ErrorKind::Closed => f.write_str("the watcher is closed"),
-    }?;
+    f.write_str(match self.kind {
+      ErrorKind::InvalidPath => "the path cannot be watched",
+      ErrorKind::WatchLimit => "the OS has no room for one more watch, polling instead",
+      ErrorKind::PermissionDenied => "permission denied",
+      ErrorKind::Io => "input or output error",
+      ErrorKind::Closed => "the watcher is closed",
+    })?;
     if let Some(path) = &self.path {
       write!(f, ": {}", path.display())?;
     }
@@ -55,6 +41,10 @@ impl fmt::Display for Error {
     }
     Ok(())
   }
+}
+
+pub(crate) fn context(what: &str, error: &io::Error) -> io::Error {
+  io::Error::new(error.kind(), format!("{what}: {error}"))
 }
 
 impl error::Error for Error {

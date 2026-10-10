@@ -19,7 +19,7 @@ use crate::{
   backend::{Backend, Coverage, DirKey, Hint, Signal, Sink, Want, is_watch_limit},
   config::Config,
   engine::{Engine, Options, Output},
-  error::{Error, ErrorKind},
+  error::{Error, ErrorKind, context},
   event::Event,
   fs::StdFs,
   path::normalize,
@@ -308,7 +308,13 @@ impl Watcher {
             run(Engine::new(backend, StdFs, options), handler, &receiver, &queue, &stop);
           }
           Err(error) => {
-            let kind = if is_os_limit(&error) { ErrorKind::WatchLimit } else { ErrorKind::Io };
+            // A limit says by itself what is missing and that the watcher polls.
+            let (kind, error) = if is_watch_limit(&error) {
+              (ErrorKind::WatchLimit, error)
+            } else {
+              let what = "the OS watcher did not start, so every path is polled";
+              (ErrorKind::Io, context(what, &error))
+            };
             handler(Err(Error::new(kind, None, Some(error))));
             let engine = Engine::new(NoBackend::<B::Raw>(PhantomData), StdFs, fallback);
             run(engine, handler, &receiver, &queue, &stop);
@@ -316,7 +322,10 @@ impl Watcher {
         }
       })
     };
-    let thread = thread.map_err(|error| Error::new(ErrorKind::Io, None, Some(error)))?;
+    let thread = thread.map_err(|error| {
+      let error = context("the thread of the watcher did not start", &error);
+      Error::new(ErrorKind::Io, None, Some(error))
+    })?;
 
     Ok(Self {
       send: Box::new(move |command| sender.send(Message::Command(command)).is_ok()),
@@ -516,15 +525,4 @@ fn clean(path: &Path) -> Option<PathBuf> {
     }
   }
   normalize(&joined).map(Cow::into_owned)
-}
-
-/// Whether a backend could not start because a limit of the OS is reached.
-fn is_os_limit(error: &io::Error) -> bool {
-  // inotify: the limit of instances for one user (`fs.inotify.max_user_instances`) is
-  // `EMFILE`, like the limit of open files.
-  #[cfg(any(target_os = "linux", target_os = "android"))]
-  if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
-    return true;
-  }
-  is_watch_limit(error)
 }
