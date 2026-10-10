@@ -593,6 +593,24 @@ fn chmod_of_a_file_gives_a_hint() {
   h.hints_until(&[changed(key, "file")]);
 }
 
+/// A cover that is unwatched before the commit gets no stream. A cover below it that counted
+/// on that stream gets one of its own.
+#[test]
+fn a_cover_unwatched_before_the_commit_gets_no_stream() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("dir/below")).unwrap();
+  let dir = h.watch(1, &h.path("dir"), Want::Contents);
+  let below = h.watch(2, &h.path("dir/below"), Want::Contents);
+  assert_eq!(h.backend.pending(), [h.real("dir")]);
+
+  h.backend.unwatch(dir);
+  assert_eq!(h.backend.pending(), [h.real("dir/below")]);
+  h.commit();
+  assert_eq!(h.backend.streamed(), [h.real("dir/below")]);
+  File::create(h.path("dir/below/file")).unwrap();
+  h.hints_until(&[changed(below, "file")]);
+}
+
 #[test]
 fn ancestor_is_not_watched_unless_a_stream_reports_it() {
   let mut h = Harness::new();

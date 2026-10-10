@@ -157,7 +157,20 @@ impl Backend for FsEventsBackend {
 
   fn unwatch(&mut self, key: DirKey) {
     self.not_watched.remove(&key);
+    let Some(dir) = self.covers.dir_of.get(&key).cloned() else { return };
     self.covers.remove(key);
+    // The stream that was to start for the cover is not needed when no key is left at its
+    // path. A cover below it that counted on that stream asks for one of its own.
+    if !self.covers.by_dir.contains(&dir) && self.streams.pending.contains(&dir) {
+      self.streams.pending.remove(&dir);
+      let below = self.covers.by_dir.below(&[&dir]);
+      let below: Vec<PathBuf> = below.into_iter().map(|(below, _)| below.to_owned()).collect();
+      for below in below {
+        if !self.streams.paths.holds(&below) {
+          self.streams.pending.insert(below, ());
+        }
+      }
+    }
   }
 
   fn commit(&mut self) -> io::Result<Vec<DirKey>> {
