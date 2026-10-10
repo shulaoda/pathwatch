@@ -117,21 +117,11 @@ fn s1(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
   session.single_edits("single edits of the saved files", &saved, PATIENCE);
 
   let burst = spread(&files[1..], settings.size(2000, 50));
-  session.burst("burst of edits", &burst, || {
-    for file in &burst {
-      write(file).expect("the driver can write its own files");
-    }
-  });
+  session.burst("burst of edits", &burst, || burst.iter().try_for_each(|file| write(file)));
 
   let removed = spread(&files[2..], settings.size(200, 10));
-  session.burst("files removed", &removed, || {
-    for file in &removed {
-      fs::remove_file(file).expect("the driver can remove its own files");
-    }
-  });
-  session.burst("files written again", &removed, || {
-    write_all(&removed).expect("the driver can write its own files");
-  });
+  session.burst("files removed", &removed, || removed.iter().try_for_each(fs::remove_file));
+  session.burst("files written again", &removed, || write_all(&removed));
   session.end()
 }
 
@@ -172,26 +162,18 @@ fn s2(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
       (0..10).map(move |file| dir.join(format!("m{file}.js")))
     })
     .collect();
-  session.burst("new files in new directories", &new_files, || {
-    write_all(&new_files).expect("the driver can write its own files");
-  });
+  session.burst("new files in new directories", &new_files, || write_all(&new_files));
 
   // One group goes away, with everything that is in it by now.
   let group = Shape::group(&project, 1);
   let removed = files_below(&group);
-  session.burst("a directory tree removed", &removed, || {
-    fs::remove_dir_all(&group).expect("the driver can remove its own files");
-  });
+  session.burst("a directory tree removed", &removed, || fs::remove_dir_all(&group));
 
   // A tree comes in by one rename, and goes out by one rename.
   let inside = project.join("moved");
   let moved_files = moved.paths(&inside);
-  session.burst("a directory tree moved in", &moved_files, || {
-    fs::rename(&outside, &inside).expect("the driver can rename its own directory");
-  });
-  session.burst("a directory tree moved out", &moved_files, || {
-    fs::rename(&inside, &outside).expect("the driver can rename its own directory");
-  });
+  session.burst("a directory tree moved in", &moved_files, || fs::rename(&outside, &inside));
+  session.burst("a directory tree moved out", &moved_files, || fs::rename(&inside, &outside));
   session.end()
 }
 
@@ -338,10 +320,10 @@ fn s4(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
     "node_modules written, then one edit in src",
     std::slice::from_ref(&edited),
     || {
-      write_all(&written).expect("the driver can write its own files");
+      write_all(&written)?;
       let edit = Instant::now();
-      write(&edited).expect("the driver can write its own files");
-      edit
+      write(&edited)?;
+      Ok(edit)
     },
   );
   session.single_edits("single edits in src", &spread(&files, settings.size(20, 5)), PATIENCE);
@@ -383,9 +365,7 @@ fn s6(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
     Err(run) => return *run,
   };
   session.quiet("quiet", settings.quiet.min(Duration::from_secs(3)));
-  session.burst("the missing paths are made", &files, || {
-    write_all(&files).expect("the driver can write its own files");
-  });
+  session.burst("the missing paths are made", &files, || write_all(&files));
   session.single_edits("single edits after", &spread(&files, settings.size(20, 5)), PATIENCE);
   session.end()
 }
@@ -412,9 +392,7 @@ fn s7(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
   session.single_edits("single edits", &spread(&files, settings.size(100, 10)), PATIENCE);
   session.single_edits("single new files", &named("new", settings.size(100, 10)), PATIENCE);
   let burst = named("burst", settings.size(2000, 50));
-  session.burst("burst of new files", &burst, || {
-    write_all(&burst).expect("the driver can write its own files");
-  });
+  session.burst("burst of new files", &burst, || write_all(&burst));
   let removed = spread(&files[1..], settings.size(100, 10));
   session.single_changes("single files removed", &removed, PATIENCE, |file| fs::remove_file(file));
   session.end()

@@ -15,7 +15,7 @@ use std::{
 };
 
 use driver::{
-  adapter::{ADAPTERS, Adapter, Places, own_directory},
+  adapter::{ADAPTERS, Adapter, Places, own_directory, venv_python},
   machine,
   record::{self, Report},
   scenarios::{self, SCENARIOS, Settings},
@@ -30,8 +30,8 @@ bench [flags]
   --repeat <n>         run each scenario n times with each adapter (default 1); the tables
                        show the middle run, and how far the runs are apart
   --scenarios <list>   s1,s2,s3,s4,s5,s6,s7 (default: all)
-  --adapters <list>    pathwatch,pathwatch-0,notify,notify-fork,chokidar,parcel,fs-watch
-                       (default: all), or `rust` for the first four
+  --adapters <list>    pathwatch,pathwatch-0,notify,notify-fork,chokidar,parcel,fs-watch,
+                       watchdog (default: all), or `rust` for the first four
   --tmp <dir>          where the trees are made (default: the temporary directory of the system)
   --js <dir>           the directory of the Node adapters with their node_modules
                        (default: bench/js)
@@ -112,12 +112,17 @@ fn main() {
 
   let bench = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("driver is in bench");
   let flags = flags(bench);
-  let places =
-    Places { rust: own_directory(), js: flags.js.clone(), keep_huge_pages: flags.keep_huge_pages };
+  let places = Places {
+    rust: own_directory(),
+    js: flags.js.clone(),
+    py: bench.join("py"),
+    keep_huge_pages: flags.keep_huge_pages,
+  };
 
   // Links in the path are resolved once, here: some libraries report resolved paths, and
   // on macOS the temporary directory is behind a link.
   let tmp = fs::canonicalize(&flags.tmp).unwrap_or_else(|_| fail("--tmp must exist"));
+  let tmp = plain(tmp);
   let tmp = tmp.join(format!("pathwatch-bench-{}", process::id()));
   fs::create_dir_all(&tmp).expect("the temporary directory can be made");
 
@@ -200,6 +205,18 @@ fn main() {
   eprintln!("tables: cargo run --release --bin report -- {}", out.display());
 }
 
+/// Windows: `canonicalize` gives the long form of a path, with `\\?\` in front. Node and
+/// Python take that form for another path than the plain one, and no library reports it. So
+/// a path on a drive loses the mark.
+fn plain(path: PathBuf) -> PathBuf {
+  let rest = {
+    let text = path.to_string_lossy();
+    let rest = text.strip_prefix(r"\\?\").filter(|rest| !rest.starts_with("UNC"));
+    rest.filter(|_| cfg!(windows)).map(PathBuf::from)
+  };
+  rest.unwrap_or(path)
+}
+
 fn has(names: &[String], name: &str) -> bool {
   names.iter().any(|one| one == name)
 }
@@ -219,6 +236,9 @@ fn chosen_adapters(names: Option<&[String]>, places: &Places) -> Vec<&'static Ad
       eprintln!("  (Rust adapters: `cargo build --release`; Node adapters: `npm install` in js)");
     } else if adapter.is_node() && !places.js.join("node_modules").exists() {
       eprintln!("skipped {}: run `npm install` in {}", adapter.name, places.js.display());
+    } else if adapter.is_python() && !venv_python(&places.py).exists() {
+      eprintln!("skipped {}: make the environment in {}", adapter.name, places.py.display());
+      eprintln!("  (`python -m venv .venv`, then `pip install -r requirements.txt` with its pip)");
     } else {
       adapters.push(adapter);
     }

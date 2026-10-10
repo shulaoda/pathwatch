@@ -3,6 +3,7 @@
 
 use std::{
   collections::{BTreeMap, HashMap, HashSet},
+  io,
   path::{Path, PathBuf},
   time::{Duration, Instant},
 };
@@ -219,8 +220,10 @@ impl Session {
     for file in files {
       let mut tally = Tally::new(std::slice::from_ref(file), &self.root);
       let start = Instant::now();
-      change(file).expect("the driver can change its own files");
-      self.pump(&mut tally, start + patience, None);
+      match change(file) {
+        Ok(()) => self.pump(&mut tally, start + patience, None),
+        Err(error) => self.refused(&mut phase, &error),
+      }
       misses_in_a_row = if tally.complete() { 0 } else { misses_in_a_row + 1 };
       // The late events of this change belong to it and not to the next one.
       self.pump_for(&mut tally, GAP);
@@ -235,16 +238,25 @@ impl Session {
 
   /// A burst: `change` makes all changes as fast as it can, and the driver waits until every
   /// path in `changed` had an event. Every path counts its time from the start of the burst.
-  pub fn burst(&mut self, name: &str, changed: &[PathBuf], change: impl FnOnce()) {
+  pub fn burst(
+    &mut self,
+    name: &str,
+    changed: &[PathBuf],
+    change: impl FnOnce() -> io::Result<()>,
+  ) {
     self.burst_from(name, changed, || {
       let start = Instant::now();
-      change();
-      start
+      change().map(|()| start)
     });
   }
 
   /// As `burst`, but `change` says from which moment the times of the changed paths count.
-  pub fn burst_from(&mut self, name: &str, changed: &[PathBuf], change: impl FnOnce() -> Instant) {
+  pub fn burst_from(
+    &mut self,
+    name: &str,
+    changed: &[PathBuf],
+    change: impl FnOnce() -> io::Result<Instant>,
+  ) {
     if self.dead {
       return;
     }
@@ -253,10 +265,19 @@ impl Session {
     let mut tally = Tally::new(changed, &self.root);
     let before = self.sample();
     let start = Instant::now();
-    let count_from = change();
+    let changed = change();
     let written = Instant::now();
     phase.write_ms = ms(written - start);
-    self.pump(&mut tally, written + LONGEST_BURST, Some(STALL));
+    let count_from = match changed {
+      Ok(count_from) => {
+        self.pump(&mut tally, written + LONGEST_BURST, Some(STALL));
+        count_from
+      }
+      Err(error) => {
+        self.refused(&mut phase, &error);
+        start
+      }
+    };
     self.drain(&mut tally);
     tally.add_to(&mut phase, &mut times, count_from, &mut self.earlier);
     self.finish_phase(phase, times, start, before);
@@ -278,6 +299,17 @@ impl Session {
     self.pump_for(&mut tally, time);
     tally.add_to(&mut phase, &mut Vec::new(), start, &mut self.earlier);
     self.finish_phase(phase, Vec::new(), start, before);
+  }
+
+  /// The system refused a change of the driver. On Windows that happens while the watcher
+  /// holds a file or a directory open: a directory with an open handle below it cannot be
+  /// renamed. The phase counts as stopped early, and a note says why.
+  fn refused(&mut self, phase: &mut Phase, error: &io::Error) {
+    phase.abandoned = true;
+    let note = format!("{}: the system refused a change of the driver: {error}", phase.name);
+    if !self.run.notes.contains(&note) {
+      self.run.notes.push(note);
+    }
   }
 
   /// Closes the adapter and returns everything that was written down.

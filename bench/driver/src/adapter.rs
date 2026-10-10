@@ -1,10 +1,14 @@
 //! The adapters, and one of them running as a child process.
 
 use std::{
+  env,
   io::{self, BufRead, BufReader, BufWriter, Read, Write},
   path::{Path, PathBuf},
   process::{ChildStdin, Command, Stdio},
-  sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+  sync::{
+    OnceLock,
+    mpsc::{self, Receiver, RecvTimeoutError, Sender},
+  },
   thread,
   time::{Duration, Instant},
 };
@@ -20,6 +24,8 @@ enum Program {
   Rust(&'static str, &'static [&'static str]),
   /// A script of `bench/js`, run by `node`.
   Node(&'static str),
+  /// A script of `bench/py`, run by the Python of `bench/py/.venv`.
+  Python(&'static str),
 }
 
 /// Every adapter, in the order of the tables.
@@ -34,6 +40,7 @@ pub const ADAPTERS: &[Adapter] = &[
   Adapter { name: "chokidar", program: Program::Node("chokidar.mjs") },
   Adapter { name: "parcel", program: Program::Node("parcel.mjs") },
   Adapter { name: "fs-watch", program: Program::Node("fs-watch.mjs") },
+  Adapter { name: "watchdog", program: Program::Python("watchdog_adapter.py") },
   // Node with no watcher at all. It is only run for the table of bases.
   Adapter { name: "node-idle", program: Program::Node("idle.mjs") },
 ];
@@ -44,6 +51,8 @@ pub struct Places {
   pub rust: PathBuf,
   /// `bench/js`, or a copy of it with its own `node_modules`.
   pub js: PathBuf,
+  /// `bench/py`, with its `.venv`.
+  pub py: PathBuf,
   /// Linux: leave the memory allocator of the system as it is. See `Adapter::command`.
   pub keep_huge_pages: bool,
 }
@@ -54,12 +63,18 @@ impl Adapter {
     matches!(self.program, Program::Node(_))
   }
 
+  #[must_use]
+  pub fn is_python(&self) -> bool {
+    matches!(self.program, Program::Python(_))
+  }
+
   /// The file that must exist for the adapter to run.
   #[must_use]
   pub fn file(&self, places: &Places) -> PathBuf {
     match self.program {
-      Program::Rust(name, _) => places.rust.join(name),
+      Program::Rust(name, _) => places.rust.join(format!("{name}{}", env::consts::EXE_SUFFIX)),
       Program::Node(script) => places.js.join(script),
+      Program::Python(script) => places.py.join(script),
     }
   }
 
@@ -83,12 +98,70 @@ impl Adapter {
         command
       }
       Program::Node(_) => {
-        let mut command = Command::new("node");
+        let mut command = Command::new(node());
         command.arg(self.file(places));
+        command
+      }
+      Program::Python(_) => {
+        let (python, packages) = python(&places.py);
+        let mut command = Command::new(python);
+        command.arg(self.file(places));
+        if let Some(packages) = packages {
+          command.env("PYTHONPATH", packages);
+        }
         command
       }
     }
   }
+}
+
+/// The first line that a program prints, or `None` when it cannot run.
+fn first_line(program: &Path, args: &[&str]) -> Option<String> {
+  let output = Command::new(program).args(args).output().ok()?;
+  let text = String::from_utf8_lossy(&output.stdout);
+  text.lines().next().map(str::to_owned).filter(|line| !line.is_empty())
+}
+
+/// The program that runs a Node script.
+///
+/// Windows: `node` can be a small program that starts the real Node as another process (the
+/// shims of version managers). The driver measures the process that it starts, so it asks
+/// once where the real program is, and starts that one.
+#[must_use]
+pub fn node() -> &'static Path {
+  static NODE: OnceLock<PathBuf> = OnceLock::new();
+  NODE.get_or_init(|| {
+    let real = first_line(Path::new("node"), &["-p", "process.execPath"]);
+    real.filter(|_| cfg!(windows)).map_or_else(|| PathBuf::from("node"), PathBuf::from)
+  })
+}
+
+/// The Python of `bench/py/.venv`.
+#[must_use]
+pub fn venv_python(py: &Path) -> PathBuf {
+  let venv = py.join(".venv");
+  if cfg!(windows) { venv.join("Scripts").join("python.exe") } else { venv.join("bin/python") }
+}
+
+/// The program that runs a Python script, and the directory of the packages that it must be
+/// told about.
+///
+/// Windows: the `python.exe` of a virtual environment starts the real Python as another
+/// process. So the driver asks it once where the real program and the packages of the
+/// environment are, and starts the real one. Elsewhere the Python of the environment is a
+/// link to the real program.
+fn python(py: &Path) -> &'static (PathBuf, Option<PathBuf>) {
+  static PYTHON: OnceLock<(PathBuf, Option<PathBuf>)> = OnceLock::new();
+  PYTHON.get_or_init(|| {
+    let venv = venv_python(py);
+    let ask = |code: &str| first_line(&venv, &["-c", code]).map(PathBuf::from);
+    let real = ask("import sys; print(sys._base_executable)");
+    let packages = ask("import sysconfig; print(sysconfig.get_path('purelib'))");
+    match (real, packages) {
+      (Some(real), Some(packages)) if cfg!(windows) => (real, Some(packages)),
+      _ => (venv, None),
+    }
+  })
 }
 
 /// What the driver asks an adapter to do.
@@ -121,6 +194,9 @@ pub struct Child {
   pub pid: i32,
   /// Just before the process was started.
   pub spawned: Instant,
+  /// Windows: while this handle is open, the process id names the adapter, also after its
+  /// end. The driver reads the CPU time and the memory of the adapter by that id.
+  _process: std::process::Child,
   lines: Receiver<Line>,
   /// Closing it tells the adapter to exit.
   stdin: Option<ChildStdin>,
@@ -161,7 +237,7 @@ impl Child {
     let stdin = writer.into_inner().map_err(io::IntoInnerError::into_error)?;
 
     let pid = i32::try_from(child.id()).expect("a process id fits");
-    Ok(Self { pid, spawned, lines, stdin: Some(stdin) })
+    Ok(Self { pid, spawned, _process: child, lines, stdin: Some(stdin) })
   }
 
   /// The next line, or `None` when there is none before `until`.

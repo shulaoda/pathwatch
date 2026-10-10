@@ -9,6 +9,7 @@ bench/
   driver/     the driver (`bench`) and the program that makes the tables (`report`)
   adapters/   one small Rust program for each Rust library
   js/         one small Node script for each Node library
+  py/         one small Python script for each Python library
   results/    the JSON file of a run, and its tables as Markdown
 ```
 
@@ -38,6 +39,9 @@ How the numbers are read:
 - Linux: the CPU clock of the process (`clock_getcpuclockid`, nanoseconds) and
   `/proc/<pid>/smaps_rollup` (resident size, private pages). The highest resident size is
   `VmHWM` of `/proc/<pid>/status`.
+- Windows: `GetProcessTimes` (CPU time, in steps of 15.6 ms) and `GetProcessMemoryInfo`: the
+  working set is the resident size, `PeakWorkingSetSize` its highest value, and the private
+  bytes (`PrivateUsage`) are the footprint.
 
 ## The adapters
 
@@ -50,6 +54,7 @@ How the numbers are read:
 | `chokidar` | chokidar 5 | `chokidar.watch(paths, { ignoreInitial: true })` and the `all` event. Ignore: a function for `ignored`. Polling: `usePolling` with `interval` and `binaryInterval`. |
 | `parcel` | @parcel/watcher 2 | `subscribe(dir, callback)`. It watches directories only, so for a set of files it watches the lowest directory that holds them all. Ignore: globs for `ignore`. It has no polling mode. |
 | `fs-watch` | Node itself | `fs.watch(dir, { recursive: true })`, once, for the lowest directory that holds all paths. It is the floor: no library. Polling: `fs.watchFile` for each path. It has no ignore rule. |
+| `watchdog` | watchdog 6 (Python) | `Observer().schedule(handler, dir, recursive=True)`. It watches directories, so for a set of files it watches the lowest directory that holds them all. Ignore: `RegexMatchingEventHandler` with `ignore_regexes`, which drops events of a directory that is still watched. Polling: `PollingObserver`. |
 
 Why this is fair:
 
@@ -91,11 +96,13 @@ spellings of a name for one (macOS, Windows), until it asked the disk for the on
 
 ## How to run it
 
-Once: the Node packages and the build.
+Once: the Node packages, the Python packages and the build. Without `py/.venv` the driver
+skips `watchdog`.
 
 ```sh
 cd bench
 (cd js && npm install)
+(cd py && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt)
 cargo build --release
 ```
 
@@ -111,6 +118,20 @@ three rounds):
 
 ./target/release/bench --repeat 3 --out results/macos.json
 ./target/release/report results/macos.json > results/macos.md
+```
+
+On Windows (PowerShell, in `bench`):
+
+```powershell
+cd js; npm install; cd ..
+cd py; python -m venv .venv; .venv\Scripts\pip install -r requirements.txt; cd ..
+cargo build --release
+
+.\target\release\bench.exe --quick --out results\quick-windows.json
+.\target\release\report.exe results\quick-windows.json | Out-File -Encoding utf8 results\quick-windows.md
+
+.\target\release\bench.exe --repeat 3 --out results\windows.json
+.\target\release\report.exe results\windows.json | Out-File -Encoding utf8 results\windows.md
 ```
 
 In the OrbStack VM (Linux). The build directory and the Node packages must be in the VM, and
@@ -261,4 +282,22 @@ The rules of the driver:
   first two phases. pathwatch checks each of them against the disk: that is the CPU time
   there.
 - **Linux in a VM is not Linux on a machine**, and a `tmpfs` is not a disk.
-- **Windows is not supported** by the driver (it reads `/proc` and `proc_pid_rusage`).
+- **Windows is measured in another way than macOS and Linux**, so its tables stand alone:
+  - CPU time comes in steps of 15.6 ms (`GetProcessTimes`). A phase with less than that
+    shows 0.0, and small numbers are noise. Only the big ones can be compared.
+  - The footprint is the private bytes: memory that the process asked for, touched or not.
+    For Node that is more than the resident size. Read `RSS above base` there.
+  - There is no load average. The driver measures how many cores are busy in the half second
+    before the run and warns with the same rule.
+  - `node` and the `python.exe` of a virtual environment can be small programs that start
+    the real one as another process. The driver asks for the real program once
+    (`process.execPath`, `sys._base_executable`) and starts that, so the numbers are those
+    of the runtime and not of the starter.
+  - A directory cannot be renamed while a program holds a handle on a directory below it.
+    A library that opens one handle for each directory (chokidar) makes the rename of S2
+    ("a directory tree moved out") fail for everybody. The driver does not stop: the phase
+    counts as stopped early, and a note below the table says so.
+  - The virus scanner of Windows reads every file that is written. It makes every write of
+    the driver slower and takes CPU time that no table shows. An exclusion for the temporary
+    directory (or `--tmp` on a Dev Drive) takes it out.
+

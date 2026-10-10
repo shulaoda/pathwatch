@@ -2,7 +2,10 @@
 
 use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
-use crate::record::Machine;
+use crate::{
+  adapter::{node, venv_python},
+  record::Machine,
+};
 
 /// The output of a command, or an empty text when it cannot run.
 fn output(program: &str, args: &[&str]) -> String {
@@ -14,6 +17,7 @@ fn output(program: &str, args: &[&str]) -> String {
 }
 
 /// The value of a `name: value` or `name=value` line of a text file.
+#[cfg(unix)]
 fn field(file: &str, name: &str) -> Option<String> {
   let text = fs::read_to_string(file).ok()?;
   let line = text.lines().find(|line| line.starts_with(name))?;
@@ -21,11 +25,134 @@ fn field(file: &str, name: &str) -> Option<String> {
   Some(value.trim().trim_matches('"').to_owned())
 }
 
+#[cfg(unix)]
 #[must_use]
 pub fn now_utc() -> String {
   output("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
 }
 
+/// Windows has no `date` program that prints this form.
+#[cfg(windows)]
+#[must_use]
+pub fn now_utc() -> String {
+  let seconds = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0, |since| since.as_secs());
+  let (days, rest) = (seconds / 86400, seconds % 86400);
+  // The day number to a date of the calendar, by the algorithm of Howard Hinnant
+  // (`civil_from_days`). Its years begin in March, so a leap day is the last day of a year.
+  let days = days + 719_468;
+  let (era, day_of_era) = (days / 146_097, days % 146_097);
+  let year_of_era =
+    (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365;
+  let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+  let month = (5 * day_of_year + 2) / 153;
+  let day = day_of_year - (153 * month + 2) / 5 + 1;
+  let month = if month < 10 { month + 3 } else { month - 9 };
+  let year = year_of_era + era * 400 + u64::from(month <= 2);
+  let (hour, minute, second) = (rest / 3600, rest % 3600 / 60, rest % 60);
+  format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Windows has no load average and no limit of open files that a process can raise. In the
+/// place of the load average stands the number of cores that were busy in the half second
+/// before the run, three times.
+#[cfg(windows)]
+#[must_use]
+pub fn machine(tmp: &Path) -> Machine {
+  use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+  let cores = std::thread::available_parallelism().map_or(0, usize::from);
+  // SAFETY: the struct is plain numbers, so all zeros is a valid value.
+  let mut memory: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+  memory.dwLength = u32::try_from(size_of::<MEMORYSTATUSEX>()).unwrap_or(0);
+  // SAFETY: the pointer is to a `MEMORYSTATUSEX` with its length set, as the call wants.
+  unsafe { GlobalMemoryStatusEx(&raw mut memory) };
+  let registry = |key: &str, value: &str| {
+    // `reg query` prints `    <value>    REG_SZ    <data>`.
+    let text = output("reg", &["query", key, "/v", value]);
+    let line = text.lines().find(|line| line.trim_start().starts_with(value));
+    line.and_then(|line| Some(line.split_once("REG_SZ")?.1.trim().to_owned())).unwrap_or_default()
+  };
+  let version = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+  let processor = r"HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0";
+  // `ver` prints `Microsoft Windows [Version 10.0.26200.1234]`, in the words of the system
+  // language. The number is after the last space.
+  let ver = output("cmd", &["/c", "ver"]);
+  let build = ver.rsplit(' ').next().unwrap_or_default().trim_end_matches(']');
+  // The registry says `Windows 10 Pro` on Windows 11 too. Windows 11 starts at build 22000.
+  let os = registry(version, "ProductName");
+  let number = build.split('.').nth(2).and_then(|number| number.parse::<u32>().ok());
+  let os = if number >= Some(22000) { os.replace("Windows 10", "Windows 11") } else { os };
+  let busy = busy_cores(cores);
+  Machine {
+    cpu: registry(processor, "ProcessorNameString"),
+    cores,
+    memory_gb: (memory.ullTotalPhys as f64 / f64::from(1 << 30)).round(),
+    os,
+    kernel: format!("Windows NT {build} {}", std::env::consts::ARCH),
+    tmp_filesystem: filesystem(tmp),
+    open_files_limit: 0,
+    huge_pages: None,
+    load_average: [busy; 3],
+  }
+}
+
+/// How many cores were busy in the last half second, over the whole machine.
+#[cfg(windows)]
+fn busy_cores(cores: usize) -> f64 {
+  use windows_sys::Win32::{Foundation::FILETIME, System::Threading::GetSystemTimes};
+
+  let times = || {
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut idle, mut kernel, mut user) = (zero, zero, zero);
+    // SAFETY: the three pointers are valid places for the results.
+    unsafe { GetSystemTimes(&raw mut idle, &raw mut kernel, &raw mut user) };
+    let ticks = |time: FILETIME| {
+      ((u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)) as f64
+    };
+    // The kernel time holds the idle time.
+    (ticks(idle), ticks(kernel) + ticks(user))
+  };
+  let (idle_before, all_before) = times();
+  std::thread::sleep(std::time::Duration::from_millis(500));
+  let (idle_after, all_after) = times();
+  let all = all_after - all_before;
+  if all <= 0.0 {
+    return 0.0;
+  }
+  (1.0 - (idle_after - idle_before) / all) * cores as f64
+}
+
+/// The name of the file system that holds `path`: `NTFS`, `ReFS`, ...
+#[cfg(windows)]
+fn filesystem(path: &Path) -> String {
+  use std::os::windows::ffi::OsStrExt;
+
+  use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
+
+  let path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+  let mut volume = [0_u16; 261];
+  let mut name = [0_u16; 261];
+  // SAFETY: `path` ends with a zero, and `volume` is as long as the call is told.
+  if unsafe { GetVolumePathNameW(path.as_ptr(), volume.as_mut_ptr(), 261) } == 0 {
+    return String::new();
+  }
+  let null = std::ptr::null_mut::<u32>();
+  // SAFETY: `volume` ends with a zero, `name` is as long as the call is told, and the other
+  // answers are not asked for.
+  let ok = unsafe {
+    let no_label = std::ptr::null_mut();
+    GetVolumeInformationW(volume.as_ptr(), no_label, 0, null, null, null, name.as_mut_ptr(), 261)
+  };
+  if ok == 0 {
+    return String::new();
+  }
+  let end = name.iter().position(|&unit| unit == 0).unwrap_or(name.len());
+  String::from_utf16_lossy(&name[..end])
+}
+
+#[cfg(unix)]
 #[must_use]
 pub fn machine(tmp: &Path) -> Machine {
   let mut load_average = [0.0; 3];
@@ -75,6 +202,7 @@ pub fn machine(tmp: &Path) -> Machine {
 /// A library that opens one file for each watched file needs more than the 256 open files
 /// that a shell on macOS allows. The limit of the shell must not decide a result, so the
 /// driver raises its own limit, and every adapter gets the same one. Returns the limit.
+#[cfg(unix)]
 fn raise_open_files_limit() -> u64 {
   const WANTED: libc::rlim_t = 65536;
   let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -93,6 +221,7 @@ fn raise_open_files_limit() -> u64 {
 }
 
 /// The name of the file system that holds `path`: `apfs`, `ext4`, `tmpfs`, ...
+#[cfg(unix)]
 fn filesystem(path: &Path) -> String {
   if cfg!(target_os = "macos") {
     // `mount` prints `/dev/disk3s5 on /System/Volumes/Data (apfs, local, ...)`.
@@ -115,7 +244,14 @@ fn filesystem(path: &Path) -> String {
 pub fn versions(bench: &Path, js: &Path) -> BTreeMap<String, String> {
   let mut versions = BTreeMap::new();
   versions.insert("rustc".to_owned(), output("rustc", &["--version"]));
-  versions.insert("node".to_owned(), output("node", &["--version"]));
+  versions.insert("node".to_owned(), output(&node().to_string_lossy(), &["--version"]));
+  let python = venv_python(&bench.join("py"));
+  if python.exists() {
+    let python = python.to_string_lossy();
+    versions.insert("python".to_owned(), output(&python, &["--version"]));
+    let code = "import importlib.metadata as m; print(m.version('watchdog'))";
+    versions.insert("watchdog".to_owned(), output(&python, &["-c", code]));
+  }
 
   let lock = fs::read_to_string(bench.join("Cargo.lock")).unwrap_or_default();
   let pathwatch = locked(&lock, "pathwatch").unwrap_or_default();

@@ -35,13 +35,21 @@ fn markdown(report: &Report) -> String {
   );
   let busy =
     if one > machine.cores as f64 / 4.0 { " **busy machine: times are rough**" } else { "" };
-  let _ = writeln!(out, "- Open files limit of the adapters: {}", machine.open_files_limit);
+  // Windows has no such limit.
+  if machine.open_files_limit > 0 {
+    let _ = writeln!(out, "- Open files limit of the adapters: {}", machine.open_files_limit);
+  }
   if let Some(setting) = &machine.huge_pages {
     let malloc = if report.settings.keep_huge_pages { "as the system has it" } else { "off" };
     let _ =
       writeln!(out, "- Transparent huge pages: {setting}; for malloc of the adapters: {malloc}");
   }
-  let _ = writeln!(out, "- Load average at the start: {one:.1} {five:.1} {fifteen:.1}{busy}");
+  if machine.kernel.starts_with("Windows") {
+    // Windows has no load average: see `machine::machine`.
+    let _ = writeln!(out, "- Busy cores at the start (half a second): {one:.1}{busy}");
+  } else {
+    let _ = writeln!(out, "- Load average at the start: {one:.1} {five:.1} {fifteen:.1}{busy}");
+  }
   let full = if (report.settings.scale - 1.0).abs() < f64::EPSILON {
     "the full sizes".to_owned()
   } else {
