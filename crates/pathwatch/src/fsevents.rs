@@ -157,11 +157,11 @@ impl Backend for FsEventsBackend {
 
   fn unwatch(&mut self, key: DirKey) {
     self.not_watched.remove(&key);
-    let Some(dir) = self.covers.dir_of.get(&key).cloned() else { return };
-    self.covers.remove(key);
     // The stream that was to start for the cover is not needed when no key is left at its
     // path. A cover below it that counted on that stream asks for one of its own.
-    if !self.covers.by_dir.contains(&dir) && self.streams.pending.contains(&dir) {
+    if let Some(dir) = self.covers.remove(key)
+      && self.streams.pending.contains(&dir)
+    {
       self.streams.pending.remove(&dir);
       let below = self.covers.by_dir.below(&[&dir]);
       let below: Vec<PathBuf> = below.into_iter().map(|(below, _)| below.to_owned()).collect();
@@ -301,13 +301,16 @@ impl Covers {
     self.dir_of.insert(key, dir);
   }
 
-  fn remove(&mut self, key: DirKey) {
-    let Some(dir) = self.dir_of.remove(&key) else { return };
-    let Some(keys) = self.by_dir.get_mut(&dir) else { return };
+  /// Forgets the cover of `key`. Gives its directory when no key is left at it.
+  fn remove(&mut self, key: DirKey) -> Option<PathBuf> {
+    let dir = self.dir_of.remove(&key)?;
+    let keys = self.by_dir.get_mut(&dir)?;
     keys.retain(|known| *known != key);
-    if keys.is_empty() {
-      self.by_dir.remove(&dir);
+    if !keys.is_empty() {
+      return None;
     }
+    self.by_dir.remove(&dir);
+    Some(dir)
   }
 
   fn retain(&mut self, keep: impl Fn(&Path) -> bool) {
