@@ -14,7 +14,7 @@ It first ran on 2026-10-10, on Windows 11 Pro (build 26200) with NTFS on a local
   above an open handle, and Windows refuses that. It is skipped for this backend.
 
 That first run also found what the engine got wrong about an NTFS disk when it polls. All of
-it is in `fs.rs` now (`told` and `stat`):
+it is in `fs/windows.rs` now (`told` and `stat`):
 
 - **An entry that is being deleted answers "access denied"** to every call, until the one who
   deletes it closes its handle. So does a directory that is opened as a file. The engine took
@@ -45,7 +45,7 @@ backend:
 Then the two numbers in which the backend was far behind (`bench/results/windows.md`):
 
 - **Setup.** One `lstat` of std opens the entry, asks, and closes it: 10 us. Two faster ways,
-  both in `fs.rs`:
+  both in `fs/windows.rs`:
   - `GetFileInformationByName` (Windows 11 24H2 and later; looked up at run time) tells the
     same in one call that opens nothing: 3.5 us. It takes the path as it is, so a path of
     260 units or more goes the old way.
@@ -106,7 +106,7 @@ the real disk, with this backend and with polling.
 
 ## Not verified on Windows
 
-- **The spelling of a name** (`Fs::name_on_disk` in `fs.rs`). On a disk that takes two
+- **The spelling of a name** (`Fs::name_on_disk`, `fs/windows.rs`). On a disk that takes two
   spellings of a name for one, a look asks how the disk spells the name that `lstat` found
   (design 5.2). Here that is `FindFirstFileW` for the path, and the name that it gives back.
   It was only compiled. To check: it gives the name as the directory holds it, also for a

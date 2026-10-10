@@ -252,7 +252,7 @@ crates/
       backend.rs             the `Backend` trait: what the engine asks of an OS watch API
       inotify.rs  fsevents.rs  windows.rs  poll.rs     one backend each
       engine/                the engine: watched_paths, check, filter, scan, os_watch, events
-      tree/  fs.rs  path.rs
+      tree/  fs/  path.rs
     tests/
       disk/                  the promises above, on the real disk
       watcher.rs             the thread
