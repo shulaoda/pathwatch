@@ -228,15 +228,16 @@ mod windows {
   use windows_sys::Win32::{
     Foundation::{
       ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION,
-      MAX_PATH, NTSTATUS, STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE,
-      STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+      INVALID_HANDLE_VALUE, MAX_PATH, NTSTATUS, STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY,
+      STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
     },
     Storage::FileSystem::{
       BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-      FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO,
-      FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-      FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, GetFileInformationByHandle,
-      GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+      FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+      FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+      FILE_SHARE_WRITE, FileAttributeTagInfo, FileIdBothDirectoryInfo,
+      FileIdBothDirectoryRestartInfo, FindClose, FindFirstFileW, GetFileInformationByHandle,
+      GetFileInformationByHandleEx, GetVolumeInformationByHandleW, WIN32_FIND_DATAW,
     },
     System::{
       IO::DeviceIoControl,
@@ -261,18 +262,22 @@ mod windows {
     SystemTime::UNIX_EPOCH + Duration::from_nanos(steps.saturating_mul(100))
   }
 
-  /// What `lstat` tells of an entry, from the numbers that each of the calls below gives.
-  fn entry(attributes: u32, tag: u32, written: u64, size: u64, index: u64, dir_id: DirId) -> Meta {
-    let kind = if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && tag & NAME_SURROGATE != 0 {
+  /// The kind of an entry with these attributes. `tag` is the one of its reparse point.
+  fn kind(attributes: u32, tag: u32) -> FileType {
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && tag & NAME_SURROGATE != 0 {
       FileType::Symlink
     } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
       FileType::Dir
     } else {
       FileType::File
-    };
+    }
+  }
+
+  /// What `lstat` tells of an entry. There is no change time: the modification time stands in
+  /// for it, as with std.
+  fn entry(kind: FileType, written: u64, size: u64, dir_id: DirId) -> Meta {
     let modified = time(written);
-    // No change time: the modification time stands in for it, as with std.
-    Meta { kind, modified, changed: modified, size, file_id: index, dir_id }
+    Meta { kind, modified, changed: modified, size, file_id: dir_id.inode, dir_id }
   }
 
   /// What a failed call tells, when Windows says less: "access denied" is also its answer for
@@ -396,14 +401,8 @@ mod windows {
     // The low half is the number that a handle gives: both ways must name a volume alike.
     let volume = info.volume_serial_number & u64::from(u32::MAX);
     let dir_id = DirId { volume, inode: info.file_id, birth: info.creation_time };
-    Some(Ok(entry(
-      info.file_attributes,
-      info.reparse_tag,
-      info.last_write_time,
-      info.end_of_file,
-      info.file_id,
-      dir_id,
-    )))
+    let kind = kind(info.file_attributes, info.reparse_tag);
+    Some(Ok(entry(kind, info.last_write_time, info.end_of_file, dir_id)))
   }
 
   fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
@@ -438,13 +437,22 @@ mod windows {
     let index = wide(info.nFileIndexHigh, info.nFileIndexLow);
     let birth = wide(info.ftCreationTime.dwHighDateTime, info.ftCreationTime.dwLowDateTime);
     let dir_id = DirId { volume: u64::from(info.dwVolumeSerialNumber), inode: index, birth };
+    // Only a reparse point has a tag, and this answer does not hold it.
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO { FileAttributes: 0, ReparseTag: 0 };
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-      // Only some of these are links, and this answer has no tag to tell: std asks for it.
-      return Ok(meta(&file.metadata()?, (index, dir_id)));
+      let size = u32::try_from(size_of::<FILE_ATTRIBUTE_TAG_INFO>()).unwrap_or(0);
+      // SAFETY: the handle is open, and the call writes one whole struct into `tag`.
+      let asked = unsafe {
+        let class = FileAttributeTagInfo;
+        GetFileInformationByHandleEx(file.as_raw_handle(), class, (&raw mut tag).cast(), size)
+      };
+      if asked == 0 {
+        return Err(io::Error::last_os_error());
+      }
     }
     let written = wide(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime);
     let size = wide(info.nFileSizeHigh, info.nFileSizeLow);
-    Ok(entry(info.dwFileAttributes, 0, written, size, index, dir_id))
+    Ok(entry(kind(info.dwFileAttributes, tag.ReparseTag), written, size, dir_id))
   }
 
   fn wide(high: u32, low: u32) -> u64 {
@@ -453,7 +461,7 @@ mod windows {
 
   /// The room for one answer of the system. The records in it start at multiples of eight.
   #[repr(C, align(8))]
-  struct Records<const N: usize>([u8; N]);
+  struct Aligned<const N: usize>([u8; N]);
 
   /// A number that changes with each change of the file at `path`: the place of the last
   /// record about the file in the change journal of its disk. `None`: the disk keeps no
@@ -468,7 +476,7 @@ mod windows {
     // A directory cannot be opened in this way: it is no file to compare (see `told`).
     let file = OpenOptions::new().access_mode(0).share_mode(SHARE_ALL).open(path).map_err(told)?;
     // The longest record: its fixed part and a name of 255 units.
-    let mut record = Records([0; 1024]);
+    let mut record = Aligned([0; 1024]);
     let size = u32::try_from(record.0.len()).unwrap_or(u32::MAX);
     let mut filled = 0;
     // SAFETY: the handle is open. The call reads no input, writes at most `size` bytes into
@@ -537,7 +545,7 @@ mod windows {
       return Ok(false);
     }
 
-    let mut records = Records([0; 16 * 1024]);
+    let mut records = Aligned([0; 16 * 1024]);
     let size = u32::try_from(records.0.len()).unwrap_or(u32::MAX);
     let mut name = Vec::new();
     let mut class = FileIdBothDirectoryRestartInfo;
@@ -587,14 +595,12 @@ mod windows {
     name.clear();
     name.extend(name_bytes.as_chunks().0.iter().map(|&unit| u16::from_ne_bytes(unit)));
     let (attributes, index) = (u32_at(ATTRIBUTES)?, u64_at(INDEX)?);
-    let found =
-      entry(attributes, u32_at(TAG)?, u64_at(WRITTEN)?, u64_at(SIZE)?, index, DirId::default());
     let plain = attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
-    let told = match found.kind {
+    let told = match kind(attributes, u32_at(TAG)?) {
       // A reparse point that is no link (a file in a cloud, a mounted disk) is left to
       // `lstat`: not measured.
       FileType::File if plain => {
-        Entry::File { modified: found.modified, size: found.size, file_id: index }
+        Entry::File { modified: time(u64_at(WRITTEN)?), size: u64_at(SIZE)?, file_id: index }
       }
       // The identity as `stat` tells it. It is never behind: it does not change.
       FileType::Dir if plain => {
@@ -603,6 +609,39 @@ mod windows {
       kind => Entry::Kind(kind),
     };
     Some((next, told))
+  }
+
+  /// `path` for a call that takes it as it is, with a NUL at its end. A long path only works
+  /// in the `\\?\` form, which std makes for its own calls and which takes no `/`.
+  fn wide_path(path: &Path) -> Vec<u16> {
+    const SEPARATOR: u16 = b'\\' as u16;
+    let units = path.as_os_str().encode_wide();
+    let units: Vec<u16> =
+      units.map(|unit| if unit == u16::from(b'/') { SEPARATOR } else { unit }).collect();
+    let verbatim = units.starts_with(&[SEPARATOR, SEPARATOR, u16::from(b'?'), SEPARATOR]);
+    let (prefix, rest) = match units.as_slice() {
+      units if verbatim || units.len() < MAX_PATH as usize - 12 => ("", units),
+      // `\\server\share` becomes `\\?\UNC\server\share`.
+      [SEPARATOR, rest @ ..] if rest.first() == Some(&SEPARATOR) => (r"\\?\UNC", rest),
+      units => (r"\\?\", units),
+    };
+    prefix.encode_utf16().chain(rest.iter().copied()).chain([0]).collect()
+  }
+
+  /// A search for the one path gives the entry as the directory holds it.
+  pub fn name_on_disk(path: &Path) -> io::Result<OsString> {
+    let wide = wide_path(path);
+    // SAFETY: all zeros is a valid value of this plain struct of numbers.
+    let mut found: WIN32_FIND_DATAW = unsafe { mem::zeroed() };
+    // SAFETY: `wide` ends with a NUL, and the call writes one whole struct into `found`.
+    let search = unsafe { FindFirstFileW(wide.as_ptr(), &raw mut found) };
+    if search == INVALID_HANDLE_VALUE {
+      return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `search` is the open handle that the call above gave, closed once.
+    unsafe { FindClose(search) };
+    let len = found.cFileName.iter().position(|&unit| unit == 0).unwrap_or(found.cFileName.len());
+    Ok(OsString::from_wide(&found.cFileName[..len]))
   }
 
   #[cfg(test)]
@@ -614,7 +653,7 @@ mod windows {
       process::Command,
     };
 
-    use super::{by_handle, by_name, read_dir, stat, version};
+    use super::{by_handle, by_name, name_on_disk, read_dir, stat, version};
     use crate::fs::{Entry, FileType, Meta};
 
     fn same(a: &Meta, b: &Meta) -> bool {
@@ -702,6 +741,25 @@ mod windows {
       assert_eq!(size(), 16);
     }
 
+    /// The name as the directory holds it, also at the end of a path of more than 260 units.
+    #[test]
+    fn the_name_on_disk() {
+      let top = tempfile::tempdir().unwrap();
+      let mut dir = top.path().to_owned();
+      for _ in 0..3 {
+        dir.push("d".repeat(100));
+        assert_eq!(
+          name_on_disk(&dir.join("ReadMe.md")).unwrap_err().kind(),
+          io::ErrorKind::NotFound
+        );
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("ReadMe.md"), "1").unwrap();
+        for spelled in ["ReadMe.md", "README.MD", "readme.md"] {
+          assert_eq!(name_on_disk(&dir.join(spelled)).unwrap(), "ReadMe.md", "{}", dir.display());
+        }
+      }
+    }
+
     /// The version of a file changes with each write, and with nothing that only reads.
     #[test]
     fn the_version_changes_with_a_write() {
@@ -729,7 +787,7 @@ mod windows {
 #[cfg(windows)]
 pub(crate) use self::windows::{Unknown, kernel32};
 #[cfg(windows)]
-use self::windows::{stat, told};
+use self::windows::{name_on_disk, stat, told};
 
 #[cfg(not(windows))]
 fn told(error: io::Error) -> io::Error {
@@ -1006,33 +1064,6 @@ fn name_on_disk(path: &Path) -> io::Result<OsString> {
   let name = start.zip(len).and_then(|(start, len)| answer.bytes.get(start..start + len));
   let name = name.ok_or_else(|| io::Error::other("getattrlist gave no name"))?;
   Ok(OsStr::from_bytes(name).to_owned())
-}
-
-/// Windows: a search for the one path gives the entry as the directory holds it.
-#[cfg(windows)]
-fn name_on_disk(path: &Path) -> io::Result<OsString> {
-  use std::{
-    mem,
-    os::windows::ffi::{OsStrExt, OsStringExt},
-  };
-
-  use windows_sys::Win32::{
-    Foundation::INVALID_HANDLE_VALUE,
-    Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW},
-  };
-
-  let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-  // SAFETY: all zeros is a valid value of this plain struct of numbers.
-  let mut found: WIN32_FIND_DATAW = unsafe { mem::zeroed() };
-  // SAFETY: `wide` ends with a NUL, and the call writes one whole struct into `found`.
-  let search = unsafe { FindFirstFileW(wide.as_ptr(), &raw mut found) };
-  if search == INVALID_HANDLE_VALUE {
-    return Err(io::Error::last_os_error());
-  }
-  // SAFETY: `search` is the open handle that the call above gave, closed once.
-  unsafe { FindClose(search) };
-  let len = found.cFileName.iter().position(|&unit| unit == 0).unwrap_or(found.cFileName.len());
-  Ok(OsString::from_wide(&found.cFileName[..len]))
 }
 
 /// No call gives the name of one entry here, so the listing of its directory is read: 1.8 ms
