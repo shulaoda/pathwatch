@@ -246,11 +246,14 @@ mod place {
 }
 
 mod handles {
-  use std::{io, path::PathBuf};
+  use std::{
+    io,
+    path::{Path, PathBuf},
+  };
 
   use pathwatch::{
     backend::{Coverage, Want, is_watch_limit},
-    windows::{Change, Handles, MAX_HANDLES, Open, WatchId, place},
+    windows::{Handles, MAX_HANDLES, System, Told, WatchId, place},
   };
 
   use super::{dir, index, key};
@@ -265,53 +268,67 @@ mod handles {
     Failed,
   }
 
-  /// `Handles`, with an `open` that only writes down what it is asked for.
+  /// The system of these tests: it writes down what `Handles` asks of it.
   #[derive(Default)]
-  struct Fake {
-    handles: Handles,
+  struct Disk {
     /// The handles that are open now, in the order in which they were opened.
     open: Vec<(WatchId, PathBuf)>,
     /// Every id that `open` was called with.
     ids: Vec<WatchId>,
     /// A handle on this directory cannot be opened.
     broken: Option<PathBuf>,
-    /// The keys that were told that another handle serves them, or none.
-    moved: Vec<u32>,
+    /// The junctions.
+    links: Vec<PathBuf>,
+  }
+
+  impl System for Disk {
+    fn open(&mut self, id: WatchId, dir: &Path) -> io::Result<()> {
+      self.ids.push(id);
+      if self.broken.as_deref() == Some(dir) {
+        return Err(io::ErrorKind::PermissionDenied.into());
+      }
+      self.open.push((id, dir.to_owned()));
+      Ok(())
+    }
+
+    fn close(&mut self, id: WatchId) {
+      let at = self.open.iter().position(|(open, _)| *open == id);
+      self.open.remove(at.expect("a handle is closed that is not open"));
+    }
+
+    fn is_link(&mut self, path: &Path) -> bool {
+      self.links.iter().any(|link| link == path)
+    }
+  }
+
+  #[derive(Default)]
+  struct Fake {
+    handles: Handles,
+    disk: Disk,
+    /// The keys that were told that no handle serves them any more.
+    lost: Vec<u32>,
     /// The keys that got no handle before and that a new handle reports now.
     covered: Vec<u32>,
   }
 
   impl Fake {
-    /// One call of `Handles`, with an `open` that writes down what it is asked for.
-    fn call<T>(&mut self, call: impl FnOnce(&mut Handles, Open<'_>) -> T) -> T {
-      let Self { handles, open, ids, broken, .. } = self;
-      call(handles, &mut |id, dir| {
-        ids.push(id);
-        if broken.as_deref() == Some(dir) {
-          return Err(io::ErrorKind::PermissionDenied.into());
-        }
-        open.push((id, dir.to_owned()));
-        Ok(())
-      })
-    }
-
     fn watch(&mut self, index: u32, path: &str, want: Want) -> Answer {
       let (key, dir) = (key(index), dir(path));
-      let (mut coverage, change) = self.call(|handles, open| handles.watch(key, &dir, want, open));
-      self.finish(change);
+      let (mut coverage, told) = self.handles.watch(key, &dir, want, &mut self.disk);
+      self.told(told);
       // The engine commits after its calls of `watch`, and only then looks at the disk.
-      let mut settled = self.call(|handles, open| handles.commit(open));
+      let mut settled = self.handles.commit(&mut self.disk);
       // A key that the commit left without a handle is told. The engine asks again for it,
       // and that answer says why.
-      let told = settled.moved.iter().position(|&told| told == key);
-      if let Some(at) = told {
-        settled.moved.swap_remove(at);
+      let lost = settled.lost.iter().position(|&lost| lost == key);
+      if let Some(at) = lost {
+        settled.lost.swap_remove(at);
       }
-      self.finish(settled);
-      if told.is_some() {
-        let (answer, change) = self.call(|handles, open| handles.watch(key, &dir, want, open));
+      self.told(settled);
+      if lost.is_some() {
+        let (answer, told) = self.handles.watch(key, &dir, want, &mut self.disk);
         coverage = answer;
-        self.finish(change);
+        self.told(told);
       }
       match coverage {
         Coverage::WatchedTree => Answer::Tree,
@@ -329,30 +346,25 @@ mod handles {
     }
 
     fn unwatch(&mut self, index: u32) {
-      let change = self.call(|handles, open| handles.unwatch(key(index), open));
-      self.finish(change);
+      let told = self.handles.unwatch(key(index), &mut self.disk);
+      self.told(told);
     }
 
-    /// Does what the backend does with a `Change`. The new handles are open at this point: a
-    /// handle that is closed here was open next to them.
-    fn finish(&mut self, change: Change) {
-      for id in change.close {
-        let at = self.open.iter().position(|(open, _)| *open == id);
-        self.open.remove(at.expect("a handle is closed that is not open"));
+    /// Keeps what a call told, and checks what holds after every call: no handle is below
+    /// another, and there are never too many.
+    fn told(&mut self, told: Told) {
+      self.lost.extend(told.lost.into_iter().map(index));
+      self.covered.extend(told.covered.into_iter().map(index));
+      for (_, above) in &self.disk.open {
+        let below = self.disk.open.iter().filter(|(_, dir)| dir.starts_with(above)).count();
+        assert_eq!(below, 1, "{} in {:?}", above.display(), self.disk.open);
       }
-      self.moved.extend(change.moved.into_iter().map(index));
-      self.covered.extend(change.covered.into_iter().map(index));
-      // No handle is below another, and there are never too many.
-      for (_, above) in &self.open {
-        let below = self.open.iter().filter(|(_, dir)| dir.starts_with(above)).count();
-        assert_eq!(below, 1, "{} in {:?}", above.display(), self.open);
-      }
-      assert!(self.open.len() <= MAX_HANDLES);
+      assert!(self.disk.open.len() <= MAX_HANDLES);
     }
 
     /// The handle on `path` died.
     fn died(&mut self, id: WatchId) -> Vec<u32> {
-      self.open.retain(|(open, _)| *open != id);
+      self.disk.open.retain(|(open, _)| *open != id);
       let mut keys: Vec<u32> = self.handles.closed(id).into_iter().map(index).collect();
       keys.sort_unstable();
       keys
@@ -360,21 +372,21 @@ mod handles {
 
     /// The directories of the open handles.
     fn dirs(&self) -> Vec<PathBuf> {
-      let mut dirs: Vec<PathBuf> = self.open.iter().map(|(_, dir)| dir.clone()).collect();
+      let mut dirs: Vec<PathBuf> = self.disk.open.iter().map(|(_, dir)| dir.clone()).collect();
       dirs.sort();
       dirs
     }
 
     /// The id of the handle on `path`.
     fn id(&self, path: &str) -> WatchId {
-      let on_path = self.open.iter().find(|(_, open)| *open == dir(path));
-      on_path.unwrap_or_else(|| panic!("no handle is on {path}: {:?}", self.open)).0
+      let on_path = self.disk.open.iter().find(|(_, open)| *open == dir(path));
+      on_path.unwrap_or_else(|| panic!("no handle is on {path}: {:?}", self.disk.open)).0
     }
 
     /// The keys that were told since the last call.
-    fn moved(&mut self) -> Vec<u32> {
-      self.moved.sort_unstable();
-      std::mem::take(&mut self.moved)
+    fn lost(&mut self) -> Vec<u32> {
+      self.lost.sort_unstable();
+      std::mem::take(&mut self.lost)
     }
   }
 
@@ -408,22 +420,35 @@ mod handles {
     assert_eq!(fake.covered, []);
   }
 
-  fn dirs<const N: usize>(paths: [&str; N]) -> Vec<PathBuf> {
-    paths.map(dir).into()
+  /// A handle reports nothing for what is behind a junction below it. A key there is not
+  /// served, whether the handle is there first or comes with it in one commit.
+  #[test]
+  fn a_key_behind_a_link_is_not_served() {
+    let mut fake = Fake::default();
+    fake.disk.links = vec![dir("/p/link")];
+    fake.open(0, "/p");
+    for behind in ["/p/link", "/p/link/sub"] {
+      assert_eq!(fake.watch(1, behind, Want::Contents), Answer::NotWatched);
+    }
+    assert_eq!(fake.watch(2, "/p/plain/sub", Want::Contents), Answer::Tree);
+    assert_eq!(fake.disk.open.len(), 1);
+    assert_eq!(fake.lost(), []);
+
+    let mut fake = Fake::default();
+    fake.disk.links = vec![dir("/p/link")];
+    for (index, path) in [(0, "/p"), (1, "/p/link/sub")] {
+      let (coverage, _) =
+        fake.handles.watch(key(index), &dir(path), Want::Contents, &mut fake.disk);
+      assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
+    }
+    let told = fake.handles.commit(&mut fake.disk);
+    assert_eq!(told.lost, [key(1)]);
+    assert_eq!(fake.watch(1, "/p/link/sub", Want::Contents), Answer::NotWatched);
+    assert_eq!(fake.dirs(), dirs(["/p"]));
   }
 
-  #[test]
-  fn a_dir_request_opens_a_handle() {
-    let mut fake = Fake::default();
-    assert_eq!(fake.watch(0, "/p/a", Want::Contents), Answer::Tree);
-    assert_eq!(fake.dirs(), dirs(["/p/a"]));
-    assert_eq!(fake.watch(1, "/p/b", Want::Contents), Answer::Tree);
-    assert_eq!(fake.dirs(), dirs(["/p/a", "/p/b"]));
-    fake.unwatch(0);
-    assert_eq!(fake.dirs(), dirs(["/p/b"]));
-    fake.unwatch(1);
-    assert_eq!(fake.dirs(), dirs([]));
-    assert_eq!(fake.moved(), []);
+  fn dirs<const N: usize>(paths: [&str; N]) -> Vec<PathBuf> {
+    paths.map(dir).into()
   }
 
   #[test]
@@ -447,15 +472,15 @@ mod handles {
     {
       assert_eq!(fake.watch(index, "/p/a/b/c", want), answer);
       fake.unwatch(index);
-      assert_eq!(fake.open, [(id, dir("/p/a"))]);
+      assert_eq!(fake.disk.open, [(id, dir("/p/a"))]);
     }
-    assert_eq!(fake.ids, [id]);
+    assert_eq!(fake.disk.ids, [id]);
     // Another key for the directory of the handle itself opens no second handle there: the
     // one handle is replaced, as for every request for that directory.
     assert_eq!(fake.watch(3, "/p/a", Want::Contents), Answer::Tree);
     assert_eq!(fake.dirs(), dirs(["/p/a"]));
     assert_ne!(fake.id("/p/a"), id);
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
   }
 
   #[test]
@@ -475,11 +500,11 @@ mod handles {
     let other = fake.open(2, "/q");
 
     let high = fake.open(3, "/p");
-    assert_eq!(fake.open, [(other, dir("/q")), (high, dir("/p"))]);
+    assert_eq!(fake.disk.open, [(other, dir("/q")), (high, dir("/p"))]);
     assert!(![low, deep, other].contains(&high));
     // The keys of the closed handles are not told: the new handle reported before the old
     // ones stopped.
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
 
     // They are served by the new one, and no handle goes with them. The handle elsewhere still
     // stands.
@@ -488,11 +513,11 @@ mod handles {
     fake.unwatch(0);
     fake.unwatch(1);
     assert_eq!(fake.watch(4, "/q/x", Want::Contents), Answer::Tree);
-    assert_eq!(fake.open, [(other, dir("/q")), (high, dir("/p"))]);
+    assert_eq!(fake.disk.open, [(other, dir("/q")), (high, dir("/p"))]);
     fake.unwatch(2);
     // The key below it is still there, so its handle only moves down.
     assert_eq!(fake.dirs(), dirs(["/p", "/q/x"]));
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
   }
 
   #[test]
@@ -501,8 +526,8 @@ mod handles {
     let first = fake.open(0, "/p");
     let second = fake.open(0, "/p");
     assert_ne!(first, second);
-    assert_eq!(fake.open, [(second, dir("/p"))]);
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.disk.open, [(second, dir("/p"))]);
+    assert_eq!(fake.lost(), []);
     assert_eq!(fake.died(first), []);
     assert_eq!(fake.died(second), [0]);
   }
@@ -518,44 +543,67 @@ mod handles {
       assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
       assert_eq!(fake.watch(2, "/p/b", Want::Contents), Answer::Tree);
     }
-    assert_eq!(fake.open, [(shared, dir("/p"))]);
+    assert_eq!(fake.disk.open, [(shared, dir("/p"))]);
 
     assert_eq!(fake.watch(0, "/p", Want::Contents), Answer::Tree);
     assert_ne!(fake.id("/p"), shared);
     // The other keys of the handle are not told, and they are keys of the new handle.
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
     assert_eq!(fake.died(shared), []);
     let new = fake.id("/p");
     assert_eq!(fake.died(new), [0, 1, 2]);
   }
 
+  /// A key that got no handle is not put off to the commit when it asks again: the engine
+  /// would take it for watched until the commit says no, at every poll.
+  #[test]
+  fn a_key_that_got_no_handle_is_answered_at_once_the_next_time() {
+    let mut fake = Fake::default();
+    fake.disk.broken = Some(dir("/p"));
+    assert_eq!(fake.watch(0, "/p", Want::Contents), Answer::Failed);
+    let (coverage, told) = fake.handles.watch(key(0), &dir("/p"), Want::Contents, &mut fake.disk);
+    assert!(matches!(coverage, Coverage::Failed(_)), "{coverage:?}");
+    assert_eq!(told.lost, []);
+
+    // When the handle can be opened, the key is like every other one again.
+    fake.disk.broken = None;
+    assert_eq!(fake.watch(0, "/p", Want::Contents), Answer::Tree);
+    fake.unwatch(0);
+    let (coverage, _) = fake.handles.watch(key(0), &dir("/p"), Want::Contents, &mut fake.disk);
+    assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
+    assert_eq!(fake.disk.open, []);
+  }
+
   #[test]
   fn an_id_is_never_given_out_twice() {
-    let mut fake = Fake { broken: Some(dir("/failed")), ..Fake::default() };
+    let mut fake = Fake::default();
+    fake.disk.broken = Some(dir("/failed"));
     for round in 0..3 {
       assert_eq!(fake.watch(9, "/failed", Want::Contents), Answer::Failed);
       fake.open(round, "/p");
       fake.open(round, "/p");
       fake.unwatch(round);
     }
-    // The open that fails is tried twice: by the commit, and again for the answer.
-    let count = fake.ids.len();
-    assert_eq!(count, 12);
-    fake.ids.sort_by_key(|id| id.0);
-    fake.ids.dedup();
-    assert_eq!(fake.ids.len(), count);
+    // The open that fails is tried twice the first time: by the commit, and again for the
+    // answer. After that it is tried once.
+    let count = fake.disk.ids.len();
+    assert_eq!(count, 10);
+    fake.disk.ids.sort_by_key(|id| id.0);
+    fake.disk.ids.dedup();
+    assert_eq!(fake.disk.ids.len(), count);
   }
 
   #[test]
   fn a_handle_that_could_not_be_opened_changes_nothing() {
-    let mut fake = Fake { broken: Some(dir("/p")), ..Fake::default() };
+    let mut fake = Fake::default();
+    fake.disk.broken = Some(dir("/p"));
     let low = fake.open(0, "/p/a");
     assert_eq!(fake.watch(1, "/p", Want::Contents), Answer::Failed);
-    assert_eq!(fake.open, [(low, dir("/p/a"))]);
+    assert_eq!(fake.disk.open, [(low, dir("/p/a"))]);
     // The key that failed is forgotten.
     fake.unwatch(1);
     assert_eq!(fake.watch(2, "/p/a/b", Want::Contents), Answer::Tree);
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
     assert_eq!(fake.died(low), [0, 2]);
   }
 
@@ -564,12 +612,12 @@ mod handles {
     let mut fake = Fake::default();
     let id = fake.open(0, "/p");
     assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
-    fake.broken = Some(dir("/p"));
+    fake.disk.broken = Some(dir("/p"));
     // The directory of the handle cannot be opened again: after `Failed` nothing is watched
     // for the key that asked. The other key keeps a handle, on its own directory now.
     assert_eq!(fake.watch(0, "/p", Want::Contents), Answer::Failed);
     assert_eq!(fake.dirs(), dirs(["/p/a"]));
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
     assert_eq!(fake.died(id), []);
   }
 
@@ -580,26 +628,26 @@ mod handles {
     for index in 0..u32::try_from(MAX_HANDLES).unwrap() {
       fake.open(index, &format!("/d{index}"));
     }
-    let before = fake.open.clone();
+    let before = fake.disk.open.clone();
     assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Limit);
     fake.unwatch(100);
-    assert_eq!(fake.open, before);
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.disk.open, before);
+    assert_eq!(fake.lost(), []);
     // Nothing covers an ancestor, with or without room.
     assert_eq!(fake.watch(100, "/q", Want::Names), Answer::NotWatched);
 
     // A handle that takes the place of another still fits.
     fake.open(0, "/d0");
-    assert_eq!(fake.open.len(), MAX_HANDLES);
+    assert_eq!(fake.disk.open.len(), MAX_HANDLES);
     assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Limit);
 
     // Who gets none is a matter of path order, not of who came first: a directory that is
     // before the others takes the handle of the last one, and the key of that one is told.
     assert_eq!(fake.watch(101, "/a", Want::Contents), Answer::Tree);
-    assert_eq!(fake.open.len(), MAX_HANDLES);
-    assert_eq!(fake.moved(), [9]);
+    assert_eq!(fake.disk.open.len(), MAX_HANDLES);
+    assert_eq!(fake.lost(), [9]);
     assert_eq!(fake.watch(9, "/d9", Want::Contents), Answer::Limit);
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
   }
 
   #[test]
@@ -611,7 +659,7 @@ mod handles {
     assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Limit);
     fake.unwatch(7);
     assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Tree);
-    assert_eq!(fake.open.len(), MAX_HANDLES);
+    assert_eq!(fake.disk.open.len(), MAX_HANDLES);
   }
 
   #[test]
@@ -624,19 +672,19 @@ mod handles {
     // One more: all of them have `/p` in common. The directory elsewhere keeps its handle.
     assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Tree);
     assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
     // More of them open nothing.
     assert_eq!(fake.watch(101, "/p/new", Want::Contents), Answer::Tree);
     assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
 
     // With room for all, each one has its own handle again.
     fake.unwatch(101);
     assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
     fake.unwatch(100);
-    assert_eq!(fake.open.len(), MAX_HANDLES);
+    assert_eq!(fake.disk.open.len(), MAX_HANDLES);
     assert!(fake.dirs().contains(&dir("/p/5")));
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
   }
 
   #[test]
@@ -649,33 +697,34 @@ mod handles {
     let other = fake.open(71, "/p/y");
     // The 65th directory: it shares with the one next to it, and nothing else moves.
     assert_eq!(fake.watch(72, "/p/x/2", Want::Contents), Answer::Tree);
-    assert_eq!(fake.open.len(), MAX_HANDLES);
+    assert_eq!(fake.disk.open.len(), MAX_HANDLES);
     let shared = fake.id("/p/x");
     assert_eq!(fake.id("/p/y"), other);
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
     assert_eq!(fake.died(first), []);
 
     // The 66th: now all three share.
     fake.open(63, "/d63");
     assert_eq!(fake.dirs().last(), Some(&dir("/p")));
-    assert_eq!(fake.open.len(), MAX_HANDLES);
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.disk.open.len(), MAX_HANDLES);
+    assert_eq!(fake.lost(), []);
     assert_eq!(fake.died(shared), []);
   }
 
   #[test]
   fn a_shared_handle_that_cannot_be_opened_leaves_all_as_it_was() {
-    let mut fake = Fake { broken: Some(dir("/p")), ..Fake::default() };
+    let mut fake = Fake::default();
+    fake.disk.broken = Some(dir("/p"));
     for index in 0..u32::try_from(MAX_HANDLES).unwrap() {
       fake.open(index, &format!("/p/{index}"));
     }
-    let before = fake.open.clone();
+    let before = fake.disk.open.clone();
     // The handle of `/q` was opened for this, and is closed again.
     assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Failed);
-    assert_eq!(fake.open, before);
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.disk.open, before);
+    assert_eq!(fake.lost(), []);
 
-    fake.broken = None;
+    fake.disk.broken = None;
     assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Tree);
     assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
   }
@@ -685,18 +734,18 @@ mod handles {
     let mut fake = Fake::default();
     fake.open(0, "/p/a");
     fake.open(1, "/p");
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
     assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::Names);
     // The handle goes down to the one directory that still wants the contents. The key that
     // only wanted names has no handle above it any more, and is told.
     fake.unwatch(1);
     assert_eq!(fake.dirs(), dirs(["/p/a"]));
-    assert_eq!(fake.moved(), [2]);
+    assert_eq!(fake.lost(), [2]);
     assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::NotWatched);
     // A key that wants names only never moves a handle.
     assert_eq!(fake.watch(3, "/p/a/x", Want::Names), Answer::Names);
     fake.unwatch(3);
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
   }
 
   #[test]
@@ -705,7 +754,7 @@ mod handles {
     let id = fake.open(0, "/p");
     assert_eq!(fake.watch(1, "/p/a", Want::Names), Answer::Names);
     assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
-    assert_eq!(fake.open, [(id, dir("/p"))]);
+    assert_eq!(fake.disk.open, [(id, dir("/p"))]);
     // It wants the contents now, also when it is asked for less (rule 5): the handle moves to
     // it when the key above goes.
     assert_eq!(fake.watch(1, "/p/a", Want::Names), Answer::Tree);
@@ -719,7 +768,7 @@ mod handles {
     for path in ["/", "/Users", "/Users/me"] {
       assert_eq!(fake.watch(0, path, Want::Contents), Answer::NotWatched, "{path}");
     }
-    assert_eq!(fake.ids, []);
+    assert_eq!(fake.disk.ids, []);
     fake.open(1, "/Users/me/p");
   }
 
@@ -730,12 +779,12 @@ mod handles {
     assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
 
     fake.unwatch(1);
-    assert_eq!(fake.open, [(id, dir("/p"))]);
+    assert_eq!(fake.disk.open, [(id, dir("/p"))]);
     assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
     // The key below is still watched: it gets a handle on its own directory.
     fake.unwatch(0);
     assert_eq!(fake.dirs(), dirs(["/p/a"]));
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
     fake.unwatch(0);
     fake.unwatch(1);
     assert_eq!(fake.dirs(), dirs([]));
@@ -750,12 +799,12 @@ mod handles {
     fake.open(2, "/q");
     assert_eq!(fake.watch(3, "/p/b", Want::Names), Answer::Names);
     assert_eq!(fake.watch(4, "/q/c", Want::Contents), Answer::Tree);
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
 
     fake.unwatch(1);
     assert_eq!(fake.dirs(), dirs(["/p/a", "/q"]));
     // The engine asks again for each key that is told.
-    assert_eq!(fake.moved(), [3]);
+    assert_eq!(fake.lost(), [3]);
     assert_eq!(fake.watch(0, "/p/a", Want::Contents), Answer::Tree);
     assert_eq!(fake.watch(3, "/p/b", Want::Names), Answer::NotWatched);
     assert_eq!(fake.watch(4, "/q/c", Want::Contents), Answer::Tree);
@@ -797,7 +846,7 @@ mod handles {
     assert_eq!(fake.died(id), [0, 1, 2]);
     fake.open(1, "/p/a");
     assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::NotWatched);
-    assert_eq!(fake.moved(), []);
+    assert_eq!(fake.lost(), []);
   }
 
   #[test]
@@ -907,11 +956,6 @@ mod records {
   }
 
   #[test]
-  fn one_record() {
-    assert_eq!(parse(&encode(&[(MODIFIED, "a.txt")])), [Ok(named(MODIFIED, "a.txt"))]);
-  }
-
-  #[test]
   fn several_records() {
     let bytes = encode(&[(ADDED, "a"), (MODIFIED, r"sub\b.txt"), (REMOVED, "ünï")]);
     assert_eq!(
@@ -1001,12 +1045,12 @@ mod records {
 mod translate {
   use std::{
     io,
-    path::{MAIN_SEPARATOR_STR, PathBuf},
+    path::{MAIN_SEPARATOR_STR, Path, PathBuf},
   };
 
   use pathwatch::{
     backend::{Coverage, Hint, Want},
-    windows::{Handles, Raw, WatchId, translate},
+    windows::{Handles, Raw, System, WatchId, translate},
   };
 
   use super::{dir, encode, index, key};
@@ -1044,17 +1088,35 @@ mod translate {
     path: &str,
     want: Want,
   ) -> (Option<WatchId>, Vec<WatchId>) {
-    let mut opened = None;
-    let mut open = |id, _: &std::path::Path| {
-      opened = Some(id);
-      Ok(())
-    };
-    let (coverage, mut change) = handles.watch(key(index), &dir(path), want, &mut open);
+    let mut calls = Calls::default();
+    let (coverage, _) = handles.watch(key(index), &dir(path), want, &mut calls);
     // A new handle is opened by the commit.
-    change.close.extend(handles.commit(&mut open).close);
+    handles.commit(&mut calls);
     let served = matches!(coverage, Coverage::WatchedTree | Coverage::Watched);
     assert!(served && handles.serves(key(index)), "{path}: {coverage:?}");
-    (opened, change.close)
+    (calls.opened, calls.closed)
+  }
+
+  /// What `Handles` asked of the system.
+  #[derive(Default)]
+  struct Calls {
+    opened: Option<WatchId>,
+    closed: Vec<WatchId>,
+  }
+
+  impl System for Calls {
+    fn open(&mut self, id: WatchId, _dir: &Path) -> io::Result<()> {
+      self.opened = Some(id);
+      Ok(())
+    }
+
+    fn close(&mut self, id: WatchId) {
+      self.closed.push(id);
+    }
+
+    fn is_link(&mut self, _path: &Path) -> bool {
+      false
+    }
   }
 
   /// Asks for the contents of `path`, and a handle is opened for it.
@@ -1180,8 +1242,9 @@ mod translate {
   fn the_end_of_a_handle_that_was_unwatched_gives_no_hint() {
     let mut handles = Handles::default();
     let id = open(&mut handles, 0, "/p");
-    let change = handles.unwatch(key(0), &mut |_, _| panic!("nothing is left to watch"));
-    assert_eq!(change.close, [id]);
+    let mut calls = Calls::default();
+    handles.unwatch(key(0), &mut calls);
+    assert_eq!((calls.opened, calls.closed), (None, vec![id]));
     assert_eq!(hints(&mut handles, read(id, "/p", failed())), []);
     // What the handle read before it was closed gives no hint either: no key holds it.
     assert_eq!(hints(&mut handles, read(id, "/p", Ok(encode(&[(ADDED, "a")])))), []);
@@ -1351,10 +1414,10 @@ mod translate {
   }
 
   #[test]
-  fn the_keys_that_moved_to_another_handle_are_told() {
+  fn the_keys_that_lost_their_handle_are_told() {
     let mut handles = Handles::default();
     assert_eq!(
-      hints(&mut handles, Raw::Moved(vec![key(3), key(5)])),
+      hints(&mut handles, Raw::Lost(vec![key(3), key(5)])),
       [changed(3, ""), changed(5, "")]
     );
   }
