@@ -30,6 +30,8 @@
 //!
 //! The README of the repository has every promise, and what is reported late or not at all.
 
+#![deny(missing_docs)]
+
 mod config;
 mod error;
 mod event;

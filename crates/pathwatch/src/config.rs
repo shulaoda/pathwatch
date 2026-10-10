@@ -20,7 +20,9 @@ pub struct Config {
 /// What the ignore filter is asked about.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum EntryKind {
+  /// Anything that is not a directory: a symbolic link too.
   File,
+  /// A directory.
   Dir,
 }
 
