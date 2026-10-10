@@ -1007,7 +1007,14 @@ mod port {
     }
 
     fn records(&self, len: u32) -> Vec<u8> {
-      self.buffer.iter().flat_map(|word| word.to_ne_bytes()).take(len as usize).collect()
+      let len = (len as usize).min(BUFFER_BYTES as usize);
+      let words = &self.buffer[..len.div_ceil(size_of::<u64>())];
+      let mut bytes = Vec::with_capacity(size_of_val(words));
+      for word in words {
+        bytes.extend_from_slice(&word.to_ne_bytes());
+      }
+      bytes.truncate(len);
+      bytes
     }
 
     fn close(&mut self) {

@@ -405,7 +405,11 @@ fn run<B: Backend>(
   let mut out = Output::default();
   loop {
     let mut next = match engine.deadline() {
-      None => receiver.recv().ok(),
+      // The senders are gone: the watcher was dropped, and the thread ends like after `Stop`.
+      None => match receiver.recv() {
+        Ok(message) => Some(message),
+        Err(mpsc::RecvError) => return,
+      },
       Some(deadline) => {
         match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
           Ok(message) => Some(message),
