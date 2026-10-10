@@ -940,6 +940,7 @@ fn a_cover_below_a_directory_that_cannot_be_read() {
   }
   let plain = h.watch(2, &through_the_data_volume, Want::Contents);
   h.commit();
+  h.sync(plain);
   assert_eq!(h.backend.streamed().len(), 2);
   File::create(h.path("plain/file")).unwrap();
   let deadline = Instant::now() + Duration::from_secs(2);
