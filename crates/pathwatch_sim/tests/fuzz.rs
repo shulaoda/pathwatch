@@ -1581,7 +1581,7 @@ mod quick {
   use super::*;
 
   const SEEDS: u64 = 250;
-  const STEPS: usize = 150;
+  const STEPS: usize = 160;
 
   #[test]
   fn inode() {
@@ -1653,7 +1653,8 @@ mod big {
 }
 
 /// `PATHWATCH_FUZZ_SEED=<seed>`: one seed on every backend, with the cut-down story of each
-/// failure. `PATHWATCH_FUZZ_STEPS` sets the length of the run (160).
+/// failure. `PATHWATCH_FUZZ_STEPS` sets the length of the run: 160 as in the quick and the big
+/// runs, and a failure of `long` needs 5000.
 #[test]
 #[ignore = "a tool to study one seed"]
 fn replay() {

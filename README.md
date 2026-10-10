@@ -312,7 +312,8 @@ cargo test -p pathwatch_sim --test fuzz
 PATHWATCH_FUZZ_FIRST=100000 PATHWATCH_FUZZ_SEEDS=20000 \
   cargo test --release -p pathwatch_sim --test fuzz big -- --ignored
 
-# One seed again, on every backend, with the short story of each failure.
+# One seed again, on every backend, with the short story of each failure. A failure of the
+# `long` run needs `PATHWATCH_FUZZ_STEPS=5000` too.
 PATHWATCH_FUZZ_SEED=1234 cargo test -p pathwatch_sim --test fuzz replay -- --ignored --nocapture
 ```
 
