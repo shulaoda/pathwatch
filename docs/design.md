@@ -1038,7 +1038,12 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   ONLYDIR | MASK_ADD`. No `OPEN` or `ACCESS`, so the reads of the engine make no events.
 - A kernel watch belongs to the inode. A second `inotify_add_watch` for a directory (another
   spelling, or a renamed directory) gives the old `wd`: the new key is added to it, and every
-  key of a watch gets every hint. The kernel watch goes with its last key.
+  key of a watch gets every hint. The kernel watch goes with its last key. A watch has one
+  key nearly always, so the first key lies in the table itself and only a second one asks
+  for memory: 71 bytes of heap for a watched directory and no allocation that stays (92 bytes
+  and one allocation before; the kernel keeps about 1 KB for a watch). The two tables are
+  given back when most of their keys are gone: after 100,000 directories were unwatched, 67
+  KB stay and not 6.1 MB.
 - Hints: `MODIFY`, and `CREATE` or `MOVED_TO` of a non-directory → `Written` (the name holds
   other content now). Every other event of an entry → `Changed`. `ATTRIB` of a directory is
   dropped. `Q_OVERFLOW` → `Lost`.

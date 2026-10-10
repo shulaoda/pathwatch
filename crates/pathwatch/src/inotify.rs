@@ -1,7 +1,9 @@
 use std::{
+  collections::hash_map::Entry,
   ffi::OsStr,
   fs::File,
   io::{self, Read, Write},
+  iter,
   os::{
     fd::{AsRawFd, RawFd},
     unix::ffi::OsStrExt,
@@ -35,8 +37,20 @@ const ERROR_INSTANCE_LIMIT: &str = "inotify has no instance left for this user (
 pub struct InotifyBackend {
   fds: Arc<Fds>,
   reader: Option<JoinHandle<()>>,
-  keys_by_wd: FxHashMap<i32, Vec<DirKey>>,
+  keys_by_wd: FxHashMap<i32, Keys>,
   wd_by_key: FxHashMap<DirKey, i32>,
+}
+
+#[derive(Debug)]
+struct Keys {
+  first: DirKey,
+  more: Vec<DirKey>,
+}
+
+impl Keys {
+  fn iter(&self) -> impl Iterator<Item = DirKey> {
+    iter::once(self.first).chain(self.more.iter().copied())
+  }
 }
 
 #[derive(Debug)]
@@ -73,8 +87,8 @@ impl InotifyBackend {
     self.wd_by_key.get(&key).copied()
   }
 
-  pub fn keys(&self, wd: i32) -> &[DirKey] {
-    self.keys_by_wd.get(&wd).map_or(&[], Vec::as_slice)
+  pub fn keys(&self, wd: i32) -> Vec<DirKey> {
+    self.keys_by_wd.get(&wd).into_iter().flat_map(Keys::iter).collect()
   }
 
   pub fn watch_count(&self) -> usize {
@@ -83,11 +97,19 @@ impl InotifyBackend {
 
   fn unbind(&mut self, key: DirKey) {
     let Some(wd) = self.wd_by_key.remove(&key) else { return };
-    let Some(keys) = self.keys_by_wd.get_mut(&wd) else { return };
-    keys.retain(|&other| other != key);
-    if keys.is_empty() {
-      self.keys_by_wd.remove(&wd);
+    let Entry::Occupied(mut keys) = self.keys_by_wd.entry(wd) else { return };
+    let Keys { first, more } = keys.get_mut();
+    if *first != key {
+      more.retain(|&other| other != key);
+    } else if let Some(next) = more.pop() {
+      *first = next;
+    } else {
+      keys.remove();
       ffi::remove_watch(&self.fds.inotify, wd);
+    }
+    if self.wd_by_key.len() < self.wd_by_key.capacity() / 4 {
+      self.wd_by_key.shrink_to_fit();
+      self.keys_by_wd.shrink_to_fit();
     }
   }
 }
@@ -105,7 +127,12 @@ impl Backend for InotifyBackend {
       Ok(wd) => {
         self.unbind(key);
         self.wd_by_key.insert(key, wd);
-        self.keys_by_wd.entry(wd).or_default().push(key);
+        match self.keys_by_wd.entry(wd) {
+          Entry::Occupied(mut keys) => keys.get_mut().more.push(key),
+          Entry::Vacant(free) => {
+            free.insert(Keys { first: key, more: Vec::new() });
+          }
+        }
         Coverage::Watched
       }
       Err(error) => {
@@ -129,7 +156,8 @@ impl Backend for InotifyBackend {
         continue;
       }
       if event.mask & WATCH_ENDED != 0 {
-        for key in self.keys_by_wd.remove(&event.wd).unwrap_or_default() {
+        let ended = self.keys_by_wd.remove(&event.wd);
+        for key in ended.iter().flat_map(Keys::iter) {
           self.wd_by_key.remove(&key);
           hint(Hint::Changed { dir: key, rel: Path::new("") });
         }
@@ -143,13 +171,11 @@ impl Backend for InotifyBackend {
       }
       let is_written = !is_dir && event.mask & NEW_CONTENT != 0;
       let rel = Path::new(OsStr::from_bytes(event.name));
-      for &key in keys {
-        if is_written {
-          hint(Hint::Written { dir: key, rel });
-        } else {
-          hint(Hint::Changed { dir: key, rel });
-        }
-      }
+      let mut tell = |dir: DirKey| {
+        hint(if is_written { Hint::Written { dir, rel } } else { Hint::Changed { dir, rel } });
+      };
+      tell(keys.first);
+      keys.more.iter().copied().for_each(tell);
     }
     let is_cut_off = !rest.is_empty();
     if is_cut_off {
