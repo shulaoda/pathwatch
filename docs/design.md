@@ -986,7 +986,10 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   - `Lost`: notifications were lost, and the backend cannot say where. Check everything.
 - `Sink` is the way from a backend thread into the engine. It never blocks. It hands over a
   `Signal`: `raw` a raw notification, for `translate` on the watcher thread, and `failed` the
-  word that the backend cannot go on. From then on the engine polls everything.
+  word that the backend cannot go on. From then on the engine polls everything, and it drops
+  the backend at once: its kernel watches, streams, handles and threads do not wait for the
+  end of the watcher. (An inotify watch counts against a limit that all programs of the user
+  share.)
 - `watch_limit(message)` makes the error for "the OS has no room for one more watch": an
   `io::Error` with a mark of its own inside, so that no error of the OS is taken for one. (The
   mark was the kind `StorageFull` before, which the OS gives too.) Its message names the limit

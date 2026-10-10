@@ -103,7 +103,8 @@ pub struct Output {
 
 /// Watches paths through a [`Backend`] and a disk ([`Fs`]), and turns hints into file events.
 pub struct Engine<B: Backend, F: Fs> {
-  backend: B,
+  /// `None`: the backend said that it cannot go on, and it was dropped. Every node is polled.
+  backend: Option<B>,
   fs: F,
   options: Options,
   /// What the engine knows about the disk, and the marks and scans that wait.
@@ -122,8 +123,6 @@ pub struct Engine<B: Backend, F: Fs> {
   rest_until: Option<Instant>,
   /// A loss report waits for the end of that rest.
   loss_waits: bool,
-  /// The backend said that it cannot go on. Every node is polled.
-  backend_failed: bool,
 
   // The running flush.
   /// Its time, as the caller gave it. `None` before the first flush.
@@ -166,7 +165,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut tree = Tree::new();
     tree.loose_spelling = options.loose_spelling;
     Self {
-      backend,
+      backend: Some(backend),
       fs,
       options,
       tree,
@@ -176,7 +175,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       hold_queue: VecDeque::new(),
       rest_until: None,
       loss_waits: false,
-      backend_failed: false,
       now: None,
       flush_time: SystemTime::UNIX_EPOCH,
       commit_took: Duration::ZERO,
@@ -233,10 +231,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     match signal {
       Signal::Raw(raw) => {
         let tree = &mut self.tree;
-        self.backend.translate(raw, &mut |hint| left_work |= tree.hint(hint));
+        if let Some(backend) = &mut self.backend {
+          backend.translate(raw, &mut |hint| left_work |= tree.hint(hint));
+        }
       }
       Signal::Failed(error) => {
-        left_work = !self.backend_failed;
+        left_work = self.backend.is_some();
         self.backend_died(&error);
       }
     }

@@ -576,7 +576,8 @@ fn a_poll_interval_of_zero() {
 
 /// The queue is bounded by the bytes that wait, not by a count. When too many bytes wait,
 /// signals are dropped, the backend thread is not held up, and the engine checks everything.
-/// The word that the backend died is not lost with them.
+/// The word that the backend died is not lost with them, and the dead backend is dropped at
+/// once: what it holds of the OS does not wait for the end of the watcher.
 #[test]
 fn the_queue_is_bounded_by_bytes() {
   const MIB: usize = 1 << 20;
@@ -650,6 +651,9 @@ fn the_queue_is_bounded_by_bytes() {
       _ => {}
     }
   }
+  // The backend held the other end of this channel.
+  assert_eq!(enter.recv_timeout(PATIENCE), Err(RecvTimeoutError::Disconnected));
+  drop(watcher);
 }
 
 /// A signal that is dropped while the watcher thread sleeps wakes it up. Nothing else is sent

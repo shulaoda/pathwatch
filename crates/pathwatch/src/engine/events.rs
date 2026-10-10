@@ -63,8 +63,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       // No OS watch covers it from now on. That is what the node says if its hold ends
       // without a look, because a node above is held too.
       *dir = Dir { watch: Watch::Polled, ..Dir::new(dir.id, dir.complete) };
-      if asked && !self.backend_failed {
-        self.backend.unwatch(key);
+      if asked {
+        self.unwatch_dir(key);
       }
     }
     self.tree.list_if_polled(key);

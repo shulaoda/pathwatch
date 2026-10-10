@@ -22,7 +22,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// when `force` says that the watch may be gone. `path` is the path of the directory.
   pub(super) fn arm(&mut self, key: DirKey, path: &mut PathBuf, force: bool) {
     let Some(asked) = self.tree[key].dir().map(|dir| dir.asked) else { return };
-    if self.backend_failed {
+    if self.backend.is_none() {
       return self.set_state(key, Watch::Polled);
     }
     // A watch above covers this directory, and the backend holds none for it.
@@ -51,7 +51,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// covers it. That happens when the path above was watched later.
   pub(super) fn has_a_watch_to_give_back(&self, key: DirKey) -> bool {
     let has_its_own = self.tree[key].dir().is_some_and(|dir| dir.asked.is_some());
-    has_its_own && !self.backend_failed && self.is_covered_from_above(key)
+    has_its_own && self.backend.is_some() && self.is_covered_from_above(key)
   }
 
   /// Gives back the watch of each directory on the list `covered`. The commit is done, so the
@@ -67,7 +67,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         continue;
       }
       if self.has_a_watch_to_give_back(key) {
-        self.backend.unwatch(key);
+        self.unwatch_dir(key);
         if let Some(dir) = self.tree[key].dir_mut() {
           dir.asked = None;
         }
@@ -87,7 +87,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if let Some(dir) = self.tree[key].dir_mut() {
       dir.asked = Some(want);
     }
-    let answer = self.backend.watch(key, path, want);
+    let answer = self.watch_dir(key, path, want);
     self.set_watch(key, answer, path);
     // What happened while no watch covered the directory is found by a scan after the commit.
     // No hint and maybe no poll comes for it now.
@@ -116,7 +116,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.tree.want(key) != Some(Want::Names) {
       return false;
     }
-    self.backend.unwatch(key);
+    self.unwatch_dir(key);
     if let Some(dir) = self.tree[key].dir_mut() {
       dir.asked = None;
     }
@@ -155,12 +155,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// Makes the watches asked for since the last commit live. Gives the directories that the
   /// backend did not watch and that it reports now (see `ask_again`).
   pub(super) fn commit(&mut self) -> Vec<DirKey> {
-    if self.backend_failed {
+    let Some(backend) = &mut self.backend else {
       self.covered.clear();
       return Vec::new();
-    }
+    };
     let started = self.fs.now();
-    let committed = self.backend.commit();
+    let committed = backend.commit();
     // Making watches live can take long: a new stream of FSEvents takes a quarter of a
     // second. That is paid once, not for every look at the disk, so the pacing leaves it out.
     self.commit_took += self.fs.now().duration_since(started).unwrap_or_default();
@@ -200,7 +200,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let Some(dir) = self.tree.get(key).and_then(Node::dir) else { continue };
       let (Watch::Polled, Some(want)) = (dir.watch, dir.asked) else { continue };
       let path = self.tree.path(key);
-      let answer = self.backend.watch(key, &path, want);
+      let answer = self.watch_dir(key, &path, want);
       // Still not watched: nothing changed, and the poll goes on.
       if matches!(answer, Coverage::NotWatched) {
         continue;
@@ -356,12 +356,24 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// The backend cannot go on: one error, and from now on every node is polled.
+  /// What the backend answers for the directory `key`. A backend that is gone watches nothing.
+  fn watch_dir(&mut self, key: DirKey, path: &Path, want: Want) -> Coverage {
+    let backend = self.backend.as_mut();
+    backend.map_or(Coverage::NotWatched, |backend| backend.watch(key, path, want))
+  }
+
+  pub(super) fn unwatch_dir(&mut self, key: DirKey) {
+    if let Some(backend) = &mut self.backend {
+      backend.unwatch(key);
+    }
+  }
+
+  /// The backend cannot go on: one error, and from now on every node is polled. The backend
+  /// is dropped, so what it holds of the OS is given back at once.
   pub(super) fn backend_died(&mut self, error: &io::Error) {
-    if self.backend_failed {
+    if self.backend.take().is_none() {
       return;
     }
-    self.backend_failed = true;
     let error = context("the OS watcher stopped, so every path is polled", error);
     self.report(ErrorKind::Io, None, Some(error));
     self.tree.poll_all();

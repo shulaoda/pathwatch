@@ -246,8 +246,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let Kind::Dir(dir) = node.kind else { return };
     node.kind = Kind::Missing;
     self.tree.unhold(key);
-    if dir.asked.is_some() && !self.backend_failed {
-      self.backend.unwatch(key);
+    if dir.asked.is_some() {
+      self.unwatch_dir(key);
     }
 
     let children: Vec<DirKey> = self.tree.children(key).collect();
