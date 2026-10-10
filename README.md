@@ -238,7 +238,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 | Windows | `ReadDirectoryChangesW` | Tested on Windows 11 with NTFS only (`docs/windows-open-points.md`). At most 64 handles; more directories share a handle on a directory above them. No handle is put on `C:\`, `C:\Users` or `C:\Users\<name>`: what could only be watched from there is polled. |
 | every other target | none: always polling | The cost grows with the number of watched files. |
 
-Rust 1.88 or newer.
+The Rust toolchain is the one in `rust-toolchain.toml`.
 
 ## The repository
 
@@ -327,9 +327,8 @@ cargo test -p pathwatch --test fsevents -- --ignored failed_start
 unshare -Ur sh -c 'echo 8 > /proc/sys/user/max_inotify_watches &&
   cargo test -p pathwatch --test inotify -- --ignored'
 
-# Lints, the docs, and the oldest Rust.
+# Lints and the docs.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc -p pathwatch --no-deps
-cargo +1.88 check --workspace --all-targets
 ```

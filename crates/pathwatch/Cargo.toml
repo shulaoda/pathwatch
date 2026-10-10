@@ -3,7 +3,6 @@ name = "pathwatch"
 description = "Watch paths and get file events: create, update, delete"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 readme = "../../README.md"
 keywords = ["watch", "watcher", "filesystem", "events"]

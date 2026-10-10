@@ -34,14 +34,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --no-fail-fast
 
-  # The oldest Rust that the crate says it builds with (`rust-version` in `Cargo.toml`).
-  msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - run: rustup toolchain install 1.88 --profile minimal
-      - run: cargo +1.88 check --workspace --all-targets
-
   wasi:
     runs-on: ubuntu-latest
     steps:
