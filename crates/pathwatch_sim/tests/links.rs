@@ -247,6 +247,29 @@ fn a_linked_directory_inside_a_covered_tree() {
   }
 }
 
+/// A link leads into a watched tree, so the stream of the tree reports the directory behind the
+/// link too, by its real path. A directory above that one is renamed away and back before a
+/// poll, with an edit below it meanwhile. The poll finds the link as it was, and no node on the
+/// way to the watched file is the renamed directory. But the stream told about that directory,
+/// and the path behind the link stood below it: everything behind the link is scanned again.
+#[test]
+fn a_directory_above_the_one_behind_a_link_is_away_and_back() {
+  let mut d = driver(Mode::Prefix);
+  d.fs.mkdir_all("/t/a/real/sub").unwrap();
+  d.fs.write("/t/a/real/sub/g.js", "1").unwrap();
+  d.fs.symlink("/t/a/real", "/l").unwrap();
+  d.watch(&["/t"]);
+  d.watch(&["/l/sub/g.js"]);
+  assert_eq!(settled(&mut d), NONE);
+
+  d.fs.rename("/t/a", "/t/x").unwrap();
+  d.fs.write("/t/x/real/sub/g.js", "22").unwrap();
+  d.fs.rename("/t/x", "/t/a").unwrap();
+  flush(&mut d);
+  assert_eq!(taken(&mut d), ["U /l/sub/g.js", "U /t/a/real/sub/g.js"]);
+  caught_up(&mut d);
+}
+
 /// A link inside a watched directory is a file entry. `rm` and `ln -s` in the same tick of
 /// the file system clock give the new link the inode number, the time and (with a target of
 /// the same length) the size of the old one. A link is never opened, so no hash can tell.

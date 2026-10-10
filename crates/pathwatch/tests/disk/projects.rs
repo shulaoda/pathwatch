@@ -158,6 +158,56 @@ fn a_directory_is_moved_away_changed_and_moved_back() {
   });
 }
 
+/// The same with a directory above the watched path. A watch of macOS stands at the path below
+/// it and hears nothing while the directory is away, and it says nothing about the two
+/// renames: the watcher has to be told about them in another way.
+#[cfg(unix)]
+#[test]
+fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
+  each_backend(|w| {
+    w.write("r/x/a/changes.js", "1");
+    w.write("r/x/a/goes.js", "1");
+    w.watch(&["r/x/a"]);
+
+    w.rename("r/x", "r/away");
+    w.write("r/away/a/changes.js", "22");
+    w.remove("r/away/a/goes.js");
+    w.write("r/away/a/comes.js", "1");
+    w.rename("r/away", "r/x");
+    w.expect(&[
+      (Delete, "r/x/a/goes.js"),
+      (Create, "r/x/a/comes.js"),
+      (Update, "r/x/a/changes.js"),
+    ]);
+  });
+}
+
+/// The same with a directory above the target of a link. The watched path goes through the
+/// link, so no directory on the way to it is renamed: the one that is away and back is on the
+/// real path, where the watch of macOS stands.
+#[cfg(unix)]
+#[test]
+fn a_directory_above_the_target_of_a_link_is_moved_away_changed_and_moved_back() {
+  each_backend(|w| {
+    w.write("store/x/real/changes.js", "1");
+    w.write("store/x/real/goes.js", "1");
+    w.mkdir("r");
+    std::os::unix::fs::symlink(w.path("store/x/real"), w.path("r/link")).unwrap();
+    w.watch(&["r/link"]);
+
+    w.rename("store/x", "store/away");
+    w.write("store/away/real/changes.js", "22");
+    w.remove("store/away/real/goes.js");
+    w.write("store/away/real/comes.js", "1");
+    w.rename("store/away", "store/x");
+    w.expect(&[
+      (Delete, "r/link/goes.js"),
+      (Create, "r/link/comes.js"),
+      (Update, "r/link/changes.js"),
+    ]);
+  });
+}
+
 #[test]
 #[expect(clippy::print_stderr, reason = "the test tells how long the batch took")]
 fn a_big_batch_of_single_files() {

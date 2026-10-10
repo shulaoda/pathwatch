@@ -20,7 +20,7 @@ use std::{
   time::{Duration, Instant, SystemTime},
 };
 
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 
 use self::{check::Listed, scan::ScanEntry};
 pub use crate::tree::Fingerprint;
@@ -31,7 +31,7 @@ use crate::{
   event::Event,
   fs::Fs,
   path::normalize,
-  tree::{Depth, Node, Tree, emptied},
+  tree::{Depth, KEPT, Node, Tree, emptied},
 };
 
 /// While hints keep coming, the disk is still checked this often, or every four quiet times if
@@ -140,8 +140,9 @@ pub struct Engine<B: Backend, F: Fs> {
   /// The directories that give the watch of their own back after the next commit: a watch
   /// above covers them (see `still_there`).
   covered: Vec<DirKey>,
-  /// With loose spelling: the nodes that the listing of the running scan named.
-  listed: FxHashSet<DirKey>,
+  /// With loose spelling: the nodes that the listing of the running scan named, each with what
+  /// the listing gave of it.
+  listed: FxHashMap<DirKey, Listed>,
   /// A read of the disk failed during the running scan.
   scan_had_error: bool,
 
@@ -182,7 +183,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       touched: Vec::new(),
       dropped: Vec::new(),
       covered: Vec::new(),
-      listed: FxHashSet::default(),
+      listed: FxHashMap::default(),
       scan_had_error: false,
       path: PathBuf::new(),
       marks: Vec::new(),
@@ -327,6 +328,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.round(&mut path, &mut names);
     }
     (self.path, self.names) = (path, emptied(names));
+    // As `emptied` does for a list: the listing of a big directory is not kept for ever.
+    self.listed.clear();
+    self.listed.shrink_to(KEPT / size_of::<ScanEntry>());
 
     let took = self.fs.now().duration_since(self.flush_time).unwrap_or_default();
     let mut took = took.saturating_sub(self.commit_took);

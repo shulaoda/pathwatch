@@ -166,6 +166,7 @@ enum Target {
 
 /// How the simulated disk behaves.
 #[derive(Clone, Debug)]
+#[expect(clippy::struct_excessive_bools, reason = "each one is a switch of the disk")]
 struct DiskConfig {
   /// How coarse modification times are. Never above two seconds: beyond that the design does
   /// not promise to see a second write of the same size. And a step that leaves a part of a
@@ -175,6 +176,7 @@ struct DiskConfig {
   birth_times: bool,
   reuse_inode_numbers: bool,
   listing_kinds: bool,
+  listing_meta: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -233,6 +235,7 @@ impl Config {
         birth_times: random.chance(40),
         reuse_inode_numbers: !random.chance(15),
         listing_kinds: !random.chance(20),
+        listing_meta: random.chance(40),
       },
       shortest_path: random.pick(&[1, 2, 2, 3, 3]),
       steps,
@@ -630,28 +633,24 @@ fn is_directory(fs: &SimFs, followed: &BTreeSet<PathBuf>, path: &Path) -> bool {
   meta.is_ok_and(|meta| meta.kind == FileType::Dir)
 }
 
-/// For every path on the way to a watched path: the directory it leads to now, and whether only
-/// the poll finds out for the prefix backend when that changes. A stream reports what happens
-/// at and below a watched directory, and below the directory that holds a watched path with a
-/// file or nothing at it, by real path. It says nothing about the directories above that one,
-/// and nothing about a path that is reached through a link.
+/// For every path on the way to a watched path: the directory it leads to now, and whether a
+/// poll has to look before the disk changes again, for the prefix backend, when that changes.
+/// A stream reports what happens at and below a watched directory, and below the directory
+/// that holds a watched path with a file or nothing at it, by real path. It ends when a
+/// directory above that one is renamed or removed, and says so. Nothing tells about a path
+/// that is reached through a link.
 fn ways(
   fs: &SimFs,
   watched: &BTreeSet<PathBuf>,
 ) -> BTreeMap<PathBuf, (Option<(u64, PathBuf)>, bool)> {
-  let mut covers: Vec<&Path> = Vec::new();
-  for path in watched {
-    covers.extend(if fs.dir_object(path).is_some() { Some(path.as_path()) } else { path.parent() });
-  }
   let mut ways = BTreeMap::new();
   for path in followed(watched) {
     if path.parent().is_none() {
       continue;
     }
     let linked = path.ancestors().any(|above| fs.read_link(above).is_some());
-    let covered = covers.iter().any(|cover| path.starts_with(cover));
     let object = fs.dir_object(&path);
-    ways.insert(path, (object, linked || !covered));
+    ways.insert(path, (object, linked));
   }
   ways
 }
@@ -832,6 +831,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     fs.set_birth_times(config.disk.birth_times);
     fs.set_reuse_inode_numbers(config.disk.reuse_inode_numbers);
     fs.set_listing_kinds(config.disk.listing_kinds);
+    fs.set_listing_meta(config.disk.listing_meta);
     fs.set_ignore_case(config.ignore_case);
     if config.mount {
       fs.set_mount("b");
@@ -979,11 +979,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
         }
         ToWatch::Bad(path) => ((*path).to_owned(), false),
       };
-      // Not with the backend that watches by path. A change at a watched path in upper case
-      // can give a directory at or above it another spelling, and such a watch does not hear
-      // that: a known hole (`docs/design.md` 9). The tests on the real disk cover watched
-      // paths in another spelling for FSEvents.
-      let respell = valid && self.config.folds() && !self.shared.watch_moves;
+      let respell = valid && self.config.folds();
       let text = if respell { self.in_the_way_of_a_caller(&text) } else { text };
       // A path that the filter ignores for both kinds does not become a watched path.
       let filter = self.config.filter;

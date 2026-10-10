@@ -1135,6 +1135,30 @@ fn a_watched_file_below_an_ignored_directory() {
   }
 }
 
+/// A watched file below an ignored directory, and that directory goes: the directory above is
+/// replaced by another one, which has none. The watched path stays: its watch target is the
+/// directory further up now. The look at the names below the ignored directory can come before
+/// the look that finds it gone, because the new directory above is watched first and its scan
+/// waits one round.
+#[test]
+fn a_watched_path_below_an_ignored_directory_that_went_is_not_dropped() {
+  on_all(&ignore_node_modules(), |d, on| {
+    d.fs().mkdir_all("/a/p/node_modules/foo").unwrap();
+    d.fs().write("/a/p/node_modules/foo/index.js", "1").unwrap();
+    assert_eq!(d.watch(&["/a/p"]), NONE, "{on}");
+    assert_eq!(d.watch(&["/a/p/node_modules/foo/index.js"]), NONE, "{on}");
+    assert_eq!(d.settled(), NONE, "{on}");
+
+    d.fs().rename("/a/p", "/a/old").unwrap();
+    d.fs().mkdir("/a/p").unwrap();
+    assert_eq!(d.settled(), ["D /a/p/node_modules/foo/index.js"], "{on}");
+    d.fs().mkdir_all("/a/p/node_modules/foo").unwrap();
+    d.fs().write("/a/p/node_modules/foo/index.js", "22").unwrap();
+    assert_eq!(d.settled(), ["C /a/p/node_modules/foo/index.js"], "{on}");
+    d.caught_up();
+  });
+}
+
 /// (i): an ignored directory gets no node, no watch and no listing. A watched file below it
 /// works through partial nodes.
 #[test]

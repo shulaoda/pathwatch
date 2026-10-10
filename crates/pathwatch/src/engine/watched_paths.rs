@@ -9,7 +9,7 @@ use crate::{
   config::EntryKind,
   fs::Fs,
   path::split_top,
-  tree::{Added, Kind, Mark, Tree},
+  tree::{Added, Kind, Mark, Spelling, Tree},
 };
 
 /// A path becomes a watched path, and what the call finds is its baseline.
@@ -257,7 +257,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     match &mut node.kind {
       Kind::Missing => return,
       Kind::File(_) => return self.forget_file(key),
-      Kind::Dir(dir) => dir.complete = false,
+      // Nothing is asked in a partial directory, so nothing would take a wrong proof back.
+      Kind::Dir(dir) => (dir.complete, dir.spelling) = (false, Spelling::Unknown),
     }
     if stays {
       // Before the directories below, so that they know of the deep scan that comes from

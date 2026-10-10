@@ -13,7 +13,7 @@ use std::{
 use pathwatch::{
   backend::{DirKey, Hint, Want},
   fs::DirId,
-  tree::{Content, Depth, Dir, DirTimes, Fingerprint, Kind, Mark, Spelling, Tree, Watch},
+  tree::{Content, Depth, Dir, Fingerprint, Kind, Mark, Spelling, Tree, Watch},
 };
 
 fn child(tree: &mut Tree, parent: DirKey, name: &str) -> DirKey {
@@ -642,27 +642,6 @@ fn a_name_that_can_be_another_spelling() {
   f.tree.take_scans(&mut scans);
   assert_eq!(scans, []);
   assert!(!f.tree.has_other_spelling(f.tree.child(f.r, OsStr::new("\u{4e2d}.js")).unwrap()));
-}
-
-#[test]
-fn the_times_of_a_directory() {
-  let Fixture { mut tree, r, sub, .. } = fixture();
-  let at = |seconds: i64| seconds * 1_000_000_000;
-  let (old, new) =
-    (DirTimes { changed: at(1), modified: at(1) }, DirTimes { changed: at(2), modified: at(1) });
-  assert_eq!(tree.set_times(r, None), None);
-  assert_eq!(tree.set_times(r, Some(old)), None);
-  assert_eq!(tree.set_times(sub, Some(old)), None);
-  assert_eq!(tree.set_times(r, Some(new)), Some(old));
-  assert_eq!(tree.set_times(r, None), Some(new));
-  assert_eq!(tree.set_times(r, None), None);
-  tree.check_links().unwrap();
-  // They go with the node.
-  tree[sub].kind = Kind::Missing;
-  assert!(tree.check_links().is_err());
-  tree.prune(sub);
-  assert!(tree.get(sub).is_none());
-  tree.check_links().unwrap();
 }
 
 #[test]

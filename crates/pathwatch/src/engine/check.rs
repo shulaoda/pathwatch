@@ -6,7 +6,7 @@ use std::{
   hash::{Hash, Hasher},
   io, mem,
   path::{Path, PathBuf},
-  time::{Duration, SystemTime},
+  time::Duration,
 };
 
 use rustc_hash::FxHasher;
@@ -16,8 +16,8 @@ use crate::{
   backend::{Backend, DirKey, Want},
   config::EntryKind,
   error::ErrorKind,
-  fs::{DirId, FileType, Fs, Meta},
-  tree::{Added, Content, Depth, DirTimes, Fingerprint, Kind, Mark, Spelling, Tree, Watch},
+  fs::{DirId, Entry, FileType, Fs, Meta},
+  tree::{Added, Content, Depth, Fingerprint, Kind, Mark, Spelling, Watch, nanos},
 };
 
 /// How long a file is young: two writes inside this time can leave the same modification time.
@@ -36,10 +36,9 @@ pub(super) enum Found {
   /// entry with the name of the node. A second look would say the same, so what the tree has
   /// here is gone at once.
   OtherSpelling(OsString),
-  File(Meta),
+  File(FileType, Fingerprint),
   Dir {
     id: DirId,
-    times: DirTimes,
     complete: bool,
     /// The name is a link now and was none at the last check, or the other way around, or the
     /// link leads to another real path. The directory can be the same one all the same.
@@ -54,10 +53,30 @@ pub(super) enum Found {
 pub(super) enum Listed {
   /// Nothing: the check comes from a mark, or the directory was not listed.
   NotAsked,
-  /// The listing named the entry, with its type if a listing gives one.
+  /// The listing named the entry, with its kind if a listing gives one.
   Named(Option<FileType>),
+  /// The listing named the entry, a regular file, with all that a look at it reads.
+  File(Fingerprint),
   /// The whole directory was listed, and the entry was not named.
   NotNamed,
+}
+
+impl Listed {
+  pub(super) fn is_named(self) -> bool {
+    matches!(self, Self::Named(_) | Self::File(_))
+  }
+}
+
+impl From<Entry> for Listed {
+  fn from(entry: Entry) -> Self {
+    match entry {
+      Entry::Name => Self::Named(None),
+      Entry::Kind(kind) => Self::Named(Some(kind)),
+      Entry::File { modified, size, file_id } => {
+        Self::File(Fingerprint { modified: nanos(modified), size, id: file_id })
+      }
+    }
+  }
 }
 
 /// What the tree had at a node before the check, also while the node is held.
@@ -91,10 +110,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let found = self.read_entry(parent, key, path, listed);
     // A registered name with a file or nothing at it is served by the watch of the directory
     // above: that one is its watch target. If the filter ignores the target, the watched
-    // paths at the name and below it are dropped when the flush ends.
+    // paths at the name and below it are dropped when the flush ends. The target is asked
+    // from the disk: this look can come before the one that finds the directory gone, and
+    // then the target is a directory further up.
     if registered
-      && matches!(found, Found::Missing | Found::File(_))
+      && matches!(found, Found::Missing | Found::File(..))
       && self.is_ignored_target(parent)
+      && self.is_on_disk(parent, path)
     {
       self.dropped.push(key);
       path.pop();
@@ -152,31 +174,26 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       (Found::Missing, Had::File | Had::Dir { .. }) => self.missing(key),
       (Found::OtherSpelling(_), _) => self.gone(key),
 
-      (Found::File(meta), Had::File | Had::Nothing) => {
-        self.store_file(key, path, &meta, why.written);
+      (Found::File(kind, file), Had::File | Had::Nothing) => {
+        self.store_file(key, path, kind, file, why.written);
       }
-      (Found::File(meta), Had::Dir { .. }) => {
+      (Found::File(kind, file), Had::Dir { .. }) => {
         // A change of kind is never an `Update`: the files below are gone.
         self.vanish(key);
-        self.store_file(key, path, &meta, why.written);
+        self.store_file(key, path, kind, file, why.written);
       }
 
-      (Found::Dir { id, times, complete, relinked }, Had::Nothing) => {
+      (Found::Dir { id, complete, relinked }, Had::Nothing) => {
         let baseline = self.is_baseline_dir(key, relinked);
         self.appear(key, path, id, complete, baseline);
-        self.was_renamed(key, times);
       }
-      (Found::Dir { id, times, complete, relinked }, Had::File) => {
+      (Found::Dir { id, complete, relinked }, Had::File) => {
         let baseline = self.is_baseline_dir(key, relinked);
         // A change of kind is never an `Update`: the file is gone.
         self.forget_file(key);
         self.appear(key, path, id, complete, baseline);
-        self.was_renamed(key, times);
       }
-      (
-        Found::Dir { id, times, complete, relinked },
-        Had::Dir { id: old, complete: was_complete },
-      ) => {
+      (Found::Dir { id, complete, relinked }, Had::Dir { id: old, complete: was_complete }) => {
         let was_held = self.tree[key].is_held();
         if was_held {
           self.tree.unhold(key);
@@ -199,8 +216,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           self.tree[key].set_baseline(true);
         }
         // Watch it again and scan it deep when nothing tells what happened in it meanwhile:
-        // it was away (held, or renamed), it is another directory, or its link changed.
-        let moved = self.was_renamed(key, times) || was_held || id != old || relinked;
+        // it was away (held), it is another directory, or its link changed.
+        let moved = was_held || id != old || relinked;
         self.still_there(key, path, why.deep || moved);
       }
     }
@@ -235,17 +252,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         return if self.tracks_every_entry(parent) { Found::Unknown } else { Found::Missing };
       }
       // Asked before the `lstat`, so that an ignored entry costs no system call.
-      if let Listed::Named(Some(kind)) = listed
-        && self.ignores(key, path, entry_kind(kind))
-      {
+      let kind = match listed {
+        Listed::Named(kind) => kind,
+        Listed::File(_) => Some(FileType::File),
+        Listed::NotAsked | Listed::NotNamed => None,
+      };
+      if kind.is_some_and(|kind| self.ignores(key, path, entry_kind(kind))) {
         return Found::Missing;
       }
     }
 
-    let mut meta = match self.fs.lstat(path) {
-      Ok(meta) => meta,
-      Err(error) => return self.disk_error(parent, path, error),
-    };
     // In a directory that was proved strict, only a second name in another case of its
     // letters puts the proof in doubt: one that the tree has now, or one that it had when
     // this look was asked for (`check` gives `NotNamed` then).
@@ -255,6 +271,17 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       } else {
         self.tree.has_case_twin(key) || matches!(listed, Listed::NotNamed)
       };
+    // The listing told all of the file, and nothing else is to ask about its name.
+    if let Listed::File(file) = listed
+      && !registered
+      && !unsure
+    {
+      return Found::File(FileType::File, file);
+    }
+    let mut meta = match self.fs.lstat(path) {
+      Ok(meta) => meta,
+      Err(error) => return self.disk_error(parent, path, error),
+    };
     // A registered name is the path that its caller gave. It is also an entry of the complete
     // directory above only if that directory lists it under this very name. That is asked
     // about the entry itself, so before a link is followed.
@@ -299,10 +326,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let found = match kind {
       // A directory on the way to a watched path is never filtered.
       EntryKind::Dir if is_ancestor || visible => {
-        let times = DirTimes::of(&meta);
-        Found::Dir { id: meta.dir_id, times, complete: visible, relinked }
+        Found::Dir { id: meta.dir_id, complete: visible, relinked }
       }
-      EntryKind::File if visible => Found::File(meta),
+      EntryKind::File if visible => Found::File(meta.kind, Fingerprint::of(&meta)),
       _ => return other.map_or(Found::Missing, Found::OtherSpelling),
     };
     // A name that is not registered is asked after the filter: an ignored entry costs no
@@ -411,7 +437,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   fn spelling_is_unsure(&self, key: DirKey, listed: Listed) -> bool {
     let node = &self.tree[key];
     let was_entry = match listed {
-      Listed::Named(_) => return false,
+      Listed::Named(_) | Listed::File(_) => return false,
       Listed::NotNamed => false,
       Listed::NotAsked => node.is_entry(),
     };
@@ -449,20 +475,26 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Stores the file that is at the node `key`, and notes what that means for the handler.
-  fn store_file(&mut self, key: DirKey, path: &Path, meta: &Meta, written: bool) {
-    let fingerprint = Fingerprint::of(meta);
+  fn store_file(
+    &mut self,
+    key: DirKey,
+    path: &Path,
+    kind: FileType,
+    fingerprint: Fingerprint,
+    written: bool,
+  ) {
     // What the tree has of the file. A held node still has it.
     let old = match self.tree[key].kind {
       Kind::File(old) => Some((old, self.tree.content(key))),
       _ => None,
     };
-    let young = meta.kind != FileType::Other && self.is_young(key, meta.modified);
+    let young = kind != FileType::Other && self.is_young(key, fingerprint.modified);
     // A stored hash is compared one last time when the file is not young any more.
     let compare = old.is_some_and(|(old, content)| {
       old == fingerprint && matches!(content, Some(Content::Hash(_)))
     });
     let hash = if young || compare {
-      match self.content_hash(path, meta) {
+      match self.content_hash(path, kind, fingerprint.size) {
         Ok(hash) => hash,
         // The entry went away after the `lstat`, or it is of another kind now. This check
         // says nothing, and the next flush looks again.
@@ -518,9 +550,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// A hash of what can be compared of the entry at `path`: the content of a regular file
   /// that is not too big, or the target of a link (a link is never opened). `None`: there is
   /// nothing to compare.
-  fn content_hash(&self, path: &Path, meta: &Meta) -> io::Result<Option<u64>> {
-    match meta.kind {
-      FileType::File if meta.size <= HASH_LIMIT => self.fs.hash(path).map(Some),
+  fn content_hash(&self, path: &Path, kind: FileType, size: u64) -> io::Result<Option<u64>> {
+    match kind {
+      FileType::File if size <= HASH_LIMIT => self.fs.hash(path).map(Some),
       FileType::Symlink => self.fs.link_target(path).map(|target| Some(hash_of(&target))),
       _ => Ok(None),
     }
@@ -531,34 +563,25 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   ///
   /// The long time is for a time stamp in whole seconds, and for a file that only the poll
   /// looks at: it has no "written" hint to make up for a wrong guess.
-  fn is_young(&self, key: DirKey, modified: SystemTime) -> bool {
-    // A time in the future: the file is as young as can be.
-    let Ok(age) = self.flush_time.duration_since(modified) else { return true };
-    if age < YOUNG {
+  fn is_young(&self, key: DirKey, modified: i64) -> bool {
+    // Below zero for a time in the future: the file is as young as can be.
+    let age = nanos(self.flush_time).saturating_sub(modified);
+    if age < nanos_of(YOUNG) {
       return true;
     }
-    if age >= YOUNG_COARSE {
+    if age >= nanos_of(YOUNG_COARSE) {
       return false;
     }
-    let whole_seconds =
-      modified.duration_since(SystemTime::UNIX_EPOCH).is_ok_and(|time| time.subsec_nanos() == 0);
+    let whole_seconds = modified >= 0 && modified % nanos_of(Duration::from_secs(1)) == 0;
     whole_seconds || self.only_polled(key)
   }
 
-  /// Keeps the times of the directory at the node `key` when nothing but a poll tells that
-  /// the directory itself was renamed. Says whether the times tell so: the change time moved
-  /// since the last look, and the modification time did not. A directory that was renamed
-  /// away and back is the same one, but a watch by path below it heard nothing meanwhile.
-  fn was_renamed(&mut self, key: DirKey, times: DirTimes) -> bool {
-    // A top directory does not move. For every other one the times are kept from its first
-    // look on, also before any watch stands below it: the first watch can come later in the
-    // same flush, and a rename right after that must not be missed.
-    let moves = self.tree.parent(key) != Some(Tree::ROOT);
-    let new = (moves && self.only_polled(key)).then_some(times);
-    let old = self.tree.set_times(key, new);
-    old
-      .zip(new)
-      .is_some_and(|(old, new)| old.changed != new.changed && old.modified == new.modified)
+  /// Whether the directory that the tree has at the node `key` is on disk now. `path` is the
+  /// path of a name in it.
+  fn is_on_disk(&self, key: DirKey, path: &Path) -> bool {
+    let id = self.tree[key].dir().map(|dir| dir.id);
+    let now = path.parent().and_then(|dir| self.fs.stat(dir).ok());
+    now.is_some_and(|now| now.kind == FileType::Dir && Some(now.dir_id) == id)
   }
 
   /// Whether no OS watch tells about the entry at the node `key`: its directory is polled, or
@@ -588,6 +611,10 @@ pub(super) fn is_missing(error: &io::Error) -> bool {
       | io::ErrorKind::InvalidFilename
       | io::ErrorKind::InvalidInput
   )
+}
+
+fn nanos_of(time: Duration) -> i64 {
+  i64::try_from(time.as_nanos()).unwrap_or(i64::MAX)
 }
 
 fn hash_of(path: &Path) -> u64 {

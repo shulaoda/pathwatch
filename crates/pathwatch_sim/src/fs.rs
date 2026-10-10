@@ -13,7 +13,7 @@ use std::{
 
 use pathwatch::{
   backend::{DirKey, Want},
-  fs::{DirId, FileType, Fs, Meta},
+  fs::{DirId, Entry, FileType, Fs, Meta},
 };
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
@@ -51,6 +51,7 @@ impl SimFs {
       clock: 1_000_000_000_000_000_000,
       step: 1,
       listing_kinds: true,
+      listing_meta: false,
       ignore_case: false,
       mount: None,
       other_rule: FxHashSet::default(),
@@ -190,6 +191,9 @@ impl SimFs {
     }
     state.entries_mut(from_dir).remove(from_name);
     state.touch(from_dir);
+    if is_dir {
+      state.kernel.dir_moved(id);
+    }
     state.notify(from_dir, said(from.as_ref(), from_name), Act::MoveFrom, is_dir);
     state.entries_mut(to_dir).insert(to_name.to_owned(), id);
     state.touch(to_dir);
@@ -296,6 +300,12 @@ impl SimFs {
   /// Whether a listing tells the kind of each entry. On by default.
   pub fn set_listing_kinds(&self, kinds: bool) {
     self.lock().listing_kinds = kinds;
+  }
+
+  /// Whether a listing tells of each regular file all that `lstat` tells, as on APFS. Off by
+  /// default.
+  pub fn set_listing_meta(&self, meta: bool) {
+    self.lock().listing_meta = meta;
   }
 
   /// Whether names that differ only in the case of ASCII letters are one name, as on the
@@ -454,7 +464,7 @@ impl Fs for SimFs {
     state.look_up(path, true).map(|id| state.meta(id))
   }
 
-  fn read_dir(&self, dir: &Path, each: &mut dyn FnMut(&OsStr, Option<FileType>)) -> io::Result<()> {
+  fn read_dir(&self, dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()> {
     self.enter(|calls| calls.read_dir += 1);
     let state = self.lock();
     let id = state.look_up(dir, true)?;
@@ -463,7 +473,17 @@ impl Fs for SimFs {
       return Err(error(io::ErrorKind::PermissionDenied));
     }
     for (name, child) in entries {
-      each(name, state.listing_kinds.then(|| state.meta(*child).kind));
+      let meta = state.meta(*child);
+      each(
+        name,
+        if state.listing_meta && meta.kind == FileType::File {
+          Entry::File { modified: meta.modified, size: meta.size, file_id: meta.file_id }
+        } else if state.listing_kinds {
+          Entry::Kind(meta.kind)
+        } else {
+          Entry::Name
+        },
+      );
     }
     Ok(())
   }
@@ -562,6 +582,8 @@ pub(crate) struct State {
   step: u64,
   /// A listing tells the kind of each entry.
   listing_kinds: bool,
+  /// A listing tells of each regular file all that `lstat` tells.
+  listing_meta: bool,
   /// Names that differ only in the case of ASCII letters are one name.
   ignore_case: bool,
   /// `SimFs::set_mount`.
@@ -586,6 +608,17 @@ pub(crate) struct State {
 impl State {
   fn stamp(&self) -> u64 {
     self.clock / self.step * self.step
+  }
+
+  /// The directories at and above `path`, if `path` is the real path of what is at it: no
+  /// link on the way, and every name as the disk spells it.
+  pub(crate) fn chain(&self, path: &Path) -> Option<Vec<u64>> {
+    let id = self.resolve(path, false).ok().filter(|id| self.real_path(*id) == path)?;
+    let mut chain = vec![id];
+    while let Some(&last) = chain.last().filter(|&&last| last != ROOT) {
+      chain.push(self.inodes[&last].parent);
+    }
+    Some(chain)
   }
 
   fn entries(&self, dir: u64) -> io::Result<&BTreeMap<OsString, u64>> {
@@ -805,7 +838,7 @@ impl State {
       Some(Mode::Inode) => self.kernel.by_inode(dir, name, act, is_dir),
       Some(Mode::Prefix) => {
         let real = self.real_path(dir).join(name);
-        self.kernel.by_prefix(&real);
+        self.kernel.by_prefix(&real, act, is_dir);
       }
       Some(Mode::Handle) => {
         // A handle reports everything below its directory, with the path from there.

@@ -22,7 +22,7 @@ use pathwatch::{
   EventKind,
   backend::{Backend, Coverage, DirKey, Hint, Signal, Want},
   engine::{Engine, Ignored, Options, Output},
-  fs::{FileType, Fs, Meta},
+  fs::{Entry, Fs, Meta},
   poll::PollBackend,
 };
 use pathwatch_sim::{Mode, SimBackend, SimFs};
@@ -133,13 +133,13 @@ impl Fs for Timed<SimFs> {
     timed(&self.outside, || self.inner.stat(path))
   }
 
-  fn read_dir(&self, dir: &Path, each: &mut dyn FnMut(&OsStr, Option<FileType>)) -> io::Result<()> {
-    let mut entries: Vec<(OsString, Option<FileType>)> = Vec::new();
+  fn read_dir(&self, dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()> {
+    let mut entries: Vec<(OsString, Entry)> = Vec::new();
     let result = timed(&self.outside, || {
-      self.inner.read_dir(dir, &mut |name, kind| entries.push((name.to_owned(), kind)))
+      self.inner.read_dir(dir, &mut |name, entry| entries.push((name.to_owned(), entry)))
     });
-    for (name, kind) in &entries {
-      each(name, *kind);
+    for (name, entry) in &entries {
+      each(name, *entry);
     }
     result
   }

@@ -26,6 +26,11 @@ pub enum Mode {
   /// is in it. It never says `Written`. `Names` is answered `NotWatched`, unless a live stream
   /// reports the directory: then the key gets the records of that stream below its directory,
   /// and it stays on that stream when it asks for the contents later.
+  ///
+  /// A stream stands at the text of its path and hears nothing more when a directory at or
+  /// above that path is renamed or removed. The backend of FSEvents keeps each of these
+  /// directories open and is told at once: the stream ends, and its keys are told so. Here
+  /// the stream remembers the directories that were on its path when it started.
   Prefix,
   /// ReadDirectoryChangesW. One handle on a directory, for everything below it. The handle
   /// belongs to the directory, not to its path. Writes are reported as `Written`; a change of an
@@ -142,13 +147,23 @@ impl Backend for SimBackend {
     let now_streamed: Vec<DirKey> =
       self.not_watched.iter().filter(|(_, dir)| is_new(dir)).map(|(&key, _)| key).collect();
     let mut bound = Vec::new();
+    let mut started = Vec::new();
     for (key, real) in pending {
       let next = &mut kernel.next_stream;
       let stream = *kernel.streams.entry(real.clone()).or_insert_with(|| {
         *next += 1;
+        started.push((*next, real.clone()));
         *next
       });
       bound.push((key, stream, real));
+    }
+    // The path of a stream was asked at `watch`. A directory on it that moved since then is
+    // found out now: the stream ends before it told anything.
+    for (stream, real) in started {
+      match state.chain(&real) {
+        Some(chain) => drop(state.kernel.guards.insert(stream, chain)),
+        None => state.kernel.end_stream(stream),
+      }
     }
     drop(state);
     // Every key joins its stream before any key leaves one. A stream that one key leaves in
@@ -167,7 +182,7 @@ impl Backend for SimBackend {
       self.keys.entry(stream).or_default().push(key);
     }
     for (key, old) in left {
-      self.leave(key, old);
+      self.move_on(key, old);
     }
     Ok(now_streamed)
   }
@@ -175,8 +190,13 @@ impl Backend for SimBackend {
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     match raw.what {
       What::Dead => {
+        self.prefixes.remove(&raw.watch);
         for key in self.keys.remove(&raw.watch).unwrap_or_default() {
-          self.bound.remove(&key);
+          // Not a key that has another stream by now.
+          if self.bound.get(&key) == Some(&raw.watch) {
+            self.bound.remove(&key);
+            self.below.remove(&key);
+          }
           hint(Hint::Changed { dir: key, rel: Path::new("") });
         }
         return;
@@ -188,7 +208,7 @@ impl Backend for SimBackend {
         return;
       }
       What::Overflow => return hint(Hint::Lost),
-      What::Entry | What::Written => {}
+      What::Entry | What::Moved | What::Written => {}
     }
     let Some(keys) = self.keys.get(&raw.watch) else { return };
     let prefix = self.prefixes.get(&raw.watch);
@@ -200,6 +220,8 @@ impl Backend for SimBackend {
       let rel = match self.below.get(&key).or(prefix) {
         Some(dir) => match raw.path.strip_prefix(dir) {
           Ok(rel) => rel,
+          // The directory of the key went with a directory above it, or came with it.
+          Err(_) if raw.what == What::Moved && dir.starts_with(&raw.path) => Path::new(""),
           Err(_) => continue,
         },
         None => &raw.path,
@@ -239,7 +261,10 @@ impl SimBackend {
     if self.bound.get(&key) == Some(&watch) {
       return;
     }
-    self.unbind(key);
+    self.below.remove(&key);
+    if let Some(old) = self.bound.remove(&key) {
+      self.move_on(key, old);
+    }
     self.bound.insert(key, watch);
     self.keys.entry(watch).or_default().push(key);
   }
@@ -252,6 +277,17 @@ impl SimBackend {
     }
   }
 
+  /// `key` has another OS watch than `old` now. A stream that ended and has not said so yet
+  /// keeps the key: its directory was at another path for a while, and the backend of
+  /// FSEvents reports a key whose directory has another real path than before.
+  fn move_on(&mut self, key: DirKey, old: u64) {
+    let ended =
+      self.prefixes.contains_key(&old) && !self.fs.lock().kernel.guards.contains_key(&old);
+    if !ended {
+      self.leave(key, old);
+    }
+  }
+
   /// Takes `key` off the OS watch `watch`. The OS watch goes when no other key uses it.
   fn leave(&mut self, key: DirKey, watch: u64) {
     let Some(keys) = self.keys.get_mut(&watch) else { return };
@@ -259,10 +295,15 @@ impl SimBackend {
     if keys.is_empty() {
       self.keys.remove(&watch);
       let mut state = self.fs.lock();
-      if let Some(prefix) = self.prefixes.remove(&watch) {
-        state.kernel.streams.remove(&prefix);
-      } else {
-        state.kernel.watched.remove(&watch);
+      let kernel = &mut state.kernel;
+      match self.prefixes.remove(&watch) {
+        // Another stream can stand at the path by now, if this one ended by itself.
+        Some(prefix) if kernel.streams.get(&prefix) == Some(&watch) => {
+          kernel.streams.remove(&prefix);
+          kernel.guards.remove(&watch);
+        }
+        Some(_) => {}
+        None => drop(kernel.watched.remove(&watch)),
       }
     }
   }
@@ -292,6 +333,8 @@ pub struct SimRaw {
 enum What {
   /// An entry came, went or was renamed.
   Entry,
+  /// By prefix: a directory was renamed, or moved in or out. What is in it moved with it.
+  Moved,
   /// The OS says the content was written. For a directory this is noise.
   Written,
   /// The watch is gone.
@@ -313,6 +356,8 @@ pub(crate) struct Kernel {
   pub(crate) watched: FxHashMap<u64, Want>,
   /// By path prefix: the real path of each live stream, and its id.
   pub(crate) streams: FxHashMap<PathBuf, u64>,
+  /// By path prefix: for each live stream, the directories (inode id) at and above its path.
+  pub(crate) guards: FxHashMap<u64, Vec<u64>>,
   next_stream: u64,
   pub(crate) limit: Option<usize>,
   pub(crate) queue: VecDeque<SimRaw>,
@@ -331,10 +376,12 @@ impl Kernel {
     self.queue.push_back(SimRaw { watch: dir, path: name.into(), what });
   }
 
-  pub(crate) fn by_prefix(&mut self, real: &Path) {
+  pub(crate) fn by_prefix(&mut self, real: &Path, act: Act, is_dir: bool) {
+    let moved = is_dir && matches!(act, Act::MoveFrom | Act::MoveTo);
+    let what = if moved { What::Moved } else { What::Entry };
     for prefix in real.ancestors() {
       if let Some(&stream) = self.streams.get(prefix) {
-        self.queue.push_back(SimRaw { watch: stream, path: real.to_path_buf(), what: What::Entry });
+        self.queue.push_back(SimRaw { watch: stream, path: real.to_path_buf(), what });
       }
     }
   }
@@ -370,6 +417,24 @@ impl Kernel {
     if self.watched.remove(&dir).is_some() {
       self.queue.push_back(SimRaw { watch: dir, path: PathBuf::new(), what: What::Dead });
     }
+    self.dir_moved(dir);
+  }
+
+  /// A directory was renamed or removed: each stream that had it at or above its path ends.
+  pub(crate) fn dir_moved(&mut self, dir: u64) {
+    let had = |(_, chain): &(&u64, &Vec<u64>)| chain.contains(&dir);
+    let mut streams: Vec<u64> = self.guards.iter().filter(had).map(|(stream, _)| *stream).collect();
+    streams.sort_unstable();
+    for stream in streams {
+      self.end_stream(stream);
+    }
+  }
+
+  /// The stream stands at a path where its directory is no more.
+  pub(crate) fn end_stream(&mut self, stream: u64) {
+    self.guards.remove(&stream);
+    self.streams.retain(|_, live| *live != stream);
+    self.queue.push_back(SimRaw { watch: stream, path: PathBuf::new(), what: What::Dead });
   }
 }
 

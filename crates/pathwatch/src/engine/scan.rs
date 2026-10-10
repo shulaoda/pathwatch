@@ -16,6 +16,8 @@ use crate::{
 /// One node to check in a scan, with what the listing said about it.
 pub(super) type ScanEntry = (DirKey, Listed);
 
+const _: () = assert!(size_of::<ScanEntry>() == 40);
+
 /// The scan of one directory.
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Checks every node of the directory `key`: what the tree knows there, and what a listing
@@ -64,12 +66,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let why = if depth == Depth::Deep { Mark::DEEP } else { Mark::default() };
     for (index, &(child, listed)) in names.iter().enumerate() {
       let listed = match listed {
-        Listed::NotAsked if names_are_known && self.listed.contains(&child) => Listed::Named(None),
-        Listed::NotAsked if names_are_known => Listed::NotNamed,
+        Listed::NotAsked if names_are_known => {
+          self.listed.get(&child).copied().unwrap_or(Listed::NotNamed)
+        }
         said => said,
       };
       // The tree knew the node, and the listing names it: it is as it was.
-      if names_only && index < known && matches!(listed, Listed::Named(_)) {
+      if names_only && index < known && listed.is_named() {
         continue;
       }
       // A check frees no node but its own.
@@ -92,13 +95,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let known = names.len();
     let tree = &mut self.tree;
     let mut listed = tree.is_loose(key).then_some(&mut self.listed);
-    let result = self.fs.read_dir(path, &mut |name, kind| match tree.child(key, name) {
+    let result = self.fs.read_dir(path, &mut |name, entry| match tree.child(key, name) {
       Some(node) => {
         if let Some(listed) = &mut listed {
-          listed.insert(node);
+          listed.insert(node, entry.into());
         }
       }
-      None => names.push((tree.insert_child(key, name), Listed::Named(kind))),
+      None => names.push((tree.insert_child(key, name), entry.into())),
     });
     let Err(error) = result else { return Listing::Whole };
 
@@ -138,33 +141,39 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // A name that the listing gave, with no second name in the tree that can be the same
     // name. A listing of a strict directory keeps no names: there every child is tried.
     let is_listed = |&&(child, listed): &&ScanEntry| {
-      let named = was_strict || matches!(listed, Listed::Named(_)) || self.listed.contains(&child);
+      let named = was_strict || listed.is_named() || self.listed.contains_key(&child);
       named && !self.tree.has_twin(child)
     };
-    let tried = names.iter().filter(is_listed).find_map(|&(child, _)| {
+    let to_try = names.iter().filter(is_listed).filter_map(|&(child, _)| {
       let name = self.tree.name(child);
       Some((name.to_owned(), name.to_str().and_then(swap)?))
     });
-    let Some((name, other)) = tried else {
-      // No name to try: the looks must not ask for a listing again and again.
-      if !was_strict {
-        self.set_spelling(key, Spelling::Loose);
+    // A listing of a strict directory keeps no names, so a node that is tried there can be
+    // gone, which says nothing: then the next one is tried.
+    let tries = if was_strict { usize::MAX } else { 1 };
+    let (mut tried, mut found) = (false, None);
+    for (name, other) in to_try.take(tries) {
+      tried = true;
+      path.push(&name);
+      let entry = self.fs.lstat(path);
+      found = match &entry {
+        Ok(entry) if was_strict => {
+          let other = self.fs.lstat(&path.with_file_name(other));
+          other.is_ok_and(|other| other.file_id == entry.file_id).then_some(false)
+        }
+        Ok(entry) => self.tells_spellings_apart(path, entry),
+        Err(_) => None,
+      };
+      path.pop();
+      if entry.is_ok() {
+        break;
       }
-      return;
-    };
-    path.push(&name);
-    let found = match self.fs.lstat(path) {
-      Ok(entry) if was_strict => {
-        let other = self.fs.lstat(&path.with_file_name(other));
-        other.is_ok_and(|other| other.file_id == entry.file_id).then_some(false)
-      }
-      Ok(entry) => self.tells_spellings_apart(path, &entry),
-      Err(_) => None,
-    };
-    path.pop();
+    }
     match found {
       Some(true) => self.set_spelling(key, Spelling::Strict),
       Some(false) => self.set_spelling(key, Spelling::Loose),
+      // No name to try: the looks must not ask for a listing again and again.
+      None if !tried && !was_strict => self.set_spelling(key, Spelling::Loose),
       None => {}
     }
   }
@@ -237,7 +246,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let Kind::Dir(dir) = node.kind else { return };
     node.kind = Kind::Missing;
     self.tree.unhold(key);
-    self.tree.set_times(key, None);
     if dir.asked.is_some() && !self.backend_failed {
       self.backend.unwatch(key);
     }

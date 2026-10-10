@@ -6,11 +6,14 @@
 
 #![cfg(unix)]
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
-use pathwatch::engine::{Ignored, Options};
+use pathwatch::{
+  engine::{Ignored, Options},
+  fs::Fs,
+};
 use pathwatch_sim::{
-  Driver, Mode, NONE, RECURSIVE, caught_up, on_all, on_modes, settled, taken, window,
+  Driver, Mode, NONE, RECURSIVE, Sim, caught_up, on_all, on_modes, settled, taken, window,
 };
 
 /// The engine is told that the disk takes two spellings of a name for one.
@@ -423,6 +426,63 @@ fn a_strict_directory_is_replaced_by_a_loose_one() {
   });
 }
 
+/// The same, and one of the two names that the tree knows is gone with the old directory. The
+/// listing of a strict directory keeps no names, so the name that is tried can be the one that
+/// is gone: then the other one is tried.
+#[test]
+fn a_strict_directory_is_replaced_by_a_loose_one_with_a_name_less() {
+  for (kept, other_case) in [("app.js", "App.js"), ("new.js", "New.js")] {
+    on_all(&Options::default(), |d, on| {
+      d.fs().set_reuse_inode_numbers(true);
+      d.fs().set_mount("mnt");
+      d.fs().mkdir_all("/p/R").unwrap();
+      d.fs().mkdir_all("/mnt").unwrap();
+      d.fs().write("/p/R/app.js", "1").unwrap();
+      assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
+      d.fs().write("/p/R/new.js", "1").unwrap();
+      assert_eq!(d.settled(), ["C /p/R/new.js"], "{on}");
+
+      d.fs().rename("/p/R", "/p/old").unwrap();
+      d.fs().remove_all("/p/old").unwrap();
+      d.fs().mkdir("/mnt/y").unwrap();
+      d.fs().write(format!("/mnt/y/{kept}"), "22").unwrap();
+      d.fs().rename("/mnt/y", "/p/R").unwrap();
+      d.settled();
+      d.fs().rename(format!("/p/R/{kept}"), format!("/p/R/{other_case}")).unwrap();
+      let renamed = [format!("C /p/R/{other_case}"), format!("D /p/R/{kept}")];
+      assert_eq!(d.settled(), renamed, "{on}, {kept}");
+      d.caught_up();
+    });
+  }
+}
+
+/// A directory that tracks its entries no more keeps no proof: nothing is asked in a partial
+/// directory, so nothing would take the proof back. `/p/src` was proved strict. Then `/p` is
+/// replaced by a directory from a loose disk that has `Src`, and the tree cannot tell that one
+/// from the old `src` (it got its inode number). `/p` does not list the name `src` now: the
+/// node only leads to the watched path below it.
+#[test]
+fn a_directory_that_tracks_its_entries_no_more_keeps_no_proof() {
+  on_all(&Options::default(), |d, on| {
+    let inode = |d: &dyn Sim, path: &str| d.fs().lstat(Path::new(path)).unwrap().file_id;
+    d.fs().set_reuse_inode_numbers(true);
+    d.fs().set_mount("mnt");
+    d.fs().mkdir_all("/p/src/lib").unwrap();
+    d.fs().mkdir_all("/mnt").unwrap();
+    assert_eq!(d.watch(&["/p", "/p/src/lib"]), NONE, "{on}");
+    d.fs().write("/p/src/new.js", "1").unwrap();
+    assert_eq!(d.settled(), ["C /p/src/new.js"], "{on}");
+    let old = inode(&*d, "/p/src");
+
+    d.fs().remove_all("/p").unwrap();
+    d.fs().mkdir_all("/mnt/p/Src/lib").unwrap();
+    d.fs().rename("/mnt/p", "/p").unwrap();
+    assert_eq!(inode(&*d, "/p/Src"), old, "{on}");
+    assert_eq!(d.settled(), ["D /p/src/new.js"], "{on}");
+    d.caught_up();
+  });
+}
+
 /// One tree with both kinds of disk: `/mnt` takes two spellings of a name for one, and the
 /// rest does not. The engine is told nothing about it.
 #[test]
@@ -709,9 +769,10 @@ fn a_watched_path_in_another_spelling_with_an_engine_that_does_not_know_the_disk
 
 /// A watched directory is renamed, and only the case of its letters changes, on a disk that
 /// ignores case. The registered spelling still finds the directory. But a watch by path stands
-/// at the old spelling, and the OS reports the new one: the watch is deaf. The rename moves the
-/// change time of the directory alone, so the next poll watches it again, also when nothing
-/// told about the rename.
+/// at the old spelling, and the OS reports the new one: the watch is deaf. The watch itself
+/// tells about the rename only when the call names the directory as the watch does. The
+/// backend is told in both cases that the directory of the watch was renamed, and the
+/// directory is watched again.
 #[test]
 fn a_watched_directory_is_renamed_to_another_case() {
   for told in [true, false] {
@@ -723,10 +784,7 @@ fn a_watched_directory_is_renamed_to_another_case() {
       assert_eq!(d.watch(&["/p/src"]), NONE, "{on}");
       assert_eq!(d.settled(), NONE, "{on}");
 
-      d.fs().rename("/p/src", "/p/Src").unwrap();
-      if !told {
-        d.fs().take_raw(usize::MAX);
-      }
+      d.fs().rename(if told { "/p/src" } else { "/p/SRC" }, "/p/Src").unwrap();
       d.fs().write("/p/Src/x.js", "22").unwrap();
       assert_eq!(d.settled(), ["U /p/src/x.js"], "{on}");
       d.fs().write("/p/Src/x.js", "333").unwrap();
@@ -735,6 +793,36 @@ fn a_watched_directory_is_renamed_to_another_case() {
       d.caught_up();
     });
   }
+}
+
+/// A directory above the watched one is renamed to another case. The watched path still finds
+/// its directory, but the watch by path stands at the old spelling and would hear nothing
+/// more: the backend is told about the rename and watches the directory again, at the new
+/// spelling. The same when the directory is removed and made again in another case and gets
+/// the inode number of the old one: the tree cannot tell the two apart.
+#[test]
+fn a_directory_above_is_renamed_to_another_case() {
+  on_modes(&RECURSIVE, &loose(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().mkdir_all("/x/a").unwrap();
+    d.fs().write("/x/a/old.js", "1").unwrap();
+    assert_eq!(d.watch(&["/x/a"]), NONE, "{on}");
+    assert_eq!(d.settled(), NONE, "{on}");
+
+    d.fs().rename("/x", "/X").unwrap();
+    assert_eq!(d.settled(), NONE, "{on}");
+    d.fs().write("/X/a/new.js", "1").unwrap();
+    d.fs().write("/X/a/old.js", "22").unwrap();
+    assert_eq!(d.settled(), ["C /x/a/new.js", "U /x/a/old.js"], "{on}");
+
+    d.fs().remove_all("/X").unwrap();
+    d.fs().mkdir_all("/x/a").unwrap();
+    d.fs().write("/x/a/again.js", "1").unwrap();
+    assert_eq!(d.settled(), ["C /x/a/again.js", "D /x/a/new.js", "D /x/a/old.js"], "{on}");
+    d.fs().write("/x/a/again.js", "22").unwrap();
+    assert_eq!(d.settled(), ["U /x/a/again.js"], "{on}");
+    d.caught_up();
+  });
 }
 
 /// A new entry in a watched directory, on a disk that takes two spellings of a name for one.

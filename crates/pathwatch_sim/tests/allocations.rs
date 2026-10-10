@@ -23,7 +23,7 @@ use pathwatch::{
   EventKind,
   backend::{Backend, Coverage, DirKey, Hint, Signal, Want},
   engine::{Engine, Options, Output},
-  fs::{DirId, FileType, Fs, Meta},
+  fs::{DirId, Entry, FileType, Fs, Meta},
 };
 
 /// The system allocator, with a counter for each thread.
@@ -92,7 +92,7 @@ impl Fs for PlainDisk {
     self.lstat(path)
   }
 
-  fn read_dir(&self, _: &Path, _: &mut dyn FnMut(&OsStr, Option<FileType>)) -> io::Result<()> {
+  fn read_dir(&self, _: &Path, _: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()> {
     Ok(())
   }
 

@@ -412,9 +412,9 @@ fn a_hint_through_a_watch_below_a_failed_one() {
 
 /// The known hole of a backend that watches by path, closed. A directory above the watched one
 /// is renamed away, a file below it is edited, and the directory is back before the next poll.
-/// The stream stands at the old path and heard nothing. The poll finds the same directory at
-/// the path, but its change time moved and its modification time did not: it was renamed. So
-/// everything below it is watched again and scanned.
+/// The stream stands at the old path and heard nothing of the edit, and the poll finds the same
+/// directory at the path. But the stream ended when the directory above was renamed, and says
+/// so, however short the directory was away: everything below it is watched again and scanned.
 #[test]
 fn a_directory_above_a_tree_watch_is_away_and_back_between_two_polls() {
   on_modes(&RECURSIVE, &Options::default(), |d, on| {
@@ -427,7 +427,7 @@ fn a_directory_above_a_tree_watch_is_away_and_back_between_two_polls() {
     d.fs().write("/q/x/src/f.js", "22").unwrap();
     d.fs().rename("/q/x", "/q/p").unwrap();
     if on == "Prefix" {
-      assert_eq!(d.fs().pending_raw(), 0, "{on}");
+      assert_eq!(d.fs().pending_raw(), 1, "{on}");
     }
     assert_eq!(d.settled(), ["U /q/p/src/f.js"], "{on}");
 
@@ -443,47 +443,9 @@ fn a_directory_above_a_tree_watch_is_away_and_back_between_two_polls() {
   });
 }
 
-/// A new entry in a directory that only the poll looks at moves its change time and its
-/// modification time. That is no rename: nothing below is watched again or scanned. A poll
-/// costs what it always costs.
-#[test]
-fn a_new_entry_in_a_polled_directory_costs_no_deep_scan() {
-  for mode in RECURSIVE {
-    let mut d = Driver::sim(mode, Options::default());
-    d.fs.mkdir_all("/q/p/src").unwrap();
-    d.fs.write("/q/p/src/f.js", "1").unwrap();
-    d.watch(&["/q/p/src/f.js"]);
-    settled(&mut d);
-
-    // What one poll costs: the root checks `/`, `/` checks `q`, `/q` checks `p`, and `/q/p`
-    // checks `src`. Below that the stream tells.
-    let poll = |d: &mut Driver<SimBackend>| {
-      let before = d.fs.calls();
-      d.advance(Duration::from_secs(1));
-      d.tick();
-      let after = d.fs.calls();
-      (after.lstat - before.lstat, after.watch - before.watch, after.read_dir - before.read_dir)
-    };
-    assert_eq!(poll(&mut d), (4, 0, 0), "{mode:?}");
-    d.fs.write("/q/p/new.txt", "1").unwrap();
-    d.fs.mkdir("/q/p/new-dir").unwrap();
-    assert_eq!(poll(&mut d), (4, 0, 0), "{mode:?}");
-
-    // A rename of the directory itself does: `/q/p` and `/q/p/src` are asked for again, and
-    // the file is looked at.
-    d.fs.rename("/q/p", "/q/x").unwrap();
-    d.fs.rename("/q/x", "/q/p").unwrap();
-    assert_eq!(poll(&mut d), (5, 2, 0), "{mode:?}");
-    assert_eq!(poll(&mut d), (4, 0, 0), "{mode:?}");
-    assert_eq!(taken(&mut d), NONE, "{mode:?}");
-    caught_up(&mut d);
-  }
-}
-
-/// The same before the first poll after `watch`. The times of a directory are kept from its
-/// first look on: the look of `watch` itself, also when no watch stands below the directory
-/// yet at that moment. The second layout reaches the watched file through a link, and the
-/// directory behind the link is the one that is away and back.
+/// The same right after `watch`, before any poll. The second layout reaches the watched file
+/// through a link, and the directory behind the link is the one that is away and back: the
+/// stream stands at the real path, so that directory is above it.
 #[test]
 fn a_directory_is_away_and_back_before_the_first_poll() {
   on_modes(&RECURSIVE, &Options::default(), |d, on| {
@@ -494,8 +456,6 @@ fn a_directory_is_away_and_back_before_the_first_poll() {
     d.fs().symlink("/store/real", "/q/link").unwrap();
     assert_eq!(d.watch(&["/q/p/src/f.js", "/q/link/src/g.js"]), NONE, "{on}");
 
-    // The clock of the disk has moved since the directories were looked at.
-    d.advance(Duration::from_millis(5));
     d.fs().rename("/q/p", "/q/x").unwrap();
     d.fs().write("/q/x/src/f.js", "22").unwrap();
     d.fs().rename("/q/x", "/q/p").unwrap();
@@ -503,11 +463,33 @@ fn a_directory_is_away_and_back_before_the_first_poll() {
     d.fs().write("/store/x/src/g.js", "22").unwrap();
     d.fs().rename("/store/x", "/store/real").unwrap();
     if on == "Prefix" {
-      assert_eq!(d.fs().pending_raw(), 0, "{on}");
+      assert_eq!(d.fs().pending_raw(), 2, "{on}");
     }
     assert_eq!(d.settled(), ["U /q/link/src/g.js", "U /q/p/src/f.js"], "{on}");
     d.caught_up();
   });
+}
+
+/// The stream of a directory ended, because the directory was renamed away and back. Before
+/// that is told, the directory asks for more: its second spelling leads to a new watched path
+/// with nothing at it. It gets a new stream then, and the edit that the old stream did not
+/// hear is still found: the end of a stream is told to every key that it had.
+#[test]
+fn a_directory_gets_a_new_stream_before_the_end_of_its_old_one_is_told() {
+  let mut d = driver(Mode::Prefix);
+  d.fs.set_ignore_case(true);
+  d.fs.mkdir_all("/a/sub").unwrap();
+  d.fs.write("/a/sub/f.js", "1").unwrap();
+  d.watch(&["/A", "/a/sub/f.js"]);
+  assert_eq!(settled(&mut d), NONE);
+
+  d.fs.rename("/a", "/away").unwrap();
+  d.fs.write("/away/sub/f.js", "22").unwrap();
+  d.fs.rename("/away", "/a").unwrap();
+  d.watch(&["/a/new.js"]);
+  assert_eq!(taken(&mut d), NONE);
+  assert_eq!(settled(&mut d), ["U /A/sub/f.js", "U /a/sub/f.js"]);
+  caught_up(&mut d);
 }
 
 /// A directory is only polled, and before the poll comes it gets a watch of the backend,
@@ -524,10 +506,10 @@ fn a_polled_directory_gets_a_watch() {
   d.fs.write("/p/x/d/f.js", "1").unwrap();
   d.fs.write("/p/next/d/f.js", "22").unwrap();
   d.watch(&["/p/x/d"]);
-  // No watch covers `/p`, so nothing is notified. The next poll would find it.
+  // No watch covers `/p`. The stream only says that it ended, when it is asked.
   d.fs.rename("/p/x", "/p/old").unwrap();
   d.fs.rename("/p/next", "/p/x").unwrap();
-  assert_eq!(d.fs.pending_raw(), 0);
+  assert_eq!(d.fs.pending_raw(), 1);
 
   // `/p` holds a watched path with nothing at it now and gets a stream. It is polled no more.
   d.watch(&["/p/a.js"]);

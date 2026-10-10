@@ -13,7 +13,7 @@ use std::{
   },
   path::{Path, PathBuf},
   sync::{
-    Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
+    Arc, Condvar, Mutex, MutexGuard, Once, OnceLock, PoisonError,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, Receiver, TryRecvError},
   },
@@ -24,7 +24,7 @@ use std::{
 use pathwatch::{
   backend::{Backend, Coverage, DirKey, Hint, Signal, Sink, Want, is_watch_limit},
   engine::{Engine, Options, Output},
-  fs::{FileType, Fs, Meta, StdFs},
+  fs::{Entry, Fs, Meta, StdFs},
   fsevents::{
     FsEventsBackend, MAX_NEW_STREAMS, MAX_PATHS_PER_STREAM, MAX_STREAM_PATHS, MAX_STREAMS, Raw,
     flag, is_too_high,
@@ -53,6 +53,7 @@ static TURN_IS_OVER: Condvar = Condvar::new();
 impl Turn {
   fn take(alone: bool) -> Self {
     assert_few_files_next_to_the_test_program();
+    allow_more_open_files();
     let mut turns = Self::turns();
     while turns.1 || (alone && turns.0 > 0) {
       turns = TURN_IS_OVER.wait(turns).unwrap_or_else(PoisonError::into_inner);
@@ -98,6 +99,35 @@ fn assert_few_files_next_to_the_test_program() {
      stream takes 0.1 s and more to start for every 100,000 of them. `cargo clean` removes \
      the old object files of the build directory."
   );
+}
+
+/// The backend keeps one file open for each directory at and above a stream path, and takes at
+/// most half of what the program may open for that. A shell gives a program 256 files: too few
+/// for the test with thousands of stream paths, and for many tests side by side.
+fn allow_more_open_files() {
+  #[repr(C)]
+  struct Limit {
+    now: u64,
+    most: u64,
+  }
+  unsafe extern "C" {
+    fn getrlimit(resource: i32, limit: *mut Limit) -> i32;
+    fn setrlimit(resource: i32, limit: *const Limit) -> i32;
+  }
+  const OPEN_FILES: i32 = 8;
+  /// `OPEN_MAX`: macOS gives every program this many when it asks.
+  const ENOUGH: u64 = 10_240;
+  static ASKED: Once = Once::new();
+  ASKED.call_once(|| {
+    let mut limit = Limit { now: 0, most: 0 };
+    // SAFETY: both calls get a pointer to a `struct rlimit` that lives until they return.
+    unsafe {
+      if getrlimit(OPEN_FILES, &raw mut limit) == 0 && limit.now < ENOUGH {
+        limit.now = ENOUGH.min(limit.most);
+        setrlimit(OPEN_FILES, &raw const limit);
+      }
+    }
+  });
 }
 
 const NO_PATHS: [&Path; 0] = [];
@@ -758,12 +788,62 @@ fn key_follows_its_path_to_another_directory() {
   h.commit();
   assert_eq!(h.backend.covers(), [h.real("two")]);
   assert_eq!(h.backend.stream_count(), 2);
+  // The key was at another real path, and nothing else said so: it is reported lost.
+  h.hints_until(&[changed(key, "")]);
 
   File::create(h.path("one/stale")).unwrap();
   File::create(h.path("two/fresh")).unwrap();
   let mut hints = h.hints_until(&[changed(key, "fresh")]);
   hints.extend(h.sync(key));
   assert!(!rels(&hints, key).contains("stale"));
+}
+
+/// A path through the data volume is taken the short way, which is how the records spell it,
+/// but only where the short path is the same directory and a real path of its own.
+#[test]
+fn the_short_way_out_of_the_data_volume() {
+  let mut h = Harness::new();
+  fs::create_dir(h.path("dir")).unwrap();
+  let data = Path::new("/System/Volumes/Data");
+  let long = data.join(h.real("dir").strip_prefix("/").unwrap());
+  if !long.exists() {
+    // The playground is on another volume.
+    return;
+  }
+  let key = h.watch(1, &long, Want::Contents);
+  h.commit();
+  assert_eq!(h.backend.covers(), [h.real("dir")]);
+  File::create(h.path("dir/file")).unwrap();
+  h.hints_until(&[changed(key, "file")]);
+
+  // `/Users` has a parent with no short way.
+  let users = h.watch(2, &data.join("Users"), Want::Contents);
+  assert_eq!(h.backend.cover_of_key()[&users], Path::new("/Users"));
+  h.backend.unwatch(users);
+  // `/home` is a link into the data volume: the same directory, but no real path.
+  if let Ok(real) = fs::canonicalize("/home")
+    && real.starts_with(data)
+  {
+    let home = h.watch(3, Path::new("/home"), Want::Contents);
+    assert_eq!(h.backend.cover_of_key()[&home], real);
+    h.backend.unwatch(home);
+  }
+}
+
+/// Nothing is above `/`, so it needs no guard: its stream is trusted. It takes the place of
+/// the streams below it.
+#[test]
+fn a_cover_at_the_top_of_the_disk_is_trusted() {
+  let mut h = Harness::new();
+  fs::create_dir(h.path("dir")).unwrap();
+  let key = h.cover(1, "dir");
+  let top = h.watch(2, Path::new("/"), Want::Contents);
+  h.commit();
+  assert_eq!(h.backend.streamed(), [Path::new("/")]);
+  h.backend.unwatch(top);
+
+  File::create(h.path("dir/file")).unwrap();
+  h.hints_until(&[changed(key, "file")]);
 }
 
 #[test]
@@ -786,6 +866,154 @@ fn cover_renamed_in_letter_case_is_heard_after_the_next_watch() {
 
   File::create(h.path("Dir/file")).unwrap();
   h.hints_until(&[changed(key, "file")]);
+}
+
+/// A stream stands at the text of its path, and it says nothing about a directory above that
+/// path. The backend keeps each of these directories open and is told when one of them is
+/// renamed or removed: that is a loss report for each cover below it. The path is trusted no
+/// more, so the next `watch` gets a new stream, also when the directory is back by then.
+#[test]
+fn a_directory_above_a_cover_is_renamed() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("above/dir")).unwrap();
+  fs::create_dir_all(h.path("above/other")).unwrap();
+  let key = h.cover(1, "above/dir");
+  let other = h.cover(2, "above/other");
+  // One open file for each directory on the way, and the two covers share the way.
+  let playground = h.real("").components().count() - 1;
+  assert_eq!(h.backend.guarded().len(), playground + 3);
+
+  fs::rename(h.path("above"), h.path("away")).unwrap();
+  h.hints_until(&[changed(key, ""), changed(other, "")]);
+  assert_eq!(h.backend.streamed(), NO_PATHS);
+  assert_eq!(h.backend.guarded(), NO_PATHS);
+
+  fs::rename(h.path("away"), h.path("above")).unwrap();
+  h.watch(1, &h.path("above/dir"), Want::Contents);
+  assert_eq!(h.backend.pending(), [h.real("above/dir")]);
+  h.commit();
+  File::create(h.path("above/dir/file")).unwrap();
+  h.hints_until(&[changed(key, "file")]);
+  assert_eq!(h.backend.guarded().len(), playground + 2);
+}
+
+/// The directory above is renamed away, a file comes below it, and the directory is back, with
+/// no pause. The stream heard nothing of the file. The loss report comes all the same: the
+/// kernel tells about each rename, however short the directory was away.
+#[test]
+fn a_directory_above_a_cover_is_away_and_back_at_once() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("above/dir")).unwrap();
+  let key = h.cover(1, "above/dir");
+  for round in 0..20 {
+    fs::rename(h.path("above"), h.path("away")).unwrap();
+    File::create(h.path("away/dir").join(format!("file-{round}"))).unwrap();
+    fs::rename(h.path("away"), h.path("above")).unwrap();
+    h.hints_until(&[changed(key, "")]);
+    h.watch(1, &h.path("above/dir"), Want::Contents);
+    h.commit();
+    h.sync(key);
+  }
+}
+
+/// A directory above the cover that the user may pass through but not read is guarded all the
+/// same, and so is a cover whose path is spelled through the data volume, where the OS knows
+/// the directory under a shorter path too. Neither is taken for a directory that moved.
+#[test]
+fn a_cover_below_a_directory_that_cannot_be_read() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("locked/dir")).unwrap();
+  fs::set_permissions(h.path("locked"), Permissions::from_mode(0o311)).unwrap();
+  let key = h.cover(1, "locked/dir");
+  assert!(h.backend.guarded().contains(&h.real("locked").as_path()));
+  File::create(h.path("locked/dir/file")).unwrap();
+  let hints = h.hints_until(&[changed(key, "file")]);
+  assert!(!hints.contains(&changed(key, "")), "{hints:?}");
+  assert_eq!(h.backend.streamed(), [h.real("locked/dir")]);
+  fs::set_permissions(h.path("locked"), Permissions::from_mode(0o755)).unwrap();
+
+  fs::create_dir(h.path("plain")).unwrap();
+  let through_the_data_volume =
+    Path::new("/System/Volumes/Data").join(h.real("plain").strip_prefix("/").unwrap());
+  if !through_the_data_volume.is_dir() {
+    return;
+  }
+  let plain = h.watch(2, &through_the_data_volume, Want::Contents);
+  h.commit();
+  assert_eq!(h.backend.streamed().len(), 2);
+  File::create(h.path("plain/file")).unwrap();
+  let deadline = Instant::now() + Duration::from_secs(2);
+  let mut hints = Vec::new();
+  while let Some((_, more)) = h.next(deadline) {
+    hints.extend(more);
+  }
+  assert!(!hints.contains(&changed(plain, "")), "{hints:?}");
+  assert_eq!(h.backend.streamed().len(), 2);
+}
+
+/// The real path of a cover is asked at `watch`, and its stream starts at `commit`. A directory
+/// above it that is renamed in between leaves the stream at a path where nothing is, and
+/// nothing was there to tell. The backend asks where the directory of each new stream path is
+/// after the start.
+#[test]
+fn a_stream_path_that_moved_before_its_stream_started_is_lost() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("above/dir")).unwrap();
+  fs::create_dir(h.path("other")).unwrap();
+  let dir = h.watch(1, &h.path("above/dir"), Want::Contents);
+  let other = h.watch(2, &h.path("other"), Want::Contents);
+  fs::rename(h.path("above"), h.path("away")).unwrap();
+  h.commit();
+  let hints = h.hints_until(&[changed(dir, "")]);
+  assert_eq!(hints.len(), 1, "{hints:?}");
+  assert_eq!(h.backend.streamed(), [h.real("other")]);
+  h.sync(other);
+}
+
+/// A directory between the path of a new stream and a cover gets another spelling of its name
+/// before the stream starts. No stream was there to report it, and the cover stands at a path
+/// that no record will spell. The backend asks for each name below a new stream path after the
+/// start.
+#[test]
+fn a_directory_below_a_stream_path_is_spelled_anew_before_its_stream_started() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("top/mid/low")).unwrap();
+  fs::create_dir_all(h.path("top/other")).unwrap();
+  if !h.path("top/MID").exists() {
+    // The volume tells letter case apart, so there is nothing special to test.
+    return;
+  }
+  h.watch(1, &h.path("top"), Want::Contents);
+  let low = h.watch(2, &h.path("top/mid/low"), Want::Contents);
+  let other = h.watch(3, &h.path("top/other"), Want::Contents);
+  fs::rename(h.path("top/mid"), h.path("top/MID")).unwrap();
+  thread::sleep(Duration::from_millis(100));
+  h.commit();
+  let hints = h.hints_until(&[changed(low, "")]);
+  assert!(!hints.contains(&changed(other, "")), "{hints:?}");
+
+  h.watch(2, &h.path("top/mid/low"), Want::Contents);
+  h.commit();
+  assert_eq!(h.backend.cover_of_key()[&low], h.real("top/MID/low"));
+  File::create(h.path("top/mid/low/file")).unwrap();
+  h.hints_until(&[changed(low, "file")]);
+}
+
+/// A directory between the path of a stream and a cover is renamed. The stream reports the
+/// directory, and the cover below it stands at a path where nothing is: it is lost. The engine
+/// has such a cover behind a link, where no node of its tree is the renamed directory.
+#[test]
+fn a_directory_between_a_stream_path_and_a_cover_is_renamed() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("top/mid/low")).unwrap();
+  fs::create_dir_all(h.path("top/other")).unwrap();
+  let top = h.cover(1, "top");
+  let low = h.watch(2, &h.path("top/mid/low"), Want::Names);
+  let other = h.watch(3, &h.path("top/other"), Want::Names);
+
+  fs::rename(h.path("top/mid"), h.path("top/moved")).unwrap();
+  let hints = h.hints_until(&[changed(top, "mid"), changed(top, "moved"), changed(low, "")]);
+  assert!(!hints.contains(&changed(other, "")), "{hints:?}");
 }
 
 #[test]
@@ -1316,7 +1544,7 @@ impl Fs for CountingFs {
     self.disk.stat(path)
   }
 
-  fn read_dir(&self, dir: &Path, each: &mut dyn FnMut(&OsStr, Option<FileType>)) -> io::Result<()> {
+  fn read_dir(&self, dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()> {
     self.disk.read_dir(dir, each)
   }
 

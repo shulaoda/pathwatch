@@ -179,8 +179,7 @@ How it is stored (only `tree/mod.rs` knows it): all nodes live in one arena. A k
 a generation, so an old key never names a new node. A node has the list of its children, and
 one table for the whole tree finds a child by (parent, name). Small tables next to the arena
 hold what only a few nodes have: the link of a registered name (5.14), the content hash of a
-young file (5.8), the time of a hold (5.9), and the times of a directory that only the poll
-looks at (5.10).
+young file (5.8), and the time of a hold (5.9).
 
 A tree that gets smaller gives its memory back (`Tree::give_back`). A node never moves,
 because its key is its place. So only the end of the arena can go, as far as no node lives
@@ -188,6 +187,15 @@ there: one node that was made late keeps the arena as long as it is, and then on
 and the table get smaller. Measured with a million nodes (94 bytes each, 91 MiB): when all of
 them go, nothing stays; when the node that was made last stays, 71 MiB stay. A tree that goes
 and comes back pays for its memory again, as the first time (54 ns for a node, not 12).
+
+What a watcher holds, measured on macOS (the heap of the process, by `vmmap`): 0.1 MiB with
+nothing watched; 4.3 MiB for one watched directory with 50,000 files in 5,000 directories (86
+bytes for a file); 3.0 MiB for 20,000 files in 2,000 directories that are each watched by
+their own path (150 bytes for a file: the backend keeps the real path of each directory
+twice). While a `watch` call runs, the heap holds its paths once more, for the thread of the
+watcher, and the arena twice for a moment each time it grows. The lists of a flush keep their
+memory for the next flush only up to 16 KiB each (`emptied`): a longer one is given back when
+the flush ends.
 
 **`complete` is a rule.** A directory node is complete when its path is a watched path that the
 filter does not ignore, or when its parent is complete and the filter does not ignore it. Every
@@ -316,13 +324,20 @@ rename that changed only the case left the old name behind, with polling too. So
   before.
 - A proof is taken back. By such a listing, when the other spelling finds the very entry:
   the directory can be another one by now, which the tree cannot tell from the old one (the
-  same inode number, no birth time). And by a look: in a strict directory a look asks the
+  same inode number, no birth time). A listing of a strict directory keeps no names, so the
+  node that is tried can be gone with the old directory, which says nothing: then the next
+  one is tried. (Found by the fuzz test: the first node was gone, the second one was there
+  under both spellings, and the directory stayed strict.) And by a look: in a strict directory a look asks the
   disk for the name when the tree has a second name in another case of its ASCII letters
   (`Tree::has_case_twin`). That is how a loose disk shows to an engine that takes it for a
   strict one (a write through another spelling, a rename of the case). If the disk gives
   another name, the directory is loose, and its names are compared with one listing: the
   looks before took it for a strict one.
-- A directory that is replaced by another one (another id) starts again.
+- A directory that is replaced by another one (another id) starts again. So does one that
+  tracks its entries no more (a partial node): nothing is asked in it, so nothing would take a
+  wrong proof back. (Found by the fuzz test: a directory that was proved strict was replaced by
+  one with the same id from a loose disk, under another spelling of its name. The tree kept
+  it as a partial node, and the proof with it.)
 
 A second name is evidence only while its node is there. So when a look leaves nothing at a
 name (the filter ignores it, or it is gone) and the node goes, the marked nodes that can be
@@ -448,8 +463,39 @@ The parent of `node` is a directory on disk. `path` is the path of `node`.
 - A name that is not registered, in a partial directory, is missing, without a call to the disk.
 - If a listing gave the type of the entry and the name is not registered, the filter is asked
   first: an ignored entry is missing and costs no `lstat`.
-- `lstat(path)`. For a registered name that is a symbolic link: `stat(path)` too, which follows
-  it (5.14). A link that is not registered is a file. Errors: 5.12.
+- `lstat(path)`, unless the listing of the running scan told all of it (see below). For a
+  registered name that is a symbolic link: `stat(path)` too, which follows it (5.14). A link
+  that is not registered is a file. Errors: 5.12.
+
+**A listing that tells all** (`fs::Entry::File`). On APFS one call gives the entries of a
+directory with what `lstat` tells of each (`getattrlistbulk`), and a scan takes every regular
+file from it: no `lstat` for a file, at the first scan and at each later one (a deep scan
+after a loss, a poll). Only what a look at a file reads is taken: its modification time, its
+size and its inode, which is its fingerprint (5.8). So a scan holds 40 bytes for an entry of
+the directory that it is in, and not the 80 bytes of all that `lstat` tells. A registered
+name, and a name whose spelling is not sure, is looked at with `lstat` as before. Measured on a tree of 5,000 directories with 50,000 files, one
+directory watched: the watcher is ready in 122 ms, and in 153 ms with an `lstat` for each
+file. What is left is one `open` for each directory (8 µs here, a third of the time), the
+listing itself, and one `lstat` for each directory.
+
+What the listing told is as old as the listing, and the look at a file can come later. A
+write after the listing is told by the OS watch, which was live before the scan (5.3), as a
+write after an `lstat` is. A file that went since then is stored and then found gone by the
+look that its record asks for.
+
+Only what was measured to be the same as `lstat` is taken:
+
+- APFS: the same for 160,000 entries of a system in use, and for a file that is open and
+  written, cut, made longer, linked twice, compressed, renamed. Other disks are listed as
+  before: on HFS+ the listing keeps the old times of a file that was written through another
+  hard link, on exFAT an empty file gets another inode number at each call, FAT32 gives no
+  change time.
+- A regular file only. Of a directory where a disk is mounted, the listing tells what is
+  under the mount, and a link is followed by the engine itself. A file whose content is in
+  a cloud only (the flag `dataless`) is left to `lstat` too: none with a size was there to
+  measure.
+- The disk is asked by path first (`statfs`), and an entry counts only if it is on that very
+  device: the directory can be another one when it is opened.
 
 **What counts.** "Inside" means: the node is a watched path, or its parent is complete.
 
@@ -495,7 +541,7 @@ the backend for its watch (`arm`, 5.10); queue a shallow scan.
 
 `still_there(node, deep)`: `arm` the node, and with `deep` also queue a deep scan. `deep` is
 true for a `deep` mark, when the directory was held, when it is another directory than before,
-when its times say that it was renamed (5.10), and when a link on the way changed (5.14).
+and when a link on the way changed (5.14).
 Nothing below the node is thrown away: the deep scan compares each file with the fingerprint
 that the tree has, so only what differs is reported.
 
@@ -725,18 +771,20 @@ own watch is given back after the next commit, and it relies on the watch above 
 happens only with a deep scan: a watch that goes takes with it what it has not delivered yet,
 and the scan after it finds what that watch did not tell.
 
-**A directory that was renamed away and back.** A watch by path (FSEvents) stands at a path.
-When a directory above it is renamed away, changed, and renamed back, the stream heard nothing,
-and the poll of the directory above finds the same directory at the same path. So for a
-directory that nothing but a poll of its parent looks at (the parent has no OS watch, or the
-node is a link), the tree keeps its change time and its modification time. A rename of the
-directory itself moves the change time alone; an entry that comes or goes in it moves both.
-"The change time moved and the modification time did not" means renamed: the directory is
-watched again and scanned deep. A `chmod` of such a directory costs one deep scan.
+**A directory above a watch by path.** A watch by path (FSEvents) stands at the text of a
+path. When a directory above it is renamed, also only to another spelling of its name, the
+watch hears nothing more; and when the directory is renamed away and back, the watch heard
+nothing meanwhile. The poll of the directory above finds the same directory at the watched
+path both times. The engine does not try to find such a rename: the backend is told by the
+kernel and reports each of its watches below that directory as lost (7.2), and the engine
+watches the directory again and scans it deep, as after every loss report.
 
-What stays open: the directory was renamed away and back, and between the same two polls an
-entry came or went directly in it (then both times moved); or all of it happened inside one
-step of the time stamps of the disk.
+Time stamps do not tell such a rename, and the engine keeps none for directories. Measured: a
+rename moves the change time of the directory on APFS only (not on HFS+, exFAT or FAT32), and
+the modification time of the directory above. A file or a directory that is moved from the
+directory above into the renamed one, with one `rename` call, moves the same two stamps. A
+rule that took this for a rename scanned a watched project of 50,000 files again each time a
+directory was moved into it from next to it (250 ms of CPU time).
 
 **`check_moved`.** A mark can come through a watch that moved away with its directory. If the
 parent of that directory is only polled, nothing says so in time, and the marks would be
@@ -785,7 +833,10 @@ Three things are asked:
      `Names` ask of a directory that leads to a watched path;
    - a registered name in it with a file or nothing at it is **dropped**: the look that finds
      it puts it on a list (`Engine::dropped`), and the end of the flush forgets every watched
-     path at the name and below it with the code of `unwatch` (`drop_ignored`). The nodes
+     path at the name and below it with the code of `unwatch` (`drop_ignored`). The look asks
+     the disk first whether the ignored directory is still the one that the tree has there:
+     a look at a name can come before the look that finds its directory gone, and then the
+     watch target is a directory further up, which the filter may not ignore. The nodes
      that nothing else needs are freed, and their watches are given back. One thing differs
      from `unwatch`: each file there that the handler was told about, and that no other
      watched path still covers, gets its `Delete` in the same batch, also one whose `Delete`
@@ -950,6 +1001,11 @@ type has its own `new(sink: Sink<Self::Raw>)`.
    repeats them, never sends it.
 10. **A dead watch.** The OS dropped the watch: forget it. The directory was moved: keep the
     watch and its keys. Both times send `Changed` with an empty `rel` for each of its keys.
+    A watch that stands at the text of a path is dead as soon as a directory at or above that
+    path is renamed or removed, and it does not say so by itself: the backend has to find out,
+    at once and also when the directory is back a moment later. And a key that is watched
+    again and whose directory has another real path than before gets the same hint: its old
+    watch was dead for a while.
 11. **Lost notifications.** The OS names the place: `Changed` for each key of it, with an empty
     `rel` or the `rel` of a place below; the watch stands. No place, or unreadable data: `Lost`.
 12. **The end.** A backend that cannot go on calls `Sink::failed` once. Dropping the backend
@@ -1023,6 +1079,34 @@ Facts from probes on macOS (APFS):
 - A stream watches whole trees and matches by path text. Records carry the **real** path:
   links resolved, the letter case and Unicode form of the disk.
 - A renamed or moved directory gives one record for the directory and none for what is inside.
+- A stream stands at the text of its path (the text is resolved once, when the stream is
+  made). After a directory above its path is renamed, also only to another case of its
+  letters, it reports nothing more, and it says nothing about that rename. When the
+  directory is renamed back, the stream reports again. A rename of its own directory to
+  another case gives one record for it; one through another spelling (`mv X away` where the
+  disk has `x`), and a removal in that way, give no record for the directory.
+- A directory that is renamed inside a stream gives two records, for the old path and for
+  the new one, both with `ItemRenamed` and `ItemIsDir`, also when only the case changes.
+- `kFSEventStreamCreateFlagWatchRoot` gives a `RootChanged` record when a directory at or
+  above the path of a stream is renamed or removed. Not used, for three reasons, all
+  measured. It looks at the path some 100 µs after the rename and sends the record only if
+  the path is still another one: "rename away, make a file below, rename back" with no pause
+  gave no record at all in 3 of 230 runs, and the file was not reported. It opens one file
+  for each name of each stream path, and paths do not share them: 64 paths of 9 names are
+  769 open files. And a stream with it takes 0.09 to 0.16 ms to make for each path (paths
+  of 9 and of 11 names), without it 0.002 ms. (Other watchers that set it stop watching on
+  that record, or report the watched directory as removed: Watchman, .NET, notify, watchdog.)
+- The kernel tells about a rename or a removal of a directory through a queue for vnode
+  events (`kqueue`, `EVFILT_VNODE` with `NOTE_RENAME`, `NOTE_DELETE`, `NOTE_REVOKE`), on a
+  descriptor of that very directory that was opened for events only (`O_EVTONLY`; it does
+  not keep a disk from being unmounted). Measured: the event is there when `rename` returns;
+  two renames with no pause give one event; none was missed in 4,000 runs of "rename away,
+  make a file below, rename back", of a rename that only changes the case, of a swap of two
+  directories in one call, and of a directory that is replaced; the same on APFS, HFS+,
+  exFAT and FAT32. Nothing comes on a descriptor of a directory below the renamed one, so
+  each directory on the way needs its own. To open and register one takes 10 µs.
+  `fcntl(F_GETPATH)` on such a descriptor gives the path of the directory as it is now, in
+  0.3 µs, in the short spelling of a path on the data volume (`/Users/...`).
 - Flags are merged and stay set for many seconds. So flags are never read as "what happened".
 - Stopping a stream throws away what it has not delivered.
 - Records are lost without a word when one stream takes over from another while files are
@@ -1120,17 +1204,92 @@ As built:
   an empty `rel` for each key of every cover that holds the path, and of every cover below the
   path. If there is no such cover, no hint: no key can see that place. A record for `/`, and
   one with only `UserDropped` or `KernelDropped` → `Lost`. These hints come after the other
-  hints of the callback call: the covers below the lost paths are found in a list of all
-  covers in the order of their paths, which is made once for a call that has such a record
-  (`Dirs::below`). A call with a loss record for each of 8 stream paths takes 0.15 ms with
-  2,000 covers and 1.5 ms with 20,000. (A look at every cover for every record, with a
-  comparison of path components, took 3.6 ms and 38 ms, and 5 to 10 s for 4,100 records and
-  4,100 covers in one call.)
+  hints of the callback call. The covers are kept in the order of their paths (`Dirs`, an
+  ordered map), so the covers below a path are one search away: 0.2 to 0.3 µs for a path
+  with 50 to 100 covers below it, among 2,000 covers or 20,000. A flood of renamed
+  directories costs one search for each record. A record finds the covers that hold it in
+  the same map (75 ns with 2,000 covers, 90 ns with 20,000; a hash map took 65 to 75 ns).
+  No second list of the paths is kept. (A look at every cover for every record took 5 to
+  10 s for 4,100 records and 4,100 covers in one call. A sorted copy of all cover paths,
+  made after each change of the covers and kept, was as fast as the map, and held every
+  path once more.)
 - `unwatch(key)` forgets the key. The path stays in its stream until the streams are replaced.
+- **A cover is a text.** A stream stands at the text of its path, and a record finds its
+  cover by the text of the cover. Both hold only while every name in them is the one that the
+  disk has. Each way for a name to change has one place that finds it, and all of them answer
+  in the same way: the cover is reported lost, and the engine asks for it again (which reads
+  its real path anew) and scans it deep. A directory above a stream path: the guard. A
+  directory inside a stream: the record of its rename. A change between `watch` and the
+  start of the stream: the check after the start. A link that leads somewhere else: the
+  poll (5.14). The notes that follow are these four.
+- **The guard.** Each directory at and above a stream path, from the top of the disk down,
+  is kept open for events, once for all stream paths below it (`Guard`). It is opened for
+  search only (`O_SEARCH`), so a directory that the user may pass through but not read is
+  guarded too, and a disk can still be unmounted (measured on APFS and HFS+). A project with 64
+  stream paths has some 70 of them. One thread waits for the queue of the kernel. When a
+  guarded directory is renamed or removed, every stream path at or below it is trusted no
+  more (it leaves the list of stream paths, and its directories are closed), and every cover
+  at or below the directory is reported lost: the engine watches each one again, which
+  resolves its real path anew and starts a stream at it, and scans it deep. A notice counts
+  only for the registration that made it: one that comes late, for a descriptor number that
+  has been given to another directory since, is dropped. The scans that loss reports ask for
+  are paced (5.13), so a directory that is renamed again and again costs one scan in a
+  while, not one for each rename.
+- **The room for the guard.** All watchers of a process together keep at most half of the
+  files that the process may open (`getdtablesize`). When a commit would need more, it fails
+  with the watch limit error like a stream that cannot start: the new covers are polled, and
+  the old streams stay. The same for every other error of the guard, with that error. Only a
+  directory that is gone is no error: its stream path is reported lost right after the
+  start, and the engine finds out what is there. `/` has nothing above it and needs no
+  guard. (It is a cover when a watched path right below it has a file or nothing at it.)
+- **The check after the start.** The real path of a cover is asked at `watch`, and its stream
+  and its guard start at `commit`. A directory above that was renamed in between leaves the
+  stream at a path where nothing is. So after the start, the real path of each stream path
+  that is new is asked again, in the way it was asked before (`realpath`, 8 µs; the guard is
+  registered by then). One that is another path now, or that has no guard, is reported lost.
+  The same question is asked both times on purpose: `F_GETPATH` on the descriptor of the
+  guard is cheaper, but it can spell a path in another way than `realpath` does, and a
+  difference that is no rename would make the engine watch and scan again without end.
 
-Known hole, mostly closed by the engine (5.10, "A directory that was renamed away and back"): a
-directory above a cover, or a link on the way to it, that is renamed away and is back before
-the next poll, with changes made while it was away. What stays open is listed there.
+  A directory between a new stream path and a cover below it can get another spelling of
+  its name in that time too (`src` to `Src`: the watched path stays valid, so no scan finds
+  it, and no stream was there to report it). The cover would stand at a path that no record
+  spells, and hear nothing. So each name between a new stream path and a cover below it is
+  asked from the disk after the start (`getattrlist`, 1 µs for a directory, each directory
+  once), and a cover with a name that is spelled in another way, or that is a link now, is
+  reported lost. Measured with 20,000 watched files in 2,000 directories: 2 ms of a setup of
+  50 ms. A watched tree has nothing below its stream path and pays nothing.
+- **A path through the data volume.** `realpath` keeps a path that is spelled through
+  `/System/Volumes/Data` (where `/Users` and `/private` really are), and FSEvents reports the
+  directory under its short path: such a cover heard nothing. So a real path with that
+  prefix is taken without it, when the short path is the same directory (device and inode)
+  and is a real path itself. `/home` is the same directory as `/System/Volumes/Data/home`
+  too, but it is a link, and a stream at a path that is not real is never trusted (the
+  check after the start), so that one stays long. The directory itself is asked, not only
+  its parent: `/System/Volumes/Data/Users` has a parent with no short way, and is `/Users`.
+- **A cover at another real path.** A key that is watched again and whose directory has
+  another real path than before is reported lost, if its old path still has a stream that
+  is trusted: then a directory on the old path was renamed and the notice
+  of the guard is still on its way, or a link leads somewhere else. Without this, a key that
+  asks for more in that moment would take the new path with a scan of its own directory
+  only. (A key below a stream path that is trusted no more was reported with it.)
+- **Covers below a renamed directory.** A record for a renamed directory inside a stream is
+  also a loss report for every cover below the path of the record. The engine finds such a
+  cover by itself when the renamed directory is a node of its tree. It is none when a link
+  leads to the cover from somewhere else.
+
+What stays open:
+
+- A link on the way to a watched path that points somewhere else now is found by the poll
+  (5.14), within a second.
+- A stream path that is trusted no more keeps its stream until the streams are replaced. When
+  its directory is back, that stream and the new one both report it, so a record comes
+  twice, which costs one more table lookup and nothing else.
+- A directory inside a stream that gets another spelling of its name: each cover below it
+  is scanned deep twice, once for the record of the rename and once because its real path
+  is another one. The scans are paced, and only what differs is reported. The second report
+  cannot go: a cover whose path changes has missed the records that spelled the new path,
+  whatever made it change, and the backend does not know that a scan is on its way.
 
 ### 7.3 ReadDirectoryChangesW (`windows.rs`)
 
@@ -1178,8 +1337,10 @@ systems (`tests/windows_parts.rs`). What has to be checked on a real machine is 
 Unix hosts). `SimFs` is a file system in memory with inodes, a clock, a change time for each
 entry, and a mode that ignores the case of letters. `SimBackend` plays an OS watch API on it in
 three modes: by inode (inotify), by path prefix with real paths (FSEvents), by handle for a tree
-(Windows). The test decides when each notification is delivered: now, late, twice, or never,
-with or without the word that it was lost. The disk can change in the middle of an engine call.
+(Windows). A stream of the second mode ends when a directory at or above its path is renamed or
+removed, and says so, as the guard of the real backend does (7.2). The test decides when each
+notification is delivered: now, late, twice, or never, with or without the word that it was
+lost. The disk can change in the middle of an engine call.
 The backend keeps a log of every `watch` and `unwatch` call, and the disk tells where an OS
 watch is now. Not played: `MOVE_SELF` of inotify, and the shared handles of Windows.
 
@@ -1254,14 +1415,6 @@ uses polling).
 
 Known holes of the engine:
 
-- macOS: a directory above a watched path is renamed to another case of its letters, and in
-  the same second an entry comes or goes directly in it. A stream of FSEvents does not
-  follow the new spelling, and it says nothing about a directory above its path (measured).
-  The poll finds such a rename by the change time that moved alone (5.10), and here the
-  modification time moved too. Nothing below that directory is heard any more. The same
-  when the directory is removed and made again in another case, and the new one has the
-  inode number of the old one. (The fuzzer keeps watched paths in upper case away from the
-  backend that watches by path for this reason.)
 - Linux: a disk that takes two Unicode forms of a name for one and tells the case of letters
   apart (a case-sensitive volume of a Mac in a Linux machine) is proved strict. And a
   casefold flag that is changed on a watched directory while it is empty is noticed only at

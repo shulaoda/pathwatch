@@ -13,8 +13,8 @@ use pathwatch::{
   poll::PollBackend,
 };
 use pathwatch_sim::{
-  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, asked, at, caught_up, known, on_all, os_watches,
-  settled, sorted, window, window_then_settled,
+  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, SimFs, asked, at, caught_up, known, on_all,
+  os_watches, settled, sorted, window, window_then_settled,
 };
 
 /// How long the clock may move in a story where no poll runs: less than the poll interval.
@@ -607,4 +607,53 @@ fn a_polled_directory_is_asked_again_when_a_stream_above_it_starts() {
   d.fs.write("/p/a/b/f.js", "333").unwrap();
   assert_eq!(window_then_settled(&mut d), ["U /p/a/b/f.js"]);
   caught_up(&mut d);
+}
+
+/// A listing that tells all of a file (APFS) is its look: a scan asks no `lstat` for a file,
+/// the first one and the one after a loss. What the listing told can be old when the scan
+/// comes to the file: the file is written or removed, or a directory takes its place, at any
+/// moment of the `watch` call.
+#[test]
+fn a_listing_that_tells_all_of_a_file_is_its_look() {
+  fn prepare(d: &mut dyn Sim, meta: bool) {
+    d.fs().set_listing_meta(meta);
+    d.fs().mkdir_all("/p/src").unwrap();
+    d.fs().write("/p/src/a.js", "1").unwrap();
+    d.fs().write("/p/src/b.js", "1").unwrap();
+  }
+  let changes: [fn(&SimFs); 3] = [
+    |fs| fs.write("/p/src/a.js", "22").unwrap(),
+    |fs| fs.remove("/p/src/a.js").unwrap(),
+    |fs| {
+      fs.remove("/p/src/a.js").unwrap();
+      fs.mkdir_all("/p/src/a.js/in").unwrap();
+    },
+  ];
+  for (on, make) in makes() {
+    let calls = |meta: bool| {
+      let mut d = make();
+      prepare(&mut *d, meta);
+      d.watch(&["/p"]);
+      let first = d.fs().calls();
+      d.overflow();
+      d.settled();
+      let again = d.fs().calls().lstat - first.lstat;
+      d.caught_up();
+      (first, again)
+    };
+    let ((with_lstat, again_with_lstat), (first, again)) = (calls(false), calls(true));
+    assert_eq!((with_lstat.lstat - first.lstat, again_with_lstat - again), (2, 2), "{on}");
+
+    for moment in 0..first.total() {
+      for change in changes {
+        let mut d = make();
+        prepare(&mut *d, true);
+        d.fs().at_call(moment, change);
+        d.watch(&["/p"]);
+        let events = d.settled();
+        assert_eq!(d.fs().traps_run(), 1, "{on}, call {moment}: {events:?}");
+        d.caught_up();
+      }
+    }
+  }
 }

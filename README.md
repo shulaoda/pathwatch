@@ -172,14 +172,11 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   before `watch`.
 - **The link of a watched path changes** (it points somewhere else now): found by a poll,
   within a second, or within the poll interval when polling is on.
-- **macOS: a directory above a watched path is renamed to another case of its letters**
-  (`src` to `Src`), and in the same second a file comes or goes directly in it: nothing below
-  that directory is reported any more. Without the second change, the rename is found within
-  a second.
 - **macOS, Windows: the directories above a watched path** are polled once a second. When
-  they are removed, or removed and made again, the events can come up to a second late. On
-  macOS, when such a directory is renamed away, changed and renamed back between two polls,
-  the change is found in most cases, not in all (`docs/design.md` 5.10).
+  one of them is made, or made again, the events can come up to a second late. On Windows the
+  same holds when one is removed. On macOS a rename or a removal of such a directory is found
+  at once, also a rename that only changes the case of letters (`src` to `Src`), and one that
+  is taken back right away (`docs/design.md` 7.2).
 - **macOS: many watched paths and a busy disk.** Events come late when the watcher has many
   separate paths and other programs write a lot. Measured while 50,000 other files were
   written: 0.1 s with 100 paths, 0.9 s with 500, 1.8 s with 1,000, 3.5 s with 2,000. Nothing is
@@ -236,7 +233,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 | OS | Watch API | Limits |
 |---|---|---|
 | Linux, Android | inotify | One kernel watch for each directory, so a big tree needs a high `fs.inotify.max_user_watches`. At the limit the handler gets `WatchLimit` and the directory is polled once a second. When inotify cannot start at all, the handler is told once and the watcher polls everything. Changes made on another machine (NFS, a folder shared with a VM) are not reported: use polling there. |
-| macOS | FSEvents | See "Holes". A process can run 512 streams; one watcher keeps about 8. |
+| macOS | FSEvents | See "Holes". A process can run 512 streams; one watcher keeps about 8. It also keeps one file open for each directory at and above a place that a stream watches (about ten for a project, at most 64 such places), and stops at half of what the process may open: beyond that the handler gets `WatchLimit` and the directories are polled once a second. |
 | Windows | `ReadDirectoryChangesW` | Not run yet. At most 64 handles; more directories share a handle on a directory above them. No handle is put on `C:\`, `C:\Users` or `C:\Users\<name>`: what could only be watched from there is polled. |
 | every other target | none: always polling | The cost grows with the number of watched files. |
 

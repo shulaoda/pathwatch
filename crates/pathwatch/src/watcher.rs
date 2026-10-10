@@ -228,7 +228,8 @@ impl Watcher {
     if self.stop.load(Ordering::Acquire) {
       return Err(closed());
     }
-    let mut usable = Vec::new();
+    let paths = paths.into_iter();
+    let mut usable = Vec::with_capacity(paths.size_hint().0);
     let mut skipped = None;
     for path in paths {
       match clean(path.as_ref()) {

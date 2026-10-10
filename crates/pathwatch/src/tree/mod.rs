@@ -171,7 +171,7 @@ impl Fingerprint {
 
 /// A time as one number: nanoseconds since 1970. A time that does not fit (before 1678 or after
 /// 2262) becomes the nearest one that fits.
-fn nanos(time: SystemTime) -> i64 {
+pub(crate) fn nanos(time: SystemTime) -> i64 {
   let fit = |nanos: u128| i64::try_from(nanos).unwrap_or(i64::MAX);
   match time.duration_since(SystemTime::UNIX_EPOCH) {
     Ok(after) => fit(after.as_nanos()),
@@ -291,8 +291,6 @@ pub struct Tree {
   contents: FxHashMap<DirKey, Content>,
   /// The held nodes, each with the time of its second look.
   holds: FxHashMap<DirKey, Instant>,
-  /// The times of the directories that nothing but a poll of the directory above looks at.
-  times: FxHashMap<DirKey, DirTimes>,
   /// The registered nodes whose names are not plain ([`is_plain`]), by the slot of their
   /// parent. The table does not find such a node under another spelling of its name, so a
   /// hint finds it here ([`Tree::others_meant`]).
@@ -331,7 +329,6 @@ impl Tree {
       links: FxHashMap::default(),
       contents: FxHashMap::default(),
       holds: FxHashMap::default(),
-      times: FxHashMap::default(),
       not_plain: FxHashMap::default(),
       marked: Vec::new(),
       to_scan: Vec::new(),
@@ -563,7 +560,6 @@ impl Tree {
     self.links.remove(&key);
     self.contents.remove(&key);
     self.holds.remove(&key);
-    self.times.remove(&key);
 
     self.give_back();
     self.names.free(node.name_len);
@@ -761,15 +757,15 @@ fn child_hash(parent: u32, name: &OsStr) -> u64 {
   mix(hash ^ first, SEEDS[1] ^ last)
 }
 
-/// The longest list that is kept for its memory between two uses.
-const KEPT: usize = 1024;
+/// The most bytes of a list that are kept between two uses.
+pub(crate) const KEPT: usize = 16 * 1024;
 
 /// Empties a list for its next use. It keeps its memory, so that a flush for a few changes asks
 /// for none. A long list is given back: a `watch` of 20,000 paths does not leave its lists
 /// behind for ever.
 pub(crate) fn emptied<T>(mut list: Vec<T>) -> Vec<T> {
   list.clear();
-  if list.capacity() > KEPT { Vec::new() } else { list }
+  if list.capacity() * size_of::<T>() > KEPT { Vec::new() } else { list }
 }
 
 /// "Check this name at the next flush."
@@ -1170,23 +1166,7 @@ pub enum Content {
   Unknown,
 }
 
-/// When a directory changed last, in nanoseconds since 1970. A rename of the directory itself moves `changed` alone; an
-/// entry that comes or goes in it moves both.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct DirTimes {
-  /// The change time: of what the directory holds, and of the entry that it is.
-  pub changed: i64,
-  /// The modification time: of what it holds.
-  pub modified: i64,
-}
-
-impl DirTimes {
-  pub fn of(meta: &Meta) -> Self {
-    Self { changed: nanos(meta.changed), modified: nanos(meta.modified) }
-  }
-}
-
-/// What only a few nodes have, kept beside the arena: links, contents, times and holds.
+/// What only a few nodes have, kept beside the arena: links, contents and holds.
 impl Tree {
   /// A hash of the real path behind the node, if it was a symbolic link at its last check.
   pub fn link(&self, key: DirKey) -> Option<u64> {
@@ -1216,16 +1196,6 @@ impl Tree {
     } else if !self.contents.is_empty() {
       // Most of the time no file is young, and a check has nothing to take away.
       self.contents.remove(&key);
-    }
-  }
-
-  /// Keeps `times` for the directory at the node, or nothing. Gives what was kept before.
-  pub fn set_times(&mut self, key: DirKey, times: Option<DirTimes>) -> Option<DirTimes> {
-    match times {
-      Some(times) => self.times.insert(key, times),
-      // Most of the time nothing is kept for any node, and a check has nothing to take away.
-      None if self.times.is_empty() => None,
-      None => self.times.remove(&key),
     }
   }
 
@@ -1302,12 +1272,9 @@ impl Tree {
         return fail("is held, or has a time for its second look, but not both");
       }
     }
-    let kept = self.links.keys().chain(self.contents.keys()).chain(self.holds.keys());
-    if !kept.chain(self.times.keys()).all(|key| self.get(*key).is_some()) {
+    let mut kept = self.links.keys().chain(self.contents.keys()).chain(self.holds.keys());
+    if !kept.all(|key| self.get(*key).is_some()) {
       return Err("something is kept for a node that is gone".to_owned());
-    }
-    if !self.times.keys().all(|key| matches!(self[*key].kind, Kind::Dir(_))) {
-      return Err("the times of a directory are kept for a node that has none".to_owned());
     }
     if !self.contents.keys().all(|key| matches!(self[*key].kind, Kind::File(_))) {
       return Err("the content of a file is kept for a node that has no file".to_owned());
@@ -1480,9 +1447,9 @@ mod tests {
   /// A list that is used again keeps its memory, but not when it is long.
   #[test]
   fn a_long_list_is_given_back() {
-    let short = emptied(vec![1; KEPT]);
-    assert!(short.is_empty() && short.capacity() == KEPT);
-    let long = emptied(vec![1; KEPT + 1]);
+    let short = emptied(vec![1_u64; KEPT / 8]);
+    assert!(short.is_empty() && short.capacity() == KEPT / 8);
+    let long = emptied(vec![1_u64; KEPT / 8 + 1]);
     assert_eq!(long.capacity(), 0);
   }
 }

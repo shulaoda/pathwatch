@@ -30,7 +30,8 @@
 //!     `a_file_goes_through_another_spelling_of_its_name`,
 //!     `a_directory_is_renamed_to_another_letter_case`,
 //!     `every_watched_spelling_of_a_file_gets_its_events`,
-//!     `watched_paths_through_another_spelling_inside_a_watched_directory`.
+//!     `watched_paths_through_another_spelling_inside_a_watched_directory`,
+//!     `a_directory_above_a_watched_path_is_renamed_to_another_letter_case`.
 
 use std::{
   env, fs,
@@ -779,5 +780,26 @@ fn a_directory_is_renamed_to_another_letter_case() {
     w.write("r/SRC/deep/b.js", "22");
     w.write("r/SRC/deep/c.js", "1");
     w.expect(&[(Update, "r/SRC/deep/b.js"), (Create, "r/SRC/deep/c.js")]);
+  });
+}
+
+/// A directory above the watched path is renamed to another letter case. The watched path
+/// still finds its directory, and the changes below it keep coming, under the spelling of
+/// the caller.
+#[test]
+fn a_directory_above_a_watched_path_is_renamed_to_another_letter_case() {
+  each_backend(|w| {
+    w.write("r/x/a/old.js", "1");
+    if !w.path("R").exists() {
+      return;
+    }
+    w.watch(&["r/x/a"]);
+
+    w.rename("r/x", "r/X");
+    w.write("r/X/a/new.js", "1");
+    w.expect(&[(Create, "r/x/a/new.js")]);
+    w.write("r/X/a/old.js", "22");
+    w.write("r/X/a/more.js", "1");
+    w.expect(&[(Update, "r/x/a/old.js"), (Create, "r/x/a/more.js")]);
   });
 }
