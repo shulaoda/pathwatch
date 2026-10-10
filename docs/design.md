@@ -638,9 +638,11 @@ Then one flush runs, as for `watch`. A path that is watched again later gets a n
 ### 5.8 Fingerprint, identity, and young files
 
 - File fingerprint: modification time (full resolution), size, file id. The file id is the inode
-  on Unix and the creation time on Windows.
+  on Unix and the file index on Windows.
 - Directory identity: device, inode and birth time on Unix (birth time zero where there is
-  none); the creation time on Windows.
+  none); volume serial number, file index and creation time on Windows. The creation time
+  alone is no identity there: a new entry gets the one of the entry that was removed under
+  its name a moment ago.
 - No ctime: chmod, a rename, a new hard link and an xattr write change it without a content
   change.
 

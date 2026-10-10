@@ -17,7 +17,7 @@
 use std::{
   borrow::Cow,
   ffi::OsString,
-  io, mem,
+  fs, io, mem,
   path::{Component, Path, PathBuf},
 };
 
@@ -221,12 +221,16 @@ fn may_hold_a_handle(dir: &Path) -> bool {
 ///   the handle when it finds another directory there.
 /// - A `Names` request that no handle covers is not watched. Such a directory is often a top
 ///   directory (`C:\`) or a home directory, and a handle there would report the whole disk.
+///   The engine polls it. When the handles move and one comes to stand at or above it, the
+///   engine is told and asks again ([`Change::covered`]), and the poll ends.
+/// - A `Names` request that a handle covers is answered `Watched`, not `WatchedTree`: the key
+///   does not hold the handle, so the directories below it must keep their own keys.
 /// - Directories are compared by the text of their paths, part by part. Two spellings of one
 ///   directory (another letter case, a short name, a junction) can get two handles, one below
 ///   the other.
 /// - A junction or a directory link below a handle gets no events. Windows reports what
-///   happens behind it under the real path. But the path text says that the handle covers the
-///   directory behind the link, so the answer is `WatchedTree` and the engine does not poll it.
+///   happens behind it under the real path. The path text does not tell, so the caller asks
+///   the disk before it lets a handle above serve a directory (`leads_through_a_link`).
 #[derive(Debug, Default)]
 pub struct Handles {
   /// The keys by their directory, with ASCII letters in lower case. See `route`.
@@ -234,6 +238,9 @@ pub struct Handles {
   /// No handle is below another.
   open: Vec<Handle>,
   next_id: usize,
+  /// The keys that were answered `NotWatched`, with their directories. When a handle comes to
+  /// stand at or above one of them, the engine is told ([`Change::covered`]) and asks again.
+  waiting: FxHashMap<DirKey, PathBuf>,
 }
 
 impl Handles {
@@ -246,6 +253,7 @@ impl Handles {
     open: Open<'_>,
   ) -> (Coverage, Change) {
     let mut change = Change::default();
+    self.waiting.remove(&key);
     // For one key the want only goes up (rule 5).
     let want = self.served(key).map_or(want, |served| served.want.max(want));
 
@@ -263,9 +271,16 @@ impl Handles {
       // handle reports every directory below the key's too, and each record goes to the
       // deepest key above it, so the answer is the truth (rule 4). With `Watched` the engine
       // would ask for each directory below, and each would be one more key for no hint more.
-      return (Coverage::WatchedTree, change);
+      //
+      // Not for a key that wants names only. It has no say in where the handles are, and
+      // after `WatchedTree` the engine takes back the watches of the directories below it:
+      // the keys that hold the handle would go, the handle with them, and then all of them
+      // would ask again, without end.
+      let tree = want == Want::Contents;
+      return (if tree { Coverage::WatchedTree } else { Coverage::Watched }, change);
     }
     if want == Want::Names || !may_hold_a_handle(dir) {
+      self.waiting.insert(key, dir.to_owned());
       return (Coverage::NotWatched, change);
     }
 
@@ -281,9 +296,15 @@ impl Handles {
     (coverage, change)
   }
 
+  /// The directory of the handle that is at or above `dir`, by the text of the paths.
+  pub fn above(&self, dir: &Path) -> Option<&Path> {
+    self.open.iter().map(|handle| &*handle.dir).find(|top| dir.starts_with(top))
+  }
+
   /// Forgets `key`. A handle goes with its last key (rule 6).
   pub fn unwatch(&mut self, key: DirKey, open: Open<'_>) -> Change {
     let mut change = Change::default();
+    self.waiting.remove(&key);
     // A key that wants names only has no say in where the handles are.
     if self.forget(key).is_some_and(|gone| gone.want == Want::Contents) {
       // On an error the handles stay where they are. They still report all that the other
@@ -342,6 +363,10 @@ impl Handles {
         change.close.push(handle.id);
       }
     }
+    // A handle that moved up can stand above a directory that had none before.
+    let covered = |dir: &PathBuf| new.iter().any(|handle| dir.starts_with(&handle.dir));
+    let waiting = self.waiting.iter().filter(|(_, dir)| covered(dir));
+    change.covered.extend(waiting.map(|(&key, _)| key));
     self.open.extend(new);
 
     // Each key gets the handle of its place. A key that had another one before is told.
@@ -478,6 +503,9 @@ pub struct Change {
   /// them now, and what waited in the closed one is lost (rule 11). Or no handle serves them
   /// any more (rule 10). The engine asks again for each of them.
   pub moved: Vec<DirKey>,
+  /// The keys that were answered `NotWatched` and that a new handle reports now. The next
+  /// `commit` gives them to the engine, and the engine asks again for each (rule 4).
+  pub covered: Vec<DirKey>,
 }
 
 /// Opens a handle with this id on this directory. After `Ok` the handle is live.
@@ -504,11 +532,14 @@ pub struct WindowsBackend {
   port: port::Port,
   /// For the keys that moved to another handle: only `translate` can make a hint.
   sink: Sink<Raw>,
+  /// What the next `commit` returns: see [`Change::covered`].
+  covered: Vec<DirKey>,
 }
 
 impl WindowsBackend {
   pub fn new(sink: Sink<Raw>) -> io::Result<Self> {
-    Ok(Self { handles: Handles::default(), port: port::Port::new(sink.clone())?, sink })
+    let port = port::Port::new(sink.clone())?;
+    Ok(Self { handles: Handles::default(), port, sink, covered: Vec::new() })
   }
 }
 
@@ -516,6 +547,12 @@ impl Backend for WindowsBackend {
   type Raw = Raw;
 
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
+    // The handle above reports nothing under this path (rule 4). Nothing is watched for the
+    // key, and the engine polls the directory.
+    if self.handles.above(dir).is_some_and(|top| leads_through_a_link(top, dir)) {
+      self.unwatch(key);
+      return Coverage::NotWatched;
+    }
     let port = &self.port;
     let (coverage, change) = self.handles.watch(key, dir, want, &mut |id, dir| port.open(id, dir));
     self.finish(change);
@@ -526,6 +563,11 @@ impl Backend for WindowsBackend {
     let port = &self.port;
     let change = self.handles.unwatch(key, &mut |id, dir| port.open(id, dir));
     self.finish(change);
+  }
+
+  /// A handle is live when `watch` returns, so nothing is left to start here.
+  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
+    Ok(mem::take(&mut self.covered))
   }
 
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
@@ -543,14 +585,24 @@ impl Backend for WindowsBackend {
 impl WindowsBackend {
   /// The new handles are live. Only now the old ones are closed, and then the keys that moved
   /// are told.
-  fn finish(&self, change: Change) {
+  fn finish(&mut self, change: Change) {
     for id in change.close {
       self.port.close(id);
     }
+    self.covered.extend(change.covered);
     if !change.moved.is_empty() {
       self.sink.raw(Raw::Moved(change.moved));
     }
   }
+}
+
+/// Whether a name on the way from `top` down to `dir`, or `dir` itself, is a junction or a
+/// link. A handle on `top` reports what is behind it under the real path, and nothing under
+/// `dir`. One look at the disk for each name: the engine asks for a watched directory, not for
+/// every directory below it.
+fn leads_through_a_link(top: &Path, dir: &Path) -> bool {
+  let names = dir.strip_prefix(top).map_or(0, |below| below.components().count());
+  dir.ancestors().take(names).any(|path| fs::symlink_metadata(path).is_ok_and(|at| at.is_symlink()))
 }
 
 /// What the backend hands to the engine.

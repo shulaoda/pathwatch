@@ -229,6 +229,8 @@ mod handles {
   #[derive(Debug, PartialEq, Eq)]
   enum Answer {
     Tree,
+    /// A handle serves the key, which wants names only.
+    Names,
     NotWatched,
     Limit,
     Failed,
@@ -246,6 +248,8 @@ mod handles {
     broken: Option<PathBuf>,
     /// The keys that were told that another handle serves them, or none.
     moved: Vec<u32>,
+    /// The keys that got no handle before and that a new handle reports now.
+    covered: Vec<u32>,
   }
 
   impl Fake {
@@ -265,7 +269,7 @@ mod handles {
         Coverage::NotWatched => Answer::NotWatched,
         Coverage::Failed(error) if is_watch_limit(&error) => Answer::Limit,
         Coverage::Failed(_) => Answer::Failed,
-        Coverage::Watched => panic!("a handle reports a whole tree"),
+        Coverage::Watched => Answer::Names,
       }
     }
 
@@ -293,6 +297,7 @@ mod handles {
         self.open.remove(at.expect("a handle is closed that is not open"));
       }
       self.moved.extend(change.moved.into_iter().map(index));
+      self.covered.extend(change.covered.into_iter().map(index));
       // No handle is below another, and there are never too many.
       for (_, above) in &self.open {
         let below = self.open.iter().filter(|(_, dir)| dir.starts_with(above)).count();
@@ -329,6 +334,36 @@ mod handles {
     }
   }
 
+  /// A directory that wants names only gets no handle, and the engine polls it. When the
+  /// handles move up to it, it is reported, so that the engine asks again and stops the poll.
+  #[test]
+  fn a_key_without_a_handle_is_told_when_a_handle_comes_to_stand_above_it() {
+    let mut fake = Fake::default();
+    assert_eq!(fake.watch(200, "/p", Want::Names), Answer::NotWatched);
+    assert_eq!(fake.watch(201, "/p/1/deep", Want::Names), Answer::NotWatched);
+    assert_eq!(fake.watch(202, "/q", Want::Names), Answer::NotWatched);
+    assert_eq!(fake.watch(203, "/p/2/gone", Want::Names), Answer::NotWatched);
+    fake.unwatch(203);
+    let count = u32::try_from(MAX_HANDLES).unwrap();
+    for index in 0..count {
+      fake.open(index, &format!("/p/{index}"));
+    }
+    // A handle of its own on `/p/1` reports the directory below it.
+    assert_eq!(std::mem::take(&mut fake.covered), [201]);
+
+    // One more: the handles move up to `/p`.
+    assert_eq!(fake.watch(100, "/r", Want::Contents), Answer::Tree);
+    assert_eq!(fake.dirs(), dirs(["/p", "/r"]));
+    fake.covered.sort_unstable();
+    assert_eq!(std::mem::take(&mut fake.covered), [200, 201]);
+
+    // The engine asks again and is served. Nothing is told twice.
+    assert_eq!(fake.watch(200, "/p", Want::Names), Answer::Names);
+    assert_eq!(fake.watch(201, "/p/1/deep", Want::Names), Answer::Names);
+    assert_eq!(fake.watch(101, "/s", Want::Contents), Answer::Tree);
+    assert_eq!(fake.covered, []);
+  }
+
   fn dirs<const N: usize>(paths: [&str; N]) -> Vec<PathBuf> {
     paths.map(dir).into()
   }
@@ -363,8 +398,10 @@ mod handles {
   fn a_directory_at_or_below_a_handle_gets_no_handle() {
     let mut fake = Fake::default();
     let id = fake.open(0, "/p/a");
-    for (index, want) in [(1, Want::Names), (2, Want::Contents)] {
-      assert_eq!(fake.watch(index, "/p/a/b/c", want), Answer::Tree);
+    for (index, want, answer) in
+      [(1, Want::Names, Answer::Names), (2, Want::Contents, Answer::Tree)]
+    {
+      assert_eq!(fake.watch(index, "/p/a/b/c", want), answer);
       fake.unwatch(index);
       assert_eq!(fake.open, [(id, dir("/p/a"))]);
     }
@@ -430,7 +467,7 @@ mod handles {
     let mut fake = Fake::default();
     fake.open(0, "/p");
     assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
-    assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::Tree);
+    assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::Names);
     let shared = fake.id("/p");
     for _ in 0..3 {
       assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
@@ -603,7 +640,7 @@ mod handles {
     fake.open(0, "/p/a");
     fake.open(1, "/p");
     assert_eq!(fake.moved(), [0]);
-    assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::Tree);
+    assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::Names);
     // The handle goes down to the one directory that still wants the contents. The key that
     // only wanted names has no handle above it any more, and is told.
     fake.unwatch(1);
@@ -611,7 +648,7 @@ mod handles {
     assert_eq!(fake.moved(), [0, 2]);
     assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::NotWatched);
     // A key that wants names only never moves a handle.
-    assert_eq!(fake.watch(3, "/p/a/x", Want::Names), Answer::Tree);
+    assert_eq!(fake.watch(3, "/p/a/x", Want::Names), Answer::Names);
     fake.unwatch(3);
     assert_eq!(fake.moved(), []);
   }
@@ -620,7 +657,7 @@ mod handles {
   fn a_key_that_wants_more_later_keeps_its_handle() {
     let mut fake = Fake::default();
     let id = fake.open(0, "/p");
-    assert_eq!(fake.watch(1, "/p/a", Want::Names), Answer::Tree);
+    assert_eq!(fake.watch(1, "/p/a", Want::Names), Answer::Names);
     assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
     assert_eq!(fake.open, [(id, dir("/p"))]);
     // It wants the contents now, also when it is asked for less (rule 5): the handle moves to
@@ -665,7 +702,7 @@ mod handles {
     fake.open(0, "/p/a");
     fake.open(1, "/p");
     fake.open(2, "/q");
-    assert_eq!(fake.watch(3, "/p/b", Want::Names), Answer::Tree);
+    assert_eq!(fake.watch(3, "/p/b", Want::Names), Answer::Names);
     assert_eq!(fake.watch(4, "/q/c", Want::Contents), Answer::Tree);
     assert_eq!(fake.moved(), [0]);
 
@@ -709,7 +746,7 @@ mod handles {
     let mut fake = Fake::default();
     let id = fake.open(0, "/p");
     assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
-    assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::Tree);
+    assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::Names);
 
     assert_eq!(fake.died(id), [0, 1, 2]);
     fake.open(1, "/p/a");
@@ -935,7 +972,8 @@ mod translate {
       opened = Some(id);
       Ok(())
     });
-    assert!(matches!(coverage, Coverage::WatchedTree), "{path}: {coverage:?}");
+    let served = matches!(coverage, Coverage::WatchedTree | Coverage::Watched);
+    assert!(served, "{path}: {coverage:?}");
     (opened, change.close)
   }
 

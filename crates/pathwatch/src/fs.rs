@@ -53,7 +53,7 @@ pub struct Meta {
   /// renamed or gets other permissions. Where the platform gives none: the modification time.
   pub changed: SystemTime,
   pub size: u64,
-  /// The inode on Unix, the creation time on Windows.
+  /// The inode on Unix, the file index on Windows.
   pub file_id: u64,
   pub dir_id: DirId,
 }
@@ -99,11 +99,11 @@ pub struct StdFs;
 
 impl Fs for StdFs {
   fn lstat(&self, path: &Path) -> io::Result<Meta> {
-    fs::symlink_metadata(path).map(|metadata| meta(&metadata))
+    stat(path, false)
   }
 
   fn stat(&self, path: &Path) -> io::Result<Meta> {
-    fs::metadata(path).map(|metadata| meta(&metadata))
+    stat(path, true)
   }
 
   fn read_dir(&self, dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()> {
@@ -113,8 +113,8 @@ impl Fs for StdFs {
         return apple::read_dir(dir, volume, each);
       }
     }
-    for entry in fs::read_dir(dir)? {
-      let entry = entry?;
+    for entry in fs::read_dir(dir).map_err(told)? {
+      let entry = entry.map_err(told)?;
       let kind = entry.file_type().ok().map(|file_type| {
         if file_type.is_dir() {
           FileType::Dir
@@ -130,7 +130,7 @@ impl Fs for StdFs {
   }
 
   fn hash(&self, path: &Path) -> io::Result<u64> {
-    let mut file = File::open(path)?;
+    let mut file = File::open(path).map_err(told)?;
     let mut hasher = FxHasher::default();
     // On the stack: a young file is hashed at every look, and most files are small.
     let mut buffer = [0; 16 * 1024];
@@ -154,20 +154,59 @@ impl Fs for StdFs {
   }
 
   fn link_target(&self, path: &Path) -> io::Result<PathBuf> {
-    fs::read_link(path)
+    fs::read_link(path).map_err(told)
   }
 
   fn real_path(&self, path: &Path) -> io::Result<PathBuf> {
-    fs::canonicalize(path)
+    fs::canonicalize(path).map_err(told)
   }
 
   fn name_on_disk(&self, path: &Path) -> io::Result<OsString> {
-    name_on_disk(path)
+    name_on_disk(path).map_err(told)
   }
 
   fn now(&self) -> SystemTime {
     SystemTime::now()
   }
+}
+
+/// What a failed call tells, when Windows says less: "access denied" is also its answer for an
+/// entry that is being deleted (until the one who deletes it closes its handle), and for a
+/// directory that is opened as a file. Both mean that the file the engine asked about is not
+/// there, and only the status of the kernel tells them from an entry that may not be read.
+///
+/// Call it right after the call that failed, on the same thread: the status is the one of
+/// the last call that failed there.
+#[cfg(windows)]
+fn told(error: io::Error) -> io::Error {
+  use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, NTSTATUS, STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY,
+    STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+  };
+
+  #[link(name = "ntdll")]
+  unsafe extern "system" {
+    safe fn RtlGetLastNtStatus() -> NTSTATUS;
+  }
+
+  if error.raw_os_error() != Some(ERROR_ACCESS_DENIED.cast_signed()) {
+    return error;
+  }
+  match RtlGetLastNtStatus() {
+    // std asks the listing of the directory when the entry cannot be opened, so the status
+    // can also be the one of that second call: the entry is gone by then.
+    STATUS_DELETE_PENDING
+    | STATUS_FILE_IS_A_DIRECTORY
+    | STATUS_NO_SUCH_FILE
+    | STATUS_OBJECT_NAME_NOT_FOUND
+    | STATUS_OBJECT_PATH_NOT_FOUND => io::ErrorKind::NotFound.into(),
+    _ => error,
+  }
+}
+
+#[cfg(not(windows))]
+fn told(error: io::Error) -> io::Error {
+  error
 }
 
 /// macOS: `getattrlistbulk` gives the entries of a directory with what `lstat` tells of each,
@@ -511,7 +550,96 @@ fn name_on_disk(path: &Path) -> io::Result<OsString> {
   path.file_name().map(OsStr::to_owned).ok_or_else(|| io::ErrorKind::InvalidInput.into())
 }
 
-fn meta(metadata: &Metadata) -> Meta {
+#[cfg(not(windows))]
+fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
+  let metadata = if follow { fs::metadata(path) } else { fs::symlink_metadata(path) }?;
+  Ok(meta(&metadata, ids(&metadata)))
+}
+
+/// Windows: std gives the file index and the volume only on nightly, so the entry is opened
+/// here, the way std opens it for `symlink_metadata`, and the handle is asked for them.
+///
+/// They are needed: Windows gives a new entry the creation time of the one that was removed
+/// under its name a moment ago, and the clock of the time stamps moves in steps of up to
+/// 16 ms. So a file that is removed and written again can have every time and the size of the
+/// old one, and only the file index tells that it is another file.
+#[cfg(windows)]
+fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
+  use std::{
+    fs::OpenOptions,
+    mem,
+    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    time::Duration,
+  };
+
+  use windows_sys::Win32::{
+    Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION},
+    Storage::FileSystem::{
+      BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+      FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+      FILE_SHARE_WRITE, GetFileInformationByHandle,
+    },
+  };
+
+  /// From 1601 to 1970, in the steps of 100 ns that a `FILETIME` counts.
+  const TO_1970: u64 = 116_444_736_000_000_000;
+
+  let link = if follow { 0 } else { FILE_FLAG_OPEN_REPARSE_POINT };
+  let opened = OpenOptions::new()
+    // No access to the content: only what the entry is.
+    .access_mode(0)
+    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | link)
+    .open(path);
+  let file = match opened.map_err(told) {
+    Ok(file) => file,
+    Err(error) => {
+      // An entry that cannot be opened (a system file that is in use) can still be read from
+      // the listing of its directory: std does that. It has no index then.
+      let code = error.raw_os_error().map(i32::cast_unsigned);
+      if !matches!(code, Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)) {
+        return Err(error);
+      }
+      let metadata = if follow { fs::metadata(path) } else { fs::symlink_metadata(path) };
+      let metadata = metadata.map_err(told)?;
+      let created = std::os::windows::fs::MetadataExt::creation_time(&metadata);
+      return Ok(meta(&metadata, (created, DirId { volume: 0, inode: 0, birth: created })));
+    }
+  };
+  // SAFETY: all zeros is a valid value of this plain struct of numbers.
+  let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { mem::zeroed() };
+  // SAFETY: the handle is open, and the call writes one whole struct into `info`.
+  if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) } == 0 {
+    return Err(io::Error::last_os_error());
+  }
+  let wide = |high: u32, low: u32| (u64::from(high) << 32) | u64::from(low);
+  let index = wide(info.nFileIndexHigh, info.nFileIndexLow);
+  let birth = wide(info.ftCreationTime.dwHighDateTime, info.ftCreationTime.dwLowDateTime);
+  let written = wide(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime);
+  let dir_id = DirId { volume: u64::from(info.dwVolumeSerialNumber), inode: index, birth };
+  let kind = if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    // Only some of these are links (a junction, a symbolic link), and std knows which: one
+    // more question, for the few entries of this kind.
+    return Ok(meta(&file.metadata()?, (index, dir_id)));
+  } else if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+    FileType::Dir
+  } else {
+    FileType::File
+  };
+  // A time before 1970 is no time a watcher has to tell from another one.
+  let modified =
+    SystemTime::UNIX_EPOCH + Duration::from_nanos(written.saturating_sub(TO_1970) * 100);
+  Ok(Meta {
+    kind,
+    modified,
+    changed: modified,
+    size: wide(info.nFileSizeHigh, info.nFileSizeLow),
+    file_id: index,
+    dir_id,
+  })
+}
+
+fn meta(metadata: &Metadata, (file_id, dir_id): (u64, DirId)) -> Meta {
   let kind = if metadata.is_dir() {
     FileType::Dir
   } else if metadata.is_symlink() {
@@ -521,7 +649,6 @@ fn meta(metadata: &Metadata) -> Meta {
   } else {
     FileType::Other
   };
-  let (file_id, dir_id) = ids(metadata);
   let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
   Meta {
     kind,
@@ -558,15 +685,6 @@ fn ids(metadata: &Metadata) -> (u64, DirId) {
   // libc gives it (musl does not).
   let birth = metadata.created().map_or(0, nanos);
   (metadata.ino(), DirId { volume: metadata.dev(), inode: metadata.ino(), birth })
-}
-
-#[cfg(windows)]
-fn ids(metadata: &Metadata) -> (u64, DirId) {
-  use std::os::windows::fs::MetadataExt;
-
-  // Stable std gives no volume serial number and no file index.
-  let created = metadata.creation_time();
-  (created, DirId { volume: 0, inode: 0, birth: created })
 }
 
 #[cfg(not(any(unix, windows)))]

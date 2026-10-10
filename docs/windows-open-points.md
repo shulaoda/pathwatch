@@ -5,13 +5,40 @@ from the Windows documents and from the source of other watchers.
 
 It first ran on 2026-10-10, on Windows 11 Pro (build 26200) with NTFS on a local disk:
 
-- `crates/pathwatch/tests/windows.rs` (the backend with real handles): all 25 tests pass, 15
+- `crates/pathwatch/tests/windows.rs` (the backend with real handles): all tests pass, 20
   runs in a row. So each point below that has a test there holds on that system.
 - `crates/pathwatch/tests/windows_parts.rs` (the parts that make no Windows call: `place`,
   `Handles`, `Records`, `translate`): all 60 tests pass.
 - `crates/pathwatch/tests/disk` with this backend: every test passes, but one cannot run:
   `a_directory_above_a_watched_path_is_renamed_to_another_letter_case` renames a directory
   above an open handle, and Windows refuses that. It is skipped for this backend.
+
+That first run also found what the engine got wrong about an NTFS disk when it polls. All of
+it is in `fs.rs` now (`told` and `stat`):
+
+- **An entry that is being deleted answers "access denied"** to every call, until the one who
+  deletes it closes its handle. So does a directory that is opened as a file. The engine took
+  that for a file that cannot be read: it reported `PermissionDenied`, or an `Update` right
+  before the `Delete`. Only the status of the kernel (`RtlGetLastNtStatus`) tells the two
+  apart, and such an answer is "not found" now.
+- **The creation time is no identity.** A new entry gets the creation time of the one that
+  was removed under its name less than 15 seconds ago, and the clock of the time stamps
+  moves in steps of 1 to 16 ms. A file that was removed and written again with the same
+  content had every time and the size of the old one, and the poll saw no change. The
+  identity of a file and of a directory is the file index now, with the volume serial number
+  for a directory.
+
+The first run of the benchmark on Windows (`bench/results/windows.md`) found two more, in the
+backend:
+
+- **A directory that got no handle was polled for ever.** A directory on the way to a watched
+  path asks for names only and gets no handle. When the handles moved up later and one stood
+  at or above it, nobody told the engine, and it went on polling: with 20,000 watched files in
+  2,000 directories, 2,000 `lstat` calls each second while nothing changed. `commit` returns
+  such a key now (rule 4), and the engine asks again.
+- **A key that wants names only is answered `Watched`.** After `WatchedTree` the engine takes
+  back the watches of the directories below, but only a key that wants the contents holds a
+  handle: the handle went away with them, and all of them asked again, without end.
 
 What was not tried: a network share, ReFS, a FAT disk, an older Windows, Wine, and a rename
 made from WSL. A point below that has no test is still only known from documents.
@@ -165,15 +192,11 @@ change makes its hint, the rules of `Handles` hold with real handles, and `drop`
 These are known from reading. The limits of the backend are in the comments of `windows.rs`, at
 the code that they are about (`Handle`, `Handles`, `Handles::route`, `may_hold_a_handle`).
 
-1. **A link below a handle is taken for covered.** The engine calls `watch` for a directory that
-   is reached through a junction or a directory link, because a handle above does not report
-   what is behind the link. `Handles` compares path text, finds the handle above, and
-   answers `WatchedTree`. So that directory is not polled, and changes in it are not found. This
-   breaks rule 4 of `Backend` ("the answer is the truth").
-
-   Fix to try: before a handle above is taken for the key, check the path parts between the
-   directory of the handle and `dir` with `fs::symlink_metadata`. If one of them is a link,
-   open a handle on `dir`. The open follows the link, so the handle is on the target.
+1. **A directory behind a link below a handle is polled.** A handle does not report what is
+   behind a junction or a directory link below it, so the backend looks at each name between
+   the handle and the directory (`leads_through_a_link`) and answers `NotWatched` when one is
+   a link. The engine polls such a directory. A handle of its own on the directory would
+   report at once, but `place` knows no handle below another.
 
 2. **Hints after `unwatch`.** A record finds its key among the keys of now, so a read that was
    made before `unwatch` gives no hint with that key. One case is left: the notice "another

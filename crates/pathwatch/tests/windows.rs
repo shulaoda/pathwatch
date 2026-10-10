@@ -511,7 +511,7 @@ fn open_point_lost_records_become_a_hint_for_each_key_of_the_handle() {
   let mut harness = Harness::behind(&gate);
   let key = harness.handle(temp.path());
   let (sub_key, coverage) = harness.watch(&sub, Want::Names);
-  assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
+  assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
 
   {
     // The worker stops in the sink with the first records and does not read again. The kernel
@@ -620,6 +620,52 @@ fn open_point_a_change_behind_a_junction_is_reported_under_the_real_path() {
   fs::write(link.join("f.txt"), "1").unwrap();
   let seen = harness.hints_until(|hint| hint.names(key, r"target\f.txt"));
   assert!(seen.iter().all(|hint| !hint.names(key, r"link\f.txt")), "{seen:?}");
+}
+
+/// The text of the path says that the handle above covers the directory, and the handle
+/// reports nothing under that path. So the answer must not be "watched".
+#[test]
+fn a_directory_behind_a_junction_below_a_handle_is_not_covered() {
+  let temp = scratch();
+  let top = make_dir(temp.path().join("top"));
+  let plain = make_dir(top.join("plain").join("sub"));
+  make_dir(temp.path().join("target").join("sub"));
+  junction(&top.join("link"), &temp.path().join("target"));
+  let mut harness = Harness::new();
+  harness.handle(&top);
+
+  for behind in [top.join("link"), top.join("link").join("sub")] {
+    let (_, coverage) = harness.watch(&behind, Want::Contents);
+    assert!(matches!(coverage, Coverage::NotWatched), "{}: {coverage:?}", behind.display());
+  }
+  let (key, coverage) = harness.watch(&plain, Want::Contents);
+  assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
+  fs::write(plain.join("f.txt"), "1").unwrap();
+  harness.hints_until(|hint| hint.names(key, "f.txt"));
+}
+
+/// A key that a handle above served is behind a junction when the engine asks again: the
+/// handle does not serve it any more.
+#[test]
+fn a_directory_that_becomes_a_junction_below_a_handle_is_given_up() {
+  let temp = scratch();
+  let top = make_dir(temp.path().join("top"));
+  let dir = make_dir(top.join("dir"));
+  let target = make_dir(temp.path().join("target"));
+  let mut harness = Harness::new();
+  let top_key = harness.handle(&top);
+  let (key, coverage) = harness.watch(&dir, Want::Contents);
+  assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
+
+  fs::remove_dir(&dir).unwrap();
+  junction(&dir, &target);
+  let coverage = harness.watch_again(key, &dir, Want::Contents);
+  assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
+
+  // The handle still serves its own key, and no hint has the key that was given up.
+  fs::write(top.join("f.txt"), "1").unwrap();
+  let seen = harness.hints_until(|hint| hint.names(top_key, "f.txt"));
+  assert!(seen.iter().all(|hint| hint.key() != Some(key)), "{seen:?}");
 }
 
 #[test]

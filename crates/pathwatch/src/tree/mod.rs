@@ -154,7 +154,7 @@ pub enum Kind {
 }
 
 /// What tells one state of a file from the next without reading it: its modification time, its
-/// size, and its inode (on Windows: its creation time).
+/// size, and its inode (on Windows: its file index).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Fingerprint {
   /// The modification time in nanoseconds since 1970 (before 1970: below zero).

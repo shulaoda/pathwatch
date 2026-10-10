@@ -43,6 +43,11 @@ const LONGEST_WAIT: Duration = Duration::from_millis(500);
 /// goes into such work, however big the watched set is.
 const REST: u32 = 9;
 
+/// A flush counts for no more than this when the rest after it is worked out. The clock of the
+/// disk runs on while the machine sleeps: a flush that the sleep fell into seems to have taken
+/// hours, and nothing would be polled for ten times as long.
+const LONGEST_FLUSH: Duration = Duration::from_secs(60);
+
 /// The ignore filter: `true` for a path that must not be reported. An ignored directory is
 /// never entered.
 ///
@@ -333,7 +338,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.listed.shrink_to(KEPT / size_of::<ScanEntry>());
 
     let took = self.fs.now().duration_since(self.flush_time).unwrap_or_default();
-    let mut took = took.saturating_sub(self.commit_took);
+    let mut took = took.saturating_sub(self.commit_took).min(LONGEST_FLUSH);
     if loss_scans_ran {
       self.rest_until = Some(now + took + took * REST);
     }
