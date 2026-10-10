@@ -49,6 +49,8 @@ pub const RECURSIVE: [Mode; 2] = [Mode::Prefix, Mode::Handle];
 pub struct SimBackend {
   fs: SimFs,
   mode: Mode,
+  /// The last want of each key: for one key it only goes up (rule 5 of the backends).
+  wants: FxHashMap<DirKey, Want>,
   bound: FxHashMap<DirKey, u64>,
   keys: FxHashMap<u64, Vec<DirKey>>,
   /// By prefix: the real path of each stream.
@@ -67,6 +69,7 @@ impl SimBackend {
     Self {
       fs: fs.clone(),
       mode,
+      wants: FxHashMap::default(),
       bound: FxHashMap::default(),
       keys: FxHashMap::default(),
       prefixes: FxHashMap::default(),
@@ -83,6 +86,9 @@ impl Backend for SimBackend {
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
     self.fs.enter(|calls| calls.watch += 1);
     self.fs.lock().log_watch(WatchCall { key, dir: dir.to_path_buf(), want: Some(want) });
+    if let Some(had) = self.wants.insert(key, want) {
+      assert!(want >= had, "rule 5: the want of {key:?} went down from {had:?} to {want:?}");
+    }
     self.not_watched.remove(&key);
     // By prefix, a key that uses a stream above its directory stays on it when it asks for
     // more: that stream reports the whole tree already, as with FSEvents.
@@ -120,6 +126,7 @@ impl Backend for SimBackend {
 
   fn unwatch(&mut self, key: DirKey) {
     self.fs.lock().log_unwatch(key);
+    self.wants.remove(&key);
     self.not_watched.remove(&key);
     self.pending.retain(|(pending, _)| *pending != key);
     self.unbind(key);
@@ -231,6 +238,15 @@ impl Backend for SimBackend {
       } else {
         hint(Hint::Changed { dir: key, rel });
       }
+    }
+  }
+}
+
+/// A backend that is dropped gives every OS watch back (rule 12 of the backends).
+impl Drop for SimBackend {
+  fn drop(&mut self) {
+    for key in self.bound.keys().copied().collect::<Vec<DirKey>>() {
+      self.unbind(key);
     }
   }
 }
