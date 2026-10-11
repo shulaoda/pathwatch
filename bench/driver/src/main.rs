@@ -26,7 +26,7 @@ bench [flags]
 
   --quick              small sizes for a try: the same as --scale 0.05 --quiet-secs 2
   --scale <n>          multiply every size by n (default 1: the full sizes)
-  --quiet-secs <n>     how long the quiet phase is (default 10)
+  --quiet-secs <n>     how long the quiet phase is (default 5)
   --repeat <n>         run each scenario n times with each adapter (default 1); the tables
                        show the middle run, and how far the runs are apart
   --scenarios <list>   s1,s2,s3,s4,s5,s6,s7 (default: all)
@@ -56,7 +56,7 @@ struct Flags {
 fn flags(bench: &Path) -> Flags {
   let mut flags = Flags {
     scale: 1.0,
-    quiet_secs: 10.0,
+    quiet_secs: 5.0,
     repeat: 1,
     scenarios: None,
     adapters: None,

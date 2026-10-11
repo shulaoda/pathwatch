@@ -238,8 +238,9 @@ The rules of the driver:
 
 - An event of the kind `access` (a file was opened or read; only notify gives it) is counted
   apart and never used for a time.
-- After a single change the driver waits 30 ms before the next one. A phase is over when the
-  adapter printed nothing for 250 ms (at most 3 s).
+- After a single change the driver waits until the adapter printed nothing for 10 ms, and
+  30 ms at the most, before the next one. A phase is over when the adapter printed nothing for
+  250 ms (at most 3 s).
 - The wait for a single change is 3 s (10 s with polling). After five misses in a row the phase
   stops early, and the table says so.
 - A burst gives up when not one line came for 3 s, and after 60 s in any case.

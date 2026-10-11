@@ -16,8 +16,10 @@ use crate::{
 
 /// How many samples of missed and extra paths a phase keeps.
 const SAMPLES: usize = 5;
-/// The pause after a single change, so its late events are not taken for the next change.
+/// The pause after a single change, so its late events are not taken for the next change:
+/// until the adapter printed nothing for `GAP_SILENCE`, and `GAP` at the most.
 const GAP: Duration = Duration::from_millis(30);
+const GAP_SILENCE: Duration = Duration::from_millis(10);
 /// A phase is over when the adapter printed nothing for this long ...
 const SILENCE: Duration = Duration::from_millis(250);
 /// ... or when this much time has passed since the phase had all its events.
@@ -226,7 +228,7 @@ impl Session {
       }
       misses_in_a_row = if tally.complete() { 0 } else { misses_in_a_row + 1 };
       // The late events of this change belong to it and not to the next one.
-      self.pump_for(&mut tally, GAP);
+      self.pump_until_silent(&mut tally, GAP_SILENCE, GAP);
       tally.add_to(&mut phase, &mut times, start, &mut self.earlier);
       if self.dead || misses_in_a_row == MISSES_IN_A_ROW {
         phase.abandoned = phase.changes < files.len();
@@ -363,9 +365,14 @@ impl Session {
 
   /// Reads lines into the tally until the adapter is silent.
   fn drain(&mut self, tally: &mut Tally) {
-    let until = Instant::now() + LONGEST_DRAIN;
+    self.pump_until_silent(tally, SILENCE, LONGEST_DRAIN);
+  }
+
+  /// Reads lines into the tally until no line came for `silence`, and for `most` at the most.
+  fn pump_until_silent(&mut self, tally: &mut Tally, silence: Duration, most: Duration) {
+    let until = Instant::now() + most;
     while !self.dead && Instant::now() < until {
-      if !self.take_line(tally, until.min(Instant::now() + SILENCE)) {
+      if !self.take_line(tally, until.min(Instant::now() + silence)) {
         return;
       }
     }
