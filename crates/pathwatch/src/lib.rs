@@ -1,4 +1,4 @@
-//! Watch paths and get file events: create, update, delete.
+//! A path-based file event watcher: create, update, delete.
 //!
 //! ```no_run
 //! use std::sync::mpsc;
