@@ -881,10 +881,12 @@ mod ffi {
       } else {
         missing.iter().enumerate().map(open).collect::<io::Result<Vec<Guarded>>>()
       };
+      // Also after a failure: a notice for a directory that was opened and closed again must
+      // not find the next one that is opened.
+      self.last_id += missing.len();
       let opened = opened.inspect_err(|_| {
         GUARD_FDS.fetch_sub(missing.len(), Ordering::Relaxed);
       })?;
-      self.last_id += missing.len();
       for (dir, guarded) in missing.into_iter().zip(opened) {
         self.dirs.insert(dir.to_owned(), guarded);
       }
