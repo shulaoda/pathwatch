@@ -668,6 +668,29 @@ fn a_dropped_signal_wakes_the_thread() {
   assert_eq!(batch.unwrap(), [Event { path, kind: EventKind::Create }]);
 }
 
+/// The delete delay is a setting: with zero, a file that is removed and written again is a
+/// `Delete` and a `Create`, not one `Update`.
+#[test]
+fn the_delete_delay_can_be_zero() {
+  let dir = tempfile::tempdir().unwrap();
+  let path = dir.path().join("a.txt");
+  fs::write(&path, "1").unwrap();
+  let config = quick_config().with_delete_delay(Duration::ZERO);
+  let (sender, results) = mpsc::channel();
+  let watcher = Watcher::with_config(config, move |result| {
+    let _ = sender.send(result);
+  })
+  .unwrap();
+  watcher.watch(&path).unwrap();
+
+  fs::remove_file(&path).unwrap();
+  let batch = results.recv_timeout(PATIENCE).expect("the delete is reported");
+  assert_eq!(batch.unwrap(), [Event { path: path.clone(), kind: EventKind::Delete }]);
+  fs::write(&path, "2").unwrap();
+  let batch = results.recv_timeout(PATIENCE).expect("the file is reported again");
+  assert_eq!(batch.unwrap(), [Event { path: path.clone(), kind: EventKind::Create }]);
+}
+
 /// `Duration::MAX` is a way to say "never": the thread must not die of a time that no clock
 /// has.
 #[test]
@@ -690,6 +713,7 @@ fn a_time_too_long_for_a_clock() {
   // Nothing is ever due here. The thread still takes every call.
   for config in [
     Config::default().with_debounce(Duration::MAX),
+    Config::default().with_delete_delay(Duration::MAX),
     Config::default().with_polling(true).with_poll_interval(Duration::MAX),
   ] {
     let watcher = Watcher::with_config(config, |_| {}).unwrap();

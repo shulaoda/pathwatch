@@ -88,6 +88,7 @@ watcher, so it should only pass the batch on.
 |---|---|---|
 | `with_ignored(f)` | nothing is ignored | `f(path, kind) -> bool`, where `kind` is `EntryKind::File` or `EntryKind::Dir`. A path for which it returns `true` is never reported. An ignored directory is never read or watched. It must give the same answer for the same input, and if it ignores a directory it must ignore everything below it. It is asked about the paths you watch too (promise 10). |
 | `with_debounce(d)` | 50 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch still goes out every 500 ms, or every `4 × d` if that is longer. Zero: no waiting. The most is a year, also for the poll interval. |
+| `with_delete_delay(d)` | 100 ms | How long a `Delete` waits for the path to come back. A file that is removed and written again within `d` is one `Update`; a real delete is reported `d` after the OS said that the path is gone. Zero: no waiting, and such a file is a `Delete` and a `Create`. The most is a year. |
 | `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
 | `with_poll_interval(d)` | 100 ms | The shortest pause between two rounds of polling. The least is 1 ms. On a big set of paths the pause is longer: at least nine times as long as the round took. |
 
@@ -105,7 +106,8 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
    files you were told about are the files on the disk.
 3. **`Update`.** `touch` is an `Update`; `chmod` is not. An atomic save (write a temporary
    file, rename it over) is an `Update`, with no `Delete` and no `Create`. So is a file that is
-   removed and written again within 100 ms. There can be more `Update` events than writes.
+   removed and written again within the delete delay (100 ms). There can be more `Update`
+   events than writes.
 4. **What exists when `watch` returns is not reported.** Every change after that is.
 5. **The watch belongs to the path.** It keeps working when a missing path becomes a file or a
    directory, when a file becomes a directory or the other way round, when a whole chain of
@@ -221,12 +223,12 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 - **With polling** a change is found by the next round: within the poll interval (100 ms), or
   later on a big set of paths, because the pause is at least nine times as long as a round.
 - **Under a flood** of changes a batch still goes out at least every 500 ms.
-- **A `Delete`** comes 100 ms after the OS said that the path is gone, once the path was found
-  empty twice; under a flood it comes with the next batch. It comes at once when a directory is
-  found where the file was, or a file where the directory was, or when a file below a watched
-  directory is renamed to another spelling of its name (another letter case, on macOS and
-  Windows). An error of the disk that says nothing is never a `Delete`; "permission denied"
-  counts as missing.
+- **A `Delete`** comes one delete delay (100 ms) after the OS said that the path is gone, once
+  the path was found empty twice; under a flood it comes with the next batch. It comes at once
+  when a directory is found where the file was, or a file where the directory was, or when a
+  file below a watched directory is renamed to another spelling of its name (another letter
+  case, on macOS and Windows). An error of the disk that says nothing is never a `Delete`;
+  "permission denied" counts as missing.
 - **Lost notifications** (the OS dropped some, or more than 16 MiB of them waited for the
   watcher) are repaired by reading the disk again. These scans are paced: after one that took
   `t`, the next one waits `9 × t`.
@@ -241,7 +243,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 | ignored | `Config::with_ignored(f)` | Offered differently: one function, set when the watcher is made. No glob list, no change later. It is asked about watched paths too: a path that it ignores as a file and as a directory is not watched. It must ignore everything below a directory that it ignores. |
 | polling | `with_polling`, `with_poll_interval` | Offered. On top of that, a directory that the OS cannot watch is polled without an option, and so is everything when the watch API cannot start or stops: then at the poll interval of the settings. |
 | debounce | `with_debounce` | Offered, and built in. Left out: waiting until a file stops growing (chokidar `awaitWriteFinish`). A slow writer gives more than one `Update`. |
-| atomic writes | always on | Offered differently: no option. A file that is back within 100 ms is one `Update`. |
+| atomic writes | `with_delete_delay(d)` | Offered differently: an atomic save (write a temporary file, rename it over) is always one `Update`, with no option. A file that is removed and back within the delete delay (100 ms, as chokidar's `atomic`) is one `Update` too. |
 | ignore initial | always on | Left out: what exists at `watch` time is never reported. Read the directory yourself if you need the list. |
 | directory events | none | Left out: a directory is reported as its files, so a moved directory needs no walk on your side. |
 | rename events | none | Left out: a rename is a `Delete` and a `Create`. The watcher never reads what the OS says happened; it compares the disk with what it told you. |

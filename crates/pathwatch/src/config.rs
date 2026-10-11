@@ -13,6 +13,7 @@ const SHORTEST_POLL_INTERVAL: Duration = Duration::from_millis(1);
 pub struct Config {
   ignored: Option<Ignored>,
   debounce: Duration,
+  delete_delay: Duration,
   polling: bool,
   poll_interval: Duration,
 }
@@ -31,6 +32,7 @@ impl Default for Config {
     Self {
       ignored: None,
       debounce: Duration::from_millis(50),
+      delete_delay: Duration::from_millis(100),
       polling: false,
       poll_interval: Duration::from_millis(100),
     }
@@ -42,6 +44,7 @@ impl fmt::Debug for Config {
     f.debug_struct("Config")
       .field("ignored", &self.ignored.is_some())
       .field("debounce", &self.debounce)
+      .field("delete_delay", &self.delete_delay)
       .field("polling", &self.polling)
       .field("poll_interval", &self.poll_interval)
       .finish()
@@ -56,6 +59,18 @@ impl Config {
   #[must_use]
   pub fn with_debounce(mut self, debounce: Duration) -> Self {
     self.debounce = debounce;
+    self
+  }
+
+  /// How long a `Delete` waits for the path to come back. Default: 100 ms.
+  ///
+  /// A file that is removed and written again within this time is one `Update`, as the tools
+  /// that replace a file that way expect. A real delete is reported this long after the OS
+  /// said that the path is gone. Zero: a `Delete` comes at the first look that finds the path
+  /// gone, and such a file is a `Delete` and a `Create`. The most is a year.
+  #[must_use]
+  pub fn with_delete_delay(mut self, delay: Duration) -> Self {
+    self.delete_delay = delay;
     self
   }
 
@@ -101,11 +116,11 @@ impl Config {
     Options {
       ignored: self.ignored,
       debounce: self.debounce,
+      delete_delay: self.delete_delay,
       poll_interval: if polling { self.poll_interval } else { FALLBACK_POLL_INTERVAL },
       poll_interval_alone: Some(self.poll_interval),
       // macOS and Windows: a disk takes two spellings of a name for one.
       loose_spelling: cfg!(any(target_vendor = "apple", windows)),
-      ..Options::default()
     }
   }
 }

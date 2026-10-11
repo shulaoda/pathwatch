@@ -33,7 +33,7 @@ watcher.close();
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
 | `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
-| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 50 ms (5.13); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
+| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 50 ms (5.13); `with_delete_delay(d)`: the delete delay, 100 ms, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
 
@@ -65,10 +65,9 @@ on macOS the limit of streams, when the limit of open files had stopped the guar
 without a path is about the watcher: its backend did not start or has stopped, and the source
 says which, and that every path is polled now.
 
-Not options: the delete delay is 100 ms, and with a native backend the poll of what the OS
-does not watch runs once a second. `Config` turns `loose_spelling` on for macOS and Windows:
-there every disk takes two spellings of a name for one. Elsewhere each directory is asked
-(5.2).
+Not an option: with a native backend the poll of what the OS does not watch runs once a
+second. `Config` turns `loose_spelling` on for macOS and Windows: there every disk takes two
+spellings of a name for one. Elsewhere each directory is asked (5.2).
 
 ## 3. The contract
 
@@ -742,7 +741,7 @@ is not told at once.
 - **A change of kind ends the hold at once** (5.4).
 - A file that is not told yet is not held: when it is gone, it is forgotten.
 - If a node above a held node is found missing too, the upper one decides for both.
-- With a delay of zero (only the tests set it) nothing is held.
+- With a delay of zero (`with_delete_delay`) nothing is held: a `Delete` comes at the first look.
 
 ### 5.10 Want, watch, poll
 
@@ -1496,7 +1495,7 @@ cargo test --release -p pathwatch_sim --test cost -- --ignored --nocapture    # 
 
 Left out on purpose: events for directories; rename pairs; a report of what exists at `watch`
 time, and changes from before the call; globs; a depth option; following symbolic links inside
-a watched directory; options for the delete delay and for the one-second poll; kqueue (FreeBSD
+a watched directory; an option for the one-second poll; kqueue (FreeBSD
 uses polling).
 
 Known holes of the engine:
