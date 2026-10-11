@@ -144,7 +144,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         let queued = self
           .tree
           .held_until(key)
-          .is_some_and(|until| self.hold_queue.iter().any(|entry| *entry == (until, key)));
+          .is_some_and(|until| self.hold_queue.iter().any(|entry| entry.0 == (until, key)));
         if !queued && !node.is_marked() {
           return fail("is held, and nothing brings its second look");
         }
@@ -200,7 +200,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         return fail("relies on a watch above, and there is none");
       }
       if node.is_marked() {
-        if !self.tree.marked.contains(&key) {
+        if !self.tree.marked.iter().any(|&(marked, _)| marked == key) {
           return fail("has a mark but is not on the list of marked nodes");
         }
         if !parent_is_dir {

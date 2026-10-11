@@ -10,7 +10,8 @@ mod test_hooks;
 mod watched_paths;
 
 use std::{
-  collections::VecDeque,
+  cmp::Reverse,
+  collections::BinaryHeap,
   fmt, io, mem,
   path::{Path, PathBuf},
   sync::Arc,
@@ -28,7 +29,7 @@ use crate::{
   event::Event,
   fs::Fs,
   path::normalize,
-  tree::{Depth, KEPT, Node, Tree, emptied},
+  tree::{Depth, KEPT, Mark, Node, Tree, emptied},
 };
 
 /// A batch goes out at least this often while hints keep coming, or every four quiet times.
@@ -117,8 +118,8 @@ pub struct Engine<B: Backend, F: Fs> {
   flush_by: Option<Instant>,
   /// The next poll. `None` while nothing is registered.
   poll_at: Option<Instant>,
-  /// The held nodes by the time of their second look. An entry can be stale.
-  hold_queue: VecDeque<(Instant, DirKey)>,
+  /// The held nodes by the time of their second look, the earliest on top. An entry can be stale.
+  hold_queue: BinaryHeap<Reverse<(Instant, DirKey)>>,
   /// The scans that loss reports ask for wait until then.
   rest_until: Option<Instant>,
   /// A loss report waits for the end of that rest.
@@ -149,7 +150,7 @@ pub struct Engine<B: Backend, F: Fs> {
   /// Every path for the disk is built here.
   path: PathBuf,
   /// The marks of a flush, in the order of their checks.
-  marks: Vec<(usize, DirKey, DirKey)>,
+  marks: Vec<(usize, DirKey, DirKey, Option<Instant>)>,
   /// The scans of one round.
   scans: Vec<(DirKey, Depth)>,
   /// The nodes of the directory that is scanned.
@@ -175,7 +176,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       flush_at: None,
       flush_by: None,
       poll_at: None,
-      hold_queue: VecDeque::new(),
+      hold_queue: BinaryHeap::new(),
       rest_until: None,
       loss_waits: false,
       now: None,
@@ -230,7 +231,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       Signal::Raw(raw) => {
         let tree = &mut self.tree;
         if let Some(backend) = &mut self.backend {
+          tree.hint_time = Some(now);
           backend.translate(raw, &mut |hint| left_work |= tree.hint(hint));
+          tree.hint_time = None;
         }
       }
       Signal::Failed(error) => {
@@ -346,9 +349,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut loss_checks_ran = false;
     // The path of one directory is built once for all of its marks.
     let mut path_of = None;
-    for &(_, parent, key) in &marks {
+    for &(_, parent, key, since) in &marks {
       // No mark: the directory of the node went away earlier in this flush.
       let Some(mark) = self.tree.take_mark(key) else { continue };
+      let mark = Mark { since, ..mark };
       // Below a held node nothing is checked: its second look decides for this node too.
       if self.tree.frozen(key) {
         self.tree.unhold(key);

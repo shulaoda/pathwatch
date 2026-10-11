@@ -167,7 +167,7 @@ The words, each for one idea:
 | coverage | what the backend answers | `Coverage::{Watched, WatchedTree, NotWatched, Failed}` |
 | polled | no OS watch covers the directory, so the timer scans it | `Watch::Polled` |
 | held | a look found nothing at the node; what the tree has there, and below, stays until the second look | `Node::is_held`, `Tree::hold` |
-| delete delay | the time between the two looks: 100 ms | `Options::delete_delay` |
+| delete delay | the time from the hint to the second look: 100 ms | `Options::delete_delay` |
 | young | a file whose modification time is too close to the check to trust | `Content` |
 | quiet time | the debounce: how long no hint must come before the disk is checked | `Options::debounce` |
 | rest | the pause after work that no hint asked for by name: a poll, the scans after loss reports | `REST`, `rest_until` |
@@ -726,9 +726,12 @@ no rule: a file that came and went gives nothing, a file that went and came give
 is not told at once.
 
 - The first look that finds nothing where the tree has a file or a directory only **holds** the
-  node, with the time of its second look (now + 100 ms). Nothing else changes: the fingerprint
-  stays, and under a directory every node stays as it is. A directory that vanishes with 50,000
-  files is one held node. The backend forgets the watch of a held directory at once.
+  node, with the time of its second look: 100 ms after the hint that asked for the first look,
+  so the quiet time before the look does not add to the delay; 100 ms after the look where no
+  hint asked for it (a poll, a scan). A first look that comes later than that, as under a
+  flood, gets its second look at once, in the next flush. Nothing else changes: the
+  fingerprint stays, and under a directory every node stays as it is. A directory that vanishes
+  with 50,000 files is one held node. The backend forgets the watch of a held directory at once.
 - **The second look** comes at its time, also when no hint came and also with polling. Still
   nothing: a file is forgotten (`Delete`), a directory is `vanish`ed (`Delete` for each told
   file below it, in one batch). If the disk does not answer, the hold stays until it does: an
@@ -1575,7 +1578,7 @@ the order in which a change meets them.
 - **Fingerprint.** The modification time, the size and the id of a file: what tells one state of
   it from the next without reading it.
 - **Held.** A look found nothing where the tree has a file or a directory. The node waits for a
-  second look, one delete delay later, and only that look decides.
+  second look, one delete delay after the hint, and only that look decides.
 - **Frozen.** A node below a held node. Nothing is done there before the second look above.
 - **Uncover, let go.** A node is no watched path any more and no watched directory covers it:
   what the tree has there is forgotten. A node that is not registered any more is an entry like

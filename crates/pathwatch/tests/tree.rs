@@ -78,7 +78,7 @@ fn marks(tree: &Tree) -> Vec<String> {
 
 /// Takes every mark away, as a flush does.
 fn clear_marks(tree: &mut Tree) {
-  for key in mem::take(&mut tree.marked) {
+  for (key, _) in mem::take(&mut tree.marked) {
     tree.take_mark(key);
     tree.prune(key);
   }
@@ -486,7 +486,26 @@ fn marks_for_one_name_merge() {
   f.tree.mark(file, Mark::LOST);
   assert_eq!(marks(&f.tree), ["/p/r|a.js|dw"]);
   assert!(!f.tree[file].mark().unwrap().lost);
-  assert_eq!(f.tree.marked, [f.tree.child(f.r, OsStr::new("a.js")).unwrap()]);
+  assert_eq!(f.tree.marked, [(f.tree.child(f.r, OsStr::new("a.js")).unwrap(), None)]);
+}
+
+/// A mark made while the engine turns hints into marks carries their time, one made by the
+/// engine itself carries none, and a second mark does not change the time.
+#[test]
+fn a_mark_carries_the_time_of_its_hint() {
+  let mut f = fixture();
+  let at = Instant::now();
+  f.tree.hint_time = Some(at);
+  assert!(f.tree.hint(changed(f.r, "a.js", false)));
+  f.tree.hint_time = None;
+  assert!(f.tree.hint(changed(f.r, "a.js", true)));
+  assert!(f.tree.hint(changed(f.r, "c.js", false)));
+  let a = f.tree.child(f.r, OsStr::new("a.js")).unwrap();
+  let c = f.tree.child(f.r, OsStr::new("c.js")).unwrap();
+  assert_eq!(f.tree.marked, [(a, Some(at)), (c, None)]);
+  let mut marks = Vec::new();
+  f.tree.take_marked(&mut marks);
+  assert_eq!(marks, [(4, f.r, a, Some(at)), (4, f.r, c, None)]);
 }
 
 /// Its mark says `lost` until a hint that names the path joins it.
@@ -505,7 +524,7 @@ fn a_hint_for_the_directory_itself_is_a_loss_report() {
   assert!(f.tree.hint(changed(f.sub, "", false)));
   let mark = f.tree.take_mark(f.sub).unwrap();
   assert!(!mark.lost && mark.deep);
-  assert_eq!(f.tree.marked, [f.sub]);
+  assert_eq!(f.tree.marked, [(f.sub, None)]);
 
   // Neither a path below it, nor a node with no directory, is a loss report.
   assert!(f.tree.hint(changed(f.r, "a.js", false)));
@@ -654,7 +673,7 @@ fn a_top_directory_is_marked_in_the_root() {
   let mut f = fixture();
   f.tree.hint(changed(f.top, "", false));
   assert_eq!(marks(&f.tree), ["|/|d"]);
-  assert_eq!(f.tree.marked, [f.top]);
+  assert_eq!(f.tree.marked, [(f.top, None)]);
   assert_eq!(f.tree.to_scan, []);
 }
 
@@ -789,11 +808,20 @@ fn the_marks_in_the_order_of_their_checks() {
   f.tree.mark(gone, Mark::default());
   f.tree.take_mark(gone);
   f.tree.prune(gone);
-  f.tree.marked.push(gone);
+  f.tree.marked.push((gone, None));
 
   let mut marks = Vec::new();
   f.tree.take_marked(&mut marks);
-  assert_eq!(marks, [(2, f.top, f.p), (3, f.p, f.f), (4, f.r, a), (4, f.r, c), (5, f.sub, b)]);
+  assert_eq!(
+    marks,
+    [
+      (2, f.top, f.p, None),
+      (3, f.p, f.f, None),
+      (4, f.r, a, None),
+      (4, f.r, c, None),
+      (5, f.sub, b, None)
+    ]
+  );
   // The marks stay on the nodes. Only the list is empty.
   assert!(f.tree.marked.is_empty() && f.tree[a].is_marked());
 }

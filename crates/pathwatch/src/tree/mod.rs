@@ -129,6 +129,7 @@ impl Node {
       written: old.written || mark.written,
       // A check that anything else asked for does not wait with the loss reports.
       lost: old.lost && mark.lost,
+      since: None,
     })));
     old.is_none()
   }
@@ -278,8 +279,11 @@ pub struct Tree {
   /// The registered nodes whose names are not plain, by the slot of their parent: the table does
   /// not find them under another spelling, so a hint looks here ([`Tree::others_meant`]).
   not_plain: FxHashMap<u32, Vec<u32>>,
-  /// The nodes with a mark. A key can be stale.
-  pub marked: Vec<DirKey>,
+  /// The nodes with a mark, each with the time of the hint that made it, if a hint did: the
+  /// delete delay counts from it. A key can be stale.
+  pub marked: Vec<(DirKey, Option<Instant>)>,
+  /// The time of the hints that are being turned into marks: the engine sets it meanwhile.
+  pub hint_time: Option<Instant>,
   /// The nodes that are queued for a scan. A key can be stale or be there twice.
   pub to_scan: Vec<DirKey>,
   /// The directories the timer looks at ([`Dir::is_polled`]); the root is always on it. Before
@@ -313,6 +317,7 @@ impl Tree {
       ahead: FxHashMap::default(),
       not_plain: FxHashMap::default(),
       marked: Vec::new(),
+      hint_time: None,
       to_scan: Vec::new(),
       polled: vec![Self::ROOT],
       lost: false,
@@ -745,13 +750,16 @@ pub struct Mark {
   pub written: bool,
   /// Only a loss report asked for this check. The engine paces such checks.
   pub lost: bool,
+  /// The time of the hint that asked for the check: a `Delete` counts its delay from it. `None`:
+  /// the engine itself asked, and the delay counts from the look.
+  pub since: Option<Instant>,
 }
 
 impl Mark {
   /// Something said that this very path changed.
-  pub const DEEP: Self = Self { deep: true, written: false, lost: false };
+  pub const DEEP: Self = Self { deep: true, written: false, lost: false, since: None };
   /// The backend lost notifications of the directory at the path, or its watch.
-  pub const LOST: Self = Self { deep: true, written: false, lost: true };
+  pub const LOST: Self = Self { deep: true, written: false, lost: true, since: None };
 }
 
 /// The work for the next flush: marks and queued scans, and the way from a hint to a mark.
@@ -821,7 +829,7 @@ impl Tree {
         Some(child) => self.key(child),
         None => self.insert_child(self.key(at), name),
       };
-      self.mark(child, Mark { deep: !written, written, lost: false });
+      self.mark(child, Mark { deep: !written, written, lost: false, since: None });
       return true;
     }
     found
@@ -859,7 +867,7 @@ impl Tree {
   /// Adds a mark to a node. Two marks for one node become one.
   pub fn mark(&mut self, key: DirKey, mark: Mark) {
     if self[key].add_mark(mark) {
-      self.marked.push(key);
+      self.marked.push((key, self.hint_time));
     }
   }
 
@@ -895,18 +903,19 @@ impl Tree {
     self.to_scan = emptied(queue);
   }
 
-  /// Takes the marked nodes into `marks`, each with its level and its directory, from the top
-  /// down and one directory after the other. The marks stay on the nodes; a stale key is left out.
-  pub fn take_marked(&mut self, marks: &mut Vec<(usize, DirKey, DirKey)>) {
+  /// Takes the marked nodes into `marks`, each with its level, its directory and the time of its
+  /// hint, from the top down and one directory after the other. The marks stay on the nodes; a
+  /// stale key is left out.
+  pub fn take_marked(&mut self, marks: &mut Vec<(usize, DirKey, DirKey, Option<Instant>)>) {
     marks.clear();
     let mut marked = mem::take(&mut self.marked);
-    for key in marked.drain(..) {
+    for (key, since) in marked.drain(..) {
       if let Some(parent) = self.parent(key) {
-        marks.push((self.level(key), parent, key));
+        marks.push((self.level(key), parent, key, since));
       }
     }
     self.marked = emptied(marked);
-    marks.sort_unstable_by_key(|&(level, parent, key)| (level, parent.index(), key.index()));
+    marks.sort_unstable_by_key(|&(level, parent, key, _)| (level, parent.index(), key.index()));
   }
 
   pub fn has_work(&self) -> bool {

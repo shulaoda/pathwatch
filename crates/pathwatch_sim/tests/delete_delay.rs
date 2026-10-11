@@ -30,8 +30,57 @@ fn a_lonely_delete_goes_out_one_delay_later() {
   assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(10)));
   assert!(d.step());
   assert_eq!(taken(&mut d), NONE);
-  // The delete has a timer of its own.
-  assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(110)));
+  // The delete has a timer of its own: one delay after the hint, not after the look.
+  assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(100)));
+  assert!(d.step());
+  assert_eq!(taken(&mut d), ["D /p/a"]);
+  caught_up(&mut d);
+}
+
+/// The delay counts from the hint of each file, not from the look that found it gone: a file
+/// that went earlier gets its `Delete` earlier, also when the look came to it last.
+#[test]
+fn the_delay_counts_from_the_hint_of_each_file() {
+  let mut d = inode();
+  d.fs.mkdir("/p").unwrap();
+  d.fs.write("/p/a", "1").unwrap();
+  d.fs.write("/p/b", "1").unwrap();
+  d.watch(&["/p/a", "/p/b"]);
+  let start = d.now;
+
+  // `b` goes first. The thread was busy: one flush looks at both, and at `a` first.
+  d.fs.remove("/p/b").unwrap();
+  d.deliver(usize::MAX);
+  d.advance(Duration::from_millis(30));
+  d.fs.remove("/p/a").unwrap();
+  d.deliver(usize::MAX);
+  assert!(d.step());
+  assert_eq!(taken(&mut d), NONE);
+  assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(100)));
+  assert!(d.step());
+  assert_eq!(taken(&mut d), ["D /p/b"]);
+  assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(130)));
+  assert!(d.step());
+  assert_eq!(taken(&mut d), ["D /p/a"]);
+  caught_up(&mut d);
+}
+
+/// The first look comes after the delay (the thread was busy, or a flood kept the batch open):
+/// the second look comes at once, and the `Delete` with the next batch.
+#[test]
+fn a_late_first_look_gets_its_second_look_at_once() {
+  let mut d = inode();
+  d.fs.mkdir("/p").unwrap();
+  d.fs.write("/p/a", "1").unwrap();
+  d.watch(&["/p/a"]);
+  let start = d.now;
+
+  d.fs.remove("/p/a").unwrap();
+  d.deliver(usize::MAX);
+  d.advance(Duration::from_millis(200));
+  d.tick();
+  assert_eq!(taken(&mut d), NONE);
+  assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(200)));
   assert!(d.step());
   assert_eq!(taken(&mut d), ["D /p/a"]);
   caught_up(&mut d);
@@ -269,7 +318,8 @@ fn a_held_directory_below_a_held_directory() {
     d.watch(&["/p/r"]);
     let start = d.now;
 
-    // At 10 ms `sub` is held until 110 ms. At 40 ms `d` is held until 140 ms.
+    // At 10 ms `sub` is held until 100 ms (its hint came at 0 ms). At 40 ms `d` is held until
+    // 130 ms (its hint came at 30 ms).
     d.fs.remove_all("/p/r/d/sub").unwrap();
     flush(&mut d);
     d.advance(millis(20));
@@ -282,11 +332,11 @@ fn a_held_directory_below_a_held_directory() {
       None => {
         // The time of `sub` comes first. Nothing happens: `d` decides, at its time.
         assert!(d.step());
-        assert_eq!(d.now, start + millis(110));
+        assert_eq!(d.now, start + millis(100));
         assert_eq!(taken(&mut d), NONE);
         assert_eq!(d.engine.pending_deletes().len(), 2);
         assert!(d.step());
-        assert_eq!(d.now, start + millis(140));
+        assert_eq!(d.now, start + millis(130));
         assert_eq!(taken(&mut d), ["D /p/r/d/g", "D /p/r/d/sub/f"]);
       }
       Some(50) => {
@@ -298,26 +348,27 @@ fn a_held_directory_below_a_held_directory() {
         assert_eq!(d.now, start + millis(60));
         assert_eq!(taken(&mut d), NONE);
         assert!(d.step());
-        assert_eq!(d.now, start + millis(110));
+        assert_eq!(d.now, start + millis(100));
         assert_eq!(taken(&mut d), ["D /p/r/d/sub/f"]);
       }
       Some(_) => {
         // `d` is back after the time of `sub`, which passed while `d` decided for both. So
-        // this is the first look at `sub` that counts: it is held again, for one more delay.
+        // this is the first look at `sub` that counts: it is held again, for one more delay
+        // from that look, since no hint asked for it.
         assert!(d.step());
-        assert_eq!(d.now, start + millis(110));
+        assert_eq!(d.now, start + millis(100));
         d.advance(millis(10));
         d.fs.rename("/q/d", "/p/r/d").unwrap();
         flush(&mut d);
-        assert_eq!(d.now, start + millis(130));
+        assert_eq!(d.now, start + millis(120));
         assert_eq!(taken(&mut d), NONE);
         assert_eq!(d.engine.pending_deletes().len(), 1);
         // The old time of `d` passes. It means nothing any more.
         assert!(d.step());
-        assert_eq!(d.now, start + millis(140));
+        assert_eq!(d.now, start + millis(130));
         assert_eq!(taken(&mut d), NONE);
         assert!(d.step());
-        assert_eq!(d.now, start + millis(230));
+        assert_eq!(d.now, start + millis(220));
         assert_eq!(taken(&mut d), ["D /p/r/d/sub/f"]);
       }
     }
@@ -366,7 +417,7 @@ fn a_file_that_is_held_twice_waits_for_its_second_time() {
   d.watch(&["/p/a"]);
   let start = d.now;
 
-  // Held at 10 ms, until 110 ms.
+  // Held at 10 ms, until 100 ms: the delay counts from the hint at 0 ms.
   d.fs.remove("/p/a").unwrap();
   flush(&mut d);
   d.advance(millis(30));
@@ -374,7 +425,7 @@ fn a_file_that_is_held_twice_waits_for_its_second_time() {
   flush(&mut d);
   assert_eq!(d.now, start + millis(50));
   assert_eq!(taken(&mut d), ["U /p/a"]);
-  // Held again at 80 ms, until 180 ms.
+  // Held again at 80 ms, until 170 ms.
   d.advance(millis(20));
   d.fs.remove("/p/a").unwrap();
   flush(&mut d);
@@ -383,12 +434,12 @@ fn a_file_that_is_held_twice_waits_for_its_second_time() {
   // The first time is over. It means nothing any more, and it costs no look at the disk.
   let before = d.fs.calls();
   assert!(d.step());
-  assert_eq!(d.now, start + millis(110));
+  assert_eq!(d.now, start + millis(100));
   assert_eq!(taken(&mut d), NONE);
   assert_eq!(d.fs.calls(), before);
   assert_eq!(d.engine.pending_deletes().len(), 1);
   assert!(d.step());
-  assert_eq!(d.now, start + millis(180));
+  assert_eq!(d.now, start + millis(170));
   assert_eq!(taken(&mut d), ["D /p/a"]);
   caught_up(&mut d);
 }
@@ -723,7 +774,7 @@ fn a_directory_is_back_and_the_disk_stops_answering() {
 
 // ---- cases of the design review ----
 
-/// A lonely pending `Delete` goes out one delete delay later, in a batch of its own.
+/// A lonely pending `Delete` goes out one delete delay after the hint, in a batch of its own.
 #[test]
 fn the_deadline_of_a_pending_delete() {
   for mode in Mode::ALL {
@@ -736,7 +787,7 @@ fn the_deadline_of_a_pending_delete() {
     d.fs.remove("/p/x").unwrap();
     assert_eq!(Sim::window(&mut d), NONE, "{mode:?}");
     assert_eq!(d.now, start + Duration::from_millis(10), "{mode:?}");
-    assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(110)), "{mode:?}");
+    assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(100)), "{mode:?}");
     assert!(d.step());
     assert_eq!(show(&d.take_events()), ["D /p/x"], "{mode:?}");
     caught_up(&mut d);
@@ -780,9 +831,9 @@ fn a_pending_delete_and_a_change_of_kind() {
   });
 }
 
-/// Hints keep coming, and a file is removed. The quiet time does not touch the delete delay:
-/// the `Delete` goes out one delete delay after the look that found nothing, and that look is
-/// the one at the longest wait.
+/// Hints keep coming, and a file is removed. The quiet time does not stretch the delete delay:
+/// the look at the longest wait finds nothing, the delay since the hint is over by then, and
+/// the `Delete` goes out with the next batch.
 #[test]
 fn the_delete_delay_holds_while_hints_keep_coming() {
   // No poll comes in between: a poll checks what waits, too.
@@ -806,11 +857,11 @@ fn the_delete_delay_holds_while_hints_keep_coming() {
       batches.push(((d.now - start).as_millis(), events));
     }
   }
-  // The look at 501 ms finds nothing at `/p/a.js`. The second look is due at 601 ms, and the
-  // first tick after that makes it, whatever the hints do.
+  // The look at 501 ms finds nothing at `/p/a.js`, 100 ms after its hint are long over: the
+  // second look is due at once, and the next tick makes it, whatever the hints do.
   let log = "U /p/logs/x.log".to_owned();
   let delete = vec!["D /p/a.js".to_owned(), log.clone()];
-  assert_eq!(batches, [(501, vec![log]), (603, delete)]);
+  assert_eq!(batches, [(501, vec![log]), (504, delete)]);
   settled(&mut d);
   caught_up(&mut d);
 }

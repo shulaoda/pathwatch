@@ -221,11 +221,12 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 - **With polling** a change is found by the next round: within the poll interval (100 ms), or
   later on a big set of paths, because the pause is at least nine times as long as a round.
 - **Under a flood** of changes a batch still goes out at least every 500 ms.
-- **A `Delete`** comes 100 ms late: only after the path was found empty twice. It comes at once
-  when a directory is found where the file was, or a file where the directory was, or when a
-  file below a watched directory is renamed to another spelling of its name (another letter
-  case, on macOS and Windows). An error of the disk that says nothing is never a `Delete`;
-  "permission denied" counts as missing.
+- **A `Delete`** comes 100 ms after the OS said that the path is gone, once the path was found
+  empty twice; under a flood it comes with the next batch. It comes at once when a directory is
+  found where the file was, or a file where the directory was, or when a file below a watched
+  directory is renamed to another spelling of its name (another letter case, on macOS and
+  Windows). An error of the disk that says nothing is never a `Delete`; "permission denied"
+  counts as missing.
 - **Lost notifications** (the OS dropped some, or more than 16 MiB of them waited for the
   watcher) are repaired by reading the disk again. These scans are paced: after one that took
   `t`, the next one waits `9 × t`.

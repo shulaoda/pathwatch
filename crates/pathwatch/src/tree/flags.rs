@@ -133,6 +133,7 @@ impl Node {
       deep: self.flags.contains(Flags::MARK_DEEP),
       written: self.flags.contains(Flags::MARK_WRITTEN),
       lost: self.flags.contains(Flags::MARK_LOST),
+      since: None,
     })
   }
 

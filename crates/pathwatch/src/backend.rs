@@ -32,7 +32,7 @@ pub trait Backend: Send + 'static {
 
 /// The name of a directory between the engine and a backend: its slot in the tree, and a
 /// generation that tells it from an earlier node in the slot.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct DirKey {
   index: u32,
   generation: u32,

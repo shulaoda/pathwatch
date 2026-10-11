@@ -297,7 +297,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(super) fn check_moved(&mut self) {
     // Only the marks that are there now: the ones that this loop adds are not looked at.
     for index in 0..self.tree.marked.len() {
-      let key = self.tree.marked[index];
+      let (key, _) = self.tree.marked[index];
       if !self.tree.get(key).is_some_and(Node::is_marked) {
         continue;
       }

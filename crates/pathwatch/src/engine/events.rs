@@ -1,7 +1,7 @@
 //! The events of one flush, and the delete delay. A check makes no event: `finish` reads each
 //! touched node once, so a path gets one event for a flush.
 
-use std::time::Instant;
+use std::{cmp::Reverse, time::Instant};
 
 use super::{Engine, Output};
 use crate::{
@@ -35,8 +35,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Nothing is at the node, and the tree has something: the first look holds it, the second look
-  /// decides (design.md 5.9).
-  pub(super) fn missing(&mut self, key: DirKey) {
+  /// decides (design.md 5.9). The delay counts from the hint that asked for the look, `since`.
+  pub(super) fn missing(&mut self, key: DirKey, since: Option<Instant>) {
     let now = self.now.expect("a check runs inside a flush");
     let delay = self.options.delete_delay;
     let node = &self.tree[key];
@@ -44,7 +44,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let unknown_file = matches!(node.kind, Kind::File(_)) && !node.told();
     match self.tree.held_until(key) {
       Some(until) if until > now => {}
-      None if !delay.is_zero() && !unknown_file => self.hold(key, now + delay),
+      None if !delay.is_zero() && !unknown_file => {
+        // A first look that came late gets its second look at once, in the next flush.
+        self.hold(key, (since.unwrap_or(now) + delay).max(now));
+      }
       _ => self.gone(key),
     }
   }
@@ -61,7 +64,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     self.tree.list_if_polled(key);
     self.tree.hold(key, until);
-    self.hold_queue.push_back((until, key));
+    self.hold_queue.push(Reverse((until, key)));
   }
 
   /// What the tree has at the node is gone for good.
@@ -84,16 +87,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// The time of the next second look.
   pub(super) fn next_hold(&self) -> Option<Instant> {
-    self.hold_queue.front().map(|(until, _)| *until)
+    self.hold_queue.peek().map(|Reverse((until, _))| *until)
   }
 
   /// Marks each held node whose time is over. `true`: a flush has to run.
   pub(super) fn mark_due_holds(&mut self, now: Instant) -> bool {
     let mut any = false;
-    while let Some(&(until, key)) = self.hold_queue.front()
+    while let Some(&Reverse((until, key))) = self.hold_queue.peek()
       && until <= now
     {
-      self.hold_queue.pop_front();
+      self.hold_queue.pop();
       // Another time, or none: the hold ended, or the node was held again later.
       if self.tree.held_until(key) == Some(until) {
         self.tree.mark(key, Mark::default());

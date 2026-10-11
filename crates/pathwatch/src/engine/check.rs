@@ -156,7 +156,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       (Found::Unknown, _) => self.tree.mark(key, why),
 
       (Found::Missing, Had::Nothing) => {}
-      (Found::Missing, Had::File | Had::Dir { .. }) => self.missing(key),
+      (Found::Missing, Had::File | Had::Dir { .. }) => self.missing(key, why.since),
       (Found::OtherSpelling(_), _) => self.gone(key),
 
       (Found::File(kind, file), Had::File | Had::Nothing) => {

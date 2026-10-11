@@ -377,7 +377,7 @@ fn a_tree_that_is_moved_in_does_not_wait_for_the_rest() {
     assert!(d.step());
     assert_eq!(taken(&mut d), ["C /p/r/sub2/a", "C /p/r/tree/deep/f"], "{mode:?}");
     // The `Delete` under the old name waits for its second look, not for the rest.
-    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(110)), "{mode:?}");
+    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(100)), "{mode:?}");
     assert!(d.step());
     assert_eq!(taken(&mut d), ["D /p/r/sub/a"], "{mode:?}");
     assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(300)), "{mode:?}");
