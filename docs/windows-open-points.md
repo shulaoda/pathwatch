@@ -150,8 +150,8 @@ the real disk, with this backend and with polling.
 - **Long paths.** std puts a long path (about 248 units or more) into `\\?\` form by itself.
   Names in records are relative to the handle and have no limit.
 - **Names that end with a dot or a space.** Windows drops the dot or the space unless the path is
-  given in `\\?\` form. This is the same for the backend and for the engine, so such a directory
-  can only be watched under its `\\?\` spelling.
+  given in `\\?\` form, and `path::normalize` takes that form as the plain one. So such a name
+  cannot be watched: the OS finds the name without the dot or the space.
 - **Short (8.3) names.** Windows may report a change under the short name of a file. A name that
   looks like one (`LONGFI~1.TXT`) becomes a `Changed` hint for the directory that holds it. A
   name with a lower-case letter (`v1~1.txt`) is never taken for one: Windows makes short names

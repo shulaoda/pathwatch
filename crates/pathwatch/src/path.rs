@@ -1,5 +1,5 @@
-//! Cleans a path given to `watch`, by text only. The disk is never asked. `..` is folded one
-//! step earlier, in `watcher.rs`: here it makes a path unusable.
+//! Cleans a path given to `watch`, by text only: `.` is dropped, `..` takes the name before it
+//! away, and no link is resolved. The disk is never asked.
 
 use std::{
   borrow::Cow,
@@ -7,11 +7,11 @@ use std::{
   path::{Path, PathBuf},
 };
 
-/// The registered form of `path`: absolute, no `.`, no repeated or trailing separator.
+/// The registered form of `path`: absolute, no `.` or `..`, no repeated or trailing separator.
 ///
-/// `None` when the path is relative, has `..` or a NUL, or names a top directory (`/`, `C:\`,
-/// `\\server\share\`), which has no parent to watch it from. Also when one of its names is longer
-/// than `MAX_NAME`.
+/// `None` when the path is relative, has a NUL, or names a top directory (`/`, `C:\`,
+/// `\\server\share\`), which has no parent to watch it from; also when `..` goes above the top
+/// directory, and when one of its names is longer than `MAX_NAME`.
 ///
 /// A path that is in this form already is given back as it is: nothing is copied. So a path can
 /// be cleaned at every door (the watcher, then the engine) and the work is done once.
@@ -194,28 +194,36 @@ pub(crate) mod windows_rules {
   }
 }
 
-/// Appends the names of `text` to `clean`, which ends with a separator. At least one name must
-/// be there, or the path is a top directory.
+/// Appends the names of `text` to `clean`, which holds the top directory and ends with a
+/// separator. At least one name must be left, or the path is a top directory.
 fn push_names<U: Unit>(
   clean: &mut Vec<U>,
   text: &[U],
   separator: impl Fn(U) -> bool,
   join: u8,
 ) -> Option<()> {
-  let mut any = false;
+  let top = clean.len();
   for name in text.split(|&unit| separator(unit)) {
     match part_of(name) {
-      Part::Nothing => continue,
+      Part::Nothing => {}
       Part::Unusable => return None,
-      Part::Name => {}
+      // Above the top directory there is nothing to take away.
+      Part::Parent => {
+        if clean.len() == top {
+          return None;
+        }
+        let last = clean[top..].iter().rposition(|&unit| is(unit, join)).unwrap_or(0);
+        clean.truncate(top + last);
+      }
+      Part::Name => {
+        if clean.len() > top {
+          clean.push(U::from(join));
+        }
+        clean.extend_from_slice(name);
+      }
     }
-    if any {
-      clean.push(U::from(join));
-    }
-    clean.extend_from_slice(name);
-    any = true;
   }
-  any.then_some(())
+  (clean.len() > top).then_some(())
 }
 
 /// Whether `text`, what comes after a top directory, is clean: names with one separator between
@@ -229,7 +237,9 @@ fn names_are_clean<U: Unit>(text: &[U], separator: impl Fn(U) -> bool) -> bool {
 enum Part {
   /// Nothing, or `.`: the clean form leaves it out.
   Nothing,
-  /// `..`, or a name with a NUL, or one that is too long: the path cannot be used.
+  /// `..`: it takes the name before it away.
+  Parent,
+  /// A name with a NUL, or one that is too long: the path cannot be used.
   Unusable,
   Name,
 }
@@ -238,7 +248,7 @@ fn part_of<U: Unit>(name: &[U]) -> Part {
   match name {
     [] => Part::Nothing,
     [dot] if is(*dot, b'.') => Part::Nothing,
-    [dot, second] if is(*dot, b'.') && is(*second, b'.') => Part::Unusable,
+    [dot, second] if is(*dot, b'.') && is(*second, b'.') => Part::Parent,
     _ if has_nul(name) || name.len() > MAX_NAME => Part::Unusable,
     _ => Part::Name,
   }
@@ -283,10 +293,13 @@ mod tests {
       ("", None),
       ("a/b", None),
       ("./a", None),
-      // `..` is not folded here: `watcher.rs` does that one step earlier.
-      ("/a/../b", None),
-      ("/a/b/..", None),
+      // `..` takes the name before it away, by text. Above the root there is nothing.
+      ("/a/../b", Some("/b")),
+      ("/a/b/../../c/d/..", Some("/c")),
+      ("/a/b/..", Some("/a")),
+      ("/a/..", None),
       ("/..", None),
+      ("/a/../..", None),
       ("/a\0b", None),
       // A top directory has no parent to watch it from.
       ("/", None),
@@ -327,7 +340,9 @@ mod tests {
       ("C:", None),
       ("/a/b", None),
       // `..`, NUL.
-      (r"C:\a\..\b", None),
+      (r"C:\a\..\b", Some(r"C:\b")),
+      (r"C:\a\..", None),
+      (r"\\server\share\a\..\b", Some(r"\\server\share\b")),
       (r"\\server\share\..", None),
       ("C:\\a\0b", None),
       // A top directory.

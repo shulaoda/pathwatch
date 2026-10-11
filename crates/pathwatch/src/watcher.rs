@@ -5,7 +5,7 @@ use std::{
   borrow::Cow,
   env, io,
   marker::PhantomData,
-  path::{Component, Path, PathBuf},
+  path::{Path, PathBuf},
   sync::{
     Arc, Mutex, PoisonError,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -502,31 +502,13 @@ impl<R: Send + 'static> Backend for NoBackend<R> {
 
 /// The form of `path` that the engine takes: absolute and clean. `None`: it cannot be used.
 ///
-/// A relative path is joined to the current directory. `..` is folded here by text; the rest
-/// of the cleaning is [`normalize`].
+/// A relative path is joined to the current directory; [`normalize`] does the rest.
 fn clean(path: &Path) -> Option<PathBuf> {
   if path.as_os_str().is_empty() {
     return None;
   }
-  // The usual case, an absolute path without `..`, needs no second buffer.
-  if path.is_absolute()
-    && let Some(clean) = normalize(path)
-  {
-    return Some(clean.into_owned());
+  if path.is_absolute() {
+    return normalize(path).map(Cow::into_owned);
   }
-  let mut joined = if path.is_absolute() { PathBuf::new() } else { env::current_dir().ok()? };
-  for component in path.components() {
-    match component {
-      Component::CurDir => {}
-      Component::ParentDir => {
-        // Nothing to take away: the path goes above the root.
-        if !joined.pop() {
-          return None;
-        }
-      }
-      // A root or a drive replaces what is there, as `Path::join` does.
-      other => joined.push(other),
-    }
-  }
-  normalize(&joined).map(Cow::into_owned)
+  normalize(&env::current_dir().ok()?.join(path)).map(Cow::into_owned)
 }
