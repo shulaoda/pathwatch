@@ -1,5 +1,4 @@
-//! The small facts of a node, kept as bits in one number so that a node stays small. The bit
-//! work is all in this file: everything else reads and sets the facts by their names.
+//! The small facts of a node, as bits in one number so that a node stays small.
 
 use bitflags::bitflags;
 
@@ -15,14 +14,12 @@ bitflags! {
     const BASELINE = 1 << 3;
     const IS_PATH = 1 << 4;
 
-    // The ignore filter: whether it was asked about a file at the path, and what it said.
+    // Whether the filter was asked about a file at the path, and what it said.
     const FILE_ASKED = 1 << 5;
     const FILE_IGNORED = 1 << 6;
-    // The same for a directory at the path.
     const DIR_ASKED = 1 << 7;
     const DIR_IGNORED = 1 << 8;
 
-    // A mark waits on the node, and the three facts of that mark.
     const MARKED = 1 << 9;
     const MARK_DEEP = 1 << 10;
     const MARK_WRITTEN = 1 << 11;
@@ -37,8 +34,6 @@ bitflags! {
 }
 
 impl Node {
-  // What is there.
-
   /// The last look found nothing where `kind` has a file or a directory. The second look
   /// decides; until then the node and everything below it stay as they are.
   pub fn is_held(&self) -> bool {
@@ -48,8 +43,6 @@ impl Node {
   pub(super) fn set_held(&mut self, held: bool) {
     self.flags.set(Flags::HELD, held);
   }
-
-  // What the handler knows.
 
   /// The handler believes that a file is at the path.
   pub fn told(&self) -> bool {
@@ -69,7 +62,7 @@ impl Node {
     self.flags.set(Flags::CHANGED, changed);
   }
 
-  // The baseline rule. Both are set only while a `watch` call runs.
+  // Both are set only while a `watch` call runs.
 
   /// What the call did with the node.
   pub fn added(&self) -> Added {
@@ -97,8 +90,6 @@ impl Node {
     self.flags.set(Flags::BASELINE, baseline);
   }
 
-  // The watched paths.
-
   pub fn is_path(&self) -> bool {
     self.flags.contains(Flags::IS_PATH)
   }
@@ -109,10 +100,8 @@ impl Node {
     self.flags.set(Flags::IS_PATH, is_path);
   }
 
-  /// The node is registered, and the last look that found an entry at its path found that
-  /// the directory above lists the entry under another spelling of the name. Then the node
-  /// is the path that its caller gave, and no entry of that directory: a watched directory
-  /// above does not cover it.
+  /// The directory above lists the entry of this registered name under another spelling: the
+  /// node is the path its caller gave, and no entry of that directory.
   pub fn is_unlisted(&self) -> bool {
     self.flags.contains(Flags::UNLISTED)
   }
@@ -121,7 +110,7 @@ impl Node {
     self.flags.set(Flags::UNLISTED, unlisted);
   }
 
-  // The ignore filter gives the same answer for the same path and kind, so the node keeps it.
+  // The filter gives the same answer for the same path and kind, so the node keeps it.
 
   /// What the filter said about a file, or a directory, at the path. `None`: it was not asked.
   pub fn ignored(&self, kind: EntryKind) -> Option<bool> {
@@ -134,8 +123,6 @@ impl Node {
     self.flags.insert(asked);
     self.flags.set(answer, ignored);
   }
-
-  // Work for the next flush.
 
   pub fn is_marked(&self) -> bool {
     self.flags.contains(Flags::MARKED)
@@ -158,7 +145,6 @@ impl Node {
   }
 }
 
-/// The two flags for one question to the filter: "was it asked" and "it said: ignored".
 fn filter_flags(kind: EntryKind) -> (Flags, Flags) {
   match kind {
     EntryKind::File => (Flags::FILE_ASKED, Flags::FILE_IGNORED),

@@ -3,8 +3,7 @@ use std::path::PathBuf;
 /// One change of one file. A batch has at most one event for a path.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Event {
-  /// The watched path as it was given to `watch`, or that path and the rest of the way down to
-  /// the file. It is absolute.
+  /// The watched path as given to `watch`, or a path below it. It is absolute.
   pub path: PathBuf,
   /// What happened to the file.
   pub kind: EventKind,

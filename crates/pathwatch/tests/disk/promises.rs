@@ -1,5 +1,5 @@
-//! What the docs of the public API promise, as far as `contract` and `projects` do not show it
-//! already. Which test proves which promise (`c::` is `contract`, `p::` is `projects`):
+//! The promises of the README, and which test proves which (`c::` is `contract`, `p::` is
+//! `projects`):
 //!
 //! 1. A watched path is a file, a directory or nothing: `c::s1`, `c::s9`, `c::s4`,
 //!    `a_file_is_anything_that_is_not_a_directory`.
@@ -55,8 +55,8 @@ fn a_file_is_anything_that_is_not_a_directory() {
 
   each_backend(|w| {
     w.mkdir("r");
-    // Two sockets, and a link that points to nothing. macOS (26) says nothing when a socket is
-    // made: there the sockets exist before the watch, and only their removal is heard.
+    // macOS 26 says nothing when a socket is made: there the sockets exist before the watch,
+    // and only their removal is heard.
     let bind = || {
       (
         UnixListener::bind(w.path("r/socket")).unwrap(),
@@ -89,14 +89,13 @@ fn touch_is_an_update_and_chmod_is_not() {
     w.write("f.txt", "1");
     w.watch(&["r", "f.txt"]);
 
-    // `touch`: a new time and the same content.
     for rel in ["r/a.txt", "f.txt"] {
       let file = fs::File::options().write(true).open(w.path(rel)).unwrap();
       file.set_modified(SystemTime::now()).unwrap();
     }
     w.expect(&[(Update, "r/a.txt"), (Update, "f.txt")]);
 
-    // `chmod`. The write of the other file is there so that the test can wait for the watcher.
+    // The write of the other file lets the test wait for the watcher.
     for rel in ["r/a.txt", "f.txt"] {
       let mut permissions = fs::metadata(w.path(rel)).unwrap().permissions();
       permissions.set_readonly(true);
@@ -117,7 +116,6 @@ fn what_exists_at_watch_time_is_not_reported() {
     w.watch(&["r", "f.txt"]);
     w.expect(&[]);
 
-    // A later `watch`: of new files, and of files that the watcher knows already.
     w.watch(&["late", "r/a.txt", "r/sub"]);
     w.expect(&[]);
 
@@ -136,8 +134,7 @@ fn a_name_on_the_way_changes_its_kind() {
   each_backend(|w| {
     w.watch(&["a/b/r.txt", "a/b/dir", "seen.txt"]);
 
-    // Missing to file. Nothing is below a file. The other file is there so that the test can
-    // wait for the watcher.
+    // Missing to file. The other file lets the test wait for the watcher.
     w.write("a", "1");
     w.write("seen.txt", "1");
     w.expect(&[(Create, "seen.txt")]);
@@ -164,16 +161,14 @@ fn a_name_on_the_way_changes_its_kind() {
   });
 }
 
-/// The directories above a watched path are missing, and then all of them and the file are
-/// made with nothing in between. The backend tells it: nobody has to wait for the poll of the
-/// places that have no OS watch, which runs once a second.
+/// The backend tells it: nobody waits for the poll of the places without an OS watch, which
+/// runs once a second.
 #[test]
 fn a_missing_chain_that_appears_at_once_is_reported_promptly() {
   const CHAINS: usize = 10;
 
   each_backend(|w| {
     let files: Vec<String> = (0..CHAINS).map(|chain| format!("{chain}/a/b/c/r.txt")).collect();
-    // A watched file, and a watched directory.
     let watched: Vec<String> = (0..CHAINS)
       .map(|chain| if chain % 2 == 0 { files[chain].clone() } else { format!("{chain}/a/b") })
       .collect();
@@ -200,11 +195,9 @@ fn unwatch_of_a_file_and_of_a_directory() {
     w.write("stays/c.txt", "1");
     w.watch(&["r", "f.txt", "missing.txt", "stays", "stays.txt"]);
 
-    // Nothing is reported for the files that are forgotten.
     w.unwatch(&["r", "f.txt", "missing.txt"]);
     w.expect(&[]);
 
-    // Nothing comes from there later. The other watched paths still report.
     w.write("r/a.txt", "22");
     w.write("r/new.txt", "1");
     w.remove("r/sub");
@@ -236,9 +229,7 @@ fn unwatch_keeps_what_another_watched_path_covers() {
     w.write("q/d.txt", "1");
     w.watch(&["r", "r/a.txt", "r/sub", "q", "q/d.txt"]);
 
-    // The directory goes: the watched paths below it stay.
     w.unwatch(&["r"]);
-    // The file goes: the directory above it still covers it.
     w.unwatch(&["q/d.txt"]);
     w.expect(&[]);
 
@@ -257,8 +248,6 @@ fn unwatch_keeps_what_another_watched_path_covers() {
   });
 }
 
-/// A relative path is joined to the current directory, and `..` takes away the name before
-/// it. The event paths are absolute and clean.
 #[test]
 fn a_relative_path_with_dot_dot() {
   each_backend(|w| {
@@ -293,7 +282,6 @@ fn a_relative_path_with_dot_dot() {
   });
 }
 
-/// A path that cannot be used does not stop the others, and the error names it.
 #[test]
 fn one_bad_path_among_good_ones() {
   each_backend(|w| {
@@ -349,8 +337,7 @@ fn watch_and_unwatch_inside_the_handler() {
   });
 }
 
-/// The filter is the witness: it is asked about the ignored directory, and never about a name
-/// inside it.
+/// The filter is the witness: asked about the ignored directory, never about a name inside it.
 #[test]
 fn an_ignored_directory_is_not_read() {
   let asked = Arc::new(Mutex::new(Vec::new()));
@@ -386,8 +373,7 @@ fn an_ignored_directory_is_not_read() {
   assert!(asked.iter().any(|path| path.ends_with("r/src/b.js")));
 }
 
-/// The filter removes files below a watched directory, and watched paths themselves: such a
-/// path counts as missing.
+/// A watched path that the filter ignores counts as missing.
 #[test]
 fn a_watched_path_that_the_filter_ignores() {
   let config = Config::default().with_ignored(|path, kind| {
@@ -416,9 +402,8 @@ fn a_watched_path_that_the_filter_ignores() {
   });
 }
 
-/// An ignored directory comes into a watched directory with all that is in it, and goes again:
-/// by a rename, and step by step. Nothing is reported, and the filter is asked about the
-/// directory and never about a name inside it.
+/// By a rename and step by step: nothing is reported, and the filter is never asked about a
+/// name inside.
 #[test]
 fn an_ignored_directory_comes_and_goes() {
   let asked = Arc::new(Mutex::new(Vec::new()));
@@ -461,9 +446,7 @@ fn an_ignored_directory_comes_and_goes() {
   assert!(asked.iter().any(|path| path.ends_with("r/node_modules")));
 }
 
-/// A path that the filter ignores as a file and as a directory can never be reported, so
-/// `watch` does not take it. Whatever comes and goes there, nothing is reported, and `unwatch`
-/// of it does nothing.
+/// `watch` does not take it, nothing is reported, and `unwatch` of it does nothing.
 #[test]
 fn a_watched_path_that_is_ignored_for_both_kinds_gets_nothing() {
   let config = Config::default()
@@ -496,9 +479,8 @@ fn a_watched_path_that_is_ignored_for_both_kinds_gets_nothing() {
   });
 }
 
-/// A filter that looks at the last name only. A watched file gets nothing when the filter
-/// ignores the directory that holds it. Only that directory is asked: a watched file one level
-/// further down is reported.
+/// Only the directory that holds the file is asked: a watched file one level further down is
+/// reported.
 #[test]
 fn a_watched_file_in_an_ignored_directory_gets_nothing() {
   let config = Config::default()
@@ -521,9 +503,7 @@ fn a_watched_file_in_an_ignored_directory_gets_nothing() {
   });
 }
 
-/// A filter for directories named `dist`, and `dist` is a watched path. While a directory is
-/// there, the path counts as missing and nothing in it is reported. A file that takes its
-/// place is reported, and it is gone when the directory is back.
+/// While a directory is there the path counts as missing; a file in its place is reported.
 #[test]
 fn an_ignored_watched_directory_is_reported_when_a_file_takes_its_place() {
   let config =
@@ -559,7 +539,6 @@ fn nothing_is_reported_beside_a_watched_path() {
     w.write("p/other.txt", "1");
     w.watch(&["p/dir", "p/file.txt", "p/missing/deep.txt"]);
 
-    // Beside the watched directory, beside the watched file, and beside the missing one.
     w.write("p/beside/b.txt", "22");
     w.write("p/beside/new.txt", "1");
     w.write("p/dir2/c.txt", "1");
@@ -579,8 +558,8 @@ fn nothing_is_reported_beside_a_watched_path() {
   });
 }
 
-/// The watched path is a link to a file: the file behind the link counts. Nothing watches the
-/// place that a link points to, so the native backend finds these changes with its poll.
+/// Nothing watches the place a link points to: the native backend finds these changes with its
+/// poll.
 #[cfg(unix)]
 #[test]
 fn a_watched_link_to_a_file_is_followed() {
@@ -599,8 +578,6 @@ fn a_watched_link_to_a_file_is_followed() {
   });
 }
 
-/// A link that is found below a watched directory is not followed: it is one file, whatever it
-/// points to.
 #[cfg(unix)]
 #[test]
 fn a_link_inside_a_watched_directory_is_a_file() {
@@ -616,7 +593,6 @@ fn a_link_inside_a_watched_directory_is_a_file() {
     symlink(w.path("outside/f.txt"), w.path("r/to_file")).unwrap();
     w.expect(&[(Create, "r/to_dir"), (Create, "r/to_file")]);
 
-    // Nothing comes from the other side of a link.
     w.write("outside/dir/a.txt", "22");
     w.write("outside/dir/b.txt", "1");
     w.write("outside/f.txt", "22");
@@ -629,8 +605,8 @@ fn a_link_inside_a_watched_directory_is_a_file() {
   });
 }
 
-/// The disk spells the name with `e` and an accent after it (two letters), the watched path
-/// with `é` (one letter). The usual disk of macOS takes them for one name.
+/// The disk spells it `e` and an accent, the watched path `é`: one name on the usual disk of
+/// macOS.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_watched_file_in_another_unicode_form() {
@@ -651,14 +627,11 @@ fn a_watched_file_in_another_unicode_form() {
   });
 }
 
-/// The watched path keeps the spelling of the caller. The names below it are the names that
-/// the disk has.
 #[test]
 fn names_below_a_watched_directory_are_spelled_as_on_the_disk() {
   each_backend(|w| {
     w.write("proj/Src/Old.TXT", "1");
-    // Where the disk takes two spellings of a name for one, the directory is watched in
-    // another letter case.
+    // Where the disk takes two spellings for one, the directory is watched in another case.
     let loose = w.path("PROJ").exists();
     let root = if loose { "PROJ" } else { "proj" };
     let at = |rel: &str| format!("{root}/{rel}");
@@ -681,8 +654,6 @@ fn names_below_a_watched_directory_are_spelled_as_on_the_disk() {
   });
 }
 
-/// A name that changes only its letter case is another name: the file under the old name is
-/// gone, and there is a new one.
 #[test]
 fn a_file_is_renamed_to_another_letter_case() {
   each_backend(|w| {
@@ -696,8 +667,7 @@ fn a_file_is_renamed_to_another_letter_case() {
   });
 }
 
-/// A file that is removed, or renamed away, through another spelling of its name is gone. The
-/// OS names it as the caller spelled it then.
+/// The OS names a file that is gone as the caller spelled it then.
 #[test]
 fn a_file_goes_through_another_spelling_of_its_name() {
   each_backend(|w| {
@@ -717,9 +687,8 @@ fn a_file_goes_through_another_spelling_of_its_name() {
   });
 }
 
-/// Every watched path is a question of its own: two watched paths that are two spellings of
-/// one file get their events both, and the watched directory around them reports the file
-/// under the name that the disk has.
+/// Each watched spelling gets its events, and the watched directory reports the name that the
+/// disk has.
 #[test]
 fn every_watched_spelling_of_a_file_gets_its_events() {
   each_backend(|w| {
@@ -740,8 +709,6 @@ fn every_watched_spelling_of_a_file_gets_its_events() {
   });
 }
 
-/// The same one level up: a watched file and a watched directory that are reached through
-/// another spelling of a directory inside a watched directory.
 #[test]
 fn watched_paths_through_another_spelling_inside_a_watched_directory() {
   each_backend(|w| {
@@ -771,8 +738,6 @@ fn watched_paths_through_another_spelling_inside_a_watched_directory() {
   });
 }
 
-/// The same for a directory: every file below the old name is gone, and every file below the
-/// new name is new.
 #[test]
 fn a_directory_is_renamed_to_another_letter_case() {
   each_backend(|w| {
@@ -793,9 +758,7 @@ fn a_directory_is_renamed_to_another_letter_case() {
   });
 }
 
-/// A directory above the watched path is renamed to another letter case. The watched path
-/// still finds its directory, and the changes below it keep coming, under the spelling of
-/// the caller.
+/// The watched path still finds its directory, and the events keep the spelling of the caller.
 #[test]
 fn a_directory_above_a_watched_path_is_renamed_to_another_letter_case() {
   each_backend(|w| {

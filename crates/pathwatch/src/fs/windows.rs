@@ -41,8 +41,7 @@ use super::{DirId, Entry, FileType, Meta, meta};
 const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 /// From 1601 to 1970, in the steps of 100 ns that Windows counts time in.
 const TO_1970: u64 = 116_444_736_000_000_000;
-/// A reparse point with this bit in its tag stands for another name: a junction, a link.
-/// The rule of std for "is a symbolic link".
+/// The bit of a reparse tag that makes the entry a link for std, and so here.
 const NAME_SURROGATE: u32 = 0x2000_0000;
 
 /// A time before 1970 is no time a watcher has to tell from another one.
@@ -62,21 +61,15 @@ fn kind(attributes: u32, tag: u32) -> FileType {
   }
 }
 
-/// What `lstat` tells of an entry. There is no change time: the modification time stands in
-/// for it, as with std.
+/// Windows has no change time: the modification time stands in, as with std.
 fn entry(kind: FileType, written: u64, size: u64, dir_id: DirId) -> Meta {
   let modified = time(written);
   Meta { kind, modified, changed: modified, size, file_id: dir_id.inode, dir_id }
 }
 
-/// What a failed call tells, when Windows says less: "access denied" is also its answer for
-/// an entry that is being deleted (until the one who deletes it closes its handle), and for
-/// a directory that is opened as a file. Both mean that the file the engine asked about is
-/// not there, and only the status of the kernel tells them from an entry that may not be
-/// read.
-///
-/// Call it right after the call that failed, on the same thread: the status is the one of
-/// the last call that failed there.
+/// "Access denied" is also what Windows says for an entry that is being deleted and for a
+/// directory opened as a file; only the status of the kernel tells these from an entry that
+/// may not be read. Call it right after the failed call, on the same thread.
 pub fn told(error: io::Error) -> io::Error {
   #[link(name = "ntdll")]
   unsafe extern "system" {
@@ -87,8 +80,7 @@ pub fn told(error: io::Error) -> io::Error {
     return error;
   }
   match RtlGetLastNtStatus() {
-    // std asks the listing of the directory when the entry cannot be opened, so the status
-    // can also be the one of that second call: the entry is gone by then.
+    // The last two come from the listing that std asks for an entry it cannot open.
     STATUS_DELETE_PENDING
     | STATUS_FILE_IS_A_DIRECTORY
     | STATUS_NO_SUCH_FILE
@@ -98,16 +90,9 @@ pub fn told(error: io::Error) -> io::Error {
   }
 }
 
-/// `lstat`, or `stat` with `follow`.
-///
-/// std gives no file index and no volume, and both are needed: Windows gives a new entry
-/// the creation time of the one that was removed under its name a moment ago, and the clock
-/// of the time stamps moves in steps of up to 16 ms. So a file that is removed and written
-/// again can have every time and the size of the old one, and only the file index tells
-/// that it is another file.
-///
-/// One call by name where Windows has it (3.5 us for a file, measured). Else the entry is
-/// opened, the way std opens it, and the handle is asked (10 us).
+/// `lstat`, or `stat` with `follow`. std gives no file index and no volume, and only the
+/// file index tells a file that was removed and written again from the old one. By name
+/// where Windows has the call (3.5 us, measured), else through a handle (10 us).
 pub fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
   match by_name(path) {
     // What is behind a link is only found through a handle.
@@ -144,8 +129,8 @@ type ByName = unsafe extern "system" fn(*const u16, i32, *mut c_void, u32) -> i3
 /// `FileStatBasicByNameInfo`.
 const STAT_BASIC: i32 = 3;
 
-/// A function of `kernel32.dll` that not every Windows has, by its name. A program that
-/// imports such a function does not start on a Windows without it.
+/// A function of `kernel32.dll` that not every Windows has: an import of it would keep the
+/// program from starting there.
 pub fn kernel32(name: &CStr) -> Option<Unknown> {
   let kernel32: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
   // SAFETY: both names end with a NUL. `kernel32.dll` is loaded in every process and is
@@ -166,15 +151,13 @@ fn by_name_call() -> Option<ByName> {
   })
 }
 
-/// `lstat` in one call that opens nothing. `None`: this call cannot say, and the handle is
-/// asked. Only an entry and "nothing is there" are taken from it: every other error (a disk
-/// that does not know the call, an entry that may not be read) is left to the open.
+/// `lstat` in one call that opens nothing. `None`: the handle is asked, as for every error
+/// but "nothing is there".
 fn by_name(path: &Path) -> Option<io::Result<Meta>> {
   let call = by_name_call()?;
   // The call takes the path as it is. A longer one needs the `\\?\` form that std makes.
   let mut wide = [0_u16; MAX_PATH as usize];
   for (at, unit) in path.as_os_str().encode_wide().enumerate() {
-    // The last unit stays zero: the end of the text.
     if unit == 0 || at + 1 == wide.len() {
       return None;
     }
@@ -197,7 +180,6 @@ fn by_name(path: &Path) -> Option<io::Result<Meta>> {
 fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
   let link = if follow { 0 } else { FILE_FLAG_OPEN_REPARSE_POINT };
   let opened = OpenOptions::new()
-    // No access to the content: only what the entry is.
     .access_mode(0)
     .share_mode(SHARE_ALL)
     .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | link)
@@ -205,8 +187,7 @@ fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
   let file = match opened.map_err(told) {
     Ok(file) => file,
     Err(error) => {
-      // An entry that cannot be opened (a system file that is in use) can still be read
-      // from the listing of its directory: std does that. It has no index then.
+      // A system file in use cannot be opened. Its listing still tells of it, without an index.
       let code = error.raw_os_error().map(i32::cast_unsigned);
       if !matches!(code, Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)) {
         return Err(error);
@@ -252,15 +233,10 @@ fn wide(high: u32, low: u32) -> u64 {
 #[repr(C, align(8))]
 struct Aligned<const N: usize>([u8; N]);
 
-/// A number that changes with each change of the file at `path`: the place of the last
-/// record about the file in the change journal of its disk. `None`: the disk keeps no
-/// journal, and the content has to be read.
-///
-/// It stands in for a hash of the content, which costs much more here: a program that opens
-/// a file to read it, right after the file was written, waits for the virus scanner (2 ms,
-/// and 14 ms for one in ten, measured). This call opens the file without access to its
-/// content and waits for nothing (0.04 ms). It also changes when the file is renamed or
-/// gets other attributes, and when a writer closes the file.
+/// The place of the last record about the file in the change journal of its disk: it moves
+/// with every write, and also with a rename, other attributes, and the close of a writer.
+/// `None`: the disk keeps no journal. A read of the content for a hash waits for the virus
+/// scanner right after a write (2 ms, 14 ms for one in ten); this call takes 0.04 ms.
 pub fn version(path: &Path) -> io::Result<Option<u64>> {
   // A directory cannot be opened in this way: it is no file to compare (see `told`).
   let file = OpenOptions::new().access_mode(0).share_mode(SHARE_ALL).open(path).map_err(told)?;
@@ -291,8 +267,7 @@ pub fn version(path: &Path) -> io::Result<Option<u64>> {
   Ok(usn.map(|usn| u64::from_ne_bytes(*usn)))
 }
 
-// Where the fields of a `FILE_ID_BOTH_DIR_INFO` record are. They are read from the bytes,
-// not through a pointer: every offset and length is checked against the answer.
+// A record is read from its bytes at these offsets, each checked against the answer.
 const NEXT: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, NextEntryOffset);
 const CREATED: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, CreationTime);
 const WRITTEN: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, LastWriteTime);
@@ -304,19 +279,14 @@ const TAG: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, EaSize);
 const INDEX: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileId);
 const NAME: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
 
-/// Lists `dir` with what `lstat` tells of each regular file: one call for some hundred
-/// entries, 0.35 us for each (measured), where an `lstat` for each takes ten times as long
-/// or more. `Ok(false)`: the disk is not NTFS, and nothing was listed. Only there it was
-/// measured that the listing and `lstat` give the same numbers.
-///
-/// The listing is behind in two cases, both measured: for a file that a writer has open (it
-/// is right again when the writer closes the file), and for a hard link whose file was
-/// written through another name. The engine knows the first (`Fs::listing_lags`).
+/// Lists `dir` with what `lstat` tells of each regular file, 0.35 us for an entry (measured).
+/// `Ok(false)`: the disk is not NTFS, the only one where this was measured to match `lstat`.
+/// The listing is behind for a file that a writer has open (`Fs::listing_lags`) and for a
+/// hard link written through another name.
 pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<bool> {
   let dir = OpenOptions::new()
     .access_mode(FILE_LIST_DIRECTORY)
     .share_mode(SHARE_ALL)
-    // Without it a directory cannot be opened at all.
     .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
     .open(dir)
     .map_err(told)?;
@@ -368,16 +338,13 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
   }
 }
 
-/// The record at the start of `bytes`: where the next one starts (zero: none), and what it
-/// tells. Its name is put into `name`. `None`: the record does not fit into the bytes.
-/// `volume` is the one of the directory that is listed: an entry that is no reparse point is
-/// on it too.
+/// The record at the start of `bytes`: where the next one starts (zero: none) and what it
+/// tells, with its name in `name`. `None`: it does not fit into the bytes.
 fn record(bytes: &[u8], volume: u64, name: &mut Vec<u16>) -> Option<(usize, Entry)> {
   let u32_at = |at: usize| Some(u32::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
   let u64_at = |at: usize| Some(u64::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
   let next = usize::try_from(u32_at(NEXT)?).ok()?;
   let name_bytes = bytes.get(NAME..)?.get(..usize::try_from(u32_at(NAME_BYTES)?).ok()?)?;
-  // The next record is inside the bytes, and after this one.
   if next != 0 && (next < NAME + name_bytes.len() || next >= bytes.len()) {
     return None;
   }
@@ -386,12 +353,11 @@ fn record(bytes: &[u8], volume: u64, name: &mut Vec<u16>) -> Option<(usize, Entr
   let (attributes, index) = (u32_at(ATTRIBUTES)?, u64_at(INDEX)?);
   let plain = attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
   let told = match kind(attributes, u32_at(TAG)?) {
-    // A reparse point that is no link (a file in a cloud, a mounted disk) is left to
-    // `lstat`: not measured.
+    // A reparse point that is no link (a file in a cloud, a mounted disk) is left to `lstat`.
     FileType::File if plain => {
       Entry::File { modified: time(u64_at(WRITTEN)?), size: u64_at(SIZE)?, file_id: index }
     }
-    // The identity as `stat` tells it. It is never behind: it does not change.
+    // The identity never changes, so the listing is never behind with it.
     FileType::Dir if plain => {
       Entry::Dir { id: DirId { volume, inode: index, birth: u64_at(CREATED)? } }
     }
@@ -400,8 +366,8 @@ fn record(bytes: &[u8], volume: u64, name: &mut Vec<u16>) -> Option<(usize, Entr
   Some((next, told))
 }
 
-/// `path` for a call that takes it as it is, with a NUL at its end. A long path only works
-/// in the `\\?\` form, which std makes for its own calls and which takes no `/`.
+/// `path` with a NUL at its end, in the `\\?\` form when it is long, as std does for its
+/// own calls.
 fn wide_path(path: &Path) -> Vec<u16> {
   const SEPARATOR: u16 = b'\\' as u16;
   let units = path.as_os_str().encode_wide();
@@ -455,8 +421,6 @@ mod tests {
     assert!(made.is_ok_and(|output| output.status.success()), "mklink /J failed");
   }
 
-  /// The call by name and the handle tell the same of a file, a directory and a junction,
-  /// and both say "not found" for what is not there.
   #[test]
   fn the_call_by_name_tells_what_the_handle_tells() {
     let top = tempfile::tempdir().unwrap();
@@ -465,7 +429,7 @@ mod tests {
     fs::write(&file, "written").unwrap();
     fs::create_dir(&dir).unwrap();
     junction(&link, &dir);
-    // An older Windows has no call by name: there is nothing to compare.
+    // An older Windows has no call by name.
     if by_name(&file).is_none() {
       return;
     }
@@ -476,15 +440,12 @@ mod tests {
       assert!(same(&named, &opened), "{}: {named:?} and {opened:?}", path.display());
       assert_eq!(named.kind, kind);
     }
-    // A link is followed through a handle, and the directory behind it is the same one.
     assert_eq!(stat(&link, true).unwrap().dir_id, stat(&dir, false).unwrap().dir_id);
     for missing in [top.path().join("none"), file.join("below a file")] {
       assert_eq!(stat(&missing, false).unwrap_err().kind(), io::ErrorKind::NotFound);
     }
   }
 
-  /// On NTFS the listing tells of a regular file what `lstat` tells, and of a directory and
-  /// a junction the kind. It is behind while a writer has the file open.
   #[test]
   fn the_listing_tells_of_a_file_what_lstat_tells() {
     let top = tempfile::tempdir().unwrap();
@@ -497,7 +458,7 @@ mod tests {
       seen.sort_by(|a, b| a.0.cmp(&b.0));
       listed.unwrap().then_some(seen)
     };
-    // Another file system: the listing of std is used there.
+    // Not NTFS: the listing of std is used there.
     let Some(seen) = list() else { return };
     let [
       (_, Entry::Dir { id }),
@@ -509,12 +470,10 @@ mod tests {
     };
     let meta = stat(&top.path().join("file"), false).unwrap();
     assert_eq!((modified, size, file_id), (meta.modified, meta.size, meta.file_id));
-    // Both ways of `stat` give the identity that the listing gave.
     let dir = top.path().join("dir");
     assert_eq!(id, stat(&dir, false).unwrap().dir_id);
     assert_eq!(id, by_handle(&dir, false).unwrap().dir_id);
 
-    // A file is no directory.
     let error = read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::NotADirectory, "{error:?}");
 
@@ -529,7 +488,7 @@ mod tests {
     assert_eq!(size(), 16);
   }
 
-  /// The name as the directory holds it, also at the end of a path of more than 260 units.
+  /// Also at the end of a path of more than 260 units.
   #[test]
   fn the_name_on_disk() {
     let top = tempfile::tempdir().unwrap();
@@ -545,13 +504,12 @@ mod tests {
     }
   }
 
-  /// The version of a file changes with each write, and with nothing that only reads.
   #[test]
   fn the_version_changes_with_a_write() {
     let top = tempfile::tempdir().unwrap();
     let file = top.path().join("file");
     fs::write(&file, "one").unwrap();
-    // A disk without a change journal: the content is hashed there.
+    // A disk without a change journal.
     let Some(first) = version(&file).unwrap() else { return };
     assert_eq!(fs::read(&file).unwrap(), b"one");
     assert_eq!(stat(&file, false).unwrap().size, 3);
@@ -561,7 +519,6 @@ mod tests {
     fs::write(&file, "two").unwrap();
     assert_ne!(version(&file).unwrap(), Some(first));
 
-    // Neither a directory nor nothing is a file to compare.
     for path in [top.path().to_owned(), top.path().join("none")] {
       assert_eq!(version(&path).unwrap_err().kind(), io::ErrorKind::NotFound);
     }

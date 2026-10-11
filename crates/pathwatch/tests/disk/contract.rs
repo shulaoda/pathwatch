@@ -1,5 +1,5 @@
 //! The behavior contract: one test for each row S1 to S14 of the table in `docs/design.md`.
-//! `r` is the watched path. `w.expect` waits for the events and fails when others come.
+//! `r` is the watched path.
 
 use std::{
   sync::{Arc, mpsc},
@@ -68,9 +68,8 @@ fn s3_deleted_and_created_again() {
 
 #[test]
 fn s3_deleted_and_created_again_inside_the_delete_delay() {
-  // The default delay of 100 ms is too short for a slow machine: the two calls below must
-  // follow each other inside it. So this test has a delay of 2 s. No public setting changes
-  // the delay: the watchers are built like the ones of `each_backend`, by hand.
+  // A delay of 100 ms is too short for a slow machine, and no public setting changes it: the
+  // watchers are built by hand.
   const DELETE_DELAY: Duration = Duration::from_secs(2);
 
   side_by_side(|polling| {
@@ -265,7 +264,6 @@ fn s14_an_ignored_directory() {
     w.write("r/visible.js", "1");
     w.expect(&[(Create, "r/visible.js")]);
 
-    // An ignored name becomes a visible one, and the other way round.
     w.rename("r/node_modules", "r/vendor");
     w.expect(&[(Create, "r/vendor/before.js"), (Create, "r/vendor/pkg/index.js")]);
     w.rename("r/vendor", "r/node_modules");

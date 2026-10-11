@@ -1,3 +1,6 @@
+//! The Windows backend: `ReadDirectoryChangesW` on at most 64 directory handles. See
+//! `docs/design.md` 7.3 and `docs/windows-open-points.md`.
+
 use std::{
   ffi::OsString,
   io, mem,
@@ -150,7 +153,7 @@ fn looks_short(part: &[u16]) -> bool {
   let (base, extension) = part.split_at(dot);
   let digits = base.iter().rev().take_while(|unit| DIGITS.contains(unit)).count();
   let tilde = base.len().checked_sub(digits + 1).filter(|&at| at > 0 && base[at] == TILDE);
-  // Windows makes a short name in upper case: `v1~1.txt` is a long name.
+  // Windows makes 8.3 names in upper case: `v1~1.txt` is a long name.
   digits > 0
     && tilde.is_some()
     && base.len() <= 8
@@ -587,6 +590,7 @@ mod records {
 
   const NEXT_ENTRY_OFFSET: usize = offset_of!(Short, NextEntryOffset);
   const ACTION: usize = offset_of!(Short, Action);
+  // Both record layouts are read with these two offsets.
   const _: () = assert!(
     offset_of!(Extended, NextEntryOffset) == NEXT_ENTRY_OFFSET
       && offset_of!(Extended, Action) == ACTION
@@ -723,7 +727,7 @@ mod port {
     fs::{FileType, Fs, StdFs, Unknown, kernel32},
   };
 
-  // No creation time: a tool that only sets it would make a `Written` hint, and so an `Update`.
+  // No creation time: a tool that only sets it would give a `Written` hint.
   const FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
     | FILE_NOTIFY_CHANGE_DIR_NAME
     | FILE_NOTIFY_CHANGE_SIZE
@@ -827,9 +831,8 @@ mod port {
     Stop,
   }
 
-  /// The handles live here. Each is known to the port by a token of its own, never by the id
-  /// of the watch: a read that fails at once can still bring a packet under the token of its
-  /// handle, and such a handle is given up, so the packet finds no watch.
+  /// The handles. The port knows each by a token of its own, not by the id of the watch: a
+  /// handle whose read failed at once is given up, and a late packet for it finds no watch.
   struct Worker {
     iocp: Arc<Iocp>,
     commands: mpsc::Receiver<Command>,
@@ -883,8 +886,8 @@ mod port {
             self.watches.insert(token, watch);
             return Ok(());
           }
-          // The disk does not know the longer records. The handle is dropped with the watch:
-          // a packet for the read that failed must not be taken for one of the next read.
+          // The disk does not know the longer records. The handle goes with the watch: a
+          // packet for the failed read must not pass for one of the next read.
           Err(error) if extended && not_supported(&error) => extended = false,
           Err(error) => return Err(error),
         }
@@ -989,19 +992,16 @@ mod port {
       }
     }
 
-    /// Queues one read. When it fails, no read is pending, and the kernel is done with the
-    /// blocks: a packet can still come for it, under the token of the handle.
+    /// Queues one read. When it fails, no read is pending and the kernel is done with the
+    /// blocks, but a packet can still come under the token of the handle.
     fn read(&mut self) -> io::Result<()> {
       let Some(dir) = &self.dir else { return Err(io::Error::other("the handle is closed")) };
       *self.overlapped = OVERLAPPED::default();
       let (handle, buffer) = (dir.as_raw_handle(), self.buffer.as_mut_ptr().cast());
       let (subtree, overlapped) = (i32::from(true), &raw mut *self.overlapped);
       let extended = read_extended().filter(|_| self.extended);
-      // SAFETY: the handle is open. The kernel writes to `buffer`, which is `BUFFER_BYTES` long,
-      // and to `overlapped` until the read completes. Both are heap blocks that do not move, and
-      // they are freed only when `pending` is false again (see `Drop`). No read is pending now, so
-      // the kernel does not use the blocks for another read: `Worker::open` calls this for a new
-      // watch, and `Worker::completed` after it took the packet of the last read.
+      // SAFETY: the handle is open and no read is pending on it. `buffer` is `BUFFER_BYTES`
+      // long, and both heap blocks stay put and are freed only when `pending` is false (`Drop`).
       let queued = unsafe {
         let (size, no_count) = (BUFFER_BYTES, ptr::null_mut());
         match extended {
@@ -1039,8 +1039,7 @@ mod port {
     fn close(&mut self) {
       let Some(dir) = self.dir.take() else { return };
       if self.pending {
-        // SAFETY: the handle is open, and `overlapped` is the block of the read that is pending on
-        // it. The call only reads the address.
+        // SAFETY: the handle is open, and `overlapped` is the block of its pending read.
         unsafe { CancelIoEx(dir.as_raw_handle(), &raw const *self.overlapped) };
       }
     }
@@ -1065,8 +1064,7 @@ mod port {
       if port.is_null() {
         return Err(io::Error::last_os_error());
       }
-      // SAFETY: the port is a new open handle that nothing else owns, and `CloseHandle` is the way
-      // to close it.
+      // SAFETY: the port is a new open handle that nothing else owns.
       Ok(Self(unsafe { OwnedHandle::from_raw_handle(port) }))
     }
 

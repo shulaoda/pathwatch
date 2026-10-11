@@ -11,8 +11,8 @@ use std::{
 
 use rustc_hash::FxHasher;
 
-/// Every call that the engine makes to the disk. `StdFs` is the real disk, and the tests
-/// have one in memory.
+/// Every call that the engine makes to the disk. `StdFs` is the real one; the tests have one
+/// in memory.
 pub trait Fs {
   /// Does not follow a symbolic link at the end of `path`.
   fn lstat(&self, path: &Path) -> io::Result<Meta>;
@@ -20,19 +20,15 @@ pub trait Fs {
   /// Follows symbolic links.
   fn stat(&self, path: &Path) -> io::Result<Meta>;
 
-  /// Calls `each` with the name of every entry of `dir`, and with what the listing gives of it
-  /// for free.
+  /// Calls `each` with the name of every entry of `dir`, and what the listing tells of it.
   fn read_dir(&self, dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()>;
 
   /// A hash of the content of a regular file.
   fn hash(&self, path: &Path) -> io::Result<u64>;
 
-  /// A number that the disk keeps for the regular file at `path` and changes with every
-  /// change of it: a write, and also a rename or other attributes. `None`: the disk has no
-  /// such number, or the file cannot be asked.
-  ///
-  /// Where an OS watch tells about writes, the engine takes it in place of the hash: the same
-  /// number at the next look says that nothing was written, and the file is not opened.
+  /// A number that the disk changes with every change of the regular file at `path`, a rename
+  /// too; `None` where the disk has none. Where an OS watch reports writes, the engine takes
+  /// it in place of the hash, so the file is not opened.
   fn version(&self, _path: &Path) -> Option<u64> {
     None
   }
@@ -40,23 +36,18 @@ pub trait Fs {
   /// Where the symbolic link at `path` points: the text that is stored in the link.
   fn link_target(&self, path: &Path) -> io::Result<PathBuf>;
 
-  /// The path that `path` leads to, without any symbolic link in it, and with every name as
-  /// the disk spells it.
+  /// The path that `path` leads to: no link in it, and every name as the disk spells it.
   fn real_path(&self, path: &Path) -> io::Result<PathBuf>;
 
-  /// The last name of `path` as the disk spells it. A link at the end is not followed.
-  ///
-  /// It is asked only on a disk that takes two spellings of a name for one. There `lstat` finds
-  /// an entry under every spelling of its name, and this call tells which one the entry has.
+  /// The last name of `path` as the disk spells it; a link at the end is not followed. Asked
+  /// only on a disk that takes two spellings of a name for one.
   fn name_on_disk(&self, path: &Path) -> io::Result<OsString>;
 
   /// The clock that the modification times come from.
   fn now(&self) -> SystemTime;
 
-  /// Whether a listing can be behind `lstat` for a file that its writer still has open
-  /// (NTFS: the directory gets the new size and time when the file is closed). Then the
-  /// engine takes a file from a listing only where an OS watch reports the write, and asks
-  /// about each file itself in a directory that it polls.
+  /// Whether a listing can be behind `lstat` for a file that its writer still has open (NTFS).
+  /// Then the engine takes a file from a listing only where an OS watch reports the write.
   fn listing_lags(&self) -> bool {
     false
   }
@@ -67,8 +58,8 @@ pub trait Fs {
 pub struct Meta {
   pub kind: FileType,
   pub modified: SystemTime,
-  /// The change time: it moves when the content changes, and also when the entry itself is
-  /// renamed or gets other permissions. Where the platform gives none: the modification time.
+  /// The change time: it moves with a rename or a chmod too. The modification time where the
+  /// platform gives none.
   pub changed: SystemTime,
   pub size: u64,
   /// The inode on Unix, the file index on Windows.
@@ -80,16 +71,15 @@ pub struct Meta {
 #[derive(Clone, Copy, Debug)]
 pub enum Entry {
   Name,
-  /// The engine only needs "directory or not" from it. The exact kind comes from an `lstat`.
+  /// Only "directory or not" is read from it; the exact kind comes from an `lstat`.
   Kind(FileType),
-  /// A regular file, with what an `lstat` would tell of it: the engine asks none then.
+  /// A regular file with what `lstat` would tell of it, so no `lstat` is asked.
   File {
     modified: SystemTime,
     size: u64,
     file_id: u64,
   },
-  /// A directory that is no link, with the identity that an `lstat` would tell: the engine
-  /// asks none then.
+  /// A directory that is no link, with its identity, so no `lstat` is asked.
   Dir {
     id: DirId,
   },
@@ -106,8 +96,8 @@ pub enum FileType {
   Other,
 }
 
-/// Tells one directory from another one at the same path. The engine uses it only to find more
-/// changes, never to skip a check.
+/// Tells one directory from another at the same path. It is used to find more changes, never
+/// to skip a check.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct DirId {
   pub volume: u64,
@@ -161,11 +151,10 @@ impl Fs for StdFs {
   fn hash(&self, path: &Path) -> io::Result<u64> {
     let mut file = File::open(path).map_err(told)?;
     let mut hasher = FxHasher::default();
-    // On the stack: a young file is hashed at every look, and most files are small.
     let mut buffer = [0; 16 * 1024];
     loop {
-      // Fill the whole buffer before it is hashed: the hash must not depend on how many bytes
-      // one `read` call happens to return.
+      // The buffer is filled before it is hashed: the hash must not depend on how many bytes
+      // one `read` call gives.
       let mut filled = 0;
       while filled < buffer.len() {
         match file.read(&mut buffer[filled..]) {
@@ -208,7 +197,7 @@ impl Fs for StdFs {
   }
 }
 
-/// Windows. What the calls of std do not tell, and what they cost too much for.
+/// Windows: what the calls of std do not tell, and what they cost too much for.
 #[cfg(windows)]
 mod windows;
 
@@ -222,10 +211,7 @@ fn told(error: io::Error) -> io::Error {
   error
 }
 
-/// macOS: `getattrlistbulk` gives the entries of a directory with what `lstat` tells of each,
-/// many of them in one call. Only a regular file on APFS is taken from it: there it was
-/// measured to tell the same as `lstat`, and on other disks not (`docs/design.md` 5.4). Of a
-/// directory where a disk is mounted it tells what is under the mount.
+/// macOS: a listing with what `lstat` tells of each entry, and the name of one entry.
 #[cfg(target_vendor = "apple")]
 mod apple;
 #[cfg(target_vendor = "apple")]
@@ -233,16 +219,10 @@ pub(crate) use self::apple::name_and_kind;
 #[cfg(target_vendor = "apple")]
 use self::apple::name_on_disk;
 
-/// No call gives the name of one entry here, so the listing of its directory is read: 1.8 ms
-/// for 2,000 entries of a folder that a Mac shares. The engine asks only in a directory that
-/// takes two spellings of a name for one (a folder of another system, a FAT or SMB disk, a
-/// directory with the casefold flag), and there only for a name that it is not sure of.
-///
-/// The entry is the one with the very name, or else one that differs in the case of ASCII
-/// letters, or else one with the same inode number (another Unicode form). If the listing has
-/// none of these, the directory has no such entry, whatever `lstat` said: on a folder that a
-/// Mac shares, Linux still finds a name that was renamed away through another spelling
-/// (measured: the kernel keeps what it knew about each spelling).
+/// Linux has no call for the name of one entry, so the listing is read (1.8 ms for 2,000
+/// entries). The entry is the one with the name, else one in another ASCII case, else one with
+/// the same inode; none of these means no such entry, whatever `lstat` said: on a folder that
+/// a Mac shares, Linux still finds a name that was renamed away through another spelling.
 #[cfg(all(unix, not(target_vendor = "apple")))]
 fn name_on_disk(path: &Path) -> io::Result<OsString> {
   use std::os::unix::fs::{DirEntryExt, MetadataExt};
@@ -268,7 +248,7 @@ fn name_on_disk(path: &Path) -> io::Result<OsString> {
   other_case.or(same_inode).ok_or_else(|| io::ErrorKind::NotFound.into())
 }
 
-/// Everywhere else a name has one spelling: the one of the path.
+/// Everywhere else a name has one spelling.
 #[cfg(not(any(unix, windows)))]
 fn name_on_disk(path: &Path) -> io::Result<OsString> {
   fs::symlink_metadata(path)?;
@@ -306,13 +286,13 @@ fn meta(metadata: &Metadata, (file_id, dir_id): (u64, DirId)) -> Meta {
 fn changed(metadata: &Metadata, _modified: SystemTime) -> SystemTime {
   use std::{os::unix::fs::MetadataExt, time::Duration};
 
-  // A time before 1970 is no time a watcher has to tell from another one.
+  // A time before 1970 counts as 1970.
   let seconds = u64::try_from(metadata.ctime()).unwrap_or(0);
   let nanos = u32::try_from(metadata.ctime_nsec()).unwrap_or(0);
   SystemTime::UNIX_EPOCH + Duration::new(seconds, nanos)
 }
 
-/// Stable std gives no change time here: the modification time stands in for it.
+/// Stable std gives no change time here.
 #[cfg(not(unix))]
 fn changed(_metadata: &Metadata, modified: SystemTime) -> SystemTime {
   modified
@@ -323,16 +303,15 @@ fn changed(_metadata: &Metadata, modified: SystemTime) -> SystemTime {
 fn ids(metadata: &Metadata) -> (u64, DirId) {
   use std::os::unix::fs::MetadataExt;
 
-  // The birth time tells a new directory from a removed one whose inode number it got. Not every
-  // libc gives it (musl does not).
+  // The birth time tells a new directory from a removed one that had the same inode number.
+  // Not every libc gives it (musl does not).
   let birth = metadata.created().map_or(0, nanos);
   (metadata.ino(), DirId { volume: metadata.dev(), inode: metadata.ino(), birth })
 }
 
 #[cfg(not(any(unix, windows)))]
 fn ids(metadata: &Metadata) -> (u64, DirId) {
-  // There is no inode here (WASI). A directory has no identity: a replaced one is found by the
-  // listing only.
+  // WASI has no inode, so a directory has no identity: a replaced one is found by the listing.
   (metadata.created().map_or(0, nanos), DirId::default())
 }
 
@@ -349,11 +328,11 @@ mod tests {
 
   use super::{Fs, StdFs};
 
-  /// A rename of a directory, or other permissions for it, moves its change time and leaves
-  /// its modification time. A new entry in it moves both.
+  /// A rename or a chmod moves the change time and not the modification time; a new entry
+  /// moves both.
   #[test]
   fn the_change_time_of_a_directory() {
-    // Longer than one step of the clock that the file systems of the tests stamp with.
+    // Longer than one step of the clock of the file system.
     let wait = || thread::sleep(Duration::from_millis(50));
     let top = tempfile::tempdir().unwrap();
     let dir = top.path().join("dir");
@@ -380,8 +359,7 @@ mod tests {
     assert!(filled.changed > permitted.changed);
   }
 
-  /// On APFS the listing tells of a regular file what `lstat` tells, also while the file is
-  /// open and written. Of a directory and of a link it tells the kind.
+  /// On APFS the listing tells of a file what `lstat` tells, also while it is open and written.
   #[cfg(target_vendor = "apple")]
   #[test]
   fn the_listing_tells_of_a_file_what_lstat_tells() {

@@ -14,20 +14,17 @@ use pathwatch::{
 
 use crate::{Watch, each, each_backend, each_backend_with};
 
-/// A fixed sequence of numbers that has no pattern, so that a test picks the same things in
-/// every run.
+/// A fixed sequence of numbers, so that a test picks the same things in every run.
 struct Random(u64);
 
 impl Random {
-  /// A number below `limit`.
   fn below(&mut self, limit: usize) -> usize {
     self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
     usize::try_from(self.0 >> 33).unwrap() % limit
   }
 }
 
-/// One change at a random place. Many of them fail (the place is missing, or a file is in the
-/// way), and that is fine.
+/// One change at a random place. Many fail (the place is missing, or a file is in the way).
 fn random_change(w: &Watch, random: &mut Random) {
   let kind = random.below(10);
   let mut place = |least: usize| {
@@ -52,8 +49,7 @@ fn random_change(w: &Watch, random: &mut Random) {
   }
 }
 
-/// Puts into `files` what a watched path at `path` reports: the file there, or every file below
-/// the directory there.
+/// Puts into `files` what a watched path at `path` stands for.
 fn files_at(path: &Path, files: &mut BTreeSet<PathBuf>) {
   if path.is_file() {
     files.insert(path.to_path_buf());
@@ -73,12 +69,10 @@ fn an_editor_saves_a_file() {
     w.may_pass("src/a.txt~");
 
     for round in 0..5 {
-      // Write a temporary file and rename it over the file.
       w.write("src/a.txt.tmp", &format!("tmp {round}"));
       w.rename("src/a.txt.tmp", "src/a.txt");
       w.expect(&[(Update, "src/a.txt")]);
 
-      // Move the file to a backup, write it again, remove the backup.
       w.rename("src/a.txt", "src/a.txt~");
       w.write("src/a.txt", &format!("backup {round}"));
       w.remove("src/a.txt~");
@@ -89,9 +83,8 @@ fn an_editor_saves_a_file() {
 
 #[test]
 fn mkdir_p_and_a_file_at_once() {
-  // Every round waits for one quiet time, so it is a short one. And with polling, the pause
-  // after a round of the poll grows with what is watched: twice the rounds take four times as
-  // long.
+  // Every round waits for a quiet time, so it is short. With polling the pause grows with what
+  // is watched: twice the rounds take four times as long.
   let config = Config::default().with_debounce(Duration::from_millis(5));
   each_backend_with(&config, |w| {
     w.mkdir("r");
@@ -99,8 +92,7 @@ fn mkdir_p_and_a_file_at_once() {
 
     let mut files = Vec::new();
     for round in 0..50 {
-      // One file below a watched directory, and one that is a watched path itself. Both get
-      // their directories and their content with nothing in between.
+      // Both files get their directories and their content with nothing in between.
       let in_dir = format!("r/{round}/a/b/f.txt");
       let alone = format!("alone/{round}/a/b/f.txt");
       w.watch(&[alone.as_str()]);
@@ -134,8 +126,7 @@ fn a_big_tree_is_moved_in_and_out() {
   });
 }
 
-/// A directory leaves the watched directory, is changed where no watch reaches it, and is back
-/// before the watcher has checked anything. It is the same directory, but not the same content.
+/// The same directory comes back, with other content.
 #[test]
 fn a_directory_is_moved_away_changed_and_moved_back() {
   each_backend(|w| {
@@ -158,9 +149,7 @@ fn a_directory_is_moved_away_changed_and_moved_back() {
   });
 }
 
-/// The same with a directory above the watched path. A watch of macOS stands at the path below
-/// it and hears nothing while the directory is away, and it says nothing about the two
-/// renames: the watcher has to be told about them in another way.
+/// A watch of macOS stands below the renamed directory and hears nothing about the renames.
 #[cfg(unix)]
 #[test]
 fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
@@ -182,9 +171,7 @@ fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
   });
 }
 
-/// The same with a directory above the target of a link. The watched path goes through the
-/// link, so no directory on the way to it is renamed: the one that is away and back is on the
-/// real path, where the watch of macOS stands.
+/// The renamed directory is on the real path behind the link, where the watch of macOS stands.
 #[cfg(unix)]
 #[test]
 fn a_directory_above_the_target_of_a_link_is_moved_away_changed_and_moved_back() {
@@ -224,10 +211,8 @@ fn a_big_batch_of_single_files() {
     let start = Instant::now();
     w.watch(&paths);
     let took = start.elapsed();
-    // Shown by `cargo test -- --nocapture`.
     eprintln!("{}: watch of {} watched paths took {took:?}", w.backend, paths.len());
-    // One `watch` call for a directory and one `lstat` for a file take far less than this. The
-    // limit is there to catch work that grows faster than the batch.
+    // Far above the cost: the limit catches work that grows faster than the batch.
     assert!(took < Duration::from_secs(30), "{}: watch took {took:?}", w.backend);
 
     let mut random = Random(1);
@@ -253,7 +238,6 @@ fn node_modules_is_ignored() {
     // A file inside the ignored directory can still be a watched path of its own.
     w.watch(&["proj", "proj/node_modules/dep/index.js"]);
 
-    // An install: many new files in the ignored directory.
     for (package, file) in (0..50).flat_map(|p| (0..10).map(move |f| (p, f))) {
       w.write(&format!("proj/node_modules/pkg{package}/lib/{file}.js"), "1");
     }
@@ -262,15 +246,15 @@ fn node_modules_is_ignored() {
     w.write("proj/src/a.js", "22");
     w.expect(&[(Update, "proj/node_modules/dep/index.js"), (Update, "proj/src/a.js")]);
 
-    // This filter looks at the last name only, so a removal name by name can show the watcher
-    // the moment when `dep` is gone and `node_modules` is still there: then the watched path
-    // is dropped. The `Delete` comes all the same.
+    // The filter looks at the last name only, so a removal name by name can show the watcher a
+    // moment when `dep` is gone and `node_modules` is still there. The `Delete` comes all the same.
     w.remove("proj/node_modules");
     w.write("proj/src/b.js", "1");
     w.expect(&[(Delete, "proj/node_modules/dep/index.js"), (Create, "proj/src/b.js")]);
   });
 }
 
+/// Every change is reported once for each spelling, whichever one the writer used.
 #[cfg(unix)]
 #[test]
 fn two_spellings_of_one_directory() {
@@ -279,7 +263,6 @@ fn two_spellings_of_one_directory() {
     std::os::unix::fs::symlink(w.path("real"), w.path("link")).unwrap();
     w.watch(&["real", "link"]);
 
-    // Every change is reported once for each spelling, whichever one the writer used.
     w.write("real/b.txt", "1");
     w.expect(&[(Create, "real/b.txt"), (Create, "link/b.txt")]);
     w.write("link/a.txt", "22");
@@ -289,10 +272,8 @@ fn two_spellings_of_one_directory() {
   });
 }
 
-/// Watched paths in another spelling than the disk has, on a disk that takes two spellings of
-/// a name for one (the usual disk of macOS): the file name of one path, and two directory
-/// names of the other. The OS names an entry as the disk spells it. The events come all the
-/// same, under the spelling that was given to `watch`.
+/// On a disk that takes two spellings of a name for one, the events carry the spelling that
+/// was given to `watch`.
 #[cfg(target_os = "macos")]
 #[test]
 fn watched_paths_in_another_spelling() {
@@ -316,8 +297,8 @@ fn watched_paths_in_another_spelling() {
   });
 }
 
-/// The watched paths go through a symbolic link, and other programs use the real path. This is
-/// what every path below the temporary directory of macOS looks like (`/var` is a link).
+/// Other programs use the real path. Every temporary directory of macOS is like this: `/var`
+/// is a link.
 #[cfg(unix)]
 #[test]
 fn watched_paths_below_a_symlinked_prefix() {
@@ -327,7 +308,6 @@ fn watched_paths_below_a_symlinked_prefix() {
     std::os::unix::fs::symlink(w.path("store"), w.path("prefix")).unwrap();
     w.watch(&["prefix/proj/src", "prefix/proj/config.json", "prefix/proj/later/x.js"]);
 
-    // Written through the real path, reported under the path that was given to `watch`.
     w.write("store/proj/src/a.js", "22");
     w.write("store/proj/src/sub/b.js", "1");
     w.write("store/proj/config.json", "22");
@@ -339,7 +319,7 @@ fn watched_paths_below_a_symlinked_prefix() {
       (Create, "prefix/proj/later/x.js"),
     ]);
 
-    // The link points to another directory now. Nothing watches a link: the next poll finds it.
+    // Nothing watches a link: the poll finds that it points elsewhere now.
     w.write("other/proj/src/c.js", "1");
     w.remove("prefix");
     std::os::unix::fs::symlink(w.path("other"), w.path("prefix")).unwrap();
@@ -353,10 +333,8 @@ fn watched_paths_below_a_symlinked_prefix() {
   });
 }
 
-/// Random changes, many at once: files and directories are written, removed and renamed, in
-/// and out of the watched directory, and names change between file and directory. Whatever the
-/// events are, each one fits what the handler knows, and in the end the handler knows exactly
-/// the files that are on the disk.
+/// Whatever the events are, each fits what the handler knows, and in the end it knows exactly
+/// the files on the disk.
 #[test]
 fn random_changes_end_in_the_state_of_the_disk() {
   each_backend(|w| {

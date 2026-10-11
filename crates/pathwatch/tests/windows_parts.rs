@@ -1,6 +1,5 @@
-//! The parts of the Windows backend that are plain code: where the handles go (`place`), keeping
-//! them there (`handles`), parsing the bytes of one read (`records`), and turning them into hints
-//! (`translate`). They make no Windows call.
+//! The parts of the Windows backend that make no Windows call: `place`, `Handles`, `Records` and
+//! `translate`.
 
 #![cfg(target_os = "windows")]
 
@@ -33,9 +32,8 @@ fn encode(records: &[(u32, &str)]) -> Vec<u8> {
 const EXTENDED_FILE_NAME: usize = 84;
 const DIRECTORY: u32 = 0x10;
 
-/// The same for the longer records of `ReadDirectoryChangesExW`: times, sizes, the attributes
-/// and two file ids are between the action and the length of the name. A record is padded to
-/// eight bytes there.
+/// The longer records of `ReadDirectoryChangesExW`: times, sizes, the attributes and two file
+/// ids between the action and the name, and each record padded to eight bytes.
 fn encode_extended(records: &[(u32, &str, bool)]) -> Vec<u8> {
   let mut bytes = Vec::new();
   for (at, &(action, name, is_dir)) in records.iter().enumerate() {
@@ -82,7 +80,7 @@ mod place {
 
   use super::{dir, index, key};
 
-  /// The placement of these directories. The key of a directory is its position in the list.
+  /// The placement of these directories; the key of each one is its position in the list.
   fn placed(wanted: &[(&str, Want)], max: usize) -> Vec<(PathBuf, Vec<u32>)> {
     let dirs: Vec<PathBuf> = wanted.iter().map(|(path, _)| dir(path)).collect();
     let wanted: Vec<_> =
@@ -316,10 +314,9 @@ mod handles {
       let (key, dir) = (key(index), dir(path));
       let (mut coverage, told) = self.handles.watch(key, &dir, want, &mut self.disk);
       self.told(told);
-      // The engine commits after its calls of `watch`, and only then looks at the disk.
       let mut settled = self.handles.commit(&mut self.disk);
-      // A key that the commit left without a handle is told. The engine asks again for it,
-      // and that answer says why.
+      // A key that got no handle at the commit is asked again, as the engine does: that
+      // answer says why.
       let lost = settled.lost.iter().position(|&lost| lost == key);
       if let Some(at) = lost {
         settled.lost.swap_remove(at);
@@ -339,7 +336,7 @@ mod handles {
       }
     }
 
-    /// Asks for the contents of `path` and gets a handle on it. Returns the id of the handle.
+    /// Asks for the contents of `path`; a handle is opened on it. Gives the id of the handle.
     fn open(&mut self, index: u32, path: &str) -> WatchId {
       assert_eq!(self.watch(index, path, Want::Contents), Answer::Tree, "{path}");
       self.id(path)
@@ -362,7 +359,6 @@ mod handles {
       assert!(self.disk.open.len() <= MAX_HANDLES);
     }
 
-    /// The handle on `path` died.
     fn died(&mut self, id: WatchId) -> Vec<u32> {
       self.disk.open.retain(|(open, _)| *open != id);
       let mut keys: Vec<u32> = self.handles.closed(id).into_iter().map(index).collect();
@@ -390,8 +386,7 @@ mod handles {
     }
   }
 
-  /// A directory that wants names only gets no handle, and the engine polls it. When the
-  /// handles move up to it, it is reported, so that the engine asks again and stops the poll.
+  /// The engine polls a directory that wants names only, until a handle stands above it.
   #[test]
   fn a_key_without_a_handle_is_told_when_a_handle_comes_to_stand_above_it() {
     let mut fake = Fake::default();
@@ -420,8 +415,7 @@ mod handles {
     assert_eq!(fake.covered, []);
   }
 
-  /// A handle reports nothing for what is behind a junction below it. A key there is not
-  /// served, whether the handle is there first or comes with it in one commit.
+  /// A handle reports nothing for what is behind a junction below it.
   #[test]
   fn a_key_behind_a_link_is_not_served() {
     let mut fake = Fake::default();
@@ -475,8 +469,7 @@ mod handles {
       assert_eq!(fake.disk.open, [(id, dir("/p/a"))]);
     }
     assert_eq!(fake.disk.ids, [id]);
-    // Another key for the directory of the handle itself opens no second handle there: the
-    // one handle is replaced, as for every request for that directory.
+    // A key for the directory of the handle itself replaces the handle, as every such request does.
     assert_eq!(fake.watch(3, "/p/a", Want::Contents), Answer::Tree);
     assert_eq!(fake.dirs(), dirs(["/p/a"]));
     assert_ne!(fake.id("/p/a"), id);
@@ -506,8 +499,6 @@ mod handles {
     // ones stopped.
     assert_eq!(fake.lost(), []);
 
-    // They are served by the new one, and no handle goes with them. The handle elsewhere still
-    // stands.
     assert_eq!(fake.watch(0, "/p/a", Want::Contents), Answer::Tree);
     assert_eq!(fake.watch(1, "/p/b/c", Want::Contents), Answer::Tree);
     fake.unwatch(0);
@@ -554,8 +545,8 @@ mod handles {
     assert_eq!(fake.died(new), [0, 1, 2]);
   }
 
-  /// A key that got no handle is not put off to the commit when it asks again: the engine
-  /// would take it for watched until the commit says no, at every poll.
+  /// Put off to the commit, the engine would take the key for watched until the commit says
+  /// no, at every poll.
   #[test]
   fn a_key_that_got_no_handle_is_answered_at_once_the_next_time() {
     let mut fake = Fake::default();
@@ -613,8 +604,7 @@ mod handles {
     let id = fake.open(0, "/p");
     assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
     fake.disk.broken = Some(dir("/p"));
-    // The directory of the handle cannot be opened again: after `Failed` nothing is watched
-    // for the key that asked. The other key keeps a handle, on its own directory now.
+    // After `Failed` nothing is watched for the key that asked; the other key gets its own handle.
     assert_eq!(fake.watch(0, "/p", Want::Contents), Answer::Failed);
     assert_eq!(fake.dirs(), dirs(["/p/a"]));
     assert_eq!(fake.lost(), []);
@@ -736,8 +726,8 @@ mod handles {
     fake.open(1, "/p");
     assert_eq!(fake.lost(), []);
     assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::Names);
-    // The handle goes down to the one directory that still wants the contents. The key that
-    // only wanted names has no handle above it any more, and is told.
+    // The handle moves down to the one directory that wants the contents: the key that wanted
+    // names only has no handle above it any more, and is told.
     fake.unwatch(1);
     assert_eq!(fake.dirs(), dirs(["/p/a"]));
     assert_eq!(fake.lost(), [2]);
@@ -1080,8 +1070,7 @@ mod translate {
     Err(io::ErrorKind::PermissionDenied.into())
   }
 
-  /// Asks to watch `path`. Returns the handle that was opened for it, if one was, and the
-  /// handles to close.
+  /// Watches `path`. Gives the handle that was opened for it, if one was, and the handles closed.
   fn watch(
     handles: &mut Handles,
     index: u32,
@@ -1090,7 +1079,6 @@ mod translate {
   ) -> (Option<WatchId>, Vec<WatchId>) {
     let mut calls = Calls::default();
     let (coverage, _) = handles.watch(key(index), &dir(path), want, &mut calls);
-    // A new handle is opened by the commit.
     handles.commit(&mut calls);
     let served = matches!(coverage, Coverage::WatchedTree | Coverage::Watched);
     assert!(served && handles.serves(key(index)), "{path}: {coverage:?}");
@@ -1129,8 +1117,7 @@ mod translate {
     Raw::Read { watch, dir: dir(path), extended: false, result }
   }
 
-  /// A buffer of records whose names have `/` between their parts. Windows puts `\` there. On
-  /// another system the parts are only parts with the separator of that system.
+  /// Records whose names have `/` between their parts: Windows puts `\` there.
   fn records(records: &[(u32, &str)]) -> Vec<u8> {
     let names: Vec<String> =
       records.iter().map(|(_, name)| name.replace('/', MAIN_SEPARATOR_STR)).collect();
@@ -1157,8 +1144,7 @@ mod translate {
     seen
   }
 
-  /// Windows sends `MODIFIED` for a directory when an entry in it changes. Where the record
-  /// says that it is a directory, it makes no hint: the entry has a record of its own.
+  /// Windows says "modified" for a directory whose entry changed: the entry has its own record.
   #[test]
   fn a_modified_record_of_a_directory_is_dropped() {
     let mut handles = Handles::default();
@@ -1232,8 +1218,7 @@ mod translate {
     let dead = hints(&mut handles, read(id, "/p", failed()));
     assert_eq!(sorted(dead), [changed(0, ""), changed(1, "")]);
     assert_eq!(hints(&mut handles, read(id, "/p", failed())), []);
-    // The keys are forgotten too: nothing holds a record now, and each key gets a handle when
-    // it asks again.
+    // The keys are forgotten too: a later read gives no hint, and a key that asks gets a new one.
     assert_eq!(hints(&mut handles, read(id, "/p", Ok(records(&[(ADDED, "sub/a")])))), []);
     open(&mut handles, 0, "/p");
   }
@@ -1306,8 +1291,7 @@ mod translate {
     let mut handles = Handles::default();
     let id = open(&mut handles, 0, "/p");
     watch(&mut handles, 1, "/p/a", Want::Contents);
-    // The directory came, went or was replaced: the key itself is told. Windows also says
-    // "modified" for a directory when an entry in it changes: that is dropped.
+    // Windows also says "modified" for a directory when an entry in it changes: that is dropped.
     let bytes =
       records(&[(REMOVED, "a"), (MODIFIED, "a"), (RENAMED_NEW_NAME, "a"), (MODIFIED, "a/sub")]);
     assert_eq!(

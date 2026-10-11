@@ -1,5 +1,4 @@
-//! The inotify backend alone: its hints for real file operations, its watches in the kernel,
-//! and its shutdown.
+//! The inotify backend alone, on the real kernel: its hints, its watches and its shutdown.
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
 use std::{
@@ -26,7 +25,6 @@ use tempfile::TempDir;
 /// Only a failing test waits this long.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A hint that owns its path.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Seen {
   Changed(DirKey, PathBuf),
@@ -43,8 +41,8 @@ fn written(dir: DirKey, rel: &str) -> Seen {
   Seen::Written(dir, PathBuf::from(rel))
 }
 
-/// A write makes MODIFY and a new file makes CREATE (both `Written`), the close after them makes
-/// CLOSE_WRITE (`Changed`). How many of each is up to the kernel, so these are compared as a set.
+/// MODIFY or CREATE (`Written`) and then CLOSE_WRITE (`Changed`). How many of each is up to the
+/// kernel, so they are compared as a set.
 fn written_and_closed(dir: DirKey, rel: &str) -> HashSet<Seen> {
   HashSet::from([written(dir, rel), changed(dir, rel)])
 }
@@ -66,13 +64,11 @@ fn event(wd: i32, mask: u32, name: &str) -> Vec<u8> {
   raw
 }
 
-/// A backend with two temp directories and the receiving end of its sink.
 struct Harness {
   backend: InotifyBackend,
   signals: Receiver<Signal<Vec<u8>>>,
-  /// The playground of the test. It starts empty.
   dir: TempDir,
-  /// Watched by the harness itself. See `hints`.
+  /// Watched by the harness itself, for `hints`.
   sentinel_dir: TempDir,
   sentinel_key: DirKey,
   sentinels: u32,
@@ -135,8 +131,8 @@ impl Harness {
     u32::from_str_radix(mask, 16).unwrap() & libc::IN_ALL_EVENTS
   }
 
-  /// Kernel watches of the test, without the one of the harness. The backend must know the
-  /// same watches as the kernel: one more in the kernel is a leak.
+  /// The kernel watches of the test, without the one of the harness. One more in the kernel
+  /// than the backend knows is a leak.
   fn watches(&self) -> usize {
     let watches = self.kernel_watches().len();
     assert_eq!(self.backend.watch_count(), watches);
@@ -170,11 +166,8 @@ impl Harness {
     seen
   }
 
-  /// Every hint for what the test did up to now, in order.
-  ///
-  /// inotify has one ordered queue per instance, and an event is in it before the system call
-  /// that caused it returns. So all of them are in front of the event for a new sentinel file,
-  /// and a test can also assert that there was no hint at all.
+  /// Every hint for what the test did up to now, in order. inotify queues an event before the
+  /// call that made it returns, so all of them are in front of the one for a new sentinel file.
   fn hints(&mut self) -> Vec<Seen> {
     self.sentinels += 1;
     let name = self.sentinels.to_string();
@@ -288,7 +281,6 @@ fn reads_make_no_hints() {
   fs::write(h.path("a"), "1").unwrap();
   h.watch(1, "", Want::Contents);
 
-  // The engine scans and reads what it watches. That must not come back as hints.
   assert_eq!(fs::read_dir(h.path("")).unwrap().count(), 1);
   assert_eq!(fs::read(h.path("a")).unwrap(), b"1");
   assert_eq!(h.hints(), []);
@@ -397,8 +389,8 @@ fn second_key_with_a_lower_want_takes_no_events_away() {
   let dir = h.watch(1, "real", Want::Contents);
   let ancestor = h.watch(2, "link", Want::Names);
 
-  // The two keys share one kernel watch, so the second one hears the writes too. More hints
-  // than a key asked for are fine.
+  // The two keys share one kernel watch, so the second hears the writes too: more hints than
+  // asked for are fine.
   fs::write(h.path("real/a"), "2").unwrap();
   let both: HashSet<Seen> =
     written_and_closed(dir, "a").union(&written_and_closed(ancestor, "a")).cloned().collect();
@@ -450,8 +442,7 @@ fn unwatch_stops_hints() {
   let mut h = Harness::new();
   let key = h.watch(1, "", Want::Contents);
 
-  // Still in the queue when the key goes: it is dropped too, and so is the IGNORED event that
-  // the kernel sends for the removed watch.
+  // Events still in the queue when the key goes are dropped, and so is the IGNORED event.
   File::create(h.path("before")).unwrap();
   h.backend.unwatch(key);
   File::create(h.path("after")).unwrap();
@@ -634,7 +625,7 @@ fn failed_watch_leaves_the_key_unwatched() {
   assert_eq!(h.hints(), []);
 }
 
-/// The watch limit against the kernel. A user namespace can lower the limit without root:
+/// A user namespace can lower the limit without root:
 ///
 /// ```sh
 /// unshare -Ur sh -c 'echo 8 > /proc/sys/user/max_inotify_watches &&
@@ -723,8 +714,8 @@ fn packed_events_unknown_watch_and_cut_off_buffer() {
   let all = h.translate(raw.clone());
   assert_eq!(all, [written(key, "a"), written(key, long_name), changed(key, "sub")]);
 
-  // The kernel never cuts an event. If a buffer is cut all the same, the whole events in front
-  // of the cut are used, and the rest is lost notifications.
+  // The kernel never cuts an event. If a buffer is cut all the same, the whole events before
+  // the cut are used, and the rest is lost.
   let mut ends = vec![0];
   for event in &events {
     ends.push(ends[ends.len() - 1] + event.len());
@@ -747,8 +738,8 @@ fn flood_arrives_whole_over_several_reads() {
   let mut h = Harness::new();
   let key = h.watch(1, "", Want::Contents);
 
-  // 6000 events of 32 bytes do not fit in two read buffers, and they stay below the default
-  // queue limit of 16384 events even if the reader thread gets no time while they are made.
+  // 6000 events of 32 bytes do not fit in two read buffers, and stay below the default queue
+  // limit of 16384 events even if the reader thread gets no time.
   let names: Vec<String> = (0..3000).map(|index| format!("file-{index}")).collect();
   for name in &names {
     File::create(h.path(name)).unwrap();
@@ -774,7 +765,6 @@ fn drop_joins_the_reader() {
   joined.recv_timeout(TIMEOUT).expect("drop does not return");
 
   File::create(dir.path().join("b")).unwrap();
-  // The reader thread owned the only sender, so the channel is closed if and only if that thread
-  // has ended. Nothing can arrive on a closed channel.
+  // The reader thread owned the only sender: the channel is closed only when that thread ended.
   assert!(matches!(signals.try_recv(), Err(TryRecvError::Disconnected)));
 }

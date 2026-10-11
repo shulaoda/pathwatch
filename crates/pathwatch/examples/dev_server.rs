@@ -24,7 +24,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     text.lines().filter(|line| !line.trim().is_empty()).map(|line| project.join(line)).collect()
   };
 
-  // Everything at or below a directory named `node_modules` or `.git`.
   let config = Config::default().with_ignored(|path, _kind| {
     path.components().any(|part| part.as_os_str() == "node_modules" || part.as_os_str() == ".git")
   });
@@ -52,7 +51,6 @@ fn main() -> Result<(), Box<dyn Error>> {
       }
     };
     if events.iter().any(|event| event.path.ends_with("watch-list.txt")) {
-      // The list changed: take back the old extra paths and watch the new ones.
       watcher.unwatch_all(&extra)?;
       extra = read_list();
       watcher.watch_all(&extra)?;
@@ -60,7 +58,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("rebuild: {} files changed", events.len());
   }
-  // Waits for the thread of the watcher. The handler is not called after this.
   watcher.close();
   println!("closed");
   Ok(())

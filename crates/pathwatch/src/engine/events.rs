@@ -1,7 +1,5 @@
-//! The events of one flush, and the delete delay.
-//!
-//! A check makes no event: it changes the node and puts it on the list `Engine::touched`.
-//! `finish` reads each touched node once, so a path gets one event for a flush.
+//! The events of one flush, and the delete delay. A check makes no event: `finish` reads each
+//! touched node once, so a path gets one event for a flush.
 
 use std::time::Instant;
 
@@ -14,8 +12,7 @@ use crate::{
 };
 
 impl<B: Backend, F: Fs> Engine<B, F> {
-  /// Reads every node that the flush touched and hands the events over as one batch. Also the
-  /// end of the baseline of a `watch` call. A node that nothing needs any more is freed.
+  /// Hands the events of the touched nodes over as one batch, and ends the baseline of a `watch`.
   pub(super) fn finish(&mut self, out: &mut Output) {
     let mut touched = std::mem::take(&mut self.touched);
     for key in touched.drain(..) {
@@ -27,7 +24,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       node.set_added(Added::No);
       node.set_baseline(false);
       if let Some(kind) = kind {
-        // Built in the buffer, so that the path of the event is one allocation of its size.
+        // Built in the buffer: the path of the event is one allocation of its size.
         self.tree.path_into(key, &mut self.path);
         out.events.push(Event { path: self.path.clone(), kind });
       }
@@ -37,11 +34,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     out.errors.append(&mut self.errors);
   }
 
-  /// Nothing is at the node `key`, and the tree has a file or a directory there.
-  ///
-  /// The first look only holds the node: `Node::told`, the fingerprint and everything below
-  /// stay as they are. The second look, one delete delay later, decides: still nothing is a
-  /// `Delete`, and a file that is back is compared with what was there before.
+  /// Nothing is at the node, and the tree has something: the first look holds it, the second look
+  /// decides (design.md 5.9).
   pub(super) fn missing(&mut self, key: DirKey) {
     let now = self.now.expect("a check runs inside a flush");
     let delay = self.options.delete_delay;
@@ -55,13 +49,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// Holds the node `key` until `until`. For a directory, the backend forgets its watch now:
-  /// if the directory comes back, it is watched again and scanned deep.
+  /// Holds the node until `until`. A directory gives its watch back meanwhile.
   fn hold(&mut self, key: DirKey, until: Instant) {
     if let Kind::Dir(dir) = &mut self.tree[key].kind {
       let asked = dir.asked.is_some();
-      // No OS watch covers it from now on. That is what the node says if its hold ends
-      // without a look, because a node above is held too.
+      // Polled from now on: a hold can end without a look when a node above is held too.
       *dir = Dir { watch: Watch::Polled, ..Dir::new(dir.id, dir.complete) };
       if asked {
         self.unwatch_dir(key);
@@ -72,7 +64,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.hold_queue.push_back((until, key));
   }
 
-  /// What the tree has at the node `key` is gone for good.
+  /// What the tree has at the node is gone for good.
   pub(super) fn gone(&mut self, key: DirKey) {
     match self.tree[key].kind {
       Kind::File(_) => self.forget_file(key),
@@ -81,8 +73,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// No file is at the node `key` any more. If the handler believes in one, the end of the
-  /// flush tells it.
+  /// Forgets the file at the node; the end of the flush tells the handler.
   pub(super) fn forget_file(&mut self, key: DirKey) {
     self.tree[key].kind = Kind::Missing;
     self.tree.set_content(key, None);
@@ -95,16 +86,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.hold_queue.front().map(|(until, _)| *until)
   }
 
-  /// Marks each held node whose time is over for its second look. `true`: there is one, so a
-  /// flush has to run.
+  /// Marks each held node whose time is over. `true`: a flush has to run.
   pub(super) fn mark_due_holds(&mut self, now: Instant) -> bool {
     let mut any = false;
     while let Some(&(until, key)) = self.hold_queue.front()
       && until <= now
     {
       self.hold_queue.pop_front();
-      // Not when the tree has another time for the node, or none: the hold is over, or the
-      // node was held again later.
+      // Another time, or none: the hold ended, or the node was held again later.
       if self.tree.held_until(key) == Some(until) {
         self.tree.mark(key, Mark::default());
         any = true;
@@ -114,14 +103,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 }
 
-/// The event that is due for a node at the end of a flush: what the handler believes against
-/// what is at the node now, whatever happened in between.
+/// The event due for a node: what the handler believes against what is there now.
 fn event_of(node: &Node) -> Option<EventKind> {
   // A held file is still a file here: its `Delete` waits.
   let is_file = matches!(node.kind, Kind::File(_));
   match (node.told(), is_file) {
     (true, false) => Some(EventKind::Delete),
-    // The baseline of a `watch` call is known without an event.
     (false, true) if !node.baseline() => Some(EventKind::Create),
     (true, true) if node.changed() => Some(EventKind::Update),
     _ => None,
@@ -139,9 +126,7 @@ mod tests {
     tree::{Dir, Fingerprint, Kind, Tree},
   };
 
-  /// What the changes of one path inside one flush come to. The first one decides what the
-  /// handler believed before the flush (`told`), and the last one what is at the node at the
-  /// end of it.
+  /// What the changes of one path inside one flush come to.
   #[test]
   fn the_event_of_a_node() {
     let file = Kind::File(Fingerprint { modified: 0, size: 1, id: 1 });

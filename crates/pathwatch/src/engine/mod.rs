@@ -1,19 +1,13 @@
 //! The engine: it watches paths through a backend, keeps the tree in line with the disk, and
 //! turns hints into file events. It has no thread and reads no clock: the caller gives the time.
-//!
-//! The way of one change of one file: `signal` makes a mark, `tick` runs `flush` (a `check` for
-//! each mark, then the scans), and `finish` reads the events off the tree.
-//!
-//! The words of this code (look, mark, told, held, complete, loose, and the rest) are explained
-//! in `docs/design.md`, section 10.
 
-mod check; // one entry: the disk against the tree
-mod events; // the events of one flush, and the delete delay
-mod filter; // the questions to the ignore filter
-mod os_watch; // what a directory asks from the backend, and what is polled
-mod scan; // one directory: every entry in it
-mod test_hooks; // what the tests read
-mod watched_paths; // a path becomes a watched path, and the way back
+mod check;
+mod events;
+mod filter;
+mod os_watch;
+mod scan;
+mod test_hooks;
+mod watched_paths;
 
 use std::{
   collections::VecDeque,
@@ -37,45 +31,34 @@ use crate::{
   tree::{Depth, KEPT, Node, Tree, emptied},
 };
 
-/// While hints keep coming, the disk is still checked this often, or every four quiet times if
-/// that is longer.
+/// A batch goes out at least this often while hints keep coming, or every four quiet times.
 const LONGEST_WAIT: Duration = Duration::from_millis(500);
 
-/// After work that no hint asked for by name (a poll, or the scans after lost notifications),
-/// the engine rests this many times as long as the work took. So about a tenth of the time
-/// goes into such work, however big the watched set is.
+/// A poll, or the scans after a loss, rests this many times as long as it took: such work
+/// takes a tenth of the time at most.
 const REST: u32 = 9;
 
-/// A flush counts for no more than this when the rest after it is worked out. The clock of the
-/// disk runs on while the machine sleeps: a flush that the sleep fell into seems to have taken
-/// hours, and nothing would be polled for ten times as long.
+/// A flush counts for no more than this in the rest: the clock runs on while the machine
+/// sleeps, and a flush that the sleep fell into would rest for hours.
 const LONGEST_FLUSH: Duration = Duration::from_secs(60);
 
-/// The ignore filter: `true` for a path that must not be reported. An ignored directory is
-/// never entered.
-///
-/// It must give the same answer for the same path and kind: a node keeps the answer, and the
-/// engine does not ask again for that node. `Config::with_ignored` says what is asked, and when.
+/// The ignore filter: `true` for a path that must not be reported. It must give the same
+/// answer for the same path and kind: the node keeps it.
 pub type Ignored = Arc<dyn Fn(&Path, EntryKind) -> bool + Send + Sync>;
 
-/// The settings of an [`Engine`].
-///
-/// `Options::default()` is for the tests: a quiet time of 10 ms and a poll each second. The
-/// defaults of the API are those of `Config` (50 ms, 100 ms), which makes the `Options` of a
-/// watcher.
+/// The settings of an [`Engine`]. `Options::default()` is for the tests (a quiet time of
+/// 10 ms); `Config` makes the ones of a watcher.
 #[derive(Clone)]
 pub struct Options {
   pub ignored: Option<Ignored>,
-  /// The debounce: the disk is checked when no hint came for this long. Zero: at once.
+  /// The quiet time: the disk is checked when no hint came for this long. Zero: at once.
   pub debounce: Duration,
-  /// How long a `Delete` waits for the file to come back, so that "remove, then write again"
-  /// is one `Update`. Zero turns it off.
+  /// How long a `Delete` waits for the file to come back. Zero turns it off.
   pub delete_delay: Duration,
   /// The shortest time between two polls of what no OS watch covers.
   pub poll_interval: Duration,
-  /// Every disk takes two spellings of a name for one: another Unicode form at least (macOS
-  /// and Windows). Without it, a directory counts as such a disk until a look proves that it
-  /// tells two spellings apart (`Tree::is_loose`).
+  /// Every disk takes two spellings of a name for one (macOS, Windows). Without it, a directory
+  /// counts as such a disk until a look proves otherwise.
   pub loose_spelling: bool,
 }
 
@@ -103,10 +86,8 @@ impl fmt::Debug for Options {
   }
 }
 
-/// What one call of [`Engine::watch`], [`Engine::unwatch`] or [`Engine::tick`] hands over.
-///
-/// The engine appends to it. The `events` of one call are one batch: one event for a path, in
-/// no order that is promised. Take them out before the next call.
+/// What one call of the engine hands over: one batch of events, one for a path, and the
+/// errors. Take them out before the next call.
 #[derive(Debug, Default)]
 pub struct Output {
   pub events: Vec<Event>,
@@ -115,60 +96,56 @@ pub struct Output {
 
 /// Watches paths through a [`Backend`] and a disk ([`Fs`]), and turns hints into file events.
 pub struct Engine<B: Backend, F: Fs> {
-  /// `None`: the backend said that it cannot go on, and it was dropped. Every node is polled.
+  /// `None`: the backend died and was dropped; every node is polled.
   backend: Option<B>,
   fs: F,
   options: Options,
-  /// What the engine knows about the disk, and the marks and scans that wait.
   tree: Tree,
 
   // When the next work is due.
-  /// The next flush: the last hint and the quiet time. `None`: nothing waits for one.
+  /// The next flush. `None`: none waits.
   flush_at: Option<Instant>,
-  /// The latest time for that flush, so that hints that keep coming do not hold it back.
+  /// The latest time for that flush, so hints that keep coming do not hold it back.
   flush_by: Option<Instant>,
   /// The next poll. `None` while nothing is registered.
   poll_at: Option<Instant>,
-  /// The held nodes in the order of their second looks. An entry can be stale.
+  /// The held nodes by the time of their second look. An entry can be stale.
   hold_queue: VecDeque<(Instant, DirKey)>,
-  /// The scans that loss reports ask for do not start before this time.
+  /// The scans that loss reports ask for wait until then.
   rest_until: Option<Instant>,
   /// A loss report waits for the end of that rest.
   loss_waits: bool,
 
   // The running flush.
-  /// Its time, as the caller gave it. `None` before the first flush.
+  /// The time of the running flush. `None` before the first.
   now: Option<Instant>,
-  /// The time of the disk at its start. The rule for young files compares with it.
+  /// The time of the disk at the start of the flush: the rule for young files compares with it.
   flush_time: SystemTime,
   /// How long the backend took to make watches live.
   commit_took: Duration,
-  /// The nodes that it changed. `finish` reads each one for its event. A key can be stale.
+  /// The nodes the flush changed: `finish` reads their events. A key can be stale.
   touched: Vec<DirKey>,
-  /// The registered names whose watch target the filter ignores. The end of the flush drops
-  /// the watched paths at and below them, with a `Delete` for each file that the handler knows.
+  /// The registered names whose watch target the filter ignores: the end of the flush drops
+  /// the watched paths below them.
   dropped: Vec<DirKey>,
-  /// The directories that give the watch of their own back after the next commit: a watch
-  /// above covers them (see `still_there`).
+  /// The directories that give their own watch back after the next commit.
   covered: Vec<DirKey>,
-  /// With loose spelling: the nodes that the listing of the running scan named, each with what
-  /// the listing gave of it.
+  /// With loose spelling: what the listing of the running scan said of the nodes it named.
   listed: FxHashMap<DirKey, Listed>,
   /// A read of the disk failed during the running scan.
   scan_had_error: bool,
 
-  // Buffers. They are kept between the flushes, so that a flush asks for no memory for them
-  // (see `emptied`). What they hold between two uses does not matter.
-  /// Every path for the disk is built here, so that a check allocates nothing.
+  // Buffers, kept between flushes so that a flush asks for no memory (see `emptied`).
+  /// Every path for the disk is built here.
   path: PathBuf,
-  /// The marks of a flush, in the order of their checks (see `Tree::take_marked`).
+  /// The marks of a flush, in the order of their checks.
   marks: Vec<(usize, DirKey, DirKey)>,
   /// The scans of one round.
   scans: Vec<(DirKey, Depth)>,
   /// The nodes of the directory that is scanned.
   names: Vec<ScanEntry>,
 
-  /// The errors that wait for the next output. One for each kind.
+  /// The errors for the next output, one of each kind.
   errors: Vec<Error>,
 }
 
@@ -203,10 +180,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// Makes every path a watched path and checks the disk once. When it returns, every path is
-  /// watched, and what exists at that moment is known and was not reported: the baseline.
-  ///
-  /// A path that cannot be watched goes to `out.errors`, and the rest is registered.
+  /// Makes every path a watched path and checks the disk once: what exists then is the baseline,
+  /// known without an event. A path that cannot be used goes to `out.errors`.
   pub fn watch(&mut self, paths: Vec<PathBuf>, now: Instant, out: &mut Output) {
     for path in paths {
       match normalize(&path) {
@@ -220,9 +195,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.stop_poll_if_idle();
   }
 
-  /// Takes back what `watch` did for every path. A file that only these paths covered is
-  /// forgotten without an event, also when its `Delete` was waiting. A file that another
-  /// watched path still covers stays as it is. A path that is not watched is skipped.
+  /// Takes back what `watch` did for every path, and reports nothing for them.
   pub fn unwatch(&mut self, paths: Vec<PathBuf>, now: Instant, out: &mut Output) {
     for path in paths {
       if let Some(clean) = normalize(&path) {
@@ -235,9 +208,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.stop_poll_if_idle();
   }
 
-  /// Takes one signal of the backend. It only makes marks: the disk is read by [`tick`].
-  ///
-  /// [`tick`]: Engine::tick
+  /// Takes one signal of the backend: it only makes marks, and [`Engine::tick`] reads the disk.
   pub fn signal(&mut self, signal: Signal<B::Raw>, now: Instant) {
     let mut left_work = false;
     match signal {
@@ -263,10 +234,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.schedule(now);
   }
 
-  /// The next time [`tick`] has work: the earliest of the flush, the second look of a held
-  /// node, the poll, and a loss report that waits for the end of a rest.
-  ///
-  /// [`tick`]: Engine::tick
+  /// The next time [`Engine::tick`] has work.
   pub fn deadline(&self) -> Option<Instant> {
     [self.flush_at, self.loss_wait(), self.next_hold(), self.poll_at].into_iter().flatten().min()
   }
@@ -285,23 +253,19 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let took = self.flush(now);
     self.finish(out);
     if poll {
-      // The next poll is counted from the end of this one, and a poll that took long is
-      // followed by a rest: a slow disk, or a big watched set, is not polled without a pause.
+      // The next poll counts from the end of this one, after a rest for a slow one.
       self.poll_at = Some(now + took + self.options.poll_interval.max(took * REST));
     }
     self.stop_poll_if_idle();
   }
 
-  /// Nothing is registered: `unwatch` took every watched path back, or each one was dropped.
-  /// Then there is nothing to poll, and the caller can sleep until the next `watch`.
   fn stop_poll_if_idle(&mut self) {
     if !self.tree[Tree::ROOT].is_registered() {
       self.poll_at = None;
     }
   }
 
-  /// A hint left work for a flush. The flush comes when no further hint came for the quiet
-  /// time. Hints that keep coming move it, but not past the longest wait.
+  /// Moves the flush to one quiet time from now, but not past the longest wait.
   fn schedule(&mut self, now: Instant) {
     let debounce = self.options.debounce;
     let longest = debounce.saturating_mul(4).max(LONGEST_WAIT);
@@ -314,18 +278,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.loss_waits { self.rest_until } else { None }
   }
 
-  /// Brings the tree in line with the disk: a `check` for every mark, then rounds of scans
-  /// until nothing is queued. The events are not made here: `finish` reads them afterwards.
-  /// Says how long the looks at the disk took, by the clock of the disk.
+  /// A check for every mark, then rounds of scans until nothing is queued. Says how long the
+  /// looks at the disk took.
   fn flush(&mut self, now: Instant) -> Duration {
     self.flush_at = None;
     self.flush_by = None;
     self.now = Some(now);
     self.flush_time = self.fs.now();
     self.commit_took = Duration::ZERO;
-    // A burst can make a backend report a loss many times a second, and each report asks for
-    // a scan of everything below a place, or of everything. So these scans are paced: after
-    // the ones of one flush, the next ones wait for the end of a rest. Nothing else waits.
+    // The scans that loss reports ask for are paced: after one flush of them, the next wait
+    // for a rest.
     let rest_is_over = self.rest_until.is_none_or(|until| until <= now);
     let mut loss_scans_ran = rest_is_over && mem::take(&mut self.tree.lost);
     if loss_scans_ran {
@@ -340,7 +302,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.round(&mut path, &mut names);
     }
     (self.path, self.names) = (path, emptied(names));
-    // As `emptied` does for a list: the listing of a big directory is not kept for ever.
+    // A big listing is not kept for ever, as `emptied` does for a list.
     self.listed.clear();
     self.listed.shrink_to(KEPT / size_of::<ScanEntry>());
 
@@ -349,7 +311,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if loss_scans_ran {
       self.rest_until = Some(now + took + took * REST);
     }
-    // Like `unwatch`, a drop can leave work, and one more flush does it.
+    // A drop can leave work, like `unwatch`: one more flush does it.
     if self.drop_ignored() {
       took += self.flush(now);
     }
@@ -363,22 +325,18 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut marks = mem::take(&mut self.marks);
     self.tree.take_marked(&mut marks);
     let mut loss_checks_ran = false;
-    // The directory whose path is in `path`: the marks of one directory come one after the
-    // other, and its path is built once for all of them.
+    // The path of one directory is built once for all of its marks.
     let mut path_of = None;
     for &(_, parent, key) in &marks {
-      // No mark: the directory of the node went away earlier in this flush and took the mark
-      // with it.
+      // No mark: the directory of the node went away earlier in this flush.
       let Some(mark) = self.tree.take_mark(key) else { continue };
-      // A node above is held: nothing below it is checked before its second look. That look
-      // decides for this node too, so a hold of its own ends here.
+      // Below a held node nothing is checked: its second look decides for this node too.
       if self.tree.frozen(key) {
         self.tree.unhold(key);
         self.tree.prune(key);
         continue;
       }
       if mark.lost && !rest_is_over {
-        // Only a loss report asked for this check: it waits for the end of the rest.
         self.tree.mark(key, mark);
         self.loss_waits = true;
         continue;
@@ -395,21 +353,19 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     loss_checks_ran
   }
 
-  /// One round: makes the watches asked for so far live, then scans what is queued. A new
-  /// directory that a scan finds is asked from the backend and queued, for the next round.
-  /// So the order holds for every directory: watch, commit, then scan.
+  /// One round: commit, then the scans queued before it. Watch, commit, then scan, for every
+  /// directory.
   fn round(&mut self, path: &mut PathBuf, names: &mut Vec<ScanEntry>) {
     let now_watched = self.commit();
     let mut scans = mem::take(&mut self.scans);
     self.tree.take_scans(&mut scans);
-    // After `take_scans`: what these two queue waits for the commit of the next round.
+    // After `take_scans`: what these two queue waits for the next commit.
     self.give_back_covered();
     self.ask_again(now_watched);
     for &(key, depth) in &scans {
       let Some(dir) = self.tree.get_mut(key).and_then(Node::dir_mut) else { continue };
       if let Some(queued) = &mut dir.scan {
-        // A scan of this round queued it again. Its watch may be new, and that watch is live
-        // only after the next commit: the node waits for the next round.
+        // Queued again in this round: its new watch is live only after the next commit.
         *queued = depth.max(*queued);
         continue;
       }

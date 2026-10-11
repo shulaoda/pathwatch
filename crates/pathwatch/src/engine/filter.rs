@@ -1,13 +1,5 @@
-//! The questions to the ignore filter (`Options::ignored`). Its rules:
-//!
-//! - An entry in a watched directory is asked with the kind that it has on disk, when it is
-//!   found. A path given to `watch` is asked as a file and as a directory.
-//! - A node keeps the answer for each kind: the filter is not asked again for that node.
-//! - A path that is ignored for both kinds is not registered: no node, no watch, no look.
-//! - The watch target of a registered name with a file or nothing at it is the directory that
-//!   holds the name. It is asked, as a directory, before the backend is asked for its contents.
-//! - A drop: when the target is ignored, the watched paths at and below the name are forgotten,
-//!   with a `Delete` for each file that the handler knows.
+//! The questions to the ignore filter (`Options::ignored`): what is asked, when, and what a node
+//! keeps of the answer (design.md 5.11).
 
 use std::{
   iter,
@@ -23,7 +15,7 @@ use crate::{
 };
 
 impl<B: Backend, F: Fs> Engine<B, F> {
-  /// Whether the filter ignores an entry of this kind at `path`, the path of the node `key`.
+  /// Asks the filter about the node, and keeps the answer on it.
   pub(super) fn ignores(&mut self, key: DirKey, path: &Path, kind: EntryKind) -> bool {
     if let Some(answer) = self.tree[key].ignored(kind) {
       return answer;
@@ -33,9 +25,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     answer
   }
 
-  /// Whether the filter ignores the directory `key` as a watch target: the directory whose
-  /// watch serves a registered name in it that has a file or nothing at it. A directory that
-  /// only leads to watched paths is never asked.
+  /// Whether the filter ignores the directory as a watch target (design.md 5.11, rule 3).
   pub(super) fn is_ignored_target(&mut self, key: DirKey) -> bool {
     // The root node has no path, and is no target.
     if key == Tree::ROOT || self.options.ignored.is_none() {
@@ -49,30 +39,20 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.ignores(key, &path, EntryKind::Dir)
   }
 
-  /// Whether the directory above the node `key` covers it: that directory tracks every entry,
-  /// and the node is one of its entries. A registered name that the directory lists under
-  /// another spelling is none (`Node::is_unlisted`).
+  /// Whether the directory above covers the node: it tracks every entry, and the node is one.
   pub(super) fn is_inside(&self, key: DirKey) -> bool {
     !self.tree[key].is_unlisted()
       && self.tree.parent(key).is_some_and(|parent| self.tracks_every_entry(parent))
   }
 
-  /// Whether a directory at the node `key` has to track every entry: the node is a watched
-  /// path, or the node above it covers it (`is_inside`); and the filter does not ignore the
-  /// directory.
-  ///
-  /// The tree can be behind this rule: a directory that becomes a watched path is complete in
-  /// the tree only after its next look, and that look can wait for the disk.
+  /// The rule for a complete node: a watched path, or inside one, and not ignored. The tree can be
+  /// behind it until the next look (design.md 5.1).
   pub(super) fn tracks_every_entry(&self, key: DirKey) -> bool {
     match self.tree[key].kind {
-      // What the tree has, also at a held node: the filter was asked when it was stored.
       Kind::Dir(dir) if dir.complete => return true,
       Kind::Dir(_) => {}
-      // The tree has no directory here: there is nothing to ask the filter about.
       Kind::File(_) | Kind::Missing => return false,
     }
-    // The nearest watched path at or above the node. There is none above most partial nodes,
-    // and then the filter is not asked at all.
     let (mut at, mut levels) = (key, 0);
     while !self.tree[at].is_path() {
       // No entry of the directory above: nothing further up covers it.
@@ -85,9 +65,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     !self.is_ignored_on_the_way(key, levels)
   }
 
-  /// Whether the filter ignores the directory at the node `key`, or one of the `levels`
-  /// directories above it. The way is walked from the top down, so nothing is asked below an
-  /// ignored directory.
+  /// Whether the filter ignores the directory or one of the `levels` above it, asked from the top
+  /// down so nothing is asked below an ignored one.
   pub(super) fn is_ignored_on_the_way(&self, key: DirKey, levels: usize) -> bool {
     let parent = |&at: &DirKey| self.tree.parent(at);
     let way: Vec<DirKey> = iter::successors(Some(key), parent).take(levels + 1).collect();
@@ -97,7 +76,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     })
   }
 
-  /// Asks the filter. `ignores` asks the same with the answer kept on the node.
+  /// Asks the filter, without keeping the answer.
   pub(super) fn ignored(&self, path: &Path, kind: EntryKind) -> bool {
     self.options.ignored.as_ref().is_some_and(|ignored| ignored(path, kind))
   }

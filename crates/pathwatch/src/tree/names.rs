@@ -1,8 +1,5 @@
-//! The names of all nodes, one after the other in one block of memory.
-//!
-//! A node keeps where its name starts and how long it is. A name that is freed leaves its
-//! bytes behind. When half of the buffer is such dead bytes, the tree packs it: the names in
-//! use move to the front, and each node is told the new place of its name.
+//! The names of all nodes, one after the other in one buffer. A freed name leaves its bytes
+//! behind; when half of the buffer is dead, the names in use are packed to the front.
 
 use std::ffi::OsStr;
 
@@ -30,8 +27,8 @@ impl Names {
   /// The name that [`Names::add`] put at `start`.
   pub fn get(&self, start: u32, len: u16) -> &OsStr {
     let bytes = &self.bytes[start as usize..][..usize::from(len)];
-    // SAFETY: `start` and `len` come from `add` or `pack`, so the bytes are one whole name,
-    // as `OsStr::as_encoded_bytes` gave it to `add`. Nothing else writes to the buffer.
+    // SAFETY: `start` and `len` came from `add` or `pack`, so the bytes are one whole name as
+    // `OsStr::as_encoded_bytes` gave it, and nothing else writes to the buffer.
     unsafe { OsStr::from_encoded_bytes_unchecked(bytes) }
   }
 
@@ -40,9 +37,8 @@ impl Names {
     self.dead += usize::from(len);
   }
 
-  /// Whether it is time to pack: half of the bytes are dead. A pass walks every slot of the
-  /// arena, so it also waits for one dead byte for each of the `slots`: then a pass never
-  /// costs more than the names that were freed for it.
+  /// Whether it is time to pack: half of the bytes are dead, and at least one for each of the
+  /// `slots` that a pass walks, so that a pass never costs more than the names freed for it.
   pub fn is_half_dead(&self, slots: usize) -> bool {
     self.dead >= slots && self.dead >= self.bytes.len() - self.dead
   }

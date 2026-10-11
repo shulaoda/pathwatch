@@ -1,7 +1,6 @@
-//! macOS: `getattrlistbulk` gives the entries of a directory with what `lstat` tells of each,
-//! many of them in one call. Only a regular file on APFS is taken from it: there it was
-//! measured to tell the same as `lstat`, and on other disks not (`docs/design.md` 5.4). Of a
-//! directory where a disk is mounted it tells what is under the mount.
+//! macOS: a listing with what `lstat` tells of each entry, in one call, and the name of one
+//! entry as the disk spells it. A file is taken from the listing on APFS only (`docs/design.md`
+//! 5.4).
 
 use std::{
   ffi::{CString, OsStr, OsString, c_char, c_void},
@@ -17,7 +16,7 @@ use std::{
 
 use super::{Entry, FileType};
 
-/// `struct attrlist`: the attributes that are asked for.
+/// `struct attrlist`.
 #[repr(C)]
 struct AttrList {
   pub bitmap_count: u16,
@@ -47,9 +46,9 @@ const ATTR_CMN_FILEID: u32 = 0x0200_0000;
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
 const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
 const ATTR_FILE_DATALENGTH: u32 = 0x200;
-/// What is read of a regular file, in the common attributes.
+/// What a look at a regular file reads, in the common attributes.
 const FILE: u32 = ATTR_CMN_DEVID | ATTR_CMN_MODTIME | ATTR_CMN_FLAGS | ATTR_CMN_FILEID;
-/// The content of the file is not on this disk (a file in a cloud).
+/// The content of the file is in a cloud, not on this disk.
 const SF_DATALESS: u32 = 0x4000_0000;
 const O_DIRECTORY: i32 = 0x0010_0000;
 const VREG: u32 = 1;
@@ -77,8 +76,8 @@ pub fn apfs_volume(dir: &Path) -> Option<i32> {
   (result == 0 && answer.type_name.starts_with(b"apfs\0")).then_some(answer.id[0])
 }
 
-/// `volume` is what `apfs_volume` gave for `dir`. An entry on another device is not taken
-/// from the listing: the directory can be another one by now.
+/// `volume` is what `apfs_volume` gave for `dir`. An entry on another device is given as a
+/// name only: the directory can be another one by now.
 pub fn read_dir(dir: &Path, volume: i32, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()> {
   // Not a pipe, which would wait for its writer.
   let dir = OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(dir)?;
@@ -91,7 +90,7 @@ pub fn read_dir(dir: &Path, volume: i32, each: &mut dyn FnMut(&OsStr, Entry)) ->
     file: ATTR_FILE_DATALENGTH,
     fork: 0,
   };
-  // On the stack, as in `hash`. The longest entry takes less than 1 KiB.
+  // An entry takes less than 1 KiB.
   let mut buffer = [0_u8; 16 * 1024];
   loop {
     // SAFETY: `dir` is open, `wanted` is a whole `attrlist`, and the call writes at most
@@ -120,7 +119,6 @@ pub fn read_dir(dir: &Path, volume: i32, each: &mut dyn FnMut(&OsStr, Entry)) ->
       let entry = Fields { bytes: rest, at: 0 }.u32().and_then(|len| rest.get(..len as usize));
       let entry = entry.ok_or_else(|| io::Error::other("getattrlistbulk gave no entry"))?;
       rest = &rest[entry.len()..];
-      // An entry without a name is left out, as a plain listing would leave it out.
       if let Some((name, told)) = read(entry, volume) {
         each(name, told);
       }
@@ -128,8 +126,8 @@ pub fn read_dir(dir: &Path, volume: i32, each: &mut dyn FnMut(&OsStr, Entry)) ->
   }
 }
 
-/// One entry of the answer: its length, the set of the attributes that follow, and these
-/// attributes in the order of their bits.
+/// One entry of the answer: its length, the attributes that follow as bits, and then these
+/// attributes in the order of their bits. `None`: it has no name.
 fn read(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   let mut fields = Fields { bytes: entry, at: size_of::<u32>() };
   let [common, _, _, file, _] = [(); 5].map(|()| fields.u32());
@@ -139,7 +137,7 @@ fn read(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   if !has(ATTR_CMN_NAME) {
     return None;
   }
-  // Where the name starts, counted from this field, and how long it is with its NUL.
+  // The name: where it starts, counted from this field, and its length with the NUL.
   let (reference, offset, len) = (fields.at, fields.i32()?, fields.u32()?);
   let start = reference.checked_add_signed(isize::try_from(offset).ok()?)?;
   let end = start.checked_add((len as usize).checked_sub(1)?)?;
@@ -153,7 +151,7 @@ fn read(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   }
   let (modified, flags, file_id, size) =
     (fields.time(), fields.u32()?, fields.u64()?, fields.u64()?);
-  // A time before 1970 is left to `lstat`, and so is a file in a cloud: not measured.
+  // A time before 1970, and a file in a cloud, are left to `lstat`: not measured.
   match modified {
     Some(modified) if flags & SF_DATALESS == 0 => {
       Some((name, Entry::File { modified, size, file_id }))
@@ -186,7 +184,7 @@ impl Fields<'_> {
     self.take().map(u64::from_ne_bytes)
   }
 
-  /// A `struct timespec`, if it is no time before 1970.
+  /// A `struct timespec`; `None` before 1970.
   fn time(&mut self) -> Option<SystemTime> {
     let [seconds, nanos] = [(); 2].map(|()| self.take().map(i64::from_ne_bytes));
     let since = u64::try_from(seconds?).ok().zip(u32::try_from(nanos?).ok());
@@ -194,7 +192,6 @@ impl Fields<'_> {
   }
 }
 
-/// The kind of an entry, from its object type.
 fn file_type(object_type: u32) -> FileType {
   match object_type {
     VREG => FileType::File,
@@ -204,11 +201,11 @@ fn file_type(object_type: u32) -> FileType {
   }
 }
 
-/// `getattrlist` in one call: the name that the directory holds for the entry at `path`, and
-/// the kind of the entry. A link at the end of the path is not followed.
+/// The name that the directory holds for the entry at `path`, and the kind of the entry, in
+/// one `getattrlist` call. A link at the end is not followed.
 pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
-  /// The answer: the length of all of it, where the name starts, counted from the field
-  /// `name_offset`, how long it is with its NUL, the object type, and then the bytes.
+  /// The answer: its length, the name as an offset from `name_offset` and a length with the
+  /// NUL, the object type, and then the bytes.
   #[repr(C)]
   struct Answer {
     length: u32,

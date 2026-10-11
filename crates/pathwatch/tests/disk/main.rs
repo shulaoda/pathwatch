@@ -1,8 +1,5 @@
-//! The watcher on the real disk. [`each_backend`] runs a test twice: with the watch API of this
-//! system and with polling, both at the same time. A path in a test is relative to a new
-//! temporary directory. No test sleeps: [`Watch::expect`] waits until the events since the last
-//! `expect` are the expected ones, and then for a short quiet time in which nothing else may
-//! come.
+//! The watcher on the real disk. Each test runs twice at the same time, with the watch API of
+//! this system and with polling, in a fresh temporary directory. No test sleeps.
 
 mod contract;
 mod projects;
@@ -23,28 +20,22 @@ use std::{
 use pathwatch::{Config, Error, Event, EventKind, Watcher};
 use tempfile::TempDir;
 
-/// How long a test waits for events that have to come.
 const PATIENCE: Duration = Duration::from_secs(30);
-/// How long nothing else may come after the expected events. It is longer than the default
-/// debounce and the delete delay together.
+/// Longer than the default debounce and the delete delay together.
 const QUIET: Duration = Duration::from_millis(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Runs `test` with the default settings on each backend.
 fn each_backend(test: impl Fn(&mut Watch) + Sync) {
   each_backend_with(&Config::default(), test);
 }
 
-/// What a test does inside the handler. It gets the watcher and one batch, before the test
-/// gets the batch.
+/// Runs inside the handler, with the watcher and the batch, before the test gets the batch.
 type Inside = fn(&Watcher, &[Event]);
 
-/// Runs `test` twice: with the backend for the watch API of this system, and with polling.
 fn each_backend_with(config: &Config, test: impl Fn(&mut Watch) + Sync) {
   run_each_backend(config, None, test);
 }
 
-/// Runs `test` on each backend. The handler calls `inside` for every batch.
 fn each_backend_inside(inside: Inside, test: impl Fn(&mut Watch) + Sync) {
   run_each_backend(&Config::default(), Some(inside), test);
 }
@@ -58,9 +49,7 @@ fn run_each_backend(config: &Config, inside: Option<Inside>, test: impl Fn(&mut 
   });
 }
 
-/// Runs `run` for the native backend (`false`) and for polling (`true`) at the same time. The
-/// two runs share nothing, and a test waits most of its time, so this halves the time of a
-/// test.
+/// Runs `run` with `false` for the native backend and `true` for polling, at the same time.
 fn side_by_side(run: impl Fn(bool) + Sync) {
   thread::scope(|scope| {
     for polling in [false, true] {
@@ -74,20 +63,16 @@ fn backend_name(polling: bool) -> &'static str {
   if polling { "polling" } else { "native" }
 }
 
-/// A watcher and a temporary directory for it.
 struct Watch {
-  // Dropped first, so that the removal of the directory is not watched. It is in an `Arc`
-  // because the handler reaches it too, for `Inside`.
+  // Dropped before `dir`, so the removal of the directory is not watched.
   watcher: Arc<Watcher>,
   results: Receiver<Result<Vec<Event>, Error>>,
-  /// Not made canonical: an event path has to be the path as the test gave it to `watch`, also
-  /// when the temporary directory lies behind a symbolic link (`/var` on macOS).
+  /// Not made canonical: on macOS it lies behind a link, and event paths must be the given ones.
   dir: TempDir,
   /// The events since the last `expect`.
   events: Vec<Event>,
-  /// The paths of [`Watch::may_pass`].
+  /// The paths of `may_pass`.
   passing: Vec<PathBuf>,
-  /// For the text of a failure.
   backend: &'static str,
 }
 
@@ -124,19 +109,17 @@ impl Watch {
     self.watcher.unwatch_all(rels.iter().map(|rel| self.path(rel))).unwrap();
   }
 
-  /// Writes a file. The directories above it are made when they are missing.
+  /// Writes a file, making the directories above it.
   fn write(&self, rel: &str, content: &str) {
     let path = self.path(rel);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, content).unwrap();
   }
 
-  /// Makes a directory and the missing ones above it, like `mkdir -p`.
   fn mkdir(&self, rel: &str) {
     fs::create_dir_all(self.path(rel)).unwrap();
   }
 
-  /// Removes a file, or a directory with all that is in it.
   fn remove(&self, rel: &str) {
     let path = self.path(rel);
     // A link to a directory is removed as a file.
@@ -151,16 +134,14 @@ impl Watch {
     fs::rename(self.path(from), self.path(to)).unwrap();
   }
 
-  /// The file at `rel` is made and removed between two `expect` calls, so the watcher may find
-  /// it or not: a `Create` and then a `Delete` of it are fine, and so is nothing.
+  /// The file at `rel` comes and goes between two `expect` calls: a `Create` and a `Delete` of
+  /// it are fine, and so is nothing.
   fn may_pass(&mut self, rel: &str) {
     self.passing.push(self.path(rel));
   }
 
-  /// Waits until the events since the last `expect` are the expected ones.
-  ///
-  /// For one path the order counts. An `Update` right after a `Create` or an `Update` of the
-  /// same path does not: the watcher may report more updates than there were writes.
+  /// Waits until the events since the last `expect` are the expected ones. For one path the
+  /// order counts; an `Update` right after a `Create` or an `Update` of the same path is fine.
   fn wait(&mut self, expected: &[(EventKind, &str)]) {
     let expected = self.expected(expected);
     let end = Instant::now() + PATIENCE;
@@ -170,8 +151,7 @@ impl Watch {
     }
   }
 
-  /// [`Watch::wait`], and then nothing else may come for a quiet time. After that the list of
-  /// events starts empty.
+  /// `wait`, and then nothing else may come for a quiet time. The events start empty after it.
   fn expect(&mut self, expected: &[(EventKind, &str)]) {
     self.wait(expected);
     let end = Instant::now() + QUIET;
@@ -182,10 +162,8 @@ impl Watch {
     self.events.clear();
   }
 
-  /// For a test that cannot tell which events come. `known` is the set of files that the
-  /// handler knows. Every event since the last `expect` must fit it (a `Create` of a file that
-  /// it does not hold, an `Update` or a `Delete` of one that it holds), and is applied to it.
-  /// This waits until `known` is `on_disk`, and then it must stay so for a quiet time.
+  /// For a test that cannot tell which events come: every event must fit `known` and is applied
+  /// to it, until `known` is `on_disk` and stays so for a quiet time.
   fn expect_known(&mut self, known: &mut BTreeSet<PathBuf>, on_disk: &BTreeSet<PathBuf>) {
     let patience = Instant::now() + PATIENCE;
     let mut end = patience;
@@ -199,9 +177,8 @@ impl Watch {
         };
         assert!(fits, "{}: {event:?} does not fit what the handler knows", self.backend);
       }
-      // What the handler knew before can be what is on the disk now, while the events of the
-      // changes in between still wait: they take that away again, and the quiet time starts
-      // anew when the two are the same once more.
+      // Events still on their way can take `known` away from `on_disk` again: the quiet time
+      // starts anew.
       if known != on_disk {
         (settled, end) = (false, patience);
       } else if !settled {
@@ -246,7 +223,7 @@ impl Watch {
     history
   }
 
-  /// Takes the next batch, and checks the rules for a batch. False: none came in time.
+  /// Takes the next batch. False: none came in time.
   fn receive(&mut self, timeout: Duration) -> bool {
     match self.results.recv_timeout(timeout) {
       Ok(Ok(events)) => {
@@ -269,12 +246,10 @@ impl Watch {
   }
 }
 
-/// One event of `kind` for each of `paths`.
 fn each(kind: EventKind, paths: &[String]) -> Vec<(EventKind, &str)> {
   paths.iter().map(|path| (kind, path.as_str())).collect()
 }
 
-/// The paths whose events are not the expected ones, for the text of a failure.
 fn differences(expected: &History, got: &History) -> String {
   let none = Vec::new();
   let lines: Vec<String> = expected

@@ -1,6 +1,5 @@
-//! The Windows backend alone, against a real Windows file system. A test whose name
-//! starts with `open_point_` checks something that was only known from documents when the
-//! backend was written; see `docs/windows-open-points.md`.
+//! The Windows backend alone, on a real Windows file system. A test named `open_point_` checks
+//! a point of `docs/windows-open-points.md`.
 #![cfg(windows)]
 
 use std::{
@@ -50,7 +49,7 @@ impl Seen {
     )
   }
 
-  /// A `Changed` for the directory of the key itself: the engine checks it and watches it again.
+  /// A loss report for the directory of the key itself.
   fn names_the_directory(&self, of: DirKey) -> bool {
     *self == Self::Changed { key: of, rel: PathBuf::new() }
   }
@@ -63,8 +62,7 @@ struct Gate {
   moved: Condvar,
 }
 
-/// Opens the gate again when it goes away, also when the test fails. A worker that stays behind
-/// a shut gate would block the drop of the backend.
+/// Opens the gate again when dropped, also when the test fails: a shut gate blocks the drop.
 struct Shut<'a>(&'a Gate);
 
 impl Gate {
@@ -115,8 +113,8 @@ impl Harness {
   fn watch_again(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
     let coverage = self.backend.watch(key, dir, want);
     self.backend.commit().unwrap();
-    // A key that the commit left without a handle is told. The engine asks again for it, and
-    // that answer says why.
+    // A key that got no handle at the commit is asked again, as the engine does: that answer
+    // says why.
     if matches!(coverage, Coverage::WatchedTree) && !self.backend.serves(key) {
       let coverage = self.backend.watch(key, dir, want);
       self.backend.commit().unwrap();
@@ -132,7 +130,7 @@ impl Harness {
     key
   }
 
-  /// Takes hints until `done` says yes to one of them. Returns every hint taken on the way.
+  /// Takes hints until `done` says yes to one. Gives every hint taken on the way.
   fn hints_until(&mut self, done: impl Fn(&Seen) -> bool) -> Vec<Seen> {
     let deadline = Instant::now() + TIMEOUT;
     let mut seen = Vec::new();
@@ -158,8 +156,8 @@ impl Harness {
   }
 }
 
-/// A new directory in the temp directory. Its path is spelled as the system spells the temp
-/// directory: often with a short name in it (`RUNNER~1`), and not in `\\?\` form.
+/// A new directory in the temp directory, spelled as the system spells it: often with a short
+/// name in it (`RUNNER~1`), and not in `\\?\` form.
 fn scratch() -> tempfile::TempDir {
   tempfile::tempdir().unwrap()
 }
@@ -169,8 +167,8 @@ fn make_dir(path: PathBuf) -> PathBuf {
   path
 }
 
-/// Tries `action` until it works. For what Windows only allows after a handle is really closed:
-/// the backend asks its thread to close a handle and does not wait for it.
+/// Tries `action` until it works: the backend closes a handle on its thread without waiting,
+/// and Windows allows some things only after the close.
 fn until_ok(action: impl Fn() -> io::Result<()>) {
   let deadline = Instant::now() + TIMEOUT;
   while let Err(error) = action() {
@@ -235,7 +233,7 @@ fn a_change_of_a_directory_becomes_a_hint() {
 
   fs::remove_dir(temp.path().join("moved")).unwrap();
   let seen = harness.hints_until(|hint| *hint == Seen::Changed { key, rel: "moved".into() });
-  // Nothing may say that the directory of the handle itself has to be checked again.
+  // A directory that goes below the handle is no loss report for the handle itself.
   assert!(
     seen.iter().all(|hint| !hint.names_the_directory(key) && *hint != Seen::Lost),
     "{seen:?}"
@@ -266,8 +264,7 @@ fn a_change_deep_below_is_reported_from_the_handle() {
   harness.hints_until(|hint| hint.names(key, r"a\b\f.txt"));
 }
 
-/// A new file in a directory below changes that directory, and Windows sends a record for the
-/// directory too. It says nothing, and it makes no hint.
+/// Windows also sends a record for the directory when an entry in it changes.
 #[test]
 fn a_change_in_a_directory_below_makes_no_hint_for_that_directory() {
   let temp = scratch();
@@ -298,10 +295,9 @@ fn a_directory_below_a_handle_gets_no_handle_of_its_own() {
   fs::write(sub.join("f.txt"), "1").unwrap();
   fs::write(top.join("marker"), "1").unwrap();
   let seen = harness.hints_until(|hint| hint.names(key, "marker"));
-  // The one handle reports both, and each record goes to the deepest key above it.
   assert!(seen.iter().any(|hint| hint.names(sub_key, "f.txt")), "{seen:?}");
   assert!(seen.iter().all(|hint| !hint.names(key, r"sub\f.txt")), "{seen:?}");
-  // With a handle on `sub`, Windows would refuse this.
+  // With a handle on `sub` Windows would refuse this rename.
   fs::rename(&top, temp.path().join("top 2")).unwrap();
 }
 
@@ -313,7 +309,6 @@ fn a_handle_above_takes_over_from_the_handle_below() {
   let low_key = harness.handle(&low);
   let key = harness.handle(temp.path());
 
-  // The handle above serves the key of the closed handle from now on.
   fs::write(low.join("f.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(low_key, "f.txt"));
 
@@ -365,7 +360,7 @@ fn unwatch_ends_the_hints() {
   let kept_key = harness.handle(&kept);
 
   harness.backend.unwatch(gone_key);
-  // The hints end when the handle is closed, and Windows allows this rename only then.
+  // Windows allows this rename only when the handle is closed.
   let moved = temp.path().join("moved");
   until_ok(|| fs::rename(temp.path().join("above"), &moved));
   fs::write(moved.join("gone").join("f.txt"), "1").unwrap();
@@ -396,7 +391,6 @@ fn more_directories_than_handles_share_a_handle() {
   let mut harness = Harness::new();
   let keys: Vec<DirKey> =
     (0..MAX_HANDLES).map(|n| harness.handle(&make_dir(temp.path().join(n.to_string())))).collect();
-  // One more: all of them go to one handle, on the directory that they have in common.
   let one_more = make_dir(temp.path().join("one more"));
   let more_key = harness.handle(&one_more);
 
@@ -405,8 +399,7 @@ fn more_directories_than_handles_share_a_handle() {
   fs::write(temp.path().join("7").join("f.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(keys[7], "f.txt"));
 
-  // The shared handle also reports what happens next to the watched directories. No key
-  // holds that place: it gives no hint.
+  // The shared handle also reports what is next to the watched directories: no key, no hint.
   let nobody = make_dir(temp.path().join("nobody").join("deep"));
   fs::write(nobody.join("f.txt"), "1").unwrap();
   fs::write(one_more.join("marker"), "1").unwrap();
@@ -429,8 +422,7 @@ fn open_point_a_directory_below_a_handle_that_is_renamed_is_told_itself() {
   let (sub_key, coverage) = harness.watch(&sub, Want::Contents);
   assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
 
-  // An entry that comes in `sub` can make Windows say "modified" for `sub` too. That is no
-  // hint for the directory itself.
+  // A new entry in `sub` makes Windows say "modified" for `sub` too: that is no hint for it.
   fs::write(sub.join("f.txt"), "1").unwrap();
   fs::write(temp.path().join("marker"), "1").unwrap();
   let seen = harness.hints_until(|hint| hint.names(key, "marker"));
@@ -499,8 +491,7 @@ fn open_point_a_directory_name_that_ends_with_a_dot() {
   let verbatim = fs::canonicalize(temp.path()).unwrap().join("dir.");
   fs::create_dir(&verbatim).unwrap();
   let mut harness = Harness::new();
-  // The backend opens a path as std does, and so does the engine. Without the `\\?\` form both
-  // read the name as `dir`, which does not exist.
+  // Without the `\\?\` form Windows reads the name as `dir`, which does not exist.
   let (_, coverage) = harness.watch(&temp.path().join("dir."), Want::Contents);
   assert!(
     matches!(&coverage, Coverage::Failed(error) if error.kind() == io::ErrorKind::NotFound),
@@ -520,7 +511,7 @@ fn open_point_a_save_becomes_a_written_hint() {
   let mut harness = Harness::new();
   let key = harness.handle(temp.path());
 
-  // Open, write, close. Windows makes one to three records for it, some only at the close.
+  // Windows makes one to three records for a save, some only when the file is closed.
   fs::write(&file, "new and longer").unwrap();
   let written = Seen::Written { key, rel: "f.txt".into() };
   harness.hints_until(|hint| *hint == written);
@@ -537,15 +528,14 @@ fn open_point_lost_records_become_a_hint_for_each_key_of_the_handle() {
   assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
 
   {
-    // The worker stops in the sink with the first records and does not read again. The kernel
-    // keeps what follows in a buffer of 64 KiB. These names need about 500 KiB.
+    // The worker stops in the sink and reads no more. The kernel keeps what follows in a
+    // buffer of 64 KiB; these names need about 500 KiB.
     let _shut = gate.shut();
     for n in 0..2000 {
       fs::write(temp.path().join(format!("{n:0>120}")), "").unwrap();
     }
   }
-  // The loss has a place: the directory of each key that the handle serves. Nothing says
-  // "everywhere".
+  // The loss has a place, the directory of each key of the handle: nothing says "everywhere".
   let seen = harness.hints_until(|hint| hint.names_the_directory(key));
   assert!(seen.iter().any(|hint| hint.names_the_directory(sub_key)), "{seen:?}");
   assert!(!seen.contains(&Seen::Lost), "{seen:?}");
@@ -645,8 +635,7 @@ fn open_point_a_change_behind_a_junction_is_reported_under_the_real_path() {
   assert!(seen.iter().all(|hint| !hint.names(key, r"link\f.txt")), "{seen:?}");
 }
 
-/// The text of the path says that the handle above covers the directory, and the handle
-/// reports nothing under that path. So the answer must not be "watched".
+/// A handle reports nothing for what is behind a junction below it.
 #[test]
 fn a_directory_behind_a_junction_below_a_handle_is_not_covered() {
   let temp = scratch();
@@ -667,8 +656,7 @@ fn a_directory_behind_a_junction_below_a_handle_is_not_covered() {
   harness.hints_until(|hint| hint.names(key, "f.txt"));
 }
 
-/// The same when both are asked for before one commit: the handle is opened by the commit, and
-/// only then it is known that it stands above the junction. The key is told and given up.
+/// The handle is opened by the commit, and only then is the junction below it known.
 #[test]
 fn a_directory_behind_a_junction_is_told_when_the_handle_above_comes_with_it() {
   let temp = scratch();
@@ -692,8 +680,6 @@ fn a_directory_behind_a_junction_is_told_when_the_handle_above_comes_with_it() {
   harness.hints_until(|hint| hint.names(top_key, "f.txt"));
 }
 
-/// A key that a handle above served is behind a junction when the engine asks again: the
-/// handle does not serve it any more.
 #[test]
 fn a_directory_that_becomes_a_junction_below_a_handle_is_given_up() {
   let temp = scratch();
@@ -710,7 +696,7 @@ fn a_directory_that_becomes_a_junction_below_a_handle_is_given_up() {
   let coverage = harness.watch_again(key, &dir, Want::Contents);
   assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
 
-  // The handle still serves its own key, and no hint has the key that was given up.
+  // No hint carries the key that was given up.
   fs::write(top.join("f.txt"), "1").unwrap();
   let seen = harness.hints_until(|hint| hint.names(top_key, "f.txt"));
   assert!(seen.iter().all(|hint| hint.key() != Some(key)), "{seen:?}");
@@ -726,8 +712,8 @@ fn open_point_a_change_made_through_a_short_name() {
   let key = harness.handle(temp.path());
 
   fs::write(temp.path().join(&short), "12").unwrap();
-  // Either Windows reports the long name, or the backend finds a short name and names the
-  // directory that holds it. The short name itself must never reach the engine.
+  // Windows may report the long name, or the backend names the directory that holds the short
+  // one. The short name itself must never reach the engine.
   let seen = harness
     .hints_until(|hint| hint.names(key, "a long file name.txt") || hint.names_the_directory(key));
   let short = short.to_string_lossy();

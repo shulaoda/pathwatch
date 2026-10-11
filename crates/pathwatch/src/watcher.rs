@@ -26,9 +26,8 @@ use crate::{
   poll::PollBackend,
 };
 
-/// How many bytes of backend signals wait at most. A signal that would make it more is
-/// dropped, and the engine checks everything instead. The bound is in bytes because one raw
-/// notification can be a few bytes or a full buffer of the OS.
+/// How many bytes of backend signals wait at most. One more is dropped, and the engine checks
+/// everything. Bytes, because a raw notification can be a few bytes or a whole buffer of the OS.
 const QUEUE_BYTES: usize = 16 << 20;
 /// How many messages are taken in one turn of the loop before the deadlines are served, so
 /// that a flood of signals cannot hold back a flush.
@@ -50,8 +49,8 @@ const MESSAGES_PER_TURN: usize = 512;
 /// # }
 /// ```
 pub struct Watcher {
-  /// Puts a command into the queue. It is a closure because it hides the type of the raw
-  /// notifications, which is another one for each backend. False: the thread is gone.
+  /// Puts a command into the queue. A closure, since the raw type differs by backend. False: the
+  /// thread is gone.
   send: Box<dyn Fn(Command) -> bool + Send + Sync>,
   stop: Arc<AtomicBool>,
   thread_id: ThreadId,
@@ -74,19 +73,14 @@ impl Watcher {
 
   /// Starts the watcher thread. Nothing is watched yet.
   ///
-  /// `handler` runs on that thread. It gets
+  /// `handler` runs on that thread and gets `Ok(events)`, one batch (never empty, at most one
+  /// event for a path, in no promised order), or `Err(error)`: something could not be watched or
+  /// read, and the watcher keeps running. Send the batch to a channel and work on another thread:
+  /// a slow handler delays every check of the disk and every `watch` and `unwatch` call.
   ///
-  /// - `Ok(events)`: one batch. It is never empty and has at most one event for a path. Its
-  ///   order is not promised.
-  /// - `Err(error)`: something could not be watched or read. The watcher keeps running.
-  ///
-  /// Send the batch to a channel and work on another thread: a slow handler delays every
-  /// check of the disk, and every call of `watch` and `unwatch` on other threads.
-  ///
-  /// When the watch API of the OS cannot be started (on Linux: the limit of inotify
-  /// instances), the watcher polls, as with [`Config::with_polling`], and tells the handler
-  /// once: [`ErrorKind::WatchLimit`] when a limit of the OS was the reason, [`ErrorKind::Io`]
-  /// otherwise.
+  /// When the watch API of the OS cannot start, the watcher polls, as with
+  /// [`Config::with_polling`], and tells the handler once: [`ErrorKind::WatchLimit`] for a limit
+  /// of the OS, [`ErrorKind::Io`] otherwise.
   ///
   /// # Errors
   ///
@@ -99,8 +93,7 @@ impl Watcher {
     if config.polling() {
       return Self::start(poll.clone(), poll, handler, PollBackend::new);
     }
-    // Which target has which native backend: this is the one place that says it. A target
-    // that is not here has none, and the watcher polls.
+    // Which target has which native backend: the one place that says it. Any other target polls.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
       Self::start(config.into_options(false), poll, handler, crate::inotify::InotifyBackend::new)
@@ -119,22 +112,14 @@ impl Watcher {
     }
   }
 
-  /// Watches a path. It can be a file, a directory, or not exist yet.
+  /// Watches a path: a file, a directory with everything below it, or a path that does not exist
+  /// yet. The call returns when the path is watched. What exists then is not reported, every later
+  /// change is; it is silent only about files that the watcher did not know already. Watching a
+  /// path again does nothing.
   ///
-  /// - File: its changes are reported.
-  /// - Directory: every file below it is reported, at any depth.
-  /// - Missing: it is reported when a file or a directory appears there.
-  ///
-  /// The call returns when the path is watched and what exists there is known. What exists at
-  /// that moment is not reported; every later change is. It is silent only about files that
-  /// the watcher did not already know: a change that was due for a file it knew (through
-  /// another watched path) is still reported. Watching a path again does nothing.
-  ///
-  /// A relative path is joined to the current directory at the time of the call, so every
-  /// event path is absolute. The path is cleaned by its text: `.` is dropped, repeated and
-  /// trailing separators are dropped, and `..` takes away the name before it, like Node does
-  /// and not like the OS behind a symbolic link. No link is resolved and no letter case is
-  /// changed.
+  /// A relative path is joined to the current directory. The path is cleaned by its text: `.`,
+  /// `..` and repeated separators, like Node does and not like the OS behind a symbolic link. No
+  /// link is resolved and no letter case is changed. Every event path starts with it.
   ///
   /// From inside the handler the call does not wait: the path is watched when the handler has
   /// returned.
@@ -161,18 +146,14 @@ impl Watcher {
     self.command(paths, Command::Watch)
   }
 
-  /// Takes back a [`watch`](Self::watch) of this very path, and nothing else. A path that is
-  /// not watched is skipped.
+  /// Takes back a [`watch`](Self::watch) of this very path. A path that is not watched is skipped.
   ///
-  /// Nothing is reported for it: the files that only this path covered are forgotten, and a
-  /// `Delete` that was waiting below the path is dropped. A file that another watched path
-  /// still covers stays known. The path is cleaned as in `watch`.
+  /// Nothing is reported for it: the files that only this path covered are forgotten, a `Delete`
+  /// that was waiting below it is dropped, and a file that another watched path still covers
+  /// stays known. It cannot cut a part out of a watched directory: use
+  /// [`Config::with_ignored`] for that.
   ///
-  /// It cannot cut a part out of a watched directory: use the ignore filter
-  /// ([`Config::with_ignored`]) for that.
-  ///
-  /// From inside the handler the call does not wait: it takes effect when the handler has
-  /// returned.
+  /// From inside the handler the call does not wait.
   ///
   /// # Errors
   ///
@@ -196,12 +177,10 @@ impl Watcher {
     self.command(paths, Command::Unwatch)
   }
 
-  /// Stops the watcher and waits for its thread. When it returns, the handler is not called
-  /// again and nothing is watched. Events that were not handed over yet are dropped.
-  ///
-  /// It can be called many times, and from inside the handler: there it does not wait, and
-  /// the thread ends when the handler returns. After it, `watch` and `unwatch` return
-  /// [`ErrorKind::Closed`].
+  /// Stops the watcher and waits for its thread. After it the handler is not called again,
+  /// nothing is watched, and `watch` and `unwatch` return [`ErrorKind::Closed`]. Events not handed
+  /// over yet are dropped. It can be called many times, and from inside the handler: there it
+  /// does not wait, and the thread ends when the handler returns.
   pub fn close(&self) {
     self.stop.store(true, Ordering::Release);
     // Wakes the thread up. It fails only when the thread is gone already.
@@ -213,7 +192,7 @@ impl Watcher {
     // when the watcher thread is gone too.
     let mut thread = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(thread) = thread.take() {
-      // A handler that panicked already took the thread down. There is nothing to add here.
+      // A panic in the handler took the thread down already.
       let _ = thread.join();
     }
   }
@@ -281,9 +260,8 @@ impl Watcher {
     Self::start(options.clone(), options, handler, make)
   }
 
-  /// Starts the watcher thread on the real file system. `make` makes the backend from its
-  /// sink, on that thread. When it fails, the handler is told once and the watcher polls with
-  /// the settings `fallback`.
+  /// Starts the watcher thread. `make` makes the backend on that thread; when it fails, the handler
+  /// is told once and the watcher polls with `fallback`.
   fn start<B, H>(
     options: Options,
     fallback: Options,
@@ -336,7 +314,6 @@ impl Watcher {
   }
 }
 
-/// What waits in the queue of the watcher thread.
 enum Message<R> {
   /// A signal of the backend, and the bytes that it counts for in the queue.
   Signal(Signal<R>, usize),
@@ -345,7 +322,6 @@ enum Message<R> {
   Wake,
 }
 
-/// What the methods of a [`Watcher`] ask its thread to do.
 enum Command {
   Watch(Vec<PathBuf>, Done),
   Unwatch(Vec<PathBuf>, Done),
@@ -443,7 +419,7 @@ fn run<B: Backend>(
       };
       deliver(&mut out, &mut handler, stop);
       if let Some(done) = done {
-        // The caller may have given up waiting. That is its business.
+        // The caller may be gone.
         let _ = done.send(());
       }
       taken += 1;
@@ -484,8 +460,8 @@ fn deliver(
   }
 }
 
-/// The backend of a watcher whose native backend could not start. It watches nothing, like
-/// [`PollBackend`], but it has the raw type of the native backend: the queue is made for it.
+/// The backend of a watcher whose native backend did not start: it watches nothing, but has the
+/// raw type of the native one, which the queue was made for.
 struct NoBackend<R>(PhantomData<fn(R)>);
 
 impl<R: Send + 'static> Backend for NoBackend<R> {

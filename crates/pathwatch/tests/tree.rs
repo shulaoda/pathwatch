@@ -1,5 +1,4 @@
-//! The tree alone: the arena, the table and the way from a hint to a mark. The paths are Unix
-//! paths.
+//! The tree alone: the arena, the table and the way from a hint to a mark, with Unix paths.
 
 #![cfg(unix)]
 
@@ -27,9 +26,8 @@ fn on_disk(tree: &mut Tree, key: DirKey, complete: bool) {
   tree[key].kind = Kind::Dir(Dir { watch: Watch::Watched, ..Dir::new(id, complete) });
 }
 
-/// `/` and `/p` only lead to watched paths, `/p/r` is a watched directory with `sub` in it,
-/// `/p/gone/deep/x.js` is a watched path below a chain that is not on disk, and `/p/f.js` is
-/// a watched file.
+/// `/p/r` is a watched directory with `sub` in it, `/p/f.js` a watched file, and
+/// `/p/gone/deep/x.js` a watched path below a chain that is not on disk.
 struct Fixture {
   tree: Tree,
   top: DirKey,
@@ -99,13 +97,11 @@ fn a_removed_key_never_names_a_node_again() {
   assert_eq!(tree.path(first), Path::new("/a"));
   assert_eq!(tree.level(first), 2);
 
-  // Nothing needs the node.
   tree.prune(first);
   assert!(tree.get(first).is_none());
   assert_eq!(tree.child(top, OsStr::new("a")), None);
   assert_eq!(tree.children(top).count(), 0);
 
-  // The slot is used again, under another generation.
   let second = child(&mut tree, top, "b");
   assert_eq!(second.index(), first.index());
   assert_ne!(second.generation(), first.generation());
@@ -138,7 +134,6 @@ fn a_child_is_found_by_its_parent_and_its_name() {
   assert_eq!(tree.child(Tree::ROOT, OsStr::new("/")), Some(top));
   assert_eq!(tree.child(p, OsStr::new("r")), Some(r));
   assert_eq!(tree.child(r, OsStr::new("sub")), Some(sub));
-  // The same name below another parent is another node, or none.
   assert_eq!(tree.child(top, OsStr::new("r")), None);
   assert_eq!(tree.child(p, OsStr::new("sub")), None);
   let twin = child(&mut tree, sub, "sub");
@@ -152,9 +147,7 @@ fn a_child_is_found_by_its_parent_and_its_name() {
   assert_eq!(tree.children(f).count(), 0);
 }
 
-/// Many children of one node, and nodes that go away from the start, the middle and the end
-/// of the list: the list and the table stay right while the table grows and the slots are
-/// used again.
+/// The list and the table stay right while the table grows and the slots are used again.
 #[test]
 fn children_come_and_go() {
   let mut tree = Tree::new();
@@ -181,7 +174,6 @@ fn children_come_and_go() {
     live = kept;
     tree.check_links().unwrap();
     assert_eq!(tree.children(top).count(), live.len());
-    // A walk from child to child goes through the same list.
     let walk = iter::successors(tree.children(top).next(), |&at| tree.next_sibling(at));
     assert!(walk.eq(tree.children(top)));
     for (name, key) in &live {
@@ -193,8 +185,7 @@ fn children_come_and_go() {
   assert!(highest < 2 + 500 + 500 * 2 / 3 + 500 * 4 / 9 + 500 * 8 / 27 + 4);
 }
 
-/// A node is kept while it is registered, while something is at its path, and while a mark
-/// waits on it.
+/// Needed: registered, something at its path, a mark, or a `Delete` still to tell.
 #[test]
 fn a_node_is_freed_when_nothing_needs_it() {
   let Fixture { mut tree, r, sub, gone, deep, f, .. } = fixture();
@@ -203,14 +194,13 @@ fn a_node_is_freed_when_nothing_needs_it() {
     tree.prune(key);
     assert!(tree.get(key).is_some());
   }
-  // A directory that was found: it goes when it is gone from the disk.
+  // A directory goes when it is gone from the disk.
   tree.prune(sub);
   assert!(tree.get(sub).is_some());
   tree[sub].kind = Kind::Missing;
   tree.prune(sub);
   assert!(tree.get(sub).is_none());
 
-  // A file that was found, with a mark.
   let file = child(&mut tree, r, "a.js");
   let fingerprint = Fingerprint { modified: 0, size: 1, id: 1 };
   tree[file].kind = Kind::File(fingerprint);
@@ -237,7 +227,6 @@ fn a_node_is_freed_when_nothing_needs_it() {
 #[test]
 fn what_is_registered() {
   let Fixture { mut tree, top, p, r, sub, gone, deep, f } = fixture();
-  // A watched path, and every node above one.
   for key in [Tree::ROOT, top, p, gone, deep] {
     assert!(tree[key].is_ancestor() && tree[key].is_registered());
   }
@@ -246,16 +235,14 @@ fn what_is_registered() {
   }
   assert!(!tree[sub].is_registered());
 
-  // A path is made a watched path once.
   assert!(!tree.make_path(r));
-  // A watched path below a watched path: both.
   let below = child(&mut tree, sub, "x.js");
   assert!(tree.make_path(below));
   assert!(tree[r].is_path() && tree[r].is_ancestor());
   assert!(tree[sub].is_ancestor() && !tree[sub].is_path());
   tree.check_links().unwrap();
 
-  // The way back. A node above another watched path stays registered.
+  // A node above another watched path stays registered.
   assert!(tree.drop_path(r));
   assert!(!tree.drop_path(r));
   assert!(!tree[r].is_path() && tree[r].is_registered());
@@ -267,7 +254,6 @@ fn what_is_registered() {
   // `/p` still leads to `f.js` and to the chain that is not on disk.
   assert!(tree[p].is_ancestor());
   tree.check_links().unwrap();
-  // With the last watched path, nothing is registered any more, up to the root.
   let x = tree.child(deep, OsStr::new("x.js")).unwrap();
   assert!(tree.drop_path(f) && tree.drop_path(x));
   for key in [f, x, deep, gone, p, top, Tree::ROOT] {
@@ -283,12 +269,10 @@ fn what_a_node_wants() {
   assert_eq!(tree.want(top), Some(Want::Names));
   // The tree has nothing at `deep`, a name on the way to a watched path.
   assert_eq!(tree.want(gone), None);
-  // A watched directory, and a directory inside one.
   assert_eq!(tree.want(r), Some(Want::Contents));
   assert_eq!(tree.want(sub), Some(Want::Contents));
 
-  // `/p` holds the watched directory `r`, and the registered names `f.js` and `gone`, where
-  // the tree has nothing: the disk has to say what is there.
+  // `f.js` and `gone` are registered with nothing at them: the disk has to say.
   assert_eq!(tree.want(p), None);
   let fingerprint = Fingerprint { modified: 0, size: 1, id: 1 };
   tree[f].kind = Kind::File(fingerprint);
@@ -346,8 +330,7 @@ fn the_content_of_a_node() {
   tree.check_links().unwrap();
 }
 
-/// A held node is no directory on disk, and everything below it is frozen. What the tree has
-/// at the node and below it stays.
+/// No directory is on disk at it, everything below is frozen, and what the tree has stays.
 #[test]
 fn a_held_node() {
   let Fixture { mut tree, top, p, r, sub, f, .. } = fixture();
@@ -360,24 +343,21 @@ fn a_held_node() {
   tree.hold(r, until);
   assert!(tree[r].is_held() && tree.held_until(r) == Some(until));
   assert_eq!(tree.holds().collect::<Vec<_>>(), [(r, until)]);
-  // The node keeps what it had, but no directory is on disk there.
   assert!(matches!(tree[r].kind, Kind::Dir(_)));
   assert!(!tree[r].is_dir() && tree[r].dir().is_none() && !tree[r].is_complete());
   assert_eq!(tree[r].watch(), Watch::None);
-  // Everything below is frozen, however deep. The held node and its neighbours are not.
+  // The held node and its neighbours are not frozen.
   for key in [sub, deeper, file] {
     assert!(tree.frozen(key));
   }
   for key in [r, f, p, top, Tree::ROOT] {
     assert!(!tree.frozen(key));
   }
-  // No scan is queued for a held node.
   tree.queue_scan(r, Depth::Deep);
   assert_eq!(tree.to_scan, []);
   tree.check_links().unwrap();
 
-  // A hint with the key of the held node, and a hint from above for a path below it, both
-  // end at the held node: its parent checks whether it is back.
+  // Both hints end at the held node: its parent checks whether it is back.
   tree.hint(changed(r, "sub/a.js", true));
   assert_eq!(marks(&tree), ["/p|r|d"]);
   clear_marks(&mut tree);
@@ -483,7 +463,6 @@ fn hint_to_mark() {
     let mut fixture = fixture();
     let nodes = fixture.tree.nodes().count();
     let hint = (case.hint)(&fixture);
-    // A hint says whether it left work.
     assert_eq!(fixture.tree.hint(hint), !case.marks.is_empty(), "{}", case.name);
     assert_eq!(marks(&fixture.tree), case.marks, "{}", case.name);
     assert_eq!(fixture.tree.marked.len(), case.marks.len(), "{}", case.name);
@@ -510,8 +489,7 @@ fn marks_for_one_name_merge() {
   assert_eq!(f.tree.marked, [f.tree.child(f.r, OsStr::new("a.js")).unwrap()]);
 }
 
-/// A hint with no path below the directory is a loss report: the backend does not know
-/// what happened at or below it. Its mark says so, until a hint that names the path comes.
+/// Its mark says `lost` until a hint that names the path joins it.
 #[test]
 fn a_hint_for_the_directory_itself_is_a_loss_report() {
   let mut f = fixture();
@@ -529,8 +507,7 @@ fn a_hint_for_the_directory_itself_is_a_loss_report() {
   assert!(!mark.lost && mark.deep);
   assert_eq!(f.tree.marked, [f.sub]);
 
-  // A hint for a path below the directory is none, and neither is one that goes to the
-  // directory above because the node has no directory.
+  // Neither a path below it, nor a node with no directory, is a loss report.
   assert!(f.tree.hint(changed(f.r, "a.js", false)));
   assert!(f.tree.hint(changed(f.gone, "", false)));
   for key in [f.tree.child(f.r, OsStr::new("a.js")).unwrap(), f.gone] {
@@ -541,18 +518,15 @@ fn a_hint_for_the_directory_itself_is_a_loss_report() {
   assert!(f.tree.hint(Hint::Lost) && f.tree.lost);
 }
 
-/// A watched path is the path that its caller gave, and the OS says what is at it. So the name
-/// of a hint also means each registered name that the OS can take for it, and nothing else.
+/// The name of a hint means each registered name that the OS can take for it, and nothing else.
 #[test]
 fn a_name_that_can_be_another_spelling() {
   let mut f = fixture();
-  // On every disk: a registered name that differs only in the case of its letters. The look
-  // decides, so the mark never says "written".
+  // The look decides, so the mark never says "written".
   assert!(f.tree.hint(changed(f.p, "F.JS", true)));
   assert_eq!(marks(&f.tree), ["/p|f.js|d"]);
   assert_eq!(f.tree.child(f.p, OsStr::new("F.JS")), None);
   clear_marks(&mut f.tree);
-  // Both names are registered: each of them is looked at.
   let upper = child(&mut f.tree, f.p, "F.JS");
   assert!(f.tree.make_path(upper));
   assert!(f.tree.hint(changed(f.p, "f.js", true)));
@@ -564,8 +538,7 @@ fn a_name_that_can_be_another_spelling() {
   assert!(f.tree.hint(changed(f.p, "R/sub/a.js", true)));
   assert_eq!(marks(&f.tree), ["/p/r/sub|a.js|d"]);
   clear_marks(&mut f.tree);
-  // A name with an accent is no other spelling of anything in a directory that a look proved
-  // strict. A directory with no such proof counts as loose.
+  // In a directory proved strict, an accent is no other spelling of anything.
   f.tree[f.p].dir_mut().unwrap().spelling = Spelling::Strict;
   assert!(!f.tree.is_loose(f.p) && f.tree.is_loose(f.r));
   let accent = child(&mut f.tree, f.p, "\u{e9}.js");
@@ -574,8 +547,7 @@ fn a_name_that_can_be_another_spelling() {
   assert!(!f.tree.has_work());
 
   f.tree.loose_spelling = true;
-  // With loose spelling no directory is strict. The name can be every registered name that
-  // is not plain. A name of ideographs is plain: it is only itself.
+  // Not plain: it can be every registered name that is not plain. Ideographs are plain.
   assert!(f.tree.hint(changed(f.p, "\u{c9}.js", true)));
   assert!(f.tree.hint(changed(f.p, "\u{444}", false)));
   assert!(!f.tree.hint(changed(f.p, "\u{4e2d}", false)));
@@ -585,7 +557,6 @@ fn a_name_that_can_be_another_spelling() {
   f.tree.prune(accent);
   f.tree.check_links().unwrap();
 
-  // No registered name of `/p` can be this one: the hint is dropped.
   assert!(!f.tree.hint(changed(f.p, "other.js", false)));
   assert!(!f.tree.hint(changed(f.p, "f.jsx", true)));
   assert!(!f.tree.hint(changed(f.p, "\u{e9}.js", true)));
@@ -600,26 +571,22 @@ fn a_name_that_can_be_another_spelling() {
   assert_eq!(f.tree.to_scan, []);
   clear_marks(&mut f.tree);
 
-  // The other spelling is below a name that matches: `/p/gone` is no directory, so the name
-  // itself is marked, as always.
+  // `/p/gone` is no directory, so the name itself is marked, as always.
   assert!(f.tree.hint(changed(f.p, "gone/DEEP/x.js", false)));
   assert_eq!(marks(&f.tree), ["/p|gone|d"]);
   clear_marks(&mut f.tree);
 
-  // A registered name is marked as always, and so is any name in a complete node.
   assert!(f.tree.hint(changed(f.p, "f.js", true)));
   assert!(f.tree.hint(changed(f.r, "New.js", false)));
   assert_eq!(marks(&f.tree), ["/p/r|New.js|d", "/p|f.js|w"]);
   assert_eq!(f.tree.to_scan, []);
   clear_marks(&mut f.tree);
 
-  // A complete node does not know the name: the OS names an entry that is gone as the caller
-  // spelled it, so the nodes that differ in the case of their letters are checked too.
+  // The OS names an entry that is gone as the caller spelled it: the other case is checked too.
   assert!(!f.tree.has_other_spelling(f.sub));
   assert!(f.tree.hint(changed(f.r, "SUB", false)));
   assert_eq!(marks(&f.tree), ["/p/r|SUB|d", "/p/r|sub|d"]);
-  // While the tree has both, the disk has to say which of the two it has, and a hint for one
-  // of them is a hint for the other.
+  // While the tree has both, a hint for one is a hint for the other.
   let other = f.tree.child(f.r, OsStr::new("SUB")).unwrap();
   assert!(f.tree.has_other_spelling(f.sub) && f.tree.has_other_spelling(other));
   f.tree.take_mark(f.sub);
@@ -627,8 +594,7 @@ fn a_name_that_can_be_another_spelling() {
   assert!(f.tree[f.sub].is_marked());
   clear_marks(&mut f.tree);
   assert!(!f.tree.has_other_spelling(f.sub));
-  // The table does not find the other spellings of a name that is not plain: its own
-  // spelling is never sure, and a listing shows the others while the name is no entry.
+  // A name that is not plain is never sure: a listing of the names is asked while it is no entry.
   let mut scans = Vec::new();
   assert!(f.tree.hint(changed(f.r, "s\u{dc}b", false)));
   assert_eq!(marks(&f.tree), ["/p/r|s\u{dc}b|d"]);
@@ -653,15 +619,12 @@ fn a_hint_for_a_dead_key_is_dropped() {
   assert!(!f.tree.has_work());
 }
 
-/// A backend can still hold the key of a directory that is gone. When the slot has a new
-/// node, the old key does not reach it: not for a read, and not for a hint.
 #[test]
 fn an_old_key_does_not_reach_the_node_that_reuses_its_slot() {
   let mut f = fixture();
   let old = f.sub;
   f.tree[old].kind = Kind::Missing;
   f.tree.prune(old);
-  // The next new node takes the free slot. It is a directory that tracks every entry.
   let new = child(&mut f.tree, f.r, "other");
   on_disk(&mut f.tree, new, true);
   assert_eq!(new.index(), old.index());
@@ -680,14 +643,12 @@ fn an_old_key_does_not_reach_the_node_that_reuses_its_slot() {
   f.tree.hint(changed(old, "", false));
   assert!(!f.tree.has_work());
   assert!(f.tree.take_mark(old).is_none());
-  // The same hints under the new key are marks.
   f.tree.hint(changed(new, "a.js", true));
   f.tree.hint(changed(new, "", false));
   assert_eq!(marks(&f.tree), ["/p/r/other|a.js|w", "/p/r|other|d"]);
   f.tree.check_links().unwrap();
 }
 
-/// A top directory has a parent like every other directory: the root.
 #[test]
 fn a_top_directory_is_marked_in_the_root() {
   let mut f = fixture();
@@ -738,7 +699,6 @@ fn mark_list(tree: &Tree) -> Vec<String> {
   all
 }
 
-/// The way from a hint to a mark, in the corners.
 #[test]
 fn from_hint_to_mark() {
   let mut tree = Tree::new();
@@ -751,8 +711,7 @@ fn from_hint_to_mark() {
   on_disk(&mut tree, p, true);
   assert!(tree.make_path(c));
 
-  // 2. `/p/a` and `/p/a/b` are not on disk. A hint for the deep one goes up to the first node
-  // that is, and marks the name that leads to it there.
+  // `/p/a` and `/p/a/b` are not on disk: the hint goes up to the first node that is.
   tree.hint(changed(b, "c.js", true));
   assert_eq!(mark_list(&tree), ["/p a deep"]);
   clear_marks(&mut tree);
@@ -760,23 +719,19 @@ fn from_hint_to_mark() {
   assert_eq!(mark_list(&tree), ["/p a deep"]);
   clear_marks(&mut tree);
 
-  // 3. "Written" for a file below a directory the tree does not know: the mark is on the
-  // unknown name, and it says "deep", because the written file is not that name.
+  // The written file is below an unknown name: that name is marked, and deep.
   tree.hint(changed(p, "new/f.js", true));
   assert_eq!(mark_list(&tree), ["/p new deep"]);
   clear_marks(&mut tree);
   tree.hint(changed(p, "f.js", true));
   assert_eq!(mark_list(&tree), ["/p f.js written"]);
 
-  // A top directory itself: the root checks it, like any parent.
   clear_marks(&mut tree);
   tree.hint(changed(top, "", false));
   assert_eq!(mark_list(&tree), [" / deep"]);
 }
 
-/// The list of the timer: a directory goes on it when its watch or its error is written, and
-/// `tidy_polled` leaves each directory that the timer has to look at once, in the order of the
-/// arena. The root is always one of them.
+/// `tidy_polled` leaves each directory to look at once, in the order of the arena; the root always.
 #[test]
 fn the_list_of_the_timer() {
   let mut f = fixture();
@@ -812,7 +767,6 @@ fn the_list_of_the_timer() {
   f.tree.tidy_polled();
   assert_eq!(f.tree.polled, [Tree::ROOT, f.top, f.p]);
 
-  // When the backend is gone, every directory is polled.
   f.tree.unhold(f.p);
   f.tree.poll_all();
   f.tree.tidy_polled();

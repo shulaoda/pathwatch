@@ -1,3 +1,5 @@
+//! The inotify backend: one kernel watch for each directory. See `docs/design.md` 7.1.
+
 use std::{
   collections::hash_map::Entry,
   ffi::OsStr,
@@ -124,6 +126,7 @@ impl Backend for InotifyBackend {
     };
     match ffi::add_watch(&self.fds.inotify, dir, events | WATCH_FLAGS) {
       Ok(wd) if self.wd_by_key.get(&key) == Some(&wd) => Coverage::Watched,
+      // A kernel watch belongs to the inode: a second add for it gives the old `wd`.
       Ok(wd) => {
         self.unbind(key);
         self.wd_by_key.insert(key, wd);
@@ -208,6 +211,8 @@ fn forward(fds: &Fds, sink: &Sink<Vec<u8>>) {
       Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
       Err(error) => break error,
     }
+    // At most one read a millisecond, unless the last read filled over half of the buffer:
+    // a flood of small writes would wake the reader for each.
     thread::sleep(next_read.saturating_duration_since(Instant::now()));
     match (&fds.inotify).read(&mut buffer) {
       Ok(0) => break io::ErrorKind::UnexpectedEof.into(),
@@ -272,6 +277,7 @@ mod ffi {
   }
 
   pub(super) fn remove_watch(inotify: &File, wd: i32) {
+    // The libc of Android takes the descriptor as u32.
     #[cfg(target_os = "android")]
     let wd = wd.cast_unsigned();
     // SAFETY: the call takes no memory of ours.

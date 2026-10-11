@@ -1,3 +1,6 @@
+//! The FSEvents backend of macOS: streams, the guard above their paths, and the covers that
+//! the keys stand for. The design is in `docs/design.md` 7.2.
+
 use std::{
   collections::{BTreeMap, VecDeque},
   ffi::{OsStr, OsString},
@@ -113,8 +116,7 @@ impl FsEventsBackend {
           _ => RealParent { asked: parent.to_owned(), real: short_way(fs::canonicalize(parent)?) },
         };
         let real_parent = &self.last_parent.insert(last).real;
-        // A link, and a name that differs by more than the case of ASCII letters, are left to
-        // the OS.
+        // A link, or a name that differs by more than ASCII case, goes the slow way, by the OS.
         match name_and_kind(dir)? {
           (on_disk, kind) if kind != FileType::Symlink && on_disk.eq_ignore_ascii_case(name) => {
             real_parent.join(on_disk)
@@ -163,8 +165,8 @@ impl Backend for FsEventsBackend {
 
   fn unwatch(&mut self, key: DirKey) {
     self.not_watched.remove(&key);
-    // The stream that was to start for the cover is not needed when no key is left at its
-    // path. A cover below it that counted on that stream asks for one of its own.
+    // The stream that was to start here is not needed: a cover below it, which counted on
+    // that stream, asks for one of its own.
     if let Some(dir) = self.covers.remove(key)
       && self.streams.pending.contains(&dir)
     {
@@ -395,6 +397,7 @@ impl Streams {
         return Err(error);
       }
     };
+    // The new streams run before the old ones retire: nothing is missed in between.
     if replace {
       let replaced: Vec<Stream> =
         mem::take(&mut self.running).into_iter().map(|running| running.stream).collect();
@@ -406,6 +409,7 @@ impl Streams {
       for path in mem::take(&mut self.paths).drain() {
         self.guard.release(&path);
       }
+      // Paths that must stay apart raise the limit: not every commit replaces the streams.
       self.path_limit =
         if paths.len() > MAX_STREAM_PATHS { 2 * paths.len() } else { MAX_STREAM_PATHS };
     }
@@ -429,6 +433,8 @@ impl Streams {
     }
   }
 
+  /// The check after the start (`docs/design.md` 7.2): a stream path, or a name between it
+  /// and a cover, can have changed between `watch` and the start of the stream.
   fn moved_since_asked(&mut self, started: &[PathBuf], covers: &Covers) -> Raw {
     let mut moved = Raw::default();
     for path in started {
@@ -455,9 +461,8 @@ impl Streams {
     moved
   }
 
-  /// Stops the streams whose records would reach no key: every path of the stream is trusted
-  /// no more, or has no cover at or below it. Nothing is lost with them, and their paths and
-  /// their guards are given back.
+  /// Stops the streams that no cover needs any more: their records would reach no key, so
+  /// nothing is lost with them.
   fn stop_idle(&mut self, covers: &Covers) {
     let needed = |path: &PathBuf| {
       self.paths.contains(path)
@@ -493,6 +498,7 @@ impl Streams {
     }
     if !stopped.is_empty() {
       self.queue.sync(move || drop(stopped));
+      // A stream that stops takes what it has not delivered: the engine reads everything again.
       let mut may_have_lost = Raw::default();
       may_have_lost.push(b"/", flag::MUST_SCAN_SUB_DIRS);
       self.sink.raw(may_have_lost);
@@ -508,6 +514,8 @@ impl Drop for Streams {
   }
 }
 
+/// `realpath` spells `/Users` as `/System/Volumes/Data/Users`, and FSEvents reports the short
+/// path. The short path is taken when it is the same directory and a real path itself.
 fn short_way(real: PathBuf) -> PathBuf {
   let Ok(below) = real.strip_prefix(DATA_VOLUME) else { return real };
   let short = Path::new("/").join(below);
@@ -521,6 +529,8 @@ fn is_gone(error: &io::Error) -> bool {
   matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }
 
+/// Whether a stream path there would report far more than the covers: `/`, a directory in
+/// it, one more name down, and the temporary directory of the user with the names above it.
 pub fn is_too_high(dir: &Path) -> bool {
   let dir = dir.strip_prefix(DATA_VOLUME).unwrap_or(dir);
   let names = dir.components().filter_map(|part| match part {
@@ -535,6 +545,8 @@ pub fn is_too_high(dir: &Path) -> bool {
   }
 }
 
+/// At most `max` stream paths for the covers: paths go up to directories that covers have in
+/// common, the deepest first, but never to one that is too high.
 fn place(covers: Vec<PathBuf>, max: usize) -> Vec<PathBuf> {
   let paths = top_most(covers);
   let too_many = paths.len().saturating_sub(max);
@@ -578,9 +590,12 @@ fn top_most(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
   paths
 }
 
+/// Directories by path, in path order: the ones that hold a path and the ones below a path
+/// are each one search away.
 #[derive(Debug)]
 struct Dirs<T> {
   by_path: BTreeMap<OsString, T>,
+  /// The shortest and the longest path: a lookup skips the ancestors that no path can be.
   path_lengths: Range<usize>,
 }
 
@@ -707,8 +722,7 @@ mod ffi {
   #[derive(Debug)]
   pub(super) struct Queue(NonNull<c_void>);
 
-  // SAFETY: a dispatch queue may be used from any thread. The pointer is a reference that GCD
-  // counts, and `Drop` gives it back once.
+  // SAFETY: a dispatch queue may be used from any thread, and `Drop` releases it once.
   unsafe impl Send for Queue {}
 
   impl Queue {
@@ -744,8 +758,8 @@ mod ffi {
   #[derive(Debug)]
   pub(super) struct Stream(NonNull<c_void>);
 
-  // SAFETY: the functions of a stream may be called from any thread. The watcher thread calls
-  // them, and a retired stream is dropped on its dispatch queue.
+  // SAFETY: the functions of a stream may be called from any thread; a retired stream is
+  // dropped on its dispatch queue.
   unsafe impl Send for Stream {}
 
   impl Stream {
@@ -763,9 +777,8 @@ mod ffi {
         release: Some(release),
         copy_description: None,
       };
-      // SAFETY: `context` and `array` are whole values that the call reads and copies.
-      // `callback` has the signature of a stream callback, and `info` is the pointer of an
-      // `Arc<Sink<Raw>>` that `retain` and `release` count.
+      // SAFETY: `context` and `array` are whole values that the call copies, and `info` is an
+      // `Arc<Sink<Raw>>` pointer that `retain` and `release` count.
       let stream = unsafe {
         FSEventStreamCreate(
           ptr::null(),
@@ -797,8 +810,7 @@ mod ffi {
 
   impl Drop for Stream {
     fn drop(&mut self) {
-      // SAFETY: `start` started the stream on a queue. Stop, invalidate, release, in this order
-      // and once, is how a stream ends.
+      // SAFETY: the stream runs on a queue, and this is its one stop, invalidate and release.
       unsafe {
         FSEventStreamStop(self.0.as_ptr());
         FSEventStreamInvalidate(self.0.as_ptr());
@@ -807,8 +819,11 @@ mod ffi {
     }
   }
 
+  /// The open files of the guards of every watcher in the process.
   static GUARD_FDS: AtomicUsize = AtomicUsize::new(0);
 
+  /// One open file for each directory at and above a stream path, so that the kernel tells
+  /// at once when one of them is renamed or removed.
   #[derive(Debug)]
   pub(super) struct Guard {
     queue: OwnedFd,
@@ -849,6 +864,7 @@ mod ffi {
     pub(super) fn hold(&mut self, path: &Path) -> io::Result<()> {
       let chain = || path.ancestors().filter(|dir| dir.parent().is_some());
       let missing: Vec<&Path> = chain().filter(|dir| !self.dirs.contains_key(*dir)).collect();
+      // The guard takes at most half of what the process may open.
       // SAFETY: the call takes no memory of ours.
       let room = usize::try_from(unsafe { getdtablesize() }).unwrap_or(0) / 2;
       let first_id = self.last_id + 1;
@@ -927,8 +943,7 @@ mod ffi {
     let udata = ptr::without_provenance_mut(id);
     let change = KEvent { ident, filter, flags, fflags: notes, data: 0, udata };
     let nothing = ptr::null_mut();
-    // SAFETY: `change` is one whole `kevent`. The call reads that one and writes none, and a
-    // null timeout means no wait.
+    // SAFETY: `change` is one whole `kevent`; the call reads it, writes none, and does not wait.
     let done = unsafe { kevent(queue.as_raw_fd(), &raw const change, 1, nothing, 0, ptr::null()) };
     if done < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
   }
@@ -967,8 +982,7 @@ mod ffi {
     flags: *const u32,
     _ids: *const u64,
   ) {
-    // SAFETY: `info` is the pointer of the `Arc<Sink<Raw>>` given to `FSEventStreamCreate`,
-    // which `retain` keeps alive as long as the stream lives.
+    // SAFETY: `info` is the `Arc<Sink<Raw>>` pointer of the stream, alive while the stream is.
     let sink = unsafe { &*info.cast::<Sink<Raw>>() };
     let paths = paths.cast::<*const c_char>();
     let mut raw = Raw {
@@ -978,8 +992,7 @@ mod ffi {
       lost: Vec::new(),
     };
     for index in 0..count {
-      // SAFETY: FSEvents gives `count` C strings in `paths` and `count` flags, and `index` is
-      // below `count`.
+      // SAFETY: FSEvents gives `count` C strings and `count` flags, and `index` is below `count`.
       let (path, flags) = unsafe { (CStr::from_ptr(*paths.add(index)), *flags.add(index)) };
       raw.push(path.to_bytes(), flags);
     }
@@ -993,8 +1006,7 @@ mod ffi {
   }
 
   extern "C" fn release(info: *const c_void) {
-    // SAFETY: FSEvents calls this once for each `retain`, so the count stays above what
-    // `Streams` holds.
+    // SAFETY: FSEvents calls this once for each `retain`, and `Streams` holds a count of its own.
     unsafe { Arc::decrement_strong_count(info.cast::<Sink<Raw>>()) };
   }
 
@@ -1002,8 +1014,7 @@ mod ffi {
 
   impl Drop for Cf {
     fn drop(&mut self) {
-      // SAFETY: the object came from a `Create` call of Core Foundation, and this is its one
-      // release.
+      // SAFETY: the object came from a `Create` call, and this is its one release.
       unsafe { CFRelease(self.0.as_ptr()) };
     }
   }
@@ -1027,8 +1038,7 @@ mod ffi {
       .collect::<Option<Vec<Cf>>>()?;
     let values: Vec<CFTypeRef> =
       strings.iter().map(|string| string.0.as_ptr().cast_const()).collect();
-    // SAFETY: `values` holds `values.len()` object pointers, the array retains each of them, and
-    // the callbacks are the standard ones.
+    // SAFETY: `values` holds `values.len()` object pointers, and the array retains each of them.
     let array = unsafe {
       CFArrayCreate(
         ptr::null(),

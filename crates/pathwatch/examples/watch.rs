@@ -1,11 +1,9 @@
-//! Prints the events for the paths given on the command line.
+//! Prints the events for the paths given on the command line. `PATHWATCH_POLLING=1` polls
+//! instead of using the watch API of the OS.
 //!
 //! ```text
 //! cargo run -p pathwatch --example watch -- src package.json not-there-yet.json
 //! ```
-//!
-//! A path can be a file, a directory, or not exist yet. A relative path is taken from the
-//! current directory. Set `PATHWATCH_POLLING=1` to poll and not use the watch API of the OS.
 #![expect(
   clippy::print_stdout,
   clippy::print_stderr,
@@ -24,7 +22,7 @@ fn main() -> Result<(), pathwatch::Error> {
   }
 
   let config = Config::default().with_polling(env::var_os("PATHWATCH_POLLING").is_some());
-  // The handler runs on the thread of the watcher: it only passes each batch on.
+  // The handler runs on the watcher thread: it only passes the batch on.
   let (sender, batches) = mpsc::channel();
   let watcher = Watcher::with_config(config, move |result| {
     let _ = sender.send(result);

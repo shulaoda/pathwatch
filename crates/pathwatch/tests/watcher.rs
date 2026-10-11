@@ -21,7 +21,6 @@ use pathwatch::{
 };
 use tempfile::TempDir;
 
-/// How long a test waits for something that has to come.
 const PATIENCE: Duration = Duration::from_secs(30);
 
 type Results = Receiver<Result<Vec<Event>, Error>>;
@@ -35,7 +34,6 @@ fn quick() -> Options {
   }
 }
 
-/// The settings of the public API for a fast test that polls.
 fn quick_config() -> Config {
   Config::default()
     .with_polling(true)
@@ -48,7 +46,7 @@ struct Watch {
   results: Results,
   dir: TempDir,
   events: Vec<Event>,
-  /// Every event that `expect` took from the watcher, also the ones that it dropped.
+  /// Every event that `expect` took, also the ones it dropped.
   log: Vec<Event>,
 }
 
@@ -61,7 +59,6 @@ fn watch_in(dir: TempDir) -> Watch {
   let watcher = Watcher::with_backend(
     quick(),
     move |result| {
-      // The test may be gone already.
       let _ = sender.send(result);
     },
     PollBackend::new,
@@ -75,13 +72,12 @@ impl Watch {
     self.dir.path().join(rel)
   }
 
-  /// Waits for an event of this kind for this path. Events before it are dropped.
+  /// Waits for the event, and drops the ones before it.
   fn expect(&mut self, kind: EventKind, rel: &str) {
     self.expect_all(kind, &[rel]);
   }
 
-  /// Waits until an event of `kind` came for each of `rels`. They can come in any order and in
-  /// several batches.
+  /// Waits until each of `rels` had the event, in any order and any batches.
   fn expect_all(&mut self, kind: EventKind, rels: &[&str]) {
     let paths: Vec<PathBuf> = rels.iter().map(|rel| self.path(rel)).collect();
     let end = Instant::now() + PATIENCE;
@@ -97,8 +93,7 @@ impl Watch {
       match self.results.recv_timeout(end.saturating_duration_since(Instant::now())) {
         Ok(Ok(mut events)) => {
           assert!(!events.is_empty(), "a batch is never empty");
-          // The order of a batch is not promised. It is sorted here, so that no test depends
-          // on it.
+          // A batch has no promised order: sorted, so no test depends on it.
           events.sort_by(|a, b| a.path.cmp(&b.path));
           assert!(
             events.windows(2).all(|pair| pair[0].path < pair[1].path),
@@ -117,15 +112,14 @@ impl Watch {
 }
 
 impl Watch {
-  /// Forgets the events so far. Call it right after a call of the watcher: such a call returns
-  /// when the handler has got everything from before it.
+  /// Forgets the events so far. After a call of the watcher nothing from before it is on its way.
   fn forget(&mut self) {
     while self.results.try_recv().is_ok() {}
     self.events.clear();
     self.log.clear();
   }
 
-  /// No event came for this path since the start, or since the last `forget`.
+  /// No event for this path since the last `forget`.
   fn nothing_for(&self, rel: &str) {
     let path = self.path(rel);
     let found: Vec<&Event> = self.log.iter().filter(|event| event.path == path).collect();
@@ -159,9 +153,7 @@ fn with_handler(
   slot
 }
 
-/// A backend that says it watches everything and never gives a hint. The test takes its sink
-/// and plays the backend thread. A raw notification with no bytes holds the watcher thread
-/// until the test lets it go.
+/// Watches everything, hints nothing. A raw notification with no bytes holds the watcher thread.
 struct Silent {
   translated: Arc<AtomicUsize>,
   entered: Sender<()>,
@@ -246,7 +238,6 @@ fn unwatch_takes_a_watch_back() {
   let mut w = watch();
   w.watcher.watch_all([w.path("a.txt"), w.path("b.txt")]).unwrap();
   w.watcher.unwatch(w.path("a.txt")).unwrap();
-  // A path that is not watched is skipped.
   w.watcher.unwatch_all([w.path("never.txt"), w.path("a.txt")]).unwrap();
 
   fs::write(w.path("a.txt"), "1").unwrap();
@@ -257,7 +248,7 @@ fn unwatch_takes_a_watch_back() {
   w.nothing_for("a.txt");
 }
 
-/// A relative path is joined to the current directory, and the event path is absolute.
+/// The event path is absolute: joined to the current directory.
 #[test]
 fn a_relative_path() {
   let here = env::current_dir().unwrap();
@@ -289,8 +280,7 @@ fn dot_dot_is_folded() {
   fs::write(w.path("sub/a.txt"), "1").unwrap();
   w.expect(EventKind::Create, "sub/a.txt");
 
-  // The folded path is the watched one: watching it again does nothing, and `unwatch` finds
-  // it under every spelling.
+  // The folded path is the watched one, under every spelling.
   w.watcher.watch(w.path("sub/a.txt")).unwrap();
   w.watcher.unwatch(w.path("sub/x/../a.txt")).unwrap();
   w.watcher.watch(w.path("b.txt")).unwrap();
@@ -305,7 +295,6 @@ fn dot_dot_is_folded() {
   assert_eq!(invalid(w.watcher.watch(&above)), above);
 }
 
-/// A path that cannot be used does not stop the others, and the call names the first one.
 #[test]
 fn one_bad_path_among_good_ones() {
   let mut w = watch();
@@ -331,7 +320,6 @@ fn one_bad_path_among_good_ones() {
   fs::write(w.path("b.txt"), "22").unwrap();
   fs::write(w.path("c.txt"), "1").unwrap();
   w.expect(EventKind::Create, "c.txt");
-  // The good paths were unwatched.
   w.nothing_for("a.txt");
   w.nothing_for("b.txt");
 }
@@ -356,7 +344,7 @@ fn close_twice() {
   let w = watch();
   w.watcher.watch(w.path("a.txt")).unwrap();
   w.watcher.close();
-  // The first `close` waited for the thread, and with the thread the handler is gone.
+  // `close` waited for the thread, so the handler is gone.
   assert!(matches!(w.results.try_recv(), Err(TryRecvError::Disconnected)));
   w.watcher.close();
   w.watcher.close();
@@ -393,8 +381,7 @@ fn close_inside_the_handler() {
   fs::write(dir.path().join("a.txt"), "1").unwrap();
 
   closed(answers.recv_timeout(PATIENCE).expect("the handler ran"));
-  // The handler is not called again, and the thread ends: the handler, and with it the
-  // sender, is dropped.
+  // The thread ends and drops the handler with its sender.
   fs::write(dir.path().join("c.txt"), "1").unwrap();
   assert!(matches!(answers.recv_timeout(PATIENCE), Err(RecvTimeoutError::Disconnected)));
   closed(watcher.watch(dir.path().join("d.txt")));
@@ -402,8 +389,7 @@ fn close_inside_the_handler() {
   watcher.close();
 }
 
-/// Inside the handler `watch` and `unwatch` do not wait. They take effect when the handler
-/// has returned.
+/// They do not wait: they take effect when the handler has returned.
 #[test]
 fn watch_and_unwatch_inside_the_handler() {
   let dir = tempfile::tempdir().unwrap();
@@ -466,9 +452,7 @@ fn watch_fails_when_the_thread_is_gone() {
   watcher.close();
 }
 
-/// A backend that cannot start does not fail the watcher: the handler is told once, with what
-/// happened and what the backend said, and the watcher polls. Only the error that a backend
-/// made for a limit counts as one: an error of the OS of any kind does not.
+/// Only the error that a backend made for a limit counts as one, not any error of the OS.
 #[test]
 fn a_backend_that_cannot_start_is_replaced_by_polling() {
   let cases = [
@@ -511,7 +495,6 @@ fn a_backend_that_cannot_start_is_replaced_by_polling() {
   }
 }
 
-/// One watcher, used by two threads at once.
 #[test]
 fn a_watcher_shared_by_two_threads() {
   fn shared<T: Send + Sync>() {}
@@ -554,7 +537,7 @@ fn a_watcher_shared_by_two_threads() {
   watcher.close();
 }
 
-/// A poll interval of zero would make the watcher thread spin. It is taken as 1 ms.
+/// It is taken as 1 ms: zero would make the watcher thread spin.
 #[test]
 fn a_poll_interval_of_zero() {
   let config = Config::default().with_polling(true).with_poll_interval(Duration::ZERO);
@@ -574,10 +557,7 @@ fn a_poll_interval_of_zero() {
   assert_eq!(batch.unwrap(), [Event { path, kind: EventKind::Create }]);
 }
 
-/// The queue is bounded by the bytes that wait, not by a count. When too many bytes wait,
-/// signals are dropped, the backend thread is not held up, and the engine checks everything.
-/// The word that the backend died is not lost with them, and the dead backend is dropped at
-/// once: what it holds of the OS does not wait for the end of the watcher.
+/// Dropped signals make the engine check everything; the word that the backend died is kept.
 #[test]
 fn the_queue_is_bounded_by_bytes() {
   const MIB: usize = 1 << 20;
@@ -623,12 +603,12 @@ fn the_queue_is_bounded_by_bytes() {
     }
   };
 
-  // Many small notifications are far below the bound: every one of them is translated.
+  // Far below the bound: every one is translated.
   hold(&|| flood(100_000, 1));
   wait_for(100_000);
 
-  // 20 MiB are above it. Nothing will ever hint at this file, and the backend says it watches
-  // the directory: only the scan of everything after the overflow can find it.
+  // Above the bound. Nothing will ever hint at this file: only the scan after the overflow
+  // finds it.
   hold(&|| {
     fs::write(dir.path().join("a.txt"), "1").unwrap();
     flood(20, MIB);
@@ -656,10 +636,6 @@ fn the_queue_is_bounded_by_bytes() {
   drop(watcher);
 }
 
-/// A signal that is dropped while the watcher thread sleeps wakes it up. Nothing else is sent
-/// here, and the next poll is an hour away (a directory above the watched one can be polled:
-/// the temporary directory of macOS lies behind a link), so the thread has no other reason to
-/// wake.
 #[test]
 fn a_dropped_signal_wakes_the_thread() {
   let dir = tempfile::tempdir().unwrap();
@@ -669,6 +645,7 @@ fn a_dropped_signal_wakes_the_thread() {
   let (sink_out, sink_in) = mpsc::channel::<Sink<Vec<u8>>>();
   let backend = Silent { translated: Arc::default(), entered, gate };
   let watcher = Watcher::with_backend(
+    // Nothing else wakes the thread: the next poll is an hour away.
     Options { poll_interval: Duration::from_secs(3600), ..quick() },
     move |result: Result<Vec<Event>, Error>| {
       let _ = sender.send(result);
@@ -682,8 +659,7 @@ fn a_dropped_signal_wakes_the_thread() {
   let sink = sink_in.recv().unwrap();
   watcher.watch(dir.path()).unwrap();
 
-  // No hint will ever name this file, and the backend says it watches the directory: only the
-  // scan of everything after the overflow can find it.
+  // Nothing will ever hint at this file: only the scan after the overflow finds it.
   let path = dir.path().join("a.txt");
   fs::write(&path, "1").unwrap();
   // One notification that is bigger than the whole queue: it is dropped.

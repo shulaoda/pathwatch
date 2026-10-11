@@ -1,3 +1,5 @@
+//! The backend that watches nothing: the engine polls every directory.
+
 use std::{convert::Infallible, io, path::Path};
 
 use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want};

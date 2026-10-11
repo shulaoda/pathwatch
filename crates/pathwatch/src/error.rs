@@ -3,11 +3,8 @@ use std::{
   path::{Path, PathBuf},
 };
 
-/// What went wrong: a path that cannot be used, a watch that the OS refused, a read of the disk
-/// that failed, or a call on a closed watcher.
-///
-/// The handler gets one error of a kind for a batch, with one path that shows the problem. The
-/// watcher keeps running after every error that the handler gets.
+/// What went wrong. The handler gets one error of a kind for a batch, with one path that shows
+/// the problem, and the watcher keeps running after every error.
 #[derive(Debug)]
 pub struct Error {
   kind: ErrorKind,

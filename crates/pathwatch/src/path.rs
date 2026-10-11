@@ -9,12 +9,9 @@ use std::{
 
 /// The registered form of `path`: absolute, no `.` or `..`, no repeated or trailing separator.
 ///
-/// `None` when the path is relative, has a NUL, or names a top directory (`/`, `C:\`,
-/// `\\server\share\`), which has no parent to watch it from; also when `..` goes above the top
-/// directory, and when one of its names is longer than `MAX_NAME`.
-///
-/// A path that is in this form already is given back as it is: nothing is copied. So a path can
-/// be cleaned at every door (the watcher, then the engine) and the work is done once.
+/// `None` when the path is relative, has a NUL, names a top directory (`/`, `C:\`,
+/// `\\server\share\`), goes above it with `..`, or has a name longer than `MAX_NAME`. A path
+/// that is clean already is given back as it is: no copy.
 pub fn normalize(path: &Path) -> Option<Cow<'_, Path>> {
   #[cfg(unix)]
   {
@@ -49,10 +46,8 @@ pub fn normalize(path: &Path) -> Option<Cow<'_, Path>> {
   }
 }
 
-/// The longest name that can be watched, in units. No disk takes a name of more than 255 units.
-///
-/// The tree keeps the length of a name in 16 bits, as bytes. A unit is at most 3 bytes there,
-/// and the name of a top directory can be two names (`\\server\share\`): both fit with this limit.
+/// The longest name that can be watched, in units. No disk takes more than 255, and the tree
+/// keeps the length of a name in 16 bits of bytes: 3 bytes a unit, two names for a share.
 pub(crate) const MAX_NAME: usize = 10_000;
 
 /// Splits a clean path at its top directory: `/a/b` gives `/` and `a/b`.
@@ -67,8 +62,8 @@ pub(crate) fn split_top(path: &Path) -> Option<(&OsStr, &Path)> {
   Some((top.as_os_str(), rest))
 }
 
-/// One unit of a path text: a byte on Unix, a UTF-16 unit on Windows. Both rule sets are generic
-/// over it so that the Windows rules can be tested on every system.
+/// A byte on Unix, a UTF-16 unit on Windows. The rules are generic, so that the Windows rules
+/// are tested on every system.
 pub(crate) trait Unit: Copy + Into<u32> + From<u8> {}
 
 impl<U: Copy + Into<u32> + From<u8>> Unit for U {}
@@ -226,8 +221,7 @@ fn push_names<U: Unit>(
   (clean.len() > top).then_some(())
 }
 
-/// Whether `text`, what comes after a top directory, is clean: names with one separator between
-/// two of them, and nothing else.
+/// Whether what comes after a top directory is clean: names with one separator between them.
 #[cfg(any(unix, windows, test))]
 fn names_are_clean<U: Unit>(text: &[U], separator: impl Fn(U) -> bool) -> bool {
   text.split(|&unit| separator(unit)).all(|name| matches!(part_of(name), Part::Name))
@@ -258,7 +252,6 @@ fn has_nul<U: Unit>(name: &[U]) -> bool {
   name.iter().any(|&unit| is(unit, 0))
 }
 
-/// Whether `unit` is the ASCII character `byte`.
 fn is<U: Unit>(unit: U, byte: u8) -> bool {
   unit.into() == u32::from(byte)
 }
@@ -368,8 +361,7 @@ mod tests {
     }
   }
 
-  /// The tree keeps the length of a name in 16 bits. The name of a top directory is its whole
-  /// path, and one UTF-16 unit can be three bytes.
+  /// The length of a name fits in 16 bits as bytes, also for a top directory of two UTF-16 names.
   #[test]
   fn a_name_has_a_longest_length() {
     assert!(u16::try_from(2 * 3 * MAX_NAME + 4).is_ok());

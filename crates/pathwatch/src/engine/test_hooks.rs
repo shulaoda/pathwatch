@@ -10,16 +10,13 @@ use crate::{
 };
 
 impl<B: Backend, F: Fs> Engine<B, F> {
-  /// Every file the handler believes to exist: what it was told about, and what was there
-  /// when a path was watched. A file whose `Delete` waits for the delete delay is still in it.
+  /// Every file the handler believes to exist, a file whose `Delete` waits too.
   pub fn view(&self) -> BTreeSet<PathBuf> {
     let told = self.tree.nodes().filter(|(_, node)| node.told());
     told.map(|(key, _)| self.tree.path(key)).collect()
   }
 
-  /// Every file the tree holds, with the fingerprint that its last check stored. A test
-  /// compares each one with the disk: a file that was looked at too early, and never again,
-  /// shows up here and nowhere else.
+  /// Every file the tree holds, with its stored fingerprint, for a test to compare with the disk.
   pub fn fingerprints(&self) -> Vec<(PathBuf, Fingerprint)> {
     let stored = |(key, node): (DirKey, &Node)| match node.kind {
       Kind::File(fingerprint) => Some((self.tree.path(key), fingerprint)),
@@ -28,8 +25,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.nodes().filter_map(stored).collect()
   }
 
-  /// The paths of the pending deletes: every file the handler believes in at or below a held
-  /// node. Its `Delete` waits for the second look.
+  /// The files whose `Delete` waits for a second look.
   pub fn pending_deletes(&self) -> BTreeSet<PathBuf> {
     let waits = |key: DirKey, node: &Node| node.told() && (node.is_held() || self.tree.frozen(key));
     let pending = self.tree.nodes().filter(|(key, node)| waits(*key, node));
@@ -58,11 +54,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// Checks `Node::is_unlisted` and `Spelling::Strict` against the disk, when the tree has caught
-  /// up with it. Both are answers of the disk that the tree keeps. The first says, for a
-  /// registered name in a complete node whose entry is on the disk, whether the disk has the
-  /// entry under another name. The second says that a directory tells two spellings of a
-  /// name apart: then no entry of it is found in the other case of its letters.
+  /// Checks the kept answers of the disk, `Node::is_unlisted` and `Spelling::Strict`, against the
+  /// disk once the tree has caught up.
   pub fn check_spellings(&self) -> Result<(), String> {
     for (key, node) in self.tree.nodes() {
       if node.dir().is_some_and(|dir| dir.spelling == Spelling::Strict) {
@@ -104,8 +97,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     Ok(())
   }
 
-  /// Whether the node `key` has a directory that has to track every entry, but does not yet
-  /// in the tree: the look that makes it complete is still to come.
+  /// Whether a directory is to be complete, and the look that makes it so is still to come.
   fn is_behind(&self, key: DirKey) -> bool {
     matches!(self.tree[key].kind, Kind::Dir(dir) if !dir.complete) && self.tracks_every_entry(key)
   }
@@ -115,10 +107,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     iter::successors(Some(key), |&at| self.tree.parent(at)).any(|at| self.tree[at].is_marked())
   }
 
-  /// Checks the invariants of the tree and the bookkeeping around them, between two calls of
-  /// the engine. The error names the first one that does not hold.
-  ///
-  /// "Has" is what the tree keeps at a node, also while the node is held.
+  /// Checks the invariants of design.md 5.1 between two calls of the engine. The error names the
+  /// first one that does not hold.
   pub fn check_invariants(&self) -> Result<(), String> {
     // 1. Every node but the root has a parent that knows it.
     self.tree.check_links()?;
@@ -139,16 +129,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if !matches!(node.kind, Kind::Missing) && !parent_is_dir {
         return fail("the tree has it below a node that is no directory");
       }
-      // 3. What the handler knows is what the tree has as a file. A change that waits for
-      // its event, and the bits of the baseline rule, live inside one call.
+      // 3. The handler knows exactly the files the tree has, and the bits of one call are cleared.
       if node.told() != matches!(node.kind, Kind::File(_)) {
         return fail("the handler and the tree do not agree about a file here");
       }
       if node.changed() || node.baseline() || node.added() != Added::No {
         return fail("an event, or the baseline, is left over from a call");
       }
-      // 4. A held node has a file or a directory, and something brings its second look: the
-      // queue, or a mark that waits for the disk to answer.
+      // 4. A held node has something, and its second look comes: by the queue, or by a mark.
       if node.is_held() {
         if matches!(node.kind, Kind::Missing) {
           return fail("is held, and the tree has nothing there");
@@ -162,23 +150,20 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         }
       }
       match &node.kind {
-        // 5. A node with nothing at its path is kept only while a watched path or a mark
-        // needs it.
+        // 5. A node with nothing at its path is kept only for a watched path or a mark.
         Kind::Missing => {
           if !node.is_registered() && !node.is_marked() {
             return fail("nothing is at the path, and nothing needs the node");
           }
         }
         Kind::File(_) => {
-          // 5. Where the node above is partial, also a file that it will track when it has
-          // caught up with the rule.
+          // 5. A partial node knows a file only if the rule makes it complete.
           if !node.is_path() && !self.is_inside(key) {
             return fail("a partial node knows a file that is no watched path");
           }
         }
         Kind::Dir(dir) => {
-          // `hold` takes the watch away. The backend is asked again when the directory is
-          // back, or when the directory of the held node above it is.
+          // `hold` takes the watch away; the backend is asked again when the directory is back.
           if node.is_held() && (dir.asked.is_some() || dir.watch != Watch::Polled) {
             return fail("is held, and the backend still has its watch");
           }
@@ -200,18 +185,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           }
         }
       }
-      // 6. A directory that was asked for names only holds no registered name with a file or
-      // nothing at it. Nothing is known about what is below a held node. And a name on the
-      // way can be without its first check while the disk gives no answer: then a mark waits
-      // on the way, and the check that it brings asks the directory for more.
+      // 6. A directory asked for names only holds no registered name without a directory, unless
+      // it is frozen or a mark waits above it.
       let frozen = self.tree.frozen(key);
       let waits = self.mark_waits_above(key);
       let names_only = self.tree[parent].dir().is_some_and(|dir| dir.asked == Some(Want::Names));
       if names_only && node.is_registered() && !node.is_dir() && !frozen && !waits {
         return fail("is a registered name with no directory at it, and its directory tells names");
       }
-      // 7. A directory that relies on a watch above has one there. While the disk gives no
-      // answer it can be without: then a mark waits on the way, and its check asks again.
+      // 7. A directory that relies on a watch above has one, unless it is frozen or a mark waits
+      // above it.
       let covered = matches!(self.tree[parent].watch(), Watch::WatchedTree | Watch::FromAbove);
       if node.watch() == Watch::FromAbove && !covered && !frozen && !waits {
         return fail("relies on a watch above, and there is none");

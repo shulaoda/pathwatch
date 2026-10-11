@@ -1,6 +1,5 @@
-//! The `Backend` trait: what the engine asks of an OS watch API, and the types that go between
-//! the two. The twelve rules that a backend keeps are in `docs/design.md`, section 6; the engine
-//! names a rule by its number.
+//! The `Backend` trait: what the engine asks of an OS watch API. The rules for a backend are in
+//! `docs/design.md`, section 6.
 
 use std::{error, fmt, io, path::Path, sync::Arc};
 
@@ -31,8 +30,8 @@ pub trait Backend: Send + 'static {
   }
 }
 
-/// The name of a directory between the engine and a backend: the slot of its node in the tree,
-/// and a generation that tells it from an earlier node in the same slot.
+/// The name of a directory between the engine and a backend: its slot in the tree, and a
+/// generation that tells it from an earlier node in the slot.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct DirKey {
   index: u32,

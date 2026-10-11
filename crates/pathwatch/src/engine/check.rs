@@ -1,5 +1,4 @@
-//! One entry: `check` reads what is at a path, compares it with what the tree had there, and
-//! changes the node. The `match` in `apply` is the heart of the engine.
+//! One entry: `check` reads what is at a path and brings the node in line with it.
 
 use std::{
   ffi::{OsStr, OsString},
@@ -20,11 +19,9 @@ use crate::{
   tree::{Added, Content, Depth, Fingerprint, Kind, Mark, Spelling, Watch, nanos},
 };
 
-/// How long a file is young: two writes inside this time can leave the same modification time.
-/// Most file systems count in steps far below 20 ms.
+/// A file is young this long: two writes inside it can leave one modification time.
 const YOUNG: Duration = Duration::from_millis(20);
-/// The same for a file system that counts in whole seconds (FAT: two of them), and for a file
-/// that only the poll looks at.
+/// The same on a file system that counts in whole seconds (FAT: two), and under the poll.
 const YOUNG_COARSE: Duration = Duration::from_secs(2);
 /// A bigger file is not hashed.
 const HASH_LIMIT: u64 = 16 * 1024 * 1024;
@@ -32,16 +29,13 @@ const HASH_LIMIT: u64 = 16 * 1024 * 1024;
 /// What is at a path, after the rules of what counts.
 pub(super) enum Found {
   Missing,
-  /// The disk has the entry under this other spelling of the name: the directory has no
-  /// entry with the name of the node. A second look would say the same, so what the tree has
-  /// here is gone at once.
+  /// The disk has the entry under another spelling: it is gone under this name, at once.
   OtherSpelling(OsString),
   File(FileType, Fingerprint),
   Dir {
     id: DirId,
     complete: bool,
-    /// The name is a link now and was none at the last check, or the other way around, or the
-    /// link leads to another real path. The directory can be the same one all the same.
+    /// The link at the name changed, or came, or went.
     relinked: bool,
   },
   /// The disk did not answer, or the look has to wait. The tree stays as it is.
@@ -51,15 +45,15 @@ pub(super) enum Found {
 /// What a listing of the directory said about a node whose check runs in a scan.
 #[derive(Clone, Copy)]
 pub(super) enum Listed {
-  /// Nothing: the check comes from a mark, or the directory was not listed.
+  /// The check comes from a mark, or the directory was not listed.
   NotAsked,
-  /// The listing named the entry, with its kind if a listing gives one.
+  /// Named, with its kind if the listing gives one.
   Named(Option<FileType>),
-  /// The listing named the entry, a regular file, with all that a look at it reads.
+  /// Named, a regular file with all that a look reads.
   File(Fingerprint),
-  /// The listing named the entry, a directory that is no link, with its identity.
+  /// Named, a directory that is no link.
   Dir(DirId),
-  /// The whole directory was listed, and the entry was not named.
+  /// The whole directory was listed, and the entry was not in it.
   NotNamed,
 }
 
@@ -90,11 +84,8 @@ enum Had {
 }
 
 impl<B: Backend, F: Fs> Engine<B, F> {
-  /// Brings the tree in line with the disk for the node `key`. `path` is the path of the
-  /// directory that holds it, and `listed` is what a listing of that directory said about it.
-  ///
-  /// It never goes into a directory: a scan is queued for that. It makes no event: a node
-  /// that changed is put on the list `touched`, and `finish` reads it.
+  /// Brings the node in line with the disk. `path` holds the directory of the node and is left so;
+  /// `listed` is what a listing of it said.
   pub(super) fn check(&mut self, key: DirKey, path: &mut PathBuf, listed: Listed, why: Mark) {
     let Some(parent) = self.tree.parent(key) else { return };
     let Some(asked) = self.tree[parent].dir().map(|dir| dir.asked) else {
@@ -111,11 +102,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
     path.push(self.tree.name(key));
     let found = self.read_entry(parent, key, path, listed);
-    // A registered name with a file or nothing at it is served by the watch of the directory
-    // above: that one is its watch target. If the filter ignores the target, the watched
-    // paths at the name and below it are dropped when the flush ends. The target is asked
-    // from the disk: this look can come before the one that finds the directory gone, and
-    // then the target is a directory further up.
+    // An ignored watch target drops the paths below the name at the end of the flush, if the
+    // directory is still there (design.md 5.11).
     if registered
       && matches!(found, Found::Missing | Found::File(..))
       && self.is_ignored_target(parent)
@@ -131,12 +119,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     };
     self.apply(key, path, found, had, why);
 
-    // A registered name with a file or nothing at it makes its directory want the contents: a
-    // file can come there, or a directory with all that is below it at once.
+    // A registered name with no directory at it makes its directory want the contents.
     let wants_more = below_names_only && !self.tree[key].is_dir();
-    // The node goes if nothing is at it and nothing needs it. A marked node that can be the
-    // same name was unsure of its spelling because the tree had this one too
-    // (`Tree::has_twin`): its look must not come after this node is gone.
+    // The twins of a node that goes are looked at now: their looks were unsure of the spelling
+    // because of this node (`Tree::has_twin`).
     let can_go = !registered && matches!(self.tree[key].kind, Kind::Missing);
     let twins = if can_go { self.tree.marked_twins(key) } else { Vec::new() };
     self.tree.prune(key);
@@ -146,12 +132,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       path.clear();
     }
     if wants_more && !self.is_ignored_target(parent) {
-      // This queues a scan of the directory: the path is looked at once more when the wider
-      // watch is live.
+      // The ask queues a scan: the name is looked at again when the wider watch is live.
       self.ask(parent, path, Want::Contents);
     }
-    // The entry is on the disk under another name. A node that the tree has for that name has
-    // a look of its own. If there is none, nothing else brings one in this flush.
+    // The entry is on the disk under another name that the tree has no node for yet.
     if let Some(name) = on_disk
       && self.tree.child(parent, &name).is_none()
     {
@@ -165,15 +149,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// What was found on disk against what the tree had: one arm for each case. `path` is the
-  /// path of the node `key`, and `why` is the mark that asked for the check.
+  /// One arm for each case of what was found against what the tree had: the table in
+  /// design.md 5.4.
   fn apply(&mut self, key: DirKey, path: &mut PathBuf, found: Found, had: Had, why: Mark) {
     match (found, had) {
-      // The disk did not answer. Nothing is done, and the same mark waits for the next flush.
       (Found::Unknown, _) => self.tree.mark(key, why),
 
       (Found::Missing, Had::Nothing) => {}
-      // Held first; gone for good when the second look finds nothing too.
       (Found::Missing, Had::File | Had::Dir { .. }) => self.missing(key),
       (Found::OtherSpelling(_), _) => self.gone(key),
 
@@ -210,24 +192,22 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         if complete && !was_complete {
           self.make_complete(key, relinked);
         } else if was_complete && !complete && self.tree[key].is_unlisted() {
-          // The directory above lists the entry under another name now. Only what a watched
-          // path below covers stays, and the files that were its entries are gone.
+          // The directory above lists it under another name now: only what a watched path covers
+          // stays.
           self.uncover(key, true, false);
         } else if complete && relinked && self.tree[key].added() == Added::Registered {
-          // The running `watch` follows this link for the first time: what is behind it is
-          // its baseline. (`register` put the node on the list `touched`.)
+          // The running `watch` follows this link for the first time: what is behind it is its
+          // baseline.
           self.tree[key].set_baseline(true);
         }
-        // Watch it again and scan it deep when nothing tells what happened in it meanwhile:
-        // it was away (held), it is another directory, or its link changed.
+        // Scan deep when nothing tells what happened in it meanwhile.
         let moved = was_held || id != old || relinked;
         self.still_there(key, path, why.deep || moved);
       }
     }
   }
 
-  /// A path above became a watched path: from now on the partial node `key` tracks every
-  /// entry of its directory.
+  /// The partial node tracks every entry of its directory from now on.
   fn make_complete(&mut self, key: DirKey, relinked: bool) {
     let baseline = self.is_baseline_dir(key, relinked);
     let node = &mut self.tree[key];
@@ -239,8 +219,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.queue_scan(key, Depth::Shallow);
   }
 
-  /// Reads what is at `path`, the path of the node `key` in the directory `parent`, and applies
-  /// what counts: an entry that no watched path covers, or that the filter ignores, is missing.
+  /// Reads what is at the node and applies what counts: an entry that no watched path covers, or
+  /// that the filter ignores, is missing.
   fn read_entry(&mut self, parent: DirKey, key: DirKey, path: &Path, listed: Listed) -> Found {
     let node = &self.tree[key];
     let (registered, is_ancestor, is_path) =
@@ -250,8 +230,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
     if !registered {
       if !in_complete {
-        // No watched path can see the entry. Or the directory is to be complete and the tree
-        // is behind: then the look that makes it complete comes first, and this one waits.
+        // Unknown while the look that makes the directory complete is still to come.
         return if self.tracks_every_entry(parent) { Found::Unknown } else { Found::Missing };
       }
       // Asked before the `lstat`, so that an ignored entry costs no system call.
@@ -266,23 +245,19 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
     }
 
-    // In a directory that was proved strict, only a second name in another case of its
-    // letters puts the proof in doubt: one that the tree has now, or one that it had when
-    // this look was asked for (`check` gives `NotNamed` then).
+    // In a strict directory only a twin in another case puts the proof in doubt.
     let unsure = in_complete
       && if self.tree.is_loose(parent) {
         self.spelling_is_unsure(key, listed)
       } else {
         self.tree.has_case_twin(key) || matches!(listed, Listed::NotNamed)
       };
-    // The listing told all of the file, and nothing else is to ask about its name.
     if let Listed::File(file) = listed
       && !registered
       && !unsure
     {
       return Found::File(FileType::File, file);
     }
-    // The same for a directory. The filter was asked above, and it does not ignore it.
     if let Listed::Dir(id) = listed
       && !registered
       && !unsure
@@ -293,9 +268,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       Ok(meta) => meta,
       Err(error) => return self.disk_error(parent, path, error),
     };
-    // A registered name is the path that its caller gave. It is also an entry of the complete
-    // directory above only if that directory lists it under this very name. That is asked
-    // about the entry itself, so before a link is followed.
+    // A registered name is an entry of the directory above only under this very name: asked
+    // before a link is followed.
     let mut other = None;
     let mut relinked = false;
     if registered {
@@ -306,7 +280,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         };
       }
       self.tree[key].set_unlisted(other.is_some());
-      // Only a registered node is followed. Nothing watches a link, so every poll checks it.
+      // Only a registered node is followed.
       let link = (meta.kind == FileType::Symlink).then(|| self.real_place(path));
       let old = self.tree.link(key);
       relinked = old != link;
@@ -317,8 +291,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           Err(error) => {
             let found = self.disk_error(parent, path, error);
             if matches!(found, Found::Unknown) {
-              // No answer: the tree stays as it is, the link too. The next look must still
-              // see that the link changed, or a watch by path is never made again.
+              // No answer: the stored link stays, or a watch by path is never made again.
               self.tree.set_link(key, old);
             }
             return match found {
@@ -342,8 +315,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       EntryKind::File if visible => Found::File(meta.kind, Fingerprint::of(&meta)),
       _ => return other.map_or(Found::Missing, Found::OtherSpelling),
     };
-    // A name that is not registered is asked after the filter: an ignored entry costs no
-    // question.
+    // Asked after the filter: an ignored entry costs no question.
     if !registered && unsure {
       match self.other_spelling(parent, key, path, &meta, is_new) {
         Ok(None) => {}
@@ -354,17 +326,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     found
   }
 
-  /// The name that the disk has for the entry at `path`, when it is not the name of the node
-  /// `key`. `meta` is what `lstat` found there. `is_new`: the tree had nothing at the name,
-  /// and no listing was asked about it.
-  ///
-  /// Where a directory can be strict, the look tries to find that out first
-  /// (`Tree::is_loose`). Only a look at a new name with no second spelling in the tree can:
-  /// such a name is there because something made it. A name that the tree knew can be there
-  /// for `lstat` alone. Measured on a folder that a Mac shares with Linux: after a rename
-  /// away through another spelling, `lstat` still finds the old name, and nothing in the
-  /// other case, as on a strict disk. When this look cannot tell and nothing is known, a
-  /// listing of the directory is asked (`ask_for_the_rule`).
+  /// The name the disk has for the entry, when it is another one than the node has. On a disk that
+  /// can be strict, a new name with no twin proves the rule first (design.md 5.2).
   fn other_spelling(
     &mut self,
     parent: DirKey,
@@ -396,9 +359,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     Ok(other)
   }
 
-  /// Keeps what a look found out about the directory `dir`. When a proof is taken back, the
-  /// looks before this one took the disk for a strict one: the names of the directory are
-  /// compared with one listing.
+  /// Keeps what a look found out. A proof of strict that is taken back costs one listing: the
+  /// looks before took the disk for a strict one.
   pub(super) fn set_spelling(&mut self, dir: DirKey, spelling: Spelling) {
     let Some(kept) = self.tree[dir].dir_mut() else { return };
     let was = mem::replace(&mut kept.spelling, spelling);
@@ -407,11 +369,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// Whether the directory of `path` tells two spellings of a name apart. `meta` is the entry
-  /// at `path`. The name of that entry is tried with the other case of its ASCII letters.
-  /// `Some(false)`: the same entry is there. `Some(true)`: no entry, or another one, and the
-  /// entry at `path` is still as it was at one more look (a change of the disk between the
-  /// looks must not pass for a proof). `None`: nothing could be tried, or the disk changed.
+  /// Whether the directory of `path` tells two spellings of a name apart, tried with the other
+  /// case of the ASCII letters of the entry. `Some(true)` needs a third look that finds the entry
+  /// as it was: a change between the looks is no proof. `None`: nothing could be tried.
   pub(super) fn tells_spellings_apart(&self, path: &Path, meta: &Meta) -> Option<bool> {
     let name = path.file_name().and_then(OsStr::to_str)?;
     if !name.bytes().any(|byte| byte.is_ascii_alphabetic()) {
@@ -431,20 +391,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.fs.lstat(path).is_ok_and(same).then_some(true)
   }
 
-  /// Whether the disk has to say how it spells the name of the node `key`, where `lstat` just
-  /// found an entry in a complete directory that counts as loose (`Tree::is_loose`).
-  ///
-  /// On such a disk `lstat` finds an entry under every spelling of its name, and the OS names
-  /// an entry that is gone as the caller spelled it. So an entry that was found is under this
-  /// name only if the disk spells it so, and that is not sure for a name that was no entry
-  /// of the directory at the last look (`Node::is_entry`), and while the tree has two
-  /// spellings of the name. A listing names an entry as the disk spells it: a node that it
-  /// named is sure, and one that it did not name is not. A name with one spelling only
-  /// (`Tree::has_spellings`) is always sure.
-  ///
-  /// An entry of the directory that is spelled in another way is not there under this name
-  /// (`Found::OtherSpelling`). A registered name is the path of its caller and is there all
-  /// the same, but then the directory above does not cover it (`Node::is_unlisted`).
+  /// Whether the disk has to say how it spells the name, in a complete directory that counts as
+  /// loose (design.md 5.2).
   fn spelling_is_unsure(&self, key: DirKey, listed: Listed) -> bool {
     let node = &self.tree[key];
     let was_entry = match listed {
@@ -460,17 +408,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.fs.real_path(path).map_or(0, |real| hash_of(&real))
   }
 
-  /// Turns an error of the disk into what it means for `path`. `owner` is the node that is
-  /// polled until the error is gone.
+  /// What an error of the disk means for the path. `owner` is polled until the error is gone.
   pub(super) fn disk_error(&mut self, owner: DirKey, path: &Path, error: io::Error) -> Found {
     if is_missing(&error) {
       return Found::Missing;
     }
     let (kind, found) = match error.kind() {
-      // The path cannot be read. For events it is missing.
       io::ErrorKind::PermissionDenied => (ErrorKind::PermissionDenied, Found::Missing),
-      // The same for a link loop. `io::ErrorKind::FilesystemLoop` cannot be named on stable
-      // Rust, and the error number differs between systems.
+      // A link loop. `FilesystemLoop` is not stable yet, and its number differs between systems.
       kind if format!("{kind:?}") == "FilesystemLoop" => (ErrorKind::Io, Found::Missing),
       _ => (ErrorKind::Io, Found::Unknown),
     };
@@ -494,19 +439,17 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     fingerprint: Fingerprint,
     written: bool,
   ) {
-    // What the tree has of the file. A held node still has it.
+    // A held node still has its file.
     let old = match self.tree[key].kind {
       Kind::File(old) => Some((old, self.tree.content(key))),
       _ => None,
     };
     let young = kind != FileType::Other && self.is_young(key, fingerprint.modified);
-    // What was kept to compare with, if the fingerprint is the same. It is compared one last
-    // time when the file is not young any more.
+    // Compared when the fingerprint is the same, and one last time when the file is old.
     let kept = old.and_then(|(old, content)| content.filter(|_| old == fingerprint));
     let compare = matches!(kept, Some(Content::Hash(_)));
-    // Where an OS watch tells about writes, the number that the disk keeps for the file
-    // stands in for the hash, and the file is not opened. Not where the file is only polled:
-    // the number also changes with what is no write, and there nothing else tells.
+    // The version of the disk stands in for the hash where an OS watch reports writes. Not
+    // under the poll: the version also moves with what is no write.
     let asks_version = kind == FileType::File
       && (young || matches!(kept, Some(Content::Version(_))))
       && !self.only_polled(key);
@@ -514,19 +457,15 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let hash = if (young && version.is_none()) || compare {
       match self.content_hash(path, kind, fingerprint.size) {
         Ok(hash) => hash,
-        // The entry went away after the `lstat`, or it is of another kind now. This check
-        // says nothing, and the next flush looks again.
+        // Gone after the `lstat`: this check says nothing, and the next flush looks again.
         Err(error) if is_missing(&error) => return self.tree.mark(key, Mark::default()),
-        // A file that cannot be read has nothing to compare.
         Err(_) => None,
       }
     } else {
       None
     };
-    // The file is young, nothing of it can be compared, and a poll looks at it again by
-    // itself. Then a look that finds the same time stamp says nothing, and the first look
-    // that finds the file old reports one `Update` for all of them. Where no poll looks, a
-    // later look is not sure to come, so every look reports.
+    // Under the poll a young file with nothing to compare waits: the first look that finds it
+    // old reports one `Update` for all. Where no poll comes, every look reports.
     let update_waits = young && hash.is_none() && self.only_polled(key);
 
     let changed = if let Some((old, content)) = old {
@@ -539,8 +478,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           Some(Content::Unknown) => !update_waits,
         }
     } else {
-      // The tree had no file here. If the handler believes in one all the same, the tree
-      // forgot it earlier in this flush, and nothing says that this is the same file.
+      // The handler may believe in a file the tree forgot earlier in this flush: nothing says it
+      // is the same one.
       let baseline = self.is_baseline_file(key);
       let node = &mut self.tree[key];
       node.set_baseline(baseline);
@@ -554,7 +493,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if node.changed() || old.is_none() {
       self.touched.push(key);
     }
-    // The file is there: if the node was held, its `Delete` is off.
     if node.is_held() {
       self.tree.unhold(key);
     }
@@ -567,9 +505,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.set_content(key, content);
   }
 
-  /// A hash of what can be compared of the entry at `path`: the content of a regular file
-  /// that is not too big, or the target of a link (a link is never opened). `None`: there is
-  /// nothing to compare.
+  /// A hash of the content of a regular file, or of the target of a link. `None`: nothing to
+  /// compare.
   fn content_hash(&self, path: &Path, kind: FileType, size: u64) -> io::Result<Option<u64>> {
     match kind {
       FileType::File if size <= HASH_LIMIT => self.fs.hash(path).map(Some),
@@ -578,11 +515,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// Whether the file at the node `key` is young: a second write can leave the modification
-  /// time as it is, so an equal fingerprint proves nothing at the next check.
-  ///
-  /// The long time is for a time stamp in whole seconds, and for a file that only the poll
-  /// looks at: it has no "written" hint to make up for a wrong guess.
+  /// Whether the file is young: an equal fingerprint proves nothing at the next check. The long
+  /// time is for whole seconds, and under the poll, which has no `Written` hint.
   fn is_young(&self, key: DirKey, modified: i64) -> bool {
     // Below zero for a time in the future: the file is as young as can be.
     let age = nanos(self.flush_time).saturating_sub(modified);
@@ -596,16 +530,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     whole_seconds || self.only_polled(key)
   }
 
-  /// Whether the directory that the tree has at the node `key` is on disk now. `path` is the
-  /// path of a name in it.
+  /// Whether the directory the tree has at the node is on disk now. `path` names an entry in it.
   fn is_on_disk(&self, key: DirKey, path: &Path) -> bool {
     let id = self.tree[key].dir().map(|dir| dir.id);
     let now = path.parent().and_then(|dir| self.fs.stat(dir).ok());
     now.is_some_and(|now| now.kind == FileType::Dir && Some(now.dir_id) == id)
   }
 
-  /// Whether no OS watch tells about the entry at the node `key`: its directory is polled, or
-  /// the node is a link, and nothing watches what is behind a link.
+  /// Whether only the poll looks at the entry: its directory is polled, or it is a link.
   fn only_polled(&self, key: DirKey) -> bool {
     let watch = self.tree.parent(key).map_or(Watch::None, |parent| self.tree[parent].watch());
     !matches!(watch, Watch::Watched | Watch::WatchedTree | Watch::FromAbove)

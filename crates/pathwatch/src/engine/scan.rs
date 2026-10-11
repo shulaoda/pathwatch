@@ -1,5 +1,5 @@
-//! One directory: the scan that checks every entry in it, and what is done when a directory
-//! appears, is still there, or vanishes.
+//! One directory: the scan of its entries, and what is done when a directory appears, is
+//! still there, or vanishes.
 
 use std::path::PathBuf;
 
@@ -18,14 +18,9 @@ pub(super) type ScanEntry = (DirKey, Listed);
 
 const _: () = assert!(size_of::<ScanEntry>() == 40);
 
-/// The scan of one directory.
 impl<B: Backend, F: Fs> Engine<B, F> {
-  /// Checks every node of the directory `key`: what the tree knows there, and what a listing
-  /// shows on top of that (if the node is complete). A deep scan also makes every directory
-  /// below watched again and scanned. A scan of the names checks only the nodes whose names
-  /// the tree and the listing do not both have.
-  ///
-  /// `path` and `names` are buffers. What they hold does not matter.
+  /// Checks every node of the directory, and what a listing shows on top if the node is complete.
+  /// `path` and `names` are buffers.
   pub(super) fn scan(
     &mut self,
     key: DirKey,
@@ -37,8 +32,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.tree.frozen(key) {
       return;
     }
-    // The names were to be compared because the directory counted as loose. A look proved
-    // meanwhile that it is strict: there is nothing to compare.
+    // A look proved meanwhile that the directory is strict: there are no names to compare.
     if depth == Depth::Names && !self.tree.is_loose(key) {
       return;
     }
@@ -53,13 +47,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if listing == Listing::Stop {
       return;
     }
-    // The listing kept the names of the known nodes if the directory counted as loose.
     let kept_names = self.tree.is_loose(key);
     if listing == Listing::Whole && known > 0 && !self.options.loose_spelling {
       self.ask_for_the_rule(key, path, names);
     }
-    // In a directory that counts as loose, a listing of all of it tells how the disk spells
-    // each name: a node of the tree is one of them, or the disk has no entry under its name.
+    // The listing of a loose directory says how the disk spells each known node, or that it is
+    // gone.
     let names_are_known = listing == Listing::Whole && kept_names;
     let names_only = depth == Depth::Names && names_are_known;
 
@@ -87,14 +80,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.list_if_polled(key);
   }
 
-  /// Lists the directory `key` and adds to `names` a new node for each entry that the tree
-  /// does not know yet. The check of such a node frees it again if the entry does not count.
-  /// In a directory that counts as loose, `Engine::listed` gets every node that the tree
-  /// knew and that the listing named.
+  /// Lists the directory and adds a node for each entry the tree does not know. With loose
+  /// spelling, `listed` gets what the listing said of the known nodes.
   fn list_new(&mut self, key: DirKey, path: &mut PathBuf, names: &mut Vec<ScanEntry>) -> Listing {
     let known = names.len();
-    // A listing that can be behind for a file that is being written is taken for the file
-    // only where an OS watch reports the write. A directory that is polled asks each file.
+    // A listing that lags behind a write is trusted for a file only where an OS watch reports
+    // the write.
     let heard =
       matches!(self.tree[key].watch(), Watch::Watched | Watch::WatchedTree | Watch::FromAbove);
     let lags = self.fs.listing_lags() && !heard;
@@ -125,8 +116,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       return Listing::Stop;
     }
     if matches!(self.disk_error(key, path, error), Found::Unknown) {
-      // The disk did not answer. The parent checks this directory at the next flush, and
-      // then all of it is scanned: what this scan was for is not forgotten.
+      // No answer: the parent checks it at the next flush, and the deep mark keeps the work.
       if self.tree.parent(key).is_some() {
         self.tree.mark(key, Mark::DEEP);
       }
@@ -136,21 +126,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     Listing::None
   }
 
-  /// Asks the disk whether the directory `key`, which was just listed, tells two spellings of
-  /// a name apart (`Tree::is_loose`), with one of its names in the other case of its letters.
-  /// The listing gave the name, so its entry is there. (`lstat` alone can find a name that is
-  /// gone: see `other_spelling`.)
-  ///
-  /// A directory that was proved strict is strict no more if that other spelling finds the
-  /// very entry: the directory can be another one by now, with the same id.
+  /// Tries one name the listing gave in the other case: whether the directory tells two spellings
+  /// apart. A proof of strict is taken back when the other spelling finds the very entry.
   fn ask_for_the_rule(&mut self, key: DirKey, path: &mut PathBuf, names: &[ScanEntry]) {
     let was_strict = !self.tree.is_loose(key);
     let swap = |name: &str| -> Option<String> {
       let has_letter = name.bytes().any(|byte| byte.is_ascii_alphabetic());
       has_letter.then(|| name.chars().map(swap_case).collect())
     };
-    // A name that the listing gave, with no second name in the tree that can be the same
-    // name. A listing of a strict directory keeps no names: there every child is tried.
+    // A listing of a strict directory keeps no names: every child is tried there, and one that
+    // is gone says nothing.
     let is_listed = |&&(child, listed): &&ScanEntry| {
       let named = was_strict || listed.is_named() || self.listed.contains_key(&child);
       named && !self.tree.has_twin(child)
@@ -159,8 +144,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let name = self.tree.name(child);
       Some((name.to_owned(), name.to_str().and_then(swap)?))
     });
-    // A listing of a strict directory keeps no names, so a node that is tried there can be
-    // gone, which says nothing: then the next one is tried.
     let tries = if was_strict { usize::MAX } else { 1 };
     let (mut tried, mut found) = (false, None);
     for (name, other) in to_try.take(tries) {
@@ -189,7 +172,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// The directory `key` is gone. Its parent finds out what is at its path now.
+  /// The directory is gone: its parent finds out what is at its path now.
   fn check_from_parent(&mut self, key: DirKey, path: &mut PathBuf) {
     let Some(parent) = self.tree.parent(key) else { return };
     self.tree.path_into(parent, path);
@@ -208,10 +191,8 @@ enum Listing {
   Stop,
 }
 
-/// What `check` does with a directory that it found, or that is gone.
 impl<B: Backend, F: Fs> Engine<B, F> {
-  /// A directory is on disk at the node `key`, and the tree had none there. `baseline`: what
-  /// is in it is the baseline of the running `watch` call.
+  /// A directory is on disk where the tree had none. `baseline`: what is in it is the baseline.
   pub(super) fn appear(
     &mut self,
     key: DirKey,
@@ -232,16 +213,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.queue_scan(key, Depth::Shallow);
   }
 
-  /// A directory is still on disk at the node `key`.
+  /// A directory is still on disk at the node.
   pub(super) fn still_there(&mut self, key: DirKey, path: &mut PathBuf, deep: bool) {
     if deep && self.has_a_watch_to_give_back(key) {
-      // A watch above covers this directory, and everything below it is read again after the
-      // next commit. So its own watch can go then: where the OS watches are does not depend on
-      // which of the two paths was watched first.
+      // A watch above covers it, and a deep scan follows the next commit: its own watch can go
+      // then, whichever path was watched first.
       self.covered.push(key);
     } else {
-      // Also when not `deep`: the node may want more now, or the watch above that covered it
-      // may be gone or may not reach it any more.
+      // Also when not deep: the node may want more, or the watch above may be gone.
       self.arm(key, path, deep);
     }
     if deep {
@@ -249,9 +228,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// The directory at the node `key` is gone for good, or a file took its place. So is
-  /// everything below it: the end of the flush tells the handler about each file it knew
-  /// there, and frees the nodes that nothing needs any more.
+  /// The directory is gone for good, with everything below it: the end of the flush tells the
+  /// handler.
   pub(super) fn vanish(&mut self, key: DirKey) {
     let node = &mut self.tree[key];
     let Kind::Dir(dir) = node.kind else { return };
