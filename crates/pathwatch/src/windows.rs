@@ -392,20 +392,30 @@ mod handles {
 
     pub(super) fn route(&self, path: &Path, found: &mut dyn FnMut(DirKey, &Path)) {
       let lower = lower_case(path);
-      let mut other_case = None;
+      // The directories of the keys told so far, and whether each is spelled like the record.
+      // With more than these, a key above them gets a hint too many, which costs one walk.
+      let mut told: [Option<(&Path, bool)>; 4] = [None; 4];
+      let mut count = 0;
       for (dir, lower_dir) in path.ancestors().zip(lower.ancestors()) {
         let Some(keys) = self.at.get(lower_dir) else { continue };
         let Ok(rel) = path.strip_prefix(dir) else { continue };
-        let mut same_text = keys.iter().filter(|key| self.keys[*key].dir == dir).peekable();
-        if same_text.peek().is_some() {
-          same_text.for_each(|&key| found(key, rel));
-          return;
-        }
-        other_case.get_or_insert((keys, rel));
-      }
-      if let Some((keys, rel)) = other_case {
+        let below = count.min(told.len());
         for &key in keys {
+          let own = self.keys[&key].dir.as_path();
+          let exact = own == dir;
+          // A key below it, on the way that this key spells, was told: the engine gets there
+          // from that one. Not when only this key is spelled like the record: in a directory
+          // that tells the case of letters apart, the one below is another directory.
+          let is_covered =
+            |&(told, told_exact): &(&Path, bool)| (told_exact || !exact) && told.starts_with(own);
+          if told[..below].iter().flatten().any(is_covered) {
+            continue;
+          }
           found(key, rel);
+          if let Some(slot) = told.get_mut(count) {
+            *slot = Some((own, exact));
+          }
+          count += 1;
         }
       }
     }
@@ -1115,7 +1125,7 @@ mod port {
       .access_mode(FILE_LIST_DIRECTORY)
       .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
       .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED)
-      .open(path)?;
+      .open(crate::fs::literal(path))?;
     if dir.metadata()?.is_dir() { Ok(dir) } else { Err(io::ErrorKind::NotADirectory.into()) }
   }
 

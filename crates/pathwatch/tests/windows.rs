@@ -491,13 +491,8 @@ fn open_point_a_directory_name_that_ends_with_a_dot() {
   let verbatim = fs::canonicalize(temp.path()).unwrap().join("dir.");
   fs::create_dir(&verbatim).unwrap();
   let mut harness = Harness::new();
-  // Without the `\\?\` form Windows reads the name as `dir`, which does not exist.
-  let (_, coverage) = harness.watch(&temp.path().join("dir."), Want::Contents);
-  assert!(
-    matches!(&coverage, Coverage::Failed(error) if error.kind() == io::ErrorKind::NotFound),
-    "{coverage:?}"
-  );
-  let key = harness.handle(&verbatim);
+  // The backend opens the directory of this very name, not `dir`, which does not exist.
+  let key = harness.handle(&temp.path().join("dir."));
 
   fs::write(verbatim.join("f.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(key, "f.txt"));

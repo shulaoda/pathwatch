@@ -1,6 +1,7 @@
 //! Windows. What the calls of std do not tell, and what they cost too much for.
 
 use std::{
+  borrow::Cow,
   ffi::{CStr, OsStr, OsString, c_void},
   fs::{self, OpenOptions},
   io, mem,
@@ -9,16 +10,17 @@ use std::{
     fs::{MetadataExt, OpenOptionsExt},
     io::AsRawHandle,
   },
-  path::Path,
+  path::{Path, PathBuf},
   sync::OnceLock,
   time::{Duration, SystemTime},
 };
 
 use windows_sys::Win32::{
   Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION,
-    INVALID_HANDLE_VALUE, MAX_PATH, NTSTATUS, STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY,
-    STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
+    ERROR_SHARING_VIOLATION, INVALID_HANDLE_VALUE, MAX_PATH, NTSTATUS, STATUS_DELETE_PENDING,
+    STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND,
   },
   Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -155,7 +157,11 @@ fn by_name_call() -> Option<ByName> {
 /// but "nothing is there".
 fn by_name(path: &Path) -> Option<io::Result<Meta>> {
   let call = by_name_call()?;
-  // The call takes the path as it is. A longer one needs the `\\?\` form that std makes.
+  // The call takes the path as it is. A longer one needs the `\\?\` form that std makes, and
+  // so does one with a name that Windows would read as another.
+  if is_odd(path) {
+    return None;
+  }
   let mut wide = [0_u16; MAX_PATH as usize];
   for (at, unit) in path.as_os_str().encode_wide().enumerate() {
     if unit == 0 || at + 1 == wide.len() {
@@ -178,6 +184,7 @@ fn by_name(path: &Path) -> Option<io::Result<Meta>> {
 }
 
 fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
+  let path = &*literal(path);
   let link = if follow { 0 } else { FILE_FLAG_OPEN_REPARSE_POINT };
   let opened = OpenOptions::new()
     .access_mode(0)
@@ -239,7 +246,8 @@ struct Aligned<const N: usize>([u8; N]);
 /// scanner right after a write (2 ms, 14 ms for one in ten); this call takes 0.04 ms.
 pub fn version(path: &Path) -> io::Result<Option<u64>> {
   // A directory cannot be opened in this way: it is no file to compare (see `told`).
-  let file = OpenOptions::new().access_mode(0).share_mode(SHARE_ALL).open(path).map_err(told)?;
+  let opened = OpenOptions::new().access_mode(0).share_mode(SHARE_ALL).open(literal(path));
+  let file = opened.map_err(told)?;
   // The longest record: its fixed part and a name of 255 units.
   let mut record = Aligned([0; 1024]);
   let size = u32::try_from(record.0.len()).unwrap_or(u32::MAX);
@@ -264,7 +272,9 @@ pub fn version(path: &Path) -> io::Result<Option<u64>> {
     _ => return Ok(None),
   };
   let usn = bytes.get(at..).and_then(|usn| usn.first_chunk());
-  Ok(usn.map(|usn| u64::from_ne_bytes(*usn)))
+  // Zero: the journal has no record about the file (it is off, or younger than the file), so
+  // the number would stay the same over a write.
+  Ok(usn.map(|usn| u64::from_ne_bytes(*usn)).filter(|&usn| usn != 0))
 }
 
 // A record is read from its bytes at these offsets, each checked against the answer.
@@ -288,7 +298,7 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
     .access_mode(FILE_LIST_DIRECTORY)
     .share_mode(SHARE_ALL)
     .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-    .open(dir)
+    .open(literal(dir))
     .map_err(told)?;
   let handle = dir.as_raw_handle();
   let mut file_system = [0_u16; 8];
@@ -316,6 +326,9 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
       let error = io::Error::last_os_error();
       return match error.raw_os_error().map(i32::cast_unsigned) {
         Some(ERROR_NO_MORE_FILES) => Ok(true),
+        // The first answer for a directory with no entry at all: the root of an empty disk,
+        // which has no `.` and no `..`.
+        Some(ERROR_FILE_NOT_FOUND) if class == FileIdBothDirectoryRestartInfo => Ok(true),
         // The answer for a handle that is open on a file.
         Some(ERROR_INVALID_PARAMETER) => Err(io::ErrorKind::NotADirectory.into()),
         _ => Err(told(error)),
@@ -366,21 +379,68 @@ fn record(bytes: &[u8], volume: u64, name: &mut Vec<u16>) -> Option<(usize, Entr
   Some((next, told))
 }
 
-/// `path` with a NUL at its end, in the `\\?\` form when it is long, as std does for its
-/// own calls.
-fn wide_path(path: &Path) -> Vec<u16> {
+/// Whether Windows reads a name of `path` as another one, unless the path has the `\\?\` form:
+/// it takes a dot or a space off the end of a name, and reads the name of a device (`NUL`,
+/// `COM1`, on an older Windows also `aux.c`) as the device. No watched path has a name of the
+/// first kind (`path::normalize`), but a directory can list both.
+fn is_odd(path: &Path) -> bool {
+  let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
+  let mut names = path.as_os_str().as_encoded_bytes().split(is_separator);
+  names.any(|name| {
+    let cut_off = matches!(name.last(), Some(b'.' | b' ')) && name != b"." && name != b"..";
+    cut_off || is_device(name)
+  })
+}
+
+/// Whether some Windows reads `name` as a device: what is before its first dot or colon,
+/// without the spaces at its end, is the name of one.
+fn is_device(name: &[u8]) -> bool {
+  let end = name.iter().position(|byte| matches!(byte, b'.' | b':')).unwrap_or(name.len());
+  let stem = name[..end].trim_ascii_end();
+  let is = |device: &[u8]| stem.eq_ignore_ascii_case(device);
+  let is_port =
+    |port: &[u8]| port.eq_ignore_ascii_case(b"COM") || port.eq_ignore_ascii_case(b"LPT");
+  match stem {
+    [_, _, _] => is(b"CON") || is(b"PRN") || is(b"AUX") || is(b"NUL"),
+    // `COM0` to `COM9` and `LPT0` to `LPT9`.
+    [port @ .., digit] if port.len() == 3 && digit.is_ascii_digit() => is_port(port),
+    // The same with a digit that is written high: `¹`, `²`, `³`.
+    [port @ .., 0xC2, 0xB2 | 0xB3 | 0xB9] if port.len() == 3 => is_port(port),
+    _ => is(b"CONIN$") || is(b"CONOUT$"),
+  }
+}
+
+/// `path` as Windows reads these very names: in the `\\?\` form when a name in it is odd
+/// (`is_odd`). Every call that takes a path of the engine gets it this way.
+pub(crate) fn literal(path: &Path) -> Cow<'_, Path> {
+  if !is_odd(path) {
+    return Cow::Borrowed(path);
+  }
+  Cow::Owned(PathBuf::from(OsString::from_wide(&verbatim(path, true))))
+}
+
+/// The units of `path`, in the `\\?\` form when it is long, as std does for its own calls, or
+/// when `always`.
+fn verbatim(path: &Path, always: bool) -> Vec<u16> {
   const SEPARATOR: u16 = b'\\' as u16;
   let units = path.as_os_str().encode_wide();
   let units: Vec<u16> =
     units.map(|unit| if unit == u16::from(b'/') { SEPARATOR } else { unit }).collect();
-  let verbatim = units.starts_with(&[SEPARATOR, SEPARATOR, u16::from(b'?'), SEPARATOR]);
+  let is_verbatim = units.starts_with(&[SEPARATOR, SEPARATOR, u16::from(b'?'), SEPARATOR]);
   let (prefix, rest) = match units.as_slice() {
-    units if verbatim || units.len() < MAX_PATH as usize - 12 => ("", units),
+    units if is_verbatim || (!always && units.len() < MAX_PATH as usize - 12) => ("", units),
     // `\\server\share` becomes `\\?\UNC\server\share`.
     [SEPARATOR, rest @ ..] if rest.first() == Some(&SEPARATOR) => (r"\\?\UNC", rest),
     units => (r"\\?\", units),
   };
-  prefix.encode_utf16().chain(rest.iter().copied()).chain([0]).collect()
+  prefix.encode_utf16().chain(rest.iter().copied()).collect()
+}
+
+/// `path` with a NUL at its end, in the form that names this very entry.
+fn wide_path(path: &Path) -> Vec<u16> {
+  let mut units = verbatim(path, is_odd(path));
+  units.push(0);
+  units
 }
 
 /// A search for the one path gives the entry as the directory holds it.
@@ -408,7 +468,7 @@ mod tests {
     process::Command,
   };
 
-  use super::{by_handle, by_name, name_on_disk, read_dir, stat, version};
+  use super::{by_handle, by_name, is_odd, literal, name_on_disk, read_dir, stat, version};
   use crate::fs::{Entry, FileType, Meta};
 
   fn same(a: &Meta, b: &Meta) -> bool {
@@ -502,6 +562,74 @@ mod tests {
         assert_eq!(name_on_disk(&dir.join(spelled)).unwrap(), "ReadMe.md", "{}", dir.display());
       }
     }
+  }
+
+  #[test]
+  fn a_name_that_windows_reads_as_another() {
+    let odd = [
+      r"C:\w\foo.",
+      r"C:\w\foo ",
+      r"C:\w\dir.\x.txt",
+      r"C:\w\...",
+      r"C:\w\nul",
+      r"C:\w\NUL.txt",
+      r"C:\w\aux.c",
+      r"C:\w\Com1",
+      r"C:\w\lpt9.log",
+      "C:\\w\\com\u{b9}",
+      r"C:\w\con \x",
+      r"C:\w\conin$",
+      r"\\server\share\prn",
+    ];
+    for path in odd {
+      assert!(is_odd(Path::new(path)), "{path}");
+    }
+    let plain = [
+      r"C:\w\foo",
+      r"C:\w\.git\..x",
+      r"C:\w\null",
+      r"C:\w\con1",
+      r"C:\w\com",
+      r"C:\w\com10",
+      r"C:\w\xnul",
+      r"C:\w\a.nul",
+      r"\\server\share\a b\c.d",
+    ];
+    for path in plain {
+      assert!(!is_odd(Path::new(path)), "{path}");
+      assert_eq!(literal(Path::new(path)), Path::new(path));
+    }
+    assert_eq!(literal(Path::new(r"C:\w\foo.")), Path::new(r"\\?\C:\w\foo."));
+    assert_eq!(literal(Path::new(r"\\?\C:\w\foo.")), Path::new(r"\\?\C:\w\foo."));
+    assert_eq!(literal(Path::new(r"\\server\share\nul")), Path::new(r"\\?\UNC\server\share\nul"));
+  }
+
+  /// Every call reads the entry with the odd name, not the one that Windows makes of it.
+  #[test]
+  fn an_odd_name_is_read_as_it_is() {
+    let top = tempfile::tempdir().unwrap();
+    // Only a path in `\\?\` form lets std make such a name.
+    let verbatim = fs::canonicalize(top.path()).unwrap();
+    fs::write(top.path().join("foo"), "the other one").unwrap();
+    for name in ["foo.", "foo ", "nul", "aux.c"] {
+      fs::write(verbatim.join(name), name).unwrap();
+      let path = top.path().join(name);
+      let found = stat(&path, false).unwrap();
+      assert_eq!((found.kind, found.size), (FileType::File, name.len() as u64), "{name}");
+      assert_eq!(name_on_disk(&path).unwrap(), name);
+      assert!(version(&path).is_ok(), "{name}");
+      assert_eq!(fs::read(literal(&path)).unwrap(), name.as_bytes());
+    }
+    fs::create_dir(verbatim.join("dir.")).unwrap();
+    fs::write(verbatim.join("dir.").join("x.txt"), "1").unwrap();
+    let dir = top.path().join("dir.");
+    assert_eq!(stat(&dir, false).unwrap().kind, FileType::Dir);
+    let mut seen = Vec::new();
+    // Not NTFS: the listing of std is used there.
+    if read_dir(&dir, &mut |name, _| seen.push(name.to_owned())).unwrap() {
+      assert_eq!(seen, ["x.txt"]);
+    }
+    assert_eq!(stat(&dir.join("x.txt"), false).unwrap().size, 1);
   }
 
   #[test]

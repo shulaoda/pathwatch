@@ -132,7 +132,7 @@ impl Fs for StdFs {
         return Ok(());
       }
     }
-    for entry in fs::read_dir(dir).map_err(told)? {
+    for entry in fs::read_dir(literal(dir)).map_err(told)? {
       let entry = entry.map_err(told)?;
       let kind = entry.file_type().ok().map(|file_type| {
         if file_type.is_dir() {
@@ -149,7 +149,7 @@ impl Fs for StdFs {
   }
 
   fn hash(&self, path: &Path) -> io::Result<u64> {
-    let mut file = File::open(path).map_err(told)?;
+    let mut file = File::open(literal(path)).map_err(told)?;
     let mut hasher = FxHasher::default();
     let mut buffer = [0; 16 * 1024];
     loop {
@@ -172,11 +172,11 @@ impl Fs for StdFs {
   }
 
   fn link_target(&self, path: &Path) -> io::Result<PathBuf> {
-    fs::read_link(path).map_err(told)
+    fs::read_link(literal(path)).map_err(told)
   }
 
   fn real_path(&self, path: &Path) -> io::Result<PathBuf> {
-    fs::canonicalize(path).map_err(told)
+    fs::canonicalize(literal(path)).map_err(told)
   }
 
   fn name_on_disk(&self, path: &Path) -> io::Result<OsString> {
@@ -202,7 +202,7 @@ impl Fs for StdFs {
 mod windows;
 
 #[cfg(windows)]
-pub(crate) use self::windows::{Unknown, kernel32};
+pub(crate) use self::windows::{Unknown, kernel32, literal};
 #[cfg(windows)]
 use self::windows::{name_on_disk, stat, told};
 
@@ -224,6 +224,12 @@ use self::apple::name_on_disk;
 /// the same inode; none of these means no such entry, whatever `lstat` said: on a folder that
 /// a Mac shares, Linux still finds a name that was renamed away through another spelling.
 #[cfg(all(unix, not(target_vendor = "apple")))]
+/// Only Windows reads a name as another one than the path says.
+#[cfg(not(windows))]
+fn literal(path: &Path) -> &Path {
+  path
+}
+
 fn name_on_disk(path: &Path) -> io::Result<OsString> {
   use std::os::unix::fs::{DirEntryExt, MetadataExt};
 

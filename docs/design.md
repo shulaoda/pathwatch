@@ -1392,8 +1392,11 @@ What was not checked, and what is known to be missing, is in `docs/windows-open-
   completed read are read on the watcher thread (`Records`, `translate`). The reads ask for
   the longer records (`ReadDirectoryChangesExW`, Windows 10 1709 and later) where Windows
   and the disk have them: they tell whether an entry is a directory.
-- **Hints.** A record goes to the deepest key whose directory holds its path; if no key
-  matches by exact text, ASCII letters are compared without case. A record that no key holds
+- **Hints.** A record goes to the deepest key whose directory holds its path, with ASCII
+  letters compared without case, and to each key above it that spells the way in another
+  manner: two watched paths that are two spellings of one directory both get it. A key that
+  is spelled like the record always gets it: in a directory that tells the case of letters
+  apart, a key below in another spelling is another directory. A record that no key holds
   is dropped. `MODIFIED` → `Written`; it is dropped when it names a directory (the longer
   records tell) or the directory of the key itself: Windows sends it whenever an entry in a
   directory changes, and that entry has a record of its own. Every other record → `Changed`. A read with no bytes, and a record with no name →

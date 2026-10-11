@@ -1334,15 +1334,22 @@ mod translate {
     let lost = hints(&mut handles, read(id, "/P", Ok(Vec::new())));
     assert_eq!(sorted(lost), [changed(0, ""), changed(1, "")]);
 
-    // A key that is spelled like the record wins, also when another one is deeper.
+    // Two spellings of one directory are two watched paths, and each has its events. A key
+    // above one that was told is left out when it spells the way as that one does; but a key
+    // that is spelled like the record is always told.
     watch(&mut handles, 2, "/p/src", Want::Contents);
     open(&mut handles, 3, "/p/SRC");
-    let bytes =
-      records(&[(ADDED, "SRC/lib/a.js"), (ADDED, "src/lib/a.js"), (ADDED, "Src/lib/a.js")]);
-    assert_eq!(
-      hints(&mut handles, read(id, "/p", Ok(bytes))),
-      [changed(3, "lib/a.js"), changed(2, "lib/a.js"), changed(0, "a.js")]
-    );
+    let told = |handles: &mut Handles, record: &str| {
+      let bytes = records(&[(ADDED, record)]);
+      sorted(hints(handles, read(id, "/p", Ok(bytes))))
+    };
+    let (deep, src, upper) =
+      (|| changed(0, "a.js"), || changed(2, "lib/a.js"), || changed(3, "lib/a.js"));
+    assert_eq!(told(&mut handles, "SRC/lib/a.js"), [deep(), src(), upper()]);
+    assert_eq!(told(&mut handles, "SRC/Lib/a.js"), [deep(), changed(2, "Lib/a.js")]);
+    assert_eq!(told(&mut handles, "src/lib/a.js"), [deep(), src()]);
+    assert_eq!(told(&mut handles, "Src/lib/a.js"), [deep(), src()]);
+    assert_eq!(told(&mut handles, "src/b.js"), [changed(2, "b.js"), changed(3, "b.js")]);
   }
 
   #[test]

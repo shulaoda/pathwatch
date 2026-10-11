@@ -8,7 +8,7 @@ It first ran on 2026-10-10, on Windows 11 Pro (build 26200) with NTFS on a local
 - `crates/pathwatch/tests/windows.rs` (the backend with real handles): all tests pass, 20
   runs in a row. So each point below that has a test there holds on that system.
 - `crates/pathwatch/tests/windows_parts.rs` (the parts that make no Windows call: `place`,
-  `Handles`, `Records`, `translate`): all 60 tests pass.
+  `Handles`, `Records`, `translate`): all 60 tests pass (63 by now).
 - `crates/pathwatch/tests/disk` with this backend: every test passes, but one cannot run:
   `a_directory_above_a_watched_path_is_renamed_to_another_letter_case` renames a directory
   above an open handle, and Windows refuses that. It is skipped for this backend.
@@ -153,6 +153,10 @@ the real disk, with this backend and with polling.
   given in `\\?\` form, and `path::normalize` takes that form as the plain one. So such a name
   cannot be watched: the OS finds the name without the dot or the space. `watch` returns
   `InvalidPath` for it, and for a name with `:`, a control character or one of `< > " | ? *`.
+  A directory can still hold such a name, and the name of a device (`nul`, `aux.c`): git, WSL
+  and an unpacked archive make them. For a path with one, every call of the engine and the
+  backend takes the `\\?\` form (`fs::literal`), so the entry is read under this very name.
+  Before that, such a file below a watched directory got no event at all (measured).
 - **Short (8.3) names.** Windows may report a change under the short name of a file. A name that
   looks like one (`LONGFI~1.TXT`) becomes a `Changed` hint for the directory that holds it. A
   name with a lower-case letter (`v1~1.txt`) is never taken for one: Windows makes short names
