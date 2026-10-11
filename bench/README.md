@@ -51,10 +51,14 @@ How the numbers are read:
 | `pathwatch-0` | this repository | The same with `with_debounce(Duration::ZERO)`. |
 | `notify` | notify 8 from crates.io | `recommended_watcher` with a channel; `paths_mut()` to add all paths in one step; `Recursive` for a directory, `NonRecursive` for a file. Polling: `PollWatcher`. It has no ignore rule. |
 | `notify-fork` | `rolldown-notify` from `github.com/rolldown/notify` | The way rolldown uses it today: `RecommendedWatcher::new` with a `Config`, `paths_mut()`, every path with `Recursive` and `TrackPath`. Ignore: `Config::with_ignored`. Polling: `PollWatcher`. |
+| `notify-debouncer` | notify-debouncer-full 0.7 on notify 8 | How most Rust programs use notify: `new_debouncer` with a timeout of 50 ms (the quiet time of pathwatch) and a channel, and `watch` for each path. It has no ignore rule. Polling: `new_debouncer_opt` with `PollWatcher`. |
 | `chokidar` | chokidar 5 | `chokidar.watch(paths, { ignoreInitial: true })` and the `all` event. Ignore: a function for `ignored`. Polling: `usePolling` with `interval` and `binaryInterval`. |
 | `parcel` | @parcel/watcher 2 | `subscribe(dir, callback)`. It watches directories only, so for a set of files it watches the lowest directory that holds them all. Ignore: globs for `ignore`. It has no polling mode. |
 | `fs-watch` | Node itself | `fs.watch(dir, { recursive: true })`, once, for the lowest directory that holds all paths. It is the floor: no library. Polling: `fs.watchFile` for each path. It has no ignore rule. |
+| `watchpack` | watchpack 2, the watcher of webpack 5 | `new Watchpack(options)` and `watch({ files, directories, missing })`, with the `change` and `remove` events and no `aggregateTimeout`. Ignore: a function for `ignored`. Polling: `poll` with the pause. It names a directory like a file. |
+| `fsnotify` | fsnotify 1 (Go) | `NewWatcher` and `Add`, for each directory of a tree and for each new one, as its README shows: it watches one directory, not what is below it. Ignore: such directories are not added, and their events are dropped. It has no polling mode. On macOS it uses kqueue, with one open file for each watched file. |
 | `watchdog` | watchdog 6 (Python) | `Observer().schedule(handler, dir, recursive=True)`. It watches directories, so for a set of files it watches the lowest directory that holds them all. Ignore: `RegexMatchingEventHandler` with `ignore_regexes`, which drops events of a directory that is still watched. Polling: `PollingObserver`. |
+| `watchfiles` | watchfiles 1 (Python, with notify inside) | The `RustNotify` class behind `watch`, with the defaults of `watch` (50 ms after the last change, 1600 ms at the most), so that `ready` is said when it is live. Ignore: the changes of such paths are dropped, as a `watch_filter` would. Polling: `force_polling` with the pause. |
 
 Why this is fair:
 
@@ -96,20 +100,23 @@ spellings of a name for one (macOS, Windows), until it asked the disk for the on
 
 ## How to run it
 
-Once: the Node packages, the Python packages and the build. Without `py/.venv` the driver
-skips `watchdog`.
+Once: the Node packages, the Python packages, the Go program and the build.
 
 ```sh
 cd bench
 (cd js && npm install)
 (cd py && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt)
+(cd go && go build -o adapter-fsnotify .)
 cargo build --release
 ```
+
+Without `py/.venv` the driver skips `watchdog` and `watchfiles`, and without `go/adapter-fsnotify`
+it skips `fsnotify`.
 
 `cargo build` builds the driver and the Rust adapters. (`cargo run` alone builds only the
 driver; the driver says which adapter is missing.)
 
-A quick run on macOS (about 5 minutes), and the full run (about 20 minutes for each of the
+A quick run on macOS (about 10 minutes), and the full run (about 25 minutes for each of the
 three rounds):
 
 ```sh
@@ -159,7 +166,7 @@ Copy the scripts again (the second command) after a change in `js/`.
 
 All flags: `./target/release/bench --help`. The useful ones:
 
-- `--scenarios s1,s3` and `--adapters pathwatch,chokidar` (or `rust` for the four Rust ones)
+- `--scenarios s1,s3` and `--adapters pathwatch,chokidar` (or `rust` for the five Rust ones)
 - `--scale 0.25`, `--quiet-secs 10`
 - `--repeat 3`: every scenario runs three times with every adapter, one round after the other
 - `--tmp <dir>`, `--js <dir>`
@@ -249,7 +256,14 @@ The rules of the driver:
 - **notify on macOS reports nothing in S1 and S3**, with no error. Its FSEvents backend puts
   every path into one stream, with `watch` for each path as with `paths_mut()`, and a stream
   takes at most 4,096 paths: for 20,000 single files the stream cannot start, and notify says
-  nothing about it. The table shows that as `missed`.
+  nothing about it. The table shows that as `missed`. The same holds for `notify-debouncer`
+  and `watchfiles`, which have notify inside. These two also take about a minute to set up
+  S1 and S3 on macOS: they add the paths one by one, and notify restarts its stream for each.
+- **fsnotify answers in a tenth of a millisecond on macOS**, where every other library needs
+  about 10 ms. It uses kqueue, not FSEvents: one open file for each watched directory and
+  file, so the kernel tells it at once. It pays at setup, with one open file for each of the
+  20,000 files of S1 and the 50,000 of S2, and a new directory can get files before its watch
+  is added (`missed` in S2).
 - **rolldown's own code is not measured.** rolldown puts a layer on top of the fork (a check
   of every event against the disk, and a walk of each new directory). `notify-fork` here is
   the library alone, so its `missed` is higher and its CPU lower than what rolldown has today.

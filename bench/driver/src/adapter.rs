@@ -26,6 +26,8 @@ enum Program {
   Node(&'static str),
   /// A script of `bench/py`, run by the Python of `bench/py/.venv`.
   Python(&'static str),
+  /// A program of `bench/go`, built there by `go build`.
+  Go(&'static str),
 }
 
 /// Every adapter, in the order of the tables.
@@ -37,10 +39,14 @@ pub const ADAPTERS: &[Adapter] = &[
   },
   Adapter { name: "notify", program: Program::Rust("adapter-notify", &[]) },
   Adapter { name: "notify-fork", program: Program::Rust("adapter-notify-fork", &[]) },
+  Adapter { name: "notify-debouncer", program: Program::Rust("adapter-notify-debouncer", &[]) },
   Adapter { name: "chokidar", program: Program::Node("chokidar.mjs") },
   Adapter { name: "parcel", program: Program::Node("parcel.mjs") },
   Adapter { name: "fs-watch", program: Program::Node("fs-watch.mjs") },
+  Adapter { name: "watchpack", program: Program::Node("watchpack.mjs") },
+  Adapter { name: "fsnotify", program: Program::Go("adapter-fsnotify") },
   Adapter { name: "watchdog", program: Program::Python("watchdog_adapter.py") },
+  Adapter { name: "watchfiles", program: Program::Python("watchfiles_adapter.py") },
   // Node with no watcher at all. It is only run for the table of bases.
   Adapter { name: "node-idle", program: Program::Node("idle.mjs") },
 ];
@@ -53,6 +59,8 @@ pub struct Places {
   pub js: PathBuf,
   /// `bench/py`, with its `.venv`.
   pub py: PathBuf,
+  /// `bench/go`, with the program that `go build` made there.
+  pub go: PathBuf,
   /// Linux: leave the memory allocator of the system as it is. See `Adapter::command`.
   pub keep_huge_pages: bool,
 }
@@ -75,6 +83,7 @@ impl Adapter {
       Program::Rust(name, _) => places.rust.join(format!("{name}{}", env::consts::EXE_SUFFIX)),
       Program::Node(script) => places.js.join(script),
       Program::Python(script) => places.py.join(script),
+      Program::Go(name) => places.go.join(format!("{name}{}", env::consts::EXE_SUFFIX)),
     }
   }
 
@@ -97,6 +106,7 @@ impl Adapter {
         command.args(args);
         command
       }
+      Program::Go(_) => Command::new(self.file(places)),
       Program::Node(_) => {
         let mut command = Command::new(node());
         command.arg(self.file(places));

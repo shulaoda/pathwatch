@@ -249,9 +249,16 @@ pub fn versions(bench: &Path, js: &Path) -> BTreeMap<String, String> {
   if python.exists() {
     let python = python.to_string_lossy();
     versions.insert("python".to_owned(), output(&python, &["--version"]));
-    let code = "import importlib.metadata as m; print(m.version('watchdog'))";
-    versions.insert("watchdog".to_owned(), output(&python, &["-c", code]));
+    for package in ["watchdog", "watchfiles"] {
+      let code = format!("import importlib.metadata as m; print(m.version('{package}'))");
+      versions.insert(package.to_owned(), output(&python, &["-c", &code]));
+    }
   }
+  let go_mod = fs::read_to_string(bench.join("go/go.mod")).unwrap_or_default();
+  let mut words =
+    go_mod.split_whitespace().skip_while(|word| *word != "github.com/fsnotify/fsnotify");
+  let fsnotify = words.nth(1).map_or("not installed", |version| version.trim_start_matches('v'));
+  versions.insert("fsnotify".to_owned(), fsnotify.to_owned());
 
   let lock = fs::read_to_string(bench.join("Cargo.lock")).unwrap_or_default();
   let pathwatch = locked(&lock, "pathwatch").unwrap_or_default();
@@ -259,8 +266,12 @@ pub fn versions(bench: &Path, js: &Path) -> BTreeMap<String, String> {
   versions.insert("pathwatch".to_owned(), format!("{pathwatch} (working tree, {commit})"));
   versions.insert("notify".to_owned(), locked(&lock, "notify").unwrap_or_default());
   versions.insert("notify-fork".to_owned(), locked(&lock, "rolldown-notify").unwrap_or_default());
+  let debouncer = locked(&lock, "notify-debouncer-full").unwrap_or_default();
+  versions.insert("notify-debouncer".to_owned(), debouncer);
 
-  for (name, package) in [("chokidar", "chokidar"), ("parcel", "@parcel/watcher")] {
+  let packages =
+    [("chokidar", "chokidar"), ("parcel", "@parcel/watcher"), ("watchpack", "watchpack")];
+  for (name, package) in packages {
     let file = js.join("node_modules").join(package).join("package.json");
     let version = fs::read_to_string(file)
       .ok()

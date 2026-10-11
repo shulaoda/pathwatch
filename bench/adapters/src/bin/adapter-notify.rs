@@ -6,11 +6,8 @@
 
 use std::{path::Path, sync::mpsc};
 
-use adapters::{Out, exit_when_stdin_closes, read_job};
-use notify::{
-  Config, Event, EventKind, PollWatcher, RecursiveMode, Watcher,
-  event::{AccessKind, AccessMode, ModifyKind},
-};
+use adapters::{Out, exit_when_stdin_closes, notify_word, read_job};
+use notify::{Config, Event, PollWatcher, RecursiveMode, Watcher};
 
 fn main() {
   let mut out = Out::new();
@@ -68,25 +65,11 @@ fn mode_for(path: &Path) -> RecursiveMode {
 fn print(out: &mut Out, result: notify::Result<Event>) {
   match result {
     Ok(event) => {
-      let kind = word(&event.kind);
+      let kind = notify_word(&event.kind);
       for path in &event.paths {
         out.event(kind, path);
       }
     }
     Err(error) => out.error(&error.to_string()),
-  }
-}
-
-/// The event kinds of notify in one word. The driver does not count `access` as a change.
-fn word(kind: &EventKind) -> &'static str {
-  match kind {
-    EventKind::Create(_) => "create",
-    EventKind::Remove(_) => "delete",
-    EventKind::Modify(ModifyKind::Name(_)) => "rename",
-    EventKind::Modify(ModifyKind::Metadata(_)) => "metadata",
-    EventKind::Modify(_) => "update",
-    EventKind::Access(AccessKind::Close(AccessMode::Write)) => "close-write",
-    EventKind::Access(_) => "access",
-    EventKind::Any | EventKind::Other => "other",
   }
 }

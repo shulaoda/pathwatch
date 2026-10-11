@@ -3,5 +3,6 @@
 .claude/
 .DS_Store
 bench/target
+bench/go/adapter-fsnotify*
 node_modules
 bench/results/quick-*

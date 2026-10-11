@@ -116,6 +116,7 @@ fn main() {
     rust: own_directory(),
     js: flags.js.clone(),
     py: bench.join("py"),
+    go: bench.join("go"),
     keep_huge_pages: flags.keep_huge_pages,
   };
 
@@ -224,7 +225,7 @@ fn has(names: &[String], name: &str) -> bool {
 /// The adapters that the flags ask for and that can run. An adapter whose program is missing
 /// is skipped with a word about it.
 fn chosen_adapters(names: Option<&[String]>, places: &Places) -> Vec<&'static Adapter> {
-  let rust = ["pathwatch", "pathwatch-0", "notify", "notify-fork"];
+  let rust = ["pathwatch", "pathwatch-0", "notify", "notify-fork", "notify-debouncer"];
   let wanted = |adapter: &Adapter| match names {
     None => true,
     Some(names) => has(names, adapter.name) || (has(names, "rust") && rust.contains(&adapter.name)),
@@ -233,7 +234,9 @@ fn chosen_adapters(names: Option<&[String]>, places: &Places) -> Vec<&'static Ad
   for adapter in ADAPTERS.iter().filter(|adapter| adapter.name != "node-idle" && wanted(adapter)) {
     if !adapter.file(places).exists() {
       eprintln!("skipped {}: {} is missing", adapter.name, adapter.file(places).display());
-      eprintln!("  (Rust adapters: `cargo build --release`; Node adapters: `npm install` in js)");
+      eprintln!(
+        "  (Rust: `cargo build --release`; Node: `npm install` in js; Go: `go build` in go)"
+      );
     } else if adapter.is_node() && !places.js.join("node_modules").exists() {
       eprintln!("skipped {}: run `npm install` in {}", adapter.name, places.js.display());
     } else if adapter.is_python() && !venv_python(&places.py).exists() {

@@ -11,3 +11,4 @@ pathwatch = { path = "../../crates/pathwatch" }
 notify = "8"
 # The fork that rolldown uses today. Its library is named `notify` too, so it gets another name.
 notify_fork = { package = "rolldown-notify", git = "https://github.com/rolldown/notify", rev = "3a1cde091855ee031e1a6ebc662c63c37fa4f091" }
+notify-debouncer-full = "0.7.0"
