@@ -261,6 +261,7 @@ impl Config {
       debounce: self.debounce,
       delete_delay: self.delete_delay,
       poll_interval: self.poll_interval,
+      poll_interval_alone: None,
       loose_spelling: self.loose_spelling,
     }
   }

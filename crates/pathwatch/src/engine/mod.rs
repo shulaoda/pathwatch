@@ -61,6 +61,8 @@ pub struct Options {
   pub delete_delay: Duration,
   /// The shortest time between two polls of what no OS watch covers.
   pub poll_interval: Duration,
+  /// The same once the backend has stopped and everything is polled. `None`: no other time.
+  pub poll_interval_alone: Option<Duration>,
   /// Every disk takes two spellings of a name for one (macOS, Windows). Without it, a directory
   /// counts as such a disk until a look proves otherwise.
   pub loose_spelling: bool,
@@ -73,6 +75,7 @@ impl Default for Options {
       debounce: Duration::from_millis(10),
       delete_delay: Duration::from_millis(100),
       poll_interval: Duration::from_secs(1),
+      poll_interval_alone: None,
       loose_spelling: false,
     }
   }
@@ -85,6 +88,7 @@ impl fmt::Debug for Options {
       .field("debounce", &self.debounce)
       .field("delete_delay", &self.delete_delay)
       .field("poll_interval", &self.poll_interval)
+      .field("poll_interval_alone", &self.poll_interval_alone)
       .field("loose_spelling", &self.loose_spelling)
       .finish()
   }
@@ -125,6 +129,8 @@ pub struct Engine<B: Backend, F: Fs> {
   now: Option<Instant>,
   /// The time of the disk at the start of the flush: the rule for young files compares with it.
   flush_time: SystemTime,
+  /// `Fs::ticks` at the start of the flush.
+  flush_ticks: Duration,
   /// How long the backend took to make watches live.
   commit_took: Duration,
   /// The nodes the flush changed: `finish` reads their events. A key can be stale.
@@ -158,6 +164,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     for time in [&mut options.debounce, &mut options.delete_delay, &mut options.poll_interval] {
       *time = (*time).min(LONGEST_SETTING);
     }
+    options.poll_interval_alone = options.poll_interval_alone.map(|time| time.min(LONGEST_SETTING));
     let mut tree = Tree::new();
     tree.loose_spelling = options.loose_spelling;
     Self {
@@ -173,6 +180,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       loss_waits: false,
       now: None,
       flush_time: SystemTime::UNIX_EPOCH,
+      flush_ticks: Duration::ZERO,
       commit_took: Duration::ZERO,
       touched: Vec::new(),
       dropped: Vec::new(),
@@ -228,6 +236,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       Signal::Failed(error) => {
         left_work = self.backend.is_some();
         self.backend_died(&error);
+        // The poll that was set with the old interval may be far away.
+        let next = now + self.options.poll_interval;
+        self.poll_at = self.poll_at.map(|at| at.min(next));
       }
     }
     if left_work {
@@ -292,6 +303,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.flush_by = None;
     self.now = Some(now);
     self.flush_time = self.fs.now();
+    self.flush_ticks = self.fs.ticks();
     self.commit_took = Duration::ZERO;
     // The scans that loss reports ask for are paced: after one flush of them, the next wait
     // for a rest.
@@ -313,7 +325,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.listed.clear();
     self.listed.shrink_to(KEPT / size_of::<ScanEntry>());
 
-    let took = self.fs.now().duration_since(self.flush_time).unwrap_or_default();
+    let took = self.fs.ticks().saturating_sub(self.flush_ticks);
     let mut took = took.saturating_sub(self.commit_took).min(LONGEST_FLUSH);
     if loss_scans_ran {
       self.rest_until = Some(now + took + took * REST);

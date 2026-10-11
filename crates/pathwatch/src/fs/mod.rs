@@ -6,7 +6,8 @@ use std::{
   hash::Hasher,
   io::{self, Read},
   path::{Path, PathBuf},
-  time::SystemTime,
+  sync::OnceLock,
+  time::{Duration, Instant, SystemTime},
 };
 
 use rustc_hash::FxHasher;
@@ -45,6 +46,13 @@ pub trait Fs {
 
   /// The clock that the modification times come from.
   fn now(&self) -> SystemTime;
+
+  /// A clock that only goes forward, counted from any start: the engine reads from it how long
+  /// its looks at the disk took. The clock of the modification times can be set, and a step of
+  /// it in the middle of a flush would count as time that the flush took.
+  fn ticks(&self) -> Duration {
+    self.now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default()
+  }
 
   /// Whether a listing can be behind `lstat` for a file that its writer still has open (NTFS).
   /// Then the engine takes a file from a listing only where an OS watch reports the write.
@@ -187,6 +195,11 @@ impl Fs for StdFs {
     SystemTime::now()
   }
 
+  fn ticks(&self) -> Duration {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+  }
+
   fn listing_lags(&self) -> bool {
     cfg!(windows)
   }
@@ -211,6 +224,12 @@ fn told(error: io::Error) -> io::Error {
   error
 }
 
+/// Only Windows reads a name as another one than the path says.
+#[cfg(not(windows))]
+fn literal(path: &Path) -> &Path {
+  path
+}
+
 /// macOS: a listing with what `lstat` tells of each entry, and the name of one entry.
 #[cfg(target_vendor = "apple")]
 mod apple;
@@ -224,12 +243,6 @@ use self::apple::name_on_disk;
 /// the same inode; none of these means no such entry, whatever `lstat` said: on a folder that
 /// a Mac shares, Linux still finds a name that was renamed away through another spelling.
 #[cfg(all(unix, not(target_vendor = "apple")))]
-/// Only Windows reads a name as another one than the path says.
-#[cfg(not(windows))]
-fn literal(path: &Path) -> &Path {
-  path
-}
-
 fn name_on_disk(path: &Path) -> io::Result<OsString> {
   use std::os::unix::fs::{DirEntryExt, MetadataExt};
 

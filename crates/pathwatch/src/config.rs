@@ -102,6 +102,7 @@ impl Config {
       ignored: self.ignored,
       debounce: self.debounce,
       poll_interval: if polling { self.poll_interval } else { FALLBACK_POLL_INTERVAL },
+      poll_interval_alone: Some(self.poll_interval),
       // macOS and Windows: a disk takes two spellings of a name for one.
       loose_spelling: cfg!(any(target_vendor = "apple", windows)),
       ..Options::default()

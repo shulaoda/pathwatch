@@ -138,11 +138,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.covered.clear();
       return Vec::new();
     };
-    let started = self.fs.now();
+    let started = self.fs.ticks();
     let committed = backend.commit();
     // A commit can take long (an FSEvents stream: a quarter of a second); the pacing leaves it
     // out.
-    self.commit_took += self.fs.now().duration_since(started).unwrap_or_default();
+    self.commit_took += self.fs.ticks().saturating_sub(started);
     let error = match committed {
       Ok(now_watched) => return now_watched,
       Err(error) => error,
@@ -330,6 +330,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     let error = context("the OS watcher stopped, so every path is polled", error);
     self.report(ErrorKind::Io, None, Some(error));
+    // The poll is all there is now: it runs as often as a watcher that only polls.
+    if let Some(alone) = self.options.poll_interval_alone {
+      self.options.poll_interval = alone;
+    }
     self.tree.poll_all();
     // Its last notifications may be lost.
     self.tree.scan_all();
