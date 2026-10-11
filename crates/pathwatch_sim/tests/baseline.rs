@@ -637,11 +637,11 @@ fn a_bad_path_is_skipped_and_the_rest_is_registered() {
   let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir_all("/p/src").unwrap();
   d.fs.mkdir_all("/p/lib").unwrap();
-  d.watch(&["src/a.js", "/p/src/../lib/a.js", "/", "/p/src/", "/p//src", "/p/./src"]);
+  d.watch(&["src/a.js", "/p/src/../lib/a.js", "/", "/p/../..", "/p/src/", "/p//src", "/p/./src"]);
   assert_eq!(Sim::errors(&d), [ErrorKind::InvalidPath]);
   d.fs.write("/p/src/a.js", "1").unwrap();
   d.fs.write("/p/lib/a.js", "1").unwrap();
-  assert_eq!(Sim::settled(&mut d), ["C /p/src/a.js"]);
+  assert_eq!(Sim::settled(&mut d), ["C /p/lib/a.js", "C /p/src/a.js"]);
   caught_up(&mut d);
 }
 

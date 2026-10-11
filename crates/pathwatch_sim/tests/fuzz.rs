@@ -482,7 +482,7 @@ fn random_to_watch(random: &mut Random, shortest: u64) -> ToWatch {
     50..60 => ToWatch::Existing(Place::Dir { which: random.small(32), rel: String::new() }),
     60..80 => ToWatch::Below { number: random.small(8), rel: random.path(1) },
     80..95 => ToWatch::Above { number: random.small(8), up: 1 + random.small(2) },
-    _ => ToWatch::Bad(random.pick(&["relative/a", "/a/../b", "/", ""])),
+    _ => ToWatch::Bad(random.pick(&["relative/a", "/..", "/", ""])),
   }
 }
 
@@ -490,7 +490,7 @@ fn random_to_unwatch(random: &mut Random) -> ToUnwatch {
   match random.below(100) {
     0..80 => ToUnwatch::Watched(random.small(8)),
     80..95 => ToUnwatch::Path(random.path(1)),
-    _ => ToUnwatch::Bad(random.pick(&["relative/a", "/a/../b", "/", ""])),
+    _ => ToUnwatch::Bad(random.pick(&["relative/a", "/..", "/", ""])),
   }
 }
 
