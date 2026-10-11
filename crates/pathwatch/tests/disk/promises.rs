@@ -5,6 +5,7 @@
 //!    `a_file_is_anything_that_is_not_a_directory`.
 //! 2. Events are the difference to the disk, one for a path in a batch:
 //!    `p::random_changes_end_in_the_state_of_the_disk`; `Watch::receive` checks every batch.
+//!    On Windows also `a_name_that_windows_reads_as_another_is_reported`.
 //! 3. `Update`: `touch_is_an_update_and_chmod_is_not`, `c::s2`,
 //!    `c::s3_deleted_and_created_again_inside_the_delete_delay`.
 //! 4. What exists at `watch` time: `what_exists_at_watch_time_is_not_reported`.
@@ -14,7 +15,8 @@
 //! 7. `unwatch`: `unwatch_of_a_file_and_of_a_directory`,
 //!    `unwatch_keeps_what_another_watched_path_covers`.
 //! 8. Paths: `a_relative_path_with_dot_dot`, `one_bad_path_among_good_ones`.
-//! 9. Calls inside the handler: `watch_and_unwatch_inside_the_handler`.
+//! 9. Calls inside the handler: `watch_and_unwatch_inside_the_handler`,
+//!    `close_inside_the_handler`.
 //! 10. The ignore filter: `c::s14`, `an_ignored_directory_is_not_read`,
 //!     `an_ignored_directory_comes_and_goes`, `a_watched_path_that_the_filter_ignores`,
 //!     `a_watched_path_that_is_ignored_for_both_kinds_gets_nothing`,
@@ -36,7 +38,7 @@
 use std::{
   env, fs,
   path::{Component, Path, PathBuf},
-  sync::{Arc, Mutex},
+  sync::{Arc, Mutex, mpsc::RecvTimeoutError},
   time::{Duration, Instant, SystemTime},
 };
 
@@ -46,7 +48,7 @@ use pathwatch::{
   Watcher,
 };
 
-use crate::{each, each_backend, each_backend_inside, each_backend_with};
+use crate::{Inside, PATIENCE, each, each_backend, each_backend_inside, each_backend_with};
 
 #[cfg(unix)]
 #[test]
@@ -252,8 +254,13 @@ fn unwatch_keeps_what_another_watched_path_covers() {
 fn a_relative_path_with_dot_dot() {
   each_backend(|w| {
     let here = env::current_dir().unwrap();
+    // On Windows the temporary directory can be on another drive, and no relative path leads
+    // there. The directory of the build is on the drive of the current directory, unless
+    // `CARGO_TARGET_DIR` says otherwise.
+    if here.components().next() != w.path("").components().next() {
+      w.dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    }
     let dir = w.path("");
-    // On Windows the two can be on two drives: no relative path leads there.
     if here.components().next() != dir.components().next() {
       return;
     }
@@ -778,5 +785,70 @@ fn a_directory_above_a_watched_path_is_renamed_to_another_letter_case() {
     w.write("r/X/a/old.js", "22");
     w.write("r/X/a/more.js", "1");
     w.expect(&[(Update, "r/x/a/old.js"), (Create, "r/x/a/more.js")]);
+  });
+}
+
+/// Windows takes a dot or a space off the end of a name and reads `nul` as a device, unless the
+/// path has the `\\?\` form. A directory can still hold such names (git, WSL and an unpacked
+/// archive make them), and they are files like the others.
+#[cfg(windows)]
+#[test]
+fn a_name_that_windows_reads_as_another_is_reported() {
+  each_backend(|w| {
+    w.write("w/foo", "the other one");
+    w.watch(&["w"]);
+    // Only a path in the `\\?\` form lets std make such a name.
+    let verbatim = fs::canonicalize(w.path("w")).unwrap();
+    for name in ["foo.", "foo ", "nul", "aux.c"] {
+      fs::write(verbatim.join(name), "1").unwrap();
+    }
+    w.expect(&[(Create, "w/foo."), (Create, "w/foo "), (Create, "w/nul"), (Create, "w/aux.c")]);
+
+    fs::write(verbatim.join("foo."), "22").unwrap();
+    w.expect(&[(Update, "w/foo.")]);
+
+    fs::create_dir(verbatim.join("dir.")).unwrap();
+    fs::write(verbatim.join("dir.").join("x.txt"), "1").unwrap();
+    w.expect(&[(Create, "w/dir./x.txt")]);
+    fs::write(verbatim.join("dir.").join("x.txt"), "22").unwrap();
+    w.expect(&[(Update, "w/dir./x.txt")]);
+
+    // `foo` stays, and its events are its own.
+    fs::remove_file(verbatim.join("foo.")).unwrap();
+    fs::remove_file(verbatim.join("nul")).unwrap();
+    w.expect(&[(Delete, "w/foo."), (Delete, "w/nul")]);
+    w.write("w/foo", "written again");
+    w.expect(&[(Update, "w/foo")]);
+
+    fs::remove_dir_all(&verbatim).unwrap();
+    w.expect(&[
+      (Delete, "w/foo"),
+      (Delete, "w/foo "),
+      (Delete, "w/aux.c"),
+      (Delete, "w/dir./x.txt"),
+    ]);
+  });
+}
+
+/// `close` inside the handler, also with the backend of the OS: its threads end, and the
+/// `close` of the test, which waits for the thread of the watcher, comes back.
+#[test]
+fn close_inside_the_handler() {
+  let inside: Inside = |watcher, _events| watcher.close();
+  each_backend_inside(inside, |w| {
+    w.mkdir("r");
+    w.watch(&["r"]);
+    w.write("r/a.txt", "1");
+    // The batch in which the handler closed the watcher still comes, and it is the last one:
+    // the thread ends, and its end of the channel with it.
+    let batch = w.results.recv_timeout(PATIENCE).expect("the handler ran").unwrap();
+    assert_eq!(batch, [Event { path: w.path("r/a.txt"), kind: Create }], "{}", w.backend);
+    w.write("r/b.txt", "1");
+    let end = w.results.recv_timeout(PATIENCE);
+    assert!(matches!(end, Err(RecvTimeoutError::Disconnected)), "{}: {end:?}", w.backend);
+
+    let closed = w.watcher.watch(w.path("r/x")).unwrap_err();
+    assert_eq!(closed.kind(), ErrorKind::Closed, "{}", w.backend);
+    w.watcher.close();
   });
 }
