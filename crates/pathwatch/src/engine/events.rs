@@ -77,6 +77,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(super) fn forget_file(&mut self, key: DirKey) {
     self.tree[key].kind = Kind::Missing;
     self.tree.set_content(key, None);
+    self.tree.set_ahead_since(key, None);
     self.tree.unhold(key);
     self.touched.push(key);
   }

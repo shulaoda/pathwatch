@@ -85,7 +85,7 @@ watcher, so it should only pass the batch on.
 | `Config` method | Default | Meaning |
 |---|---|---|
 | `with_ignored(f)` | nothing is ignored | `f(path, kind) -> bool`, where `kind` is `EntryKind::File` or `EntryKind::Dir`. A path for which it returns `true` is never reported. An ignored directory is never read or watched. It must give the same answer for the same input, and if it ignores a directory it must ignore everything below it. It is asked about the paths you watch too (promise 10). |
-| `with_debounce(d)` | 50 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch still goes out every 500 ms, or every `4 × d` if that is longer. Zero: no waiting. |
+| `with_debounce(d)` | 50 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch still goes out every 500 ms, or every `4 × d` if that is longer. Zero: no waiting. The most is a year, also for the poll interval. |
 | `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
 | `with_poll_interval(d)` | 100 ms | The shortest pause between two rounds of polling. The least is 1 ms. On a big set of paths the pause is longer: at least nine times as long as the round took. |
 
@@ -118,7 +118,9 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
 8. **Paths.** A relative path is joined to the current directory at the time of the call. `.`,
    `..` and repeated separators are cleaned by text; no link is resolved. A path that cannot be
    used (empty, a NUL in it, a file system root) is `InvalidPath`; the other paths of the same
-   `watch_all` call are watched.
+   `watch_all` call are watched. On Windows this also holds for a name that Windows does not
+   take as it is: one that ends with a dot or a space, or has a `:` (a stream of a file), a
+   control character or one of `< > " | ? *` in it.
 9. **Calls inside the handler.** `watch`, `unwatch` and `close` work there. They take effect
    when the handler has returned.
 10. **The ignore filter.** Nothing is reported from inside an ignored directory, and the
@@ -152,6 +154,13 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   same for a write through `mmap`. On Windows the directory lists the new size and time only
   when the file is closed (measured on NTFS); whether the write is reported before that was
   not checked.
+- **Windows: a second write of the same size by a writer that keeps the file open**, in the
+  same step of the clock of the time stamps (1 to 16 ms), is not found by a look: the disk
+  gives the file a new number only for its first write (measured on NTFS). It is reported
+  when Windows reports the write itself, and at the latest when the file is closed.
+- **Windows, with polling: a file that was just written is opened and read** (up to 16 MiB,
+  for 2 s after the write). A program that opens it meanwhile and shares it with nobody is
+  refused by Windows.
 - **A write through another hard link** of a watched file is not reported.
 - **macOS: a socket or a FIFO that is made** is not reported (macOS 26; macOS 27 reports it).
   It is found when something else makes the watcher look at its directory. Its removal is
@@ -263,6 +272,7 @@ crates/
       disk/                  the promises above, on the real disk
       watcher.rs             the thread
       tree.rs                the tree of the engine, alone
+      ahead.rs               the engine with polling: a file with a time ahead of the clock
       inotify.rs  fsevents.rs  windows.rs     each backend alone, on its OS
       windows_parts.rs       the parts of the Windows backend that call no Windows (on Windows only)
     examples/                watch.rs, dev_server.rs

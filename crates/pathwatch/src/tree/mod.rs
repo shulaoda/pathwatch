@@ -272,6 +272,9 @@ pub struct Tree {
   contents: FxHashMap<DirKey, Content>,
   /// The held nodes, each with the time of its second look.
   holds: FxHashMap<DirKey, Instant>,
+  /// The files whose modification time is far ahead of the clock, each with the time of the
+  /// first look that found the fingerprint it has now.
+  ahead: FxHashMap<DirKey, Instant>,
   /// The registered nodes whose names are not plain, by the slot of their parent: the table does
   /// not find them under another spelling, so a hint looks here ([`Tree::others_meant`]).
   not_plain: FxHashMap<u32, Vec<u32>>,
@@ -307,6 +310,7 @@ impl Tree {
       links: FxHashMap::default(),
       contents: FxHashMap::default(),
       holds: FxHashMap::default(),
+      ahead: FxHashMap::default(),
       not_plain: FxHashMap::default(),
       marked: Vec::new(),
       to_scan: Vec::new(),
@@ -533,6 +537,7 @@ impl Tree {
     self.links.remove(&key);
     self.contents.remove(&key);
     self.holds.remove(&key);
+    self.ahead.remove(&key);
 
     self.give_back();
     self.names.free(node.name_len);
@@ -1115,6 +1120,20 @@ impl Tree {
     }
   }
 
+  /// When the first look found the fingerprint the file has now, for a file whose modification
+  /// time is far ahead of the clock.
+  pub fn ahead_since(&self, key: DirKey) -> Option<Instant> {
+    self.ahead.get(&key).copied()
+  }
+
+  pub fn set_ahead_since(&mut self, key: DirKey, since: Option<Instant>) {
+    if let Some(since) = since {
+      self.ahead.insert(key, since);
+    } else if !self.ahead.is_empty() {
+      self.ahead.remove(&key);
+    }
+  }
+
   /// Holds the node: a look found nothing where the tree has something. Until the second look at
   /// `until`, the node and everything below it stay as they are.
   pub fn hold(&mut self, key: DirKey, until: Instant) {
@@ -1186,11 +1205,12 @@ impl Tree {
         return fail("is held, or has a time for its second look, but not both");
       }
     }
-    let mut kept = self.links.keys().chain(self.contents.keys()).chain(self.holds.keys());
-    if !kept.all(|key| self.get(*key).is_some()) {
+    let kept = self.links.keys().chain(self.contents.keys()).chain(self.holds.keys());
+    if !kept.chain(self.ahead.keys()).all(|key| self.get(*key).is_some()) {
       return Err("something is kept for a node that is gone".to_owned());
     }
-    if !self.contents.keys().all(|key| matches!(self[*key].kind, Kind::File(_))) {
+    let mut of_files = self.contents.keys().chain(self.ahead.keys());
+    if !of_files.all(|key| matches!(self[*key].kind, Kind::File(_))) {
       return Err("the content of a file is kept for a node that has no file".to_owned());
     }
     let live = self.nodes().count();

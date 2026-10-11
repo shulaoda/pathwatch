@@ -220,7 +220,9 @@ struct Number {
   values: BTreeMap<String, Vec<f64>>,
 }
 
-/// Every number in which two adapters can be compared: lower is better in each. A phase in
+/// Every number in which two adapters can be compared: lower is better in each. A run in
+/// which an adapter gave up gives no number of the setup for that adapter: what it set up did
+/// not work. A phase in
 /// which an adapter missed a change, or gave up, gives no time for that adapter: it did not
 /// do the job.
 fn numbers(report: &Report) -> Vec<Number> {
@@ -242,9 +244,13 @@ fn numbers(report: &Report) -> Vec<Number> {
     numbers[at].values.entry(run.adapter.clone()).or_default().push(value);
   };
   for run in report.runs.iter().filter(|run| run.status == "ok") {
-    add(run, "setup", "time", run.setup_ms);
-    add(run, "setup", "CPU", run.setup_cpu_ms);
-    if let Some(base) = report.bases.get(&run.adapter) {
+    // A watcher that stopped to report did not set up what it was asked for.
+    let set_up = !run.phases.iter().any(|phase| phase.abandoned);
+    if set_up {
+      add(run, "setup", "time", run.setup_ms);
+      add(run, "setup", "CPU", run.setup_cpu_ms);
+    }
+    if set_up && let Some(base) = report.bases.get(&run.adapter) {
       // The memory of the process alone where both have it, the resident size where not.
       let (with, without) = match (run.footprint_ready_kb, base.footprint_kb) {
         (Some(with), Some(without)) => (with, without),
@@ -278,7 +284,7 @@ fn behind(out: &mut String, report: &Report) {
     out,
     "Every number in which pathwatch is more than 10% behind the best other library, and by \
      more than 1 ms or 0.5 MiB. Only a library that did the job counts: it missed no change of \
-     the phase. `pathwatch` has the default settings, and `pathwatch-0` is the same without the \
+     the phase, and for the setup it stopped early in no phase of the run. `pathwatch` has the default settings, and `pathwatch-0` is the same without the \
      50 ms that pathwatch waits on purpose. `times` is `pathwatch-0` next to the best other, \
      and `pathwatch` where there is no `pathwatch-0`. With more runs than one, a number is \
      `middle (lowest to highest)`.\n"

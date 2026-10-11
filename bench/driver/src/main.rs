@@ -30,8 +30,9 @@ bench [flags]
   --repeat <n>         run each scenario n times with each adapter (default 1); the tables
                        show the middle run, and how far the runs are apart
   --scenarios <list>   s1,s2,s3,s4,s5,s6,s7 (default: all)
-  --adapters <list>    pathwatch,pathwatch-0,notify,notify-fork,chokidar,parcel,fs-watch,
-                       watchdog (default: all), or `rust` for the first four
+  --adapters <list>    pathwatch,pathwatch-0,notify,notify-fork,notify-debouncer,chokidar,
+                       parcel,fs-watch,watchpack,fsnotify,watchdog,watchfiles (default: all),
+                       or `rust` for the first five
   --tmp <dir>          where the trees are made (default: the temporary directory of the system)
   --js <dir>           the directory of the Node adapters with their node_modules
                        (default: bench/js)

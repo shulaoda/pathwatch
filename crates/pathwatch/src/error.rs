@@ -61,7 +61,9 @@ impl error::Error for Error {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ErrorKind {
   /// The path cannot be used: it is empty, has a NUL in it, names the root of a file system, or
-  /// has a name that is too long. Only `watch` and `unwatch` return it.
+  /// has a name that is too long. On Windows also: a name in it ends with a dot or a space, or
+  /// has a `:`, a control character or one of `< > " | ? *`. Only `watch` and `unwatch` return
+  /// it.
   InvalidPath,
   /// The OS has no room for one more watch. What could not be watched is polled instead.
   WatchLimit,

@@ -667,3 +667,50 @@ fn a_dropped_signal_wakes_the_thread() {
   let batch = results.recv_timeout(PATIENCE).expect("the thread wakes up and scans");
   assert_eq!(batch.unwrap(), [Event { path, kind: EventKind::Create }]);
 }
+
+/// `Duration::MAX` is a way to say "never": the thread must not die of a time that no clock
+/// has.
+#[test]
+fn a_time_too_long_for_a_clock() {
+  let dir = tempfile::tempdir().unwrap();
+  let path = dir.path().join("a.txt");
+
+  // The poll flushes by itself, whatever the quiet time is.
+  let config = quick_config().with_debounce(Duration::MAX);
+  let (sender, results) = mpsc::channel();
+  let watcher = Watcher::with_config(config, move |result| {
+    let _ = sender.send(result);
+  })
+  .unwrap();
+  watcher.watch(&path).unwrap();
+  fs::write(&path, "1").unwrap();
+  let batch = results.recv_timeout(PATIENCE).expect("the file is reported");
+  assert_eq!(batch.unwrap(), [Event { path: path.clone(), kind: EventKind::Create }]);
+
+  // Nothing is ever due here. The thread still takes every call.
+  for config in [
+    Config::default().with_debounce(Duration::MAX),
+    Config::default().with_polling(true).with_poll_interval(Duration::MAX),
+  ] {
+    let watcher = Watcher::with_config(config, |_| {}).unwrap();
+    watcher.watch(dir.path()).unwrap();
+    fs::write(&path, "22").unwrap();
+    watcher.watch(dir.path().join("later")).unwrap();
+    watcher.unwatch(dir.path()).unwrap();
+  }
+}
+
+/// Windows finds no entry under such a name as it is given, so the path would never get an event.
+#[cfg(windows)]
+#[test]
+fn a_name_that_windows_does_not_take_as_it_is() {
+  let mut w = watch();
+  for name in ["a.", "a ", "a.txt:stream", "*.js", "a?", r"dir.\a.txt"] {
+    let path = w.path(name);
+    assert_eq!(invalid(w.watcher.watch(&path)), path);
+    assert_eq!(invalid(w.watcher.unwatch(&path)), path);
+  }
+  w.watcher.watch(w.path(".a b.txt")).unwrap();
+  fs::write(w.path(".a b.txt"), "1").unwrap();
+  w.expect(EventKind::Create, ".a b.txt");
+}

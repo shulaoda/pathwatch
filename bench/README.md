@@ -9,6 +9,7 @@ bench/
   driver/     the driver (`bench`) and the program that makes the tables (`report`)
   adapters/   one small Rust program for each Rust library
   js/         one small Node script for each Node library
+  go/         one small Go program for fsnotify
   py/         one small Python script for each Python library
   results/    the JSON file of a run, and its tables as Markdown
 ```
@@ -65,7 +66,12 @@ Why this is fair:
 - Each library is used the way its own documentation shows for the case. An adapter does
   nothing clever: no filter after the library, no retry, no cache.
 - Each adapter runs in its own process, so its memory and CPU time are its own. `node-idle`
-  (Node with no watcher) and each adapter with no path give the base of the runtime.
+  (Node with no watcher) and each adapter with no path give the base of the runtime. The
+  bases are not alike: with no path, `pathwatch`, the three of notify, `chokidar`, `watchpack`
+  and `fsnotify` still make their watcher, and `parcel`, `fs-watch`, `watchdog` and
+  `watchfiles` make nothing, since they make a watcher for a path only. So the memory above
+  the base leaves out what an empty watcher costs for the first group, and holds it for the
+  second.
 - When a library cannot do a job, the adapter says so (`unsupported`, or a `note` in the
   tables) and the numbers show what the library gives. Example: notify has no ignore rule, so
   in S4 the events for `node_modules` are counted as `extra`.
@@ -132,6 +138,7 @@ On Windows (PowerShell, in `bench`):
 ```powershell
 cd js; npm install; cd ..
 cd py; python -m venv .venv; .venv\Scripts\pip install -r requirements.txt; cd ..
+cd go; go build -o adapter-fsnotify.exe .; cd ..
 cargo build --release
 
 .\target\release\bench.exe --quick --out results\quick-windows.json
@@ -198,7 +205,7 @@ Where pathwatch is behind:
 | Part | Meaning |
 | --- | --- |
 | which numbers | The time and the CPU time of the setup, the memory above the base (the footprint, or the resident size where there is no footprint), and for each phase the p50, the max and the CPU time. Lower is better in each. |
-| who is compared | `pathwatch` and `pathwatch-0` with the best of the other libraries in that number. A library counts in a phase only when it missed no change there and did not stop early. |
+| who is compared | `pathwatch` and `pathwatch-0` with the best of the other libraries in that number. A library counts in a phase only when it missed no change there and did not stop early, and in the numbers of the setup only when it stopped early in no phase of the run. |
 | behind | More than 10% above the best other, and by more than 1 ms or 0.5 MiB. |
 | the three tables | Behind with both settings; behind only with the default settings (what the 50 ms wait costs); behind only without the wait. |
 | `middle (lowest to highest)` | With more runs than one: the middle run, and how far the runs are apart. Two numbers whose ranges overlap are not apart. |

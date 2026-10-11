@@ -33,7 +33,7 @@ watcher.close();
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
 | `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
-| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 50 ms (5.13); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. |
+| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 50 ms (5.13); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
 
@@ -42,7 +42,11 @@ current directory. `.`, repeated separators and a trailing separator are dropped
 away the name before it, all by text. This clean form is the watched path, and every event path
 starts with it, byte for byte. A path that is empty, has a NUL, goes above the root, or is a
 top directory (`/`, `C:\`, `\\server\share`) cannot be used: the call returns `InvalidPath`
-with the first such path, and the other paths of the batch are still watched.
+with the first such path, and the other paths of the batch are still watched. On Windows the
+same holds for a name that Windows does not take as it is (`path::windows_rules::is_name`): it
+drops a dot or a space at the end of a name, reads `:` as the start of a stream, and has no
+name with a control character or one of `< > " | ? *`. Such a path was watched before, and
+never got an event (measured): no record of the OS spells it so.
 
 A path that does not exist is fine. A path that cannot be watched or read right now stays
 registered, the handler gets the error, and the path is polled.
@@ -667,8 +671,11 @@ Two guards:
      the file is young.
 
    **A version in place of the hash** (`Fs::version`, Windows). NTFS keeps a number for each
-   file that moves with every change of it (the place of its last record in the change
-   journal). Where an OS watch covers a young file, the engine stores that number and not a
+   file that moves when it is changed (the place of its last record in the change journal).
+   Not with every write: while a writer keeps the file open, only its first write moves the
+   number, and the close does (measured: three writes through one handle, one number). So a
+   second write of the same size inside one step of the clock, by a writer that keeps the
+   file open, is not found by a look (section 9). Where an OS watch covers a young file, the engine stores that number and not a
    hash, and the same number at the next look says that nothing was written. The file is not
    opened for reading: on Windows that waits for the virus scanner when the file was just
    written (2 ms, and 14 ms for one in ten, measured; the number takes 0.04 ms). The number
@@ -683,6 +690,13 @@ Two guards:
 | has a part of a second in it, and an OS watch covers the file | 20 ms |
 | is a whole second (the file system counts in seconds) | 2 s |
 | any, and only the poll looks at the file | 2 s |
+
+**A time far ahead of the clock** (more than 2 s: the clock of another machine, a time that a
+tool set) never gets old by the clock. Such a file was young for ever: with polling, each
+round read every such file again (measured: 5 files of 4 MiB, 420 MiB read in 20 rounds). A
+write after a look gives the file another time, whatever the clock of its disk says. So the
+file is young for 2 s, on the clock of the engine, after the first look that found the
+fingerprint it has now (`Tree::ahead_since`), and old after that.
 
 "Only the poll looks at it": the directory of the file is polled, or the node is a symbolic link
 (5.14). So with polling, a young file above 16 MiB gets one `Update` when it is 2 s old, also
@@ -1445,6 +1459,8 @@ The test files of the simulator:
 - Private functions (a `mod tests` at the end of the file): `tree/mod.rs`, `path.rs`, `fs/mod.rs`,
   `fs/windows.rs`, `engine/events.rs`, and helpers of the backends.
 - The tree alone (`tests/tree.rs`): the arena, the table, and the way from a hint to a mark.
+- The engine on a real directory with the poll backend and a clock that the test moves
+  (`tests/ahead.rs`): a file whose time is ahead of the clock (5.8). It counts the reads.
 - Each backend alone (`tests/inotify.rs`, `fsevents.rs`, `windows.rs`, each on its OS). `windows_parts.rs` runs on Windows only. In `fsevents.rs` a test
   that makes many changes runs alone, and after the others where it can (`Turn`): a flood
   makes FSEvents report losses, and a test next to it was seen to get one too. No test there
@@ -1498,6 +1514,8 @@ Known holes of the engine:
   delete delay, replaced by another one of the same size and time on a file system that uses
   the inode number again (ext4); a second write of the same size inside one step of a file
   system that counts time in steps between 20 ms and 1 s.
+- Windows: a second write of the same size, inside one step of the clock of the time stamps,
+  by a writer that keeps the file open: the version of the disk does not move (5.8).
 - A write through another hard link of a watched file. A mount over a watched directory.
 - FSEvents and Windows: after `rm -r` of the directories above a watched path, the engine
   learns that an upper directory is gone only at the next poll.

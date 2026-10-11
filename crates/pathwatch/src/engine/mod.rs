@@ -42,6 +42,10 @@ const REST: u32 = 9;
 /// sleeps, and a flush that the sleep fell into would rest for hours.
 const LONGEST_FLUSH: Duration = Duration::from_secs(60);
 
+/// No time of the settings is longer: `Duration::MAX` is a way to say "never", and a time that
+/// far ahead of now is no `Instant`.
+const LONGEST_SETTING: Duration = Duration::from_hours(365 * 24);
+
 /// The ignore filter: `true` for a path that must not be reported. It must give the same
 /// answer for the same path and kind: the node keeps it.
 pub type Ignored = Arc<dyn Fn(&Path, EntryKind) -> bool + Send + Sync>;
@@ -150,7 +154,10 @@ pub struct Engine<B: Backend, F: Fs> {
 }
 
 impl<B: Backend, F: Fs> Engine<B, F> {
-  pub fn new(backend: B, fs: F, options: Options) -> Self {
+  pub fn new(backend: B, fs: F, mut options: Options) -> Self {
+    for time in [&mut options.debounce, &mut options.delete_delay, &mut options.poll_interval] {
+      *time = (*time).min(LONGEST_SETTING);
+    }
     let mut tree = Tree::new();
     tree.loose_spelling = options.loose_spelling;
     Self {

@@ -52,7 +52,7 @@ impl Config {
   /// The quiet time: a batch goes out when no change was noticed for this long. Default: 50 ms.
   ///
   /// While changes keep coming, a batch still goes out every 500 ms, or every four quiet times
-  /// if that is longer.
+  /// if that is longer. The most is a year.
   #[must_use]
   pub fn with_debounce(mut self, debounce: Duration) -> Self {
     self.debounce = debounce;
@@ -83,7 +83,7 @@ impl Config {
   }
 
   /// The shortest pause between two rounds of polling, when the watcher polls everything.
-  /// Default: 100 ms. It is never below 1 ms.
+  /// Default: 100 ms. It is never below 1 ms and never above a year.
   ///
   /// Polling takes about a tenth of a core at most, so the pause is longer for many paths.
   #[must_use]

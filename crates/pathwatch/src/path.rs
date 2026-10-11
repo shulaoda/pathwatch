@@ -10,8 +10,9 @@ use std::{
 /// The registered form of `path`: absolute, no `.` or `..`, no repeated or trailing separator.
 ///
 /// `None` when the path is relative, has a NUL, names a top directory (`/`, `C:\`,
-/// `\\server\share\`), goes above it with `..`, or has a name longer than `MAX_NAME`. A path
-/// that is clean already is given back as it is: no copy.
+/// `\\server\share\`), goes above it with `..`, or has a name longer than `MAX_NAME`; on
+/// Windows also when a name is one that Windows does not take as it is (`is_name`). A path that
+/// is clean already is given back as it is: no copy.
 pub fn normalize(path: &Path) -> Option<Cow<'_, Path>> {
   #[cfg(unix)]
   {
@@ -74,7 +75,7 @@ pub(crate) fn unix_is_clean<U: Unit>(text: &[U]) -> bool {
   let is_slash = |unit: U| is(unit, b'/');
   text
     .split_first()
-    .is_some_and(|(first, rest)| is_slash(*first) && names_are_clean(rest, is_slash))
+    .is_some_and(|(first, rest)| is_slash(*first) && names_are_clean(rest, is_slash, any_name))
 }
 
 /// The Unix rules: the path starts with `/`, and only `/` separates.
@@ -87,7 +88,7 @@ pub(crate) fn unix<U: Unit>(text: &[U]) -> Option<Vec<U>> {
   // The clean form is never longer than the text: one allocation is enough.
   let mut clean = Vec::with_capacity(text.len());
   clean.push(U::from(b'/'));
-  push_names(&mut clean, rest, |unit| is(unit, b'/'), b'/')?;
+  push_names(&mut clean, rest, |unit| is(unit, b'/'), b'/', any_name)?;
   Some(clean)
 }
 
@@ -95,6 +96,17 @@ pub(crate) fn unix<U: Unit>(text: &[U]) -> Option<Vec<U>> {
 #[cfg(any(windows, test))]
 pub(crate) mod windows_rules {
   use super::{MAX_NAME, Unit, has_nul, is, names_are_clean, push_names};
+
+  /// Whether Windows finds an entry under this very name. It takes a dot or a space off the end
+  /// of a name, reads `:` as the start of a stream of the file, and has no name with a control
+  /// character or one of `< > " | ? *`. A path with such a name would be watched and never get
+  /// an event: no record of the OS spells it so.
+  pub(crate) fn is_name<U: Unit>(name: &[U]) -> bool {
+    let is_kept =
+      |unit: U| unit.into() >= 0x20 && !br#"<>:"|?*"#.iter().any(|&byte| is(unit, byte));
+    let ends_well = name.last().is_none_or(|&last| !is(last, b'.') && !is(last, b' '));
+    ends_well && name.iter().all(|&unit| is_kept(unit))
+  }
 
   /// Whether [`windows`] would give `text` back as it is. Only the usual form is looked at,
   /// `C:\a\b`: a clean path on a share is cleaned again, which gives the same path.
@@ -105,7 +117,11 @@ pub(crate) mod windows_rules {
     // `/` separates too, and the clean form has none.
     let has_slash = rest.iter().any(|&unit| is(unit, b'/'));
     let back = |unit: U| is(unit, b'\\');
-    is_letter && is(*colon, b':') && back(*slash) && !has_slash && names_are_clean(rest, back)
+    is_letter
+      && is(*colon, b':')
+      && back(*slash)
+      && !has_slash
+      && names_are_clean(rest, back, is_name)
   }
 
   pub(crate) fn windows<U: Unit>(text: &[U]) -> Option<Vec<U>> {
@@ -123,13 +139,13 @@ pub(crate) mod windows_rules {
         Some(share) => push_share(&mut clean, share, back)?,
         None => push_drive(&mut clean, verbatim, back)?,
       };
-      push_names(&mut clean, rest, back, b'\\')?;
+      push_names(&mut clean, rest, back, b'\\', is_name)?;
     } else if text.len() >= 2 && either(text[0]) && either(text[1]) {
       let rest = push_share(&mut clean, &text[2..], either)?;
-      push_names(&mut clean, rest, either, b'\\')?;
+      push_names(&mut clean, rest, either, b'\\', is_name)?;
     } else {
       let rest = push_drive(&mut clean, text, either)?;
-      push_names(&mut clean, rest, either, b'\\')?;
+      push_names(&mut clean, rest, either, b'\\', is_name)?;
     }
     Some(clean)
   }
@@ -196,10 +212,11 @@ fn push_names<U: Unit>(
   text: &[U],
   separator: impl Fn(U) -> bool,
   join: u8,
+  is_name: fn(&[U]) -> bool,
 ) -> Option<()> {
   let top = clean.len();
   for name in text.split(|&unit| separator(unit)) {
-    match part_of(name) {
+    match part_of(name, is_name) {
       Part::Nothing => {}
       Part::Unusable => return None,
       // Above the top directory there is nothing to take away.
@@ -223,8 +240,18 @@ fn push_names<U: Unit>(
 
 /// Whether what comes after a top directory is clean: names with one separator between them.
 #[cfg(any(unix, windows, test))]
-fn names_are_clean<U: Unit>(text: &[U], separator: impl Fn(U) -> bool) -> bool {
-  text.split(|&unit| separator(unit)).all(|name| matches!(part_of(name), Part::Name))
+fn names_are_clean<U: Unit>(
+  text: &[U],
+  separator: impl Fn(U) -> bool,
+  is_name: fn(&[U]) -> bool,
+) -> bool {
+  text.split(|&unit| separator(unit)).all(|name| matches!(part_of(name, is_name), Part::Name))
+}
+
+/// The Unix rule for a name: every text is one.
+#[cfg(any(not(windows), test))]
+fn any_name<U: Unit>(_name: &[U]) -> bool {
+  true
 }
 
 /// What the text between two separators is.
@@ -233,17 +260,18 @@ enum Part {
   Nothing,
   /// `..`: it takes the name before it away.
   Parent,
-  /// A name with a NUL, or one that is too long: the path cannot be used.
+  /// A name with a NUL, one that is too long, or one that the system does not take as it is:
+  /// the path cannot be used.
   Unusable,
   Name,
 }
 
-fn part_of<U: Unit>(name: &[U]) -> Part {
+fn part_of<U: Unit>(name: &[U], is_name: fn(&[U]) -> bool) -> Part {
   match name {
     [] => Part::Nothing,
     [dot] if is(*dot, b'.') => Part::Nothing,
     [dot, second] if is(*dot, b'.') && is(*second, b'.') => Part::Parent,
-    _ if has_nul(name) || name.len() > MAX_NAME => Part::Unusable,
+    _ if has_nul(name) || name.len() > MAX_NAME || !is_name(name) => Part::Unusable,
     _ => Part::Name,
   }
 }
@@ -350,6 +378,19 @@ mod tests {
       (r"\\.\pipe\x", None),
       (r"\\?\Volume{1b3b1146-4076-11e1-84aa-806e6f6e6963}\a", None),
       (r"\\?\C:\a/b", None),
+      // A name that Windows does not take as it is: a dot or a space at its end, a stream, a
+      // wildcard, a control character. Also in the verbatim form, which is not kept.
+      (r"C:\a\b.", None),
+      (r"C:\a\b ", None),
+      (r"C:\a.\b", None),
+      (r"C:\a\...", None),
+      (r"C:\a\b.txt:stream", None),
+      (r"C:\a\*.js", None),
+      (r"C:\a\b?", None),
+      ("C:\\a\\b\tc", None),
+      (r"\\server\share\a.", None),
+      (r"\\?\C:\a\b.", None),
+      (r"C:\a\.b\c d\e.f", Some(r"C:\a\.b\c d\e.f")),
     ];
     for (given, expected) in table {
       assert_eq!(clean_windows(given).as_deref(), expected, "{given:?}");

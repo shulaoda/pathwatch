@@ -415,8 +415,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     let (kind, found) = match error.kind() {
       io::ErrorKind::PermissionDenied => (ErrorKind::PermissionDenied, Found::Missing),
-      // A link loop. `FilesystemLoop` is not stable yet, and its number differs between systems.
-      kind if format!("{kind:?}") == "FilesystemLoop" => (ErrorKind::Io, Found::Missing),
+      _ if is_link_loop(&error) => (ErrorKind::Io, Found::Missing),
       _ => (ErrorKind::Io, Found::Unknown),
     };
     self.scan_had_error = true;
@@ -444,7 +443,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       Kind::File(old) => Some((old, self.tree.content(key))),
       _ => None,
     };
-    let young = kind != FileType::Other && self.is_young(key, fingerprint.modified);
+    let same = old.is_some_and(|(old, _)| old == fingerprint);
+    let young = kind != FileType::Other && self.is_young(key, fingerprint.modified, same);
     // Compared when the fingerprint is the same, and one last time when the file is old.
     let kept = old.and_then(|(old, content)| content.filter(|_| old == fingerprint));
     let compare = matches!(kept, Some(Content::Hash(_)));
@@ -458,7 +458,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       match self.content_hash(path, kind, fingerprint.size) {
         Ok(hash) => hash,
         // Gone after the `lstat`: this check says nothing, and the next flush looks again.
-        Err(error) if is_missing(&error) => return self.tree.mark(key, Mark::default()),
+        Err(error) if is_missing(&error) => {
+          // Nothing was stored: the node may have no file to keep the time for.
+          self.tree.set_ahead_since(key, None);
+          return self.tree.mark(key, Mark::default());
+        }
         Err(_) => None,
       }
     } else {
@@ -517,9 +521,21 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Whether the file is young: an equal fingerprint proves nothing at the next check. The long
   /// time is for whole seconds, and under the poll, which has no `Written` hint.
-  fn is_young(&self, key: DirKey, modified: i64) -> bool {
-    // Below zero for a time in the future: the file is as young as can be.
+  ///
+  /// A time far ahead of the clock (the clock of another machine, a time that a tool set) never
+  /// gets old by the clock, and the file would be read at every look for ever. A write after
+  /// the first look gives it another time, so it is young for the long time after the first
+  /// look that found this fingerprint (`same`: the tree has it). Then it is old.
+  fn is_young(&mut self, key: DirKey, modified: i64, same: bool) -> bool {
+    // Below zero for a time in the future.
     let age = nanos(self.flush_time).saturating_sub(modified);
+    if age <= -nanos_of(YOUNG_COARSE) {
+      let now = self.now.expect("a check runs inside a flush");
+      let since = self.tree.ahead_since(key).filter(|_| same).unwrap_or(now);
+      self.tree.set_ahead_since(key, Some(since));
+      return now.saturating_duration_since(since) < YOUNG_COARSE;
+    }
+    self.tree.set_ahead_since(key, None);
     if age < nanos_of(YOUNG) {
       return true;
     }
@@ -563,6 +579,25 @@ pub(super) fn is_missing(error: &io::Error) -> bool {
       | io::ErrorKind::InvalidFilename
       | io::ErrorKind::InvalidInput
   )
+}
+
+/// Whether the error is a link loop. Its kind (`FilesystemLoop`) has no stable name, so the
+/// number of the OS is read where it is known.
+fn is_link_loop(error: &io::Error) -> bool {
+  #[cfg(any(target_os = "linux", target_os = "android"))]
+  const LINK_LOOP: Option<i32> = Some(libc::ELOOP);
+  #[cfg(target_vendor = "apple")]
+  const LINK_LOOP: Option<i32> = Some(62);
+  #[cfg(windows)]
+  const LINK_LOOP: Option<i32> =
+    Some(windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME.cast_signed());
+  #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple", windows)))]
+  const LINK_LOOP: Option<i32> = None;
+
+  match LINK_LOOP {
+    Some(code) => error.raw_os_error() == Some(code),
+    None => format!("{:?}", error.kind()) == "FilesystemLoop",
+  }
 }
 
 fn nanos_of(time: Duration) -> i64 {
