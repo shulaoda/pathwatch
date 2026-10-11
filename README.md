@@ -57,6 +57,8 @@ cargo run -p pathwatch --example dev_server -- path/to/project
 | `close()` | Stops the watcher and waits for its thread. Dropping the `Watcher` does the same. |
 
 `watch`, `unwatch` and `close` can be called from any thread, and from inside the handler.
+A handler or an ignore filter that panics ends the thread of the watcher: nothing is reported
+after that, and `watch` and `unwatch` return `Closed`.
 `watch` and `unwatch` return an error only for a path that cannot be used (`InvalidPath`) and
 when the watcher is closed (`Closed`). A path that the OS cannot watch or read is no error
 there: the handler gets it.
@@ -94,7 +96,7 @@ The settings cannot be changed after the watcher is made.
 ## Promises
 
 Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the first lines of
-`promises.rs` say which).
+`promises.rs` say which). The tests of 12 make symbolic links and run on Unix only.
 
 1. **A watched path is a file, a directory or nothing.** A file is anything that is not a
    directory: also a socket, and a symbolic link inside a watched directory.
@@ -120,7 +122,8 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
    used (empty, a NUL in it, a file system root) is `InvalidPath`; the other paths of the same
    `watch_all` call are watched. On Windows this also holds for a name that Windows does not
    take as it is: one that ends with a dot or a space, or has a `:` (a stream of a file), a
-   control character or one of `< > " | ? *` in it.
+   control character or one of `< > " | ? *` in it. A name of that kind that a watched
+   directory holds (git, WSL and an unpacked archive make them) is a file like the others.
 9. **Calls inside the handler.** `watch`, `unwatch` and `close` work there. They take effect
    when the handler has returned.
 10. **The ignore filter.** Nothing is reported from inside an ignored directory, and the
@@ -151,7 +154,8 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
 What is not reported, or reported wrongly. All of these are known and not fixed.
 
 - **A writer that keeps a file open.** macOS reports nothing until the file is closed; the
-  same for a write through `mmap`. On Windows the directory lists the new size and time only
+  same for a write through `mmap`. Linux reports no write through `mmap` at all, also after
+  the file is closed: inotify has no word for it. On Windows the directory lists the new size and time only
   when the file is closed (measured on NTFS); whether the write is reported before that was
   not checked.
 - **Windows: a second write of the same size by a writer that keeps the file open**, in the
@@ -234,7 +238,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 | unwatch | `unwatch(path)`, `unwatch_all(paths)` | Offered differently: it takes back a `watch` of the same path. It cannot cut a part out of a watched directory; use the ignore filter. |
 | close | `close()`, or drop the watcher | Offered. |
 | ignored | `Config::with_ignored(f)` | Offered differently: one function, set when the watcher is made. No glob list, no change later. It is asked about watched paths too: a path that it ignores as a file and as a directory is not watched. It must ignore everything below a directory that it ignores. |
-| polling | `with_polling`, `with_poll_interval` | Offered. On top of that, a directory that the OS cannot watch is polled without an option, and so is everything when the watch API cannot start. |
+| polling | `with_polling`, `with_poll_interval` | Offered. On top of that, a directory that the OS cannot watch is polled without an option, and so is everything when the watch API cannot start or stops: then at the poll interval of the settings. |
 | debounce | `with_debounce` | Offered, and built in. Left out: waiting until a file stops growing (chokidar `awaitWriteFinish`). A slow writer gives more than one `Update`. |
 | atomic writes | always on | Offered differently: no option. A file that is back within 100 ms is one `Update`. |
 | ignore initial | always on | Left out: what exists at `watch` time is never reported. Read the directory yourself if you need the list. |
@@ -249,7 +253,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 | OS | Watch API | Limits |
 |---|---|---|
 | Linux, Android | inotify | One kernel watch for each directory, so a big tree needs a high `fs.inotify.max_user_watches`. At the limit the handler gets `WatchLimit` and the directory is polled once a second. When inotify cannot start at all, the handler is told once and the watcher polls everything. Changes made on another machine (NFS, a folder shared with a VM) are not reported: use polling there. |
-| macOS | FSEvents | See "Holes". A process can run 512 streams; one watcher keeps about 8. It also keeps one file open for each directory at and above a place that a stream watches (about ten for a project, at most 64 such places), and stops at half of what the process may open: beyond that the handler gets `WatchLimit` and the directories are polled once a second. |
+| macOS | FSEvents | See "Holes". A process can run 512 streams; one watcher most often keeps 8 or fewer, and at most about 70: a `watch` call that needs new ones adds up to 8, and from 64 on all of them are replaced. It also keeps one file open for each directory at and above a place that a stream watches (about ten for a project; 64 such places, and more only for paths that have no directory in common where a stream may stand), and stops at half of what the process may open: beyond that the handler gets `WatchLimit` and the directories are polled once a second. |
 | Windows | `ReadDirectoryChangesW` | Tested on Windows 11 with NTFS only (`docs/windows-open-points.md`). At most 64 handles; more directories share a handle on a directory above them. No handle is put on `C:\`, `C:\Users` or `C:\Users\<name>`: what could only be watched from there is polled. |
 | every other target | none: always polling | The cost grows with the number of watched files. |
 
@@ -273,6 +277,7 @@ crates/
       watcher.rs             the thread
       tree.rs                the tree of the engine, alone
       ahead.rs               the engine with polling: a file with a time ahead of the clock
+      stopped.rs             the engine after its backend stopped
       inotify.rs  fsevents.rs  windows.rs     each backend alone, on its OS
       windows_parts.rs       the parts of the Windows backend that call no Windows (on Windows only)
     examples/                watch.rs, dev_server.rs

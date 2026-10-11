@@ -78,6 +78,10 @@ impl Watcher {
   /// read, and the watcher keeps running. Send the batch to a channel and work on another thread:
   /// a slow handler delays every check of the disk and every `watch` and `unwatch` call.
   ///
+  /// A handler that panics ends the thread, and so does a filter of
+  /// [`Config::with_ignored`] that panics: nothing is reported after that, and `watch` and
+  /// `unwatch` return [`ErrorKind::Closed`].
+  ///
   /// When the watch API of the OS cannot start, the watcher polls, as with
   /// [`Config::with_polling`], and tells the handler once: [`ErrorKind::WatchLimit`] for a limit
   /// of the OS, [`ErrorKind::Io`] otherwise.
