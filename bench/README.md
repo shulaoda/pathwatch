@@ -10,7 +10,7 @@ bench/
   adapters/   one small Rust program for each Rust library
   js/         one small Node script for each Node library
   go/         one small Go program for fsnotify
-  py/         one small Python script for each Python library
+  py/         one small Python script for watchdog
   results/    the JSON file of a run, and its tables as Markdown
 ```
 
@@ -50,16 +50,11 @@ How the numbers are read:
 | --- | --- | --- |
 | `pathwatch` | this repository | `Watcher::with_config` with a handler that sends each batch to a channel, and `watch_all`. Default settings (50 ms debounce). |
 | `pathwatch-0` | this repository | The same with `with_debounce(Duration::ZERO)`. |
-| `notify` | notify 8 from crates.io | `recommended_watcher` with a channel; `paths_mut()` to add all paths in one step; `Recursive` for a directory, `NonRecursive` for a file. Polling: `PollWatcher`. It has no ignore rule. |
 | `notify-fork` | `rolldown-notify` from `github.com/rolldown/notify` | The way rolldown uses it today: `RecommendedWatcher::new` with a `Config`, `paths_mut()`, every path with `Recursive` and `TrackPath`. Ignore: `Config::with_ignored`. Polling: `PollWatcher`. |
-| `notify-debouncer` | notify-debouncer-full 0.7 on notify 8 | How most Rust programs use notify: `new_debouncer` with a timeout of 50 ms (the quiet time of pathwatch) and a channel, and `watch` for each path. It has no ignore rule. Polling: `new_debouncer_opt` with `PollWatcher`. |
 | `chokidar` | chokidar 5 | `chokidar.watch(paths, { ignoreInitial: true })` and the `all` event. Ignore: a function for `ignored`. Polling: `usePolling` with `interval` and `binaryInterval`. |
-| `parcel` | @parcel/watcher 2 | `subscribe(dir, callback)`. It watches directories only, so for a set of files it watches the lowest directory that holds them all. Ignore: globs for `ignore`. It has no polling mode. |
 | `fs-watch` | Node itself | `fs.watch(dir, { recursive: true })`, once, for the lowest directory that holds all paths. It is the floor: no library. Polling: `fs.watchFile` for each path. It has no ignore rule. |
-| `watchpack` | watchpack 2, the watcher of webpack 5 | `new Watchpack(options)` and `watch({ files, directories, missing })`, with the `change` and `remove` events and no `aggregateTimeout`. Ignore: a function for `ignored`. Polling: `poll` with the pause. It names a directory like a file. |
 | `fsnotify` | fsnotify 1 (Go) | `NewWatcher` and `Add`, for each directory of a tree and for each new one, as its README shows: it watches one directory, not what is below it. Ignore: such directories are not added, and their events are dropped. It has no polling mode. On macOS it uses kqueue, with one open file for each watched file. |
 | `watchdog` | watchdog 6 (Python) | `Observer().schedule(handler, dir, recursive=True)`. It watches directories, so for a set of files it watches the lowest directory that holds them all. Ignore: `RegexMatchingEventHandler` with `ignore_regexes`, which drops events of a directory that is still watched. Polling: `PollingObserver`. |
-| `watchfiles` | watchfiles 1 (Python, with notify inside) | The `RustNotify` class behind `watch`, with the defaults of `watch` (50 ms after the last change, 1600 ms at the most), so that `ready` is said when it is live. Ignore: the changes of such paths are dropped, as a `watch_filter` would. Polling: `force_polling` with the pause. |
 
 Why this is fair:
 
@@ -67,14 +62,13 @@ Why this is fair:
   nothing clever: no filter after the library, no retry, no cache.
 - Each adapter runs in its own process, so its memory and CPU time are its own. `node-idle`
   (Node with no watcher) and each adapter with no path give the base of the runtime. The
-  bases are not alike: with no path, `pathwatch`, the three of notify, `chokidar`, `watchpack`
-  and `fsnotify` still make their watcher, and `parcel`, `fs-watch`, `watchdog` and
-  `watchfiles` make nothing, since they make a watcher for a path only. So the memory above
-  the base leaves out what an empty watcher costs for the first group, and holds it for the
-  second.
+  bases are not alike: with no path, `pathwatch`, `notify-fork`, `chokidar` and `fsnotify`
+  still make their watcher, and `fs-watch` and `watchdog` make nothing, since they make a
+  watcher for a path only. So the memory above the base leaves out what an empty watcher costs
+  for the first group, and holds it for the second.
 - When a library cannot do a job, the adapter says so (`unsupported`, or a `note` in the
-  tables) and the numbers show what the library gives. Example: notify has no ignore rule, so
-  in S4 the events for `node_modules` are counted as `extra`.
+  tables) and the numbers show what the library gives. Example: `fs.watch` has no ignore rule,
+  so in S4 the events for `node_modules` are counted as `extra`.
 - All adapters write their lines in the same way: the events that wait go out in one write.
 - Each adapter is started once before anything is measured, because the first start of a new
   program is slow (on macOS the first start took 283 ms, and later ones 5 to 20 ms).
@@ -116,13 +110,13 @@ cd bench
 cargo build --release
 ```
 
-Without `py/.venv` the driver skips `watchdog` and `watchfiles`, and without `go/adapter-fsnotify`
-it skips `fsnotify`.
+Without `py/.venv` the driver skips `watchdog`, and without `go/adapter-fsnotify` it skips
+`fsnotify`.
 
 `cargo build` builds the driver and the Rust adapters. (`cargo run` alone builds only the
 driver; the driver says which adapter is missing.)
 
-A quick run on macOS (about 10 minutes), and the full run (about 25 minutes for each of the
+A quick run on macOS (about 5 minutes), and the full run (about 17 minutes for each of the
 three rounds):
 
 ```sh
@@ -173,7 +167,7 @@ Copy the scripts again (the second command) after a change in `js/`.
 
 All flags: `./target/release/bench --help`. The useful ones:
 
-- `--scenarios s1,s3` and `--adapters pathwatch,chokidar` (or `rust` for the five Rust ones)
+- `--scenarios s1,s3` and `--adapters pathwatch,chokidar` (or `rust` for the three Rust ones)
 - `--scale 0.25`, `--quiet-secs 10`
 - `--repeat 3`: every scenario runs three times with every adapter, one round after the other
 - `--tmp <dir>`, `--js <dir>`
@@ -243,8 +237,8 @@ A quiet phase has only the CPU time and the number of events (none is right).
 
 The rules of the driver:
 
-- An event of the kind `access` (a file was opened or read; only notify gives it) is counted
-  apart and never used for a time.
+- An event of the kind `access` (a file was opened or read; only `notify-fork` and `watchdog`
+  give it) is counted apart and never used for a time.
 - After a single change the driver waits until the adapter printed nothing for 10 ms, and
   30 ms at the most, before the next one. A phase is over when the adapter printed nothing for
   250 ms (at most 3 s).
@@ -256,17 +250,11 @@ The rules of the driver:
 
 ## What it cannot tell
 
-- **A missed path is not always a bug.** notify, @parcel/watcher and `fs.watch` report what the
-  OS tells them. For a directory that is renamed in or out, the OS names the directory only,
+- **A missed path is not always a bug.** `notify-fork` and `fs.watch` report what the OS
+  tells them. For a directory that is renamed in or out, the OS names the directory only,
   so these libraries give one event and the table shows every file below it as missed.
   A program that needs the files must list the directory itself. The table shows how much
   work is left to the program, not that the library is broken.
-- **notify on macOS reports nothing in S1 and S3**, with no error. Its FSEvents backend puts
-  every path into one stream, with `watch` for each path as with `paths_mut()`, and a stream
-  takes at most 4,096 paths: for 20,000 single files the stream cannot start, and notify says
-  nothing about it. The table shows that as `missed`. The same holds for `notify-debouncer`
-  and `watchfiles`, which have notify inside. These two also take about a minute to set up
-  S1 and S3 on macOS: they add the paths one by one, and notify restarts its stream for each.
 - **fsnotify answers in a tenth of a millisecond on macOS**, where every other library needs
   about 10 ms. It uses kqueue, not FSEvents: one open file for each watched directory and
   file, so the kernel tells it at once. It pays at setup, with one open file for each of the
@@ -275,7 +263,7 @@ The rules of the driver:
 - **rolldown's own code is not measured.** rolldown puts a layer on top of the fork (a check
   of every event against the disk, and a walk of each new directory). `notify-fork` here is
   the library alone, so its `missed` is higher and its CPU lower than what rolldown has today.
-- **`extra` in S1 and S3 for `parcel` and `fs-watch`** comes from the way they must be used:
+- **`extra` in S1 and S3 for `fs-watch` and `watchdog`** comes from the way they must be used:
   they watch the directory above all files, so they also report the temporary files of an
   atomic save and the noise in `project/dist`. A real program would filter by hand.
 - **The cost of the adapter is in the numbers**: one line of text for each event, and for Node
@@ -284,7 +272,7 @@ The rules of the driver:
   `Delete` for 100 ms. So its latency is at least that. `pathwatch-0` shows it without the
   50 ms.
 - **The word of an event is not checked.** `first word` shows it, and that is all. On macOS
-  notify says `create` for many edits, because FSEvents repeats old flags of a path.
+  `notify-fork` says `create` for many edits, because FSEvents repeats old flags of a path.
 - **Three runs are few.** `--repeat 3` shows whether two numbers are apart, not how a number
   is spread. Without `--repeat` there is one run and no spread at all.
 - **Memory of Node moves with its garbage collector.** It can go down between `ready` and the

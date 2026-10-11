@@ -4,8 +4,6 @@
   "type": "module",
   "description": "The Node adapters of the pathwatch benchmark",
   "dependencies": {
-    "@parcel/watcher": "^2.6.0",
-    "chokidar": "^5.0.0",
-    "watchpack": "^2.5.2"
+    "chokidar": "^5.0.0"
   }
 }

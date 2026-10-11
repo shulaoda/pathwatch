@@ -37,16 +37,11 @@ pub const ADAPTERS: &[Adapter] = &[
     name: "pathwatch-0",
     program: Program::Rust("adapter-pathwatch", &["--debounce-ms", "0"]),
   },
-  Adapter { name: "notify", program: Program::Rust("adapter-notify", &[]) },
   Adapter { name: "notify-fork", program: Program::Rust("adapter-notify-fork", &[]) },
-  Adapter { name: "notify-debouncer", program: Program::Rust("adapter-notify-debouncer", &[]) },
   Adapter { name: "chokidar", program: Program::Node("chokidar.mjs") },
-  Adapter { name: "parcel", program: Program::Node("parcel.mjs") },
   Adapter { name: "fs-watch", program: Program::Node("fs-watch.mjs") },
-  Adapter { name: "watchpack", program: Program::Node("watchpack.mjs") },
   Adapter { name: "fsnotify", program: Program::Go("adapter-fsnotify") },
   Adapter { name: "watchdog", program: Program::Python("watchdog_adapter.py") },
-  Adapter { name: "watchfiles", program: Program::Python("watchfiles_adapter.py") },
   // Node with no watcher at all. It is only run for the table of bases.
   Adapter { name: "node-idle", program: Program::Node("idle.mjs") },
 ];

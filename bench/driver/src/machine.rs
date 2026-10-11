@@ -249,10 +249,8 @@ pub fn versions(bench: &Path, js: &Path) -> BTreeMap<String, String> {
   if python.exists() {
     let python = python.to_string_lossy();
     versions.insert("python".to_owned(), output(&python, &["--version"]));
-    for package in ["watchdog", "watchfiles"] {
-      let code = format!("import importlib.metadata as m; print(m.version('{package}'))");
-      versions.insert(package.to_owned(), output(&python, &["-c", &code]));
-    }
+    let code = "import importlib.metadata as m; print(m.version('watchdog'))";
+    versions.insert("watchdog".to_owned(), output(&python, &["-c", code]));
   }
   let go_mod = fs::read_to_string(bench.join("go/go.mod")).unwrap_or_default();
   let mut words =
@@ -264,22 +262,14 @@ pub fn versions(bench: &Path, js: &Path) -> BTreeMap<String, String> {
   let pathwatch = locked(&lock, "pathwatch").unwrap_or_default();
   let commit = commit(&bench.join("..")).unwrap_or_else(|| "no commit".to_owned());
   versions.insert("pathwatch".to_owned(), format!("{pathwatch} (working tree, {commit})"));
-  versions.insert("notify".to_owned(), locked(&lock, "notify").unwrap_or_default());
   versions.insert("notify-fork".to_owned(), locked(&lock, "rolldown-notify").unwrap_or_default());
-  let debouncer = locked(&lock, "notify-debouncer-full").unwrap_or_default();
-  versions.insert("notify-debouncer".to_owned(), debouncer);
 
-  let packages =
-    [("chokidar", "chokidar"), ("parcel", "@parcel/watcher"), ("watchpack", "watchpack")];
-  for (name, package) in packages {
-    let file = js.join("node_modules").join(package).join("package.json");
-    let version = fs::read_to_string(file)
-      .ok()
-      .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-      .and_then(|json| Some(json.get("version")?.as_str()?.to_owned()))
-      .unwrap_or_else(|| "not installed".to_owned());
-    versions.insert(name.to_owned(), version);
-  }
+  let chokidar = fs::read_to_string(js.join("node_modules/chokidar/package.json"))
+    .ok()
+    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    .and_then(|json| Some(json.get("version")?.as_str()?.to_owned()))
+    .unwrap_or_else(|| "not installed".to_owned());
+  versions.insert("chokidar".to_owned(), chokidar);
   versions.insert("fs-watch".to_owned(), "part of node".to_owned());
   versions
 }

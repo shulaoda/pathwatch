@@ -57,25 +57,6 @@ pub fn read_job() -> Job {
   process::exit(0);
 }
 
-/// The event kinds of notify in one word. The driver does not count `access` as a change.
-#[must_use]
-pub fn notify_word(kind: &notify::EventKind) -> &'static str {
-  use notify::{
-    EventKind,
-    event::{AccessKind, AccessMode, ModifyKind},
-  };
-  match kind {
-    EventKind::Create(_) => "create",
-    EventKind::Remove(_) => "delete",
-    EventKind::Modify(ModifyKind::Name(_)) => "rename",
-    EventKind::Modify(ModifyKind::Metadata(_)) => "metadata",
-    EventKind::Modify(_) => "update",
-    EventKind::Access(AccessKind::Close(AccessMode::Write)) => "close-write",
-    EventKind::Access(_) => "access",
-    EventKind::Any | EventKind::Other => "other",
-  }
-}
-
 /// The ignore rule of the benchmark: the path has a part with this name.
 #[must_use]
 pub fn has_part(path: &Path, name: &str) -> bool {
