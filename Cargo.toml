@@ -6,6 +6,8 @@ resolver = "3"
 version = "0.0.0"
 edition = "2024"
 license = "MIT"
+# The toolchain of `rust-toolchain.toml`: the only one that the tests run on.
+rust-version = "1.99"
 
 [workspace.dependencies]
 pathwatch = { version = "0.0.0", path = "crates/pathwatch" }

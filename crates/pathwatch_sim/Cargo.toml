@@ -3,6 +3,7 @@ name = "pathwatch_sim"
 description = "Fixtures for the tests of pathwatch: a disk and backends in memory, and the engine tests that run on them"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 

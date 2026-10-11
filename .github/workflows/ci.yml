@@ -24,8 +24,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo doc -p pathwatch --no-deps
+      # What a release would hold, built from the packed files alone.
+      - run: cargo package -p pathwatch --locked
+
+  # The benchmark is a workspace of its own: its adapters must still fit the crate.
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo check --workspace --all-targets --locked
+        working-directory: bench
 
   test:
     strategy:
@@ -40,7 +51,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # The backend of each OS has docs of its own.
       - run: cargo doc -p pathwatch --no-deps
-      - run: cargo test --workspace --no-fail-fast
+      - run: cargo test --workspace --no-fail-fast --locked
 
   wasi:
     runs-on: ubuntu-latest
