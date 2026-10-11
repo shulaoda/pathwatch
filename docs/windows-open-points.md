@@ -30,7 +30,7 @@ it is in `fs/windows.rs` now (`told` and `stat`):
   identity of a file and of a directory is the file index now, with the volume serial number
   for a directory.
 
-The first run of the benchmark on Windows (`bench/results/windows.md`) found two more, in the
+The first run of the benchmark on Windows (`bench/BENCHMARK.md`) found two more, in the
 backend:
 
 - **A directory that got no handle was polled for ever.** A directory on the way to a watched
@@ -42,7 +42,7 @@ backend:
   back the watches of the directories below, but only a key that wants the contents holds a
   handle: the handle went away with them, and all of them asked again, without end.
 
-Then the two numbers in which the backend was far behind (`bench/results/windows.md`):
+Then the two numbers in which the backend was far behind (`bench/BENCHMARK.md`):
 
 - **Setup.** One `lstat` of std opens the entry, asks, and closes it: 10 us. Two faster ways,
   both in `fs/windows.rs`:

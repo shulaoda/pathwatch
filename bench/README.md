@@ -6,12 +6,13 @@ the tests and the CI of pathwatch never see the other libraries.
 
 ```
 bench/
-  driver/     the driver (`bench`) and the program that makes the tables (`report`)
-  adapters/   one small Rust program for each Rust library
-  js/         one small Node script for each Node library
-  go/         one small Go program for fsnotify
-  py/         one small Python script for watchdog
-  results/    the JSON file of a run, and its tables as Markdown
+  driver/       the driver (`bench`) and the program that makes the tables (`report`)
+  adapters/     one small Rust program for each Rust library
+  js/           one small Node script for each Node library
+  go/           one small Go program for fsnotify
+  py/           one small Python script for watchdog
+  results/      the JSON file of a run, and its tables as Markdown: not in git
+  BENCHMARK.md  the tables of the last full run on each OS, in one document
 ```
 
 ## The design: one driver, many adapters
@@ -165,6 +166,13 @@ orb bash -c 'cd /path/to/pathwatch/bench && B=$HOME/pathwatch-bench-target/relea
 `/tmp` of the VM is a `tmpfs` (files in memory). `--tmp $HOME` puts the trees on its disk.
 Copy the scripts again (the second command) after a change in `js/`.
 
+`BENCHMARK.md` is the three full runs in one document, so that `results/` can stay out
+of git:
+
+```sh
+./target/release/report results/macos.json results/linux.json results/windows.json > BENCHMARK.md
+```
+
 All flags: `./target/release/bench --help`. The useful ones:
 
 - `--scenarios s1,s3` and `--adapters pathwatch,chokidar` (or `rust` for the three Rust ones)
@@ -183,12 +191,15 @@ the temporary directory, the limit of open files, the load average at the start)
 of every library, of Node and of the Rust compiler, the settings of the run, the base of each
 adapter, and for each scenario and adapter every number of the tables. It also holds what the
 tables leave out: the notes and errors of the adapter, and up to five samples of the missed
-and of the extra paths of each phase. The types are in `driver/src/record.rs`.
+and of the extra paths of each phase. The types are in `driver/src/record.rs`. The files
+hold the paths of the machine, so `results/` is not in git.
 
 ## The tables
 
 `report` prints the summary "Where pathwatch is behind", and then, for each scenario, one
 table "Setup and memory" and one table for each phase. Times are milliseconds, memory is MiB.
+With more files than one, the runs come one after the other, each under the name of its OS.
+A path in the notes is cut at the directory of the run: `...` stands for it.
 
 With `--repeat`, a time or a size in the tables is the middle one of the runs (of two runs:
 the lower one), and a count (missed, extra, dir events, repeats, errors) is the worst one. A

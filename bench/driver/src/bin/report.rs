@@ -1,4 +1,5 @@
-//! `report <file.json>`: prints the tables of a run as Markdown.
+//! `report <file.json>...`: prints the tables of a run as Markdown. With more files than one,
+//! the runs come one after the other in one document, each under the name of its OS.
 
 use std::{collections::BTreeMap, env, fmt::Write as _, fs, process};
 
@@ -8,13 +9,43 @@ use driver::{
 };
 
 fn main() {
-  let Some(file) = env::args().nth(1) else {
-    eprintln!("report <file.json>   (prints Markdown)");
+  let files: Vec<String> = env::args().skip(1).collect();
+  if files.is_empty() {
+    eprintln!("report <file.json>...   (prints Markdown)");
     process::exit(2);
-  };
-  let text = fs::read_to_string(&file).expect("the JSON file can be read");
-  let report: Report = serde_json::from_str(&text).expect("the file is a report of `bench`");
-  print!("{}", markdown(&report));
+  }
+  let reports: Vec<Report> = files
+    .iter()
+    .map(|file| {
+      let text = fs::read_to_string(file).expect("the JSON file can be read");
+      serde_json::from_str(&text).expect("the file is a report of `bench`")
+    })
+    .collect();
+  if let [report] = &reports[..] {
+    print!("{}", markdown(report));
+    return;
+  }
+  println!("# pathwatch benchmark\n");
+  println!(
+    "The last full run on each OS, one after the other. What the columns mean, and how the \
+     numbers are taken: [README.md](README.md).\n"
+  );
+  for report in &reports {
+    println!("## {}\n", os(&report.machine.kernel));
+    // Without the title, and every heading one level down.
+    for line in markdown(report).lines().skip(2) {
+      let deeper = if line.starts_with('#') { "#" } else { "" };
+      println!("{deeper}{line}");
+    }
+  }
+}
+
+fn os(kernel: &str) -> &'static str {
+  match kernel.split(' ').next() {
+    Some("Darwin") => "macOS",
+    Some("Windows") => "Windows",
+    _ => "Linux",
+  }
 }
 
 fn markdown(report: &Report) -> String {
@@ -543,21 +574,19 @@ fn notes(out: &mut String, runs: &[&Run]) {
   let mut lines = Vec::new();
   for run in runs {
     for note in &run.notes {
-      lines.push(format!("{}: {}", run.adapter, note.replace(&run.root, "...")));
+      lines.push(format!("{}: {}", run.adapter, short(note, &run.root)));
     }
     if run.errors > 0 {
-      let first = run.error_samples[0].replace(&run.root, "...");
+      let first = short(&run.error_samples[0], &run.root);
       lines.push(format!("{}: {} errors, the first: `{first}`", run.adapter, run.errors));
     }
     for phase in &run.phases {
-      // The part of a path above the directory of the run says nothing.
-      let short = |sample: &str| sample.replace(&run.root, "...");
       if let Some(sample) = phase.missed_samples.first() {
-        let sample = short(sample);
+        let sample = short(sample, &run.root);
         lines.push(format!("{}, {}: missed for example `{sample}`", run.adapter, phase.name));
       }
       if let Some(sample) = phase.extra_samples.first() {
-        let sample = short(sample);
+        let sample = short(sample, &run.root);
         lines.push(format!("{}, {}: extra for example `{sample}`", run.adapter, phase.name));
       }
     }
@@ -570,6 +599,12 @@ fn notes(out: &mut String, runs: &[&Run]) {
     let _ = writeln!(out, "- {line}");
   }
   let _ = writeln!(out);
+}
+
+/// The part of a path above the directory of the run says nothing, and names the machine. An
+/// error of a library can hold the path the way `Debug` prints it, with doubled backslashes.
+fn short(text: &str, root: &str) -> String {
+  text.replace(&root.replace('\\', "\\\\"), "...").replace(root, "...")
 }
 
 fn table(out: &mut String, head: &[&str], rows: Vec<Vec<String>>) {

@@ -288,7 +288,7 @@ docs/
   design.md                  how it works
   windows-open-points.md     what to check on a Windows machine
 bench/                       the comparison with other watchers: a workspace of its own,
-                             with its results and the commit they were taken at
+                             with the tables of the last full runs in BENCHMARK.md
 ```
 
 `pathwatch` shows seven names: `Watcher`, `Config`, `Event`, `EventKind`, `EntryKind`, `Error`,

@@ -5,4 +5,4 @@
 bench/target
 bench/go/adapter-fsnotify*
 node_modules
-bench/results/quick-*
+bench/results/
