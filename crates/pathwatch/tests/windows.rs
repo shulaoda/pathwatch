@@ -142,17 +142,24 @@ impl Harness {
         Err(error) => panic!("the hint did not come: {error}. Hints so far: {seen:?}"),
       };
       let before = seen.len();
-      self.backend.translate(signal, &mut |hint| {
-        seen.push(match hint {
-          Hint::Changed { dir, rel } => Seen::Changed { key: dir, rel: rel.to_owned() },
-          Hint::Written { dir, rel } => Seen::Written { key: dir, rel: rel.to_owned() },
-          Hint::Lost => Seen::Lost,
-        });
-      });
+      seen.extend(self.hints_of(signal));
       if seen[before..].iter().any(&done) {
         return seen;
       }
     }
+  }
+
+  /// The hints of one signal.
+  fn hints_of(&mut self, raw: Raw) -> Vec<Seen> {
+    let mut seen = Vec::new();
+    self.backend.translate(raw, &mut |hint| {
+      seen.push(match hint {
+        Hint::Changed { dir, rel } => Seen::Changed { key: dir, rel: rel.to_owned() },
+        Hint::Written { dir, rel } => Seen::Written { key: dir, rel: rel.to_owned() },
+        Hint::Lost => Seen::Lost,
+      });
+    });
+    seen
   }
 }
 
@@ -167,8 +174,8 @@ fn make_dir(path: PathBuf) -> PathBuf {
   path
 }
 
-/// Tries `action` until it works: the backend closes a handle on its thread without waiting,
-/// and Windows allows some things only after the close.
+/// Tries `action` until it works: Windows allows some things only a moment after the last
+/// handle on a directory is closed.
 fn until_ok(action: impl Fn() -> io::Result<()>) {
   let deadline = Instant::now() + TIMEOUT;
   while let Err(error) = action() {
@@ -313,8 +320,8 @@ fn a_handle_above_takes_over_from_the_handle_below() {
   fs::write(low.join("f.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(low_key, "f.txt"));
 
-  // With the handle on `low` still open, Windows would refuse this for good.
-  until_ok(|| fs::rename(temp.path().join("mid"), temp.path().join("moved")));
+  // The handle on `low` is closed when `watch` returns: Windows refuses this while it is open.
+  fs::rename(temp.path().join("mid"), temp.path().join("moved")).unwrap();
   fs::write(temp.path().join("moved").join("low").join("g.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(key, r"moved\low\g.txt"));
 }
@@ -361,9 +368,9 @@ fn unwatch_ends_the_hints() {
   let kept_key = harness.handle(&kept);
 
   harness.backend.unwatch(gone_key);
-  // Windows allows this rename only when the handle is closed.
+  // Windows allows this rename only when the handle is closed: `unwatch` waited for it.
   let moved = temp.path().join("moved");
-  until_ok(|| fs::rename(temp.path().join("above"), &moved));
+  fs::rename(temp.path().join("above"), &moved).unwrap();
   fs::write(moved.join("gone").join("f.txt"), "1").unwrap();
   fs::write(kept.join("marker"), "1").unwrap();
   let seen = harness.hints_until(|hint| hint.names(kept_key, "marker"));
@@ -601,7 +608,51 @@ fn open_point_only_the_directories_above_a_handle_cannot_be_renamed() {
   assert!(fs::rename(temp.path().join("top"), &top_2).is_err());
 
   harness.backend.unwatch(key);
-  until_ok(|| fs::rename(temp.path().join("top"), &top_2));
+  fs::rename(temp.path().join("top"), &top_2).unwrap();
+}
+
+/// A handle that another one replaces is read until the kernel holds nothing more for it. A
+/// write in the moment between the last read that the worker took and the close of the handle
+/// is not lost, from whichever handle it comes.
+#[test]
+fn a_change_while_a_handle_is_replaced_is_not_lost() {
+  let temp = scratch();
+  let low = make_dir(temp.path().join("mid").join("low"));
+  let mut harness = Harness::new();
+  for round in 0..20 {
+    let low_key = harness.handle(&low);
+    let stop = Arc::new(AtomicUsize::new(0));
+    let writer = thread::spawn({
+      let (low, stop) = (low.clone(), Arc::clone(&stop));
+      move || {
+        let mut written = 0;
+        while stop.load(Ordering::Acquire) == 0 && written < 300 {
+          fs::write(low.join(format!("r{round}-{written}")), "1").unwrap();
+          written += 1;
+        }
+        written
+      }
+    });
+    // The handle moves up to the top: the one on `low` is replaced while the writer writes.
+    let key = harness.handle(temp.path());
+    stop.store(1, Ordering::Release);
+    let written = writer.join().unwrap();
+    fs::write(low.join(format!("r{round}-marker")), "1").unwrap();
+    let mut seen =
+      harness.hints_until(|hint| hint.names(key, &format!(r"mid\low\r{round}-marker")));
+    while let Ok(Signal::Raw(raw)) = harness.signals.recv_timeout(Duration::from_millis(200)) {
+      seen.extend(harness.hints_of(raw));
+    }
+    for n in 0..written {
+      let (name, below) = (format!("r{round}-{n}"), format!(r"mid\low\r{round}-{n}"));
+      assert!(
+        seen.iter().any(|hint| hint.names(low_key, &name) || hint.names(key, &below)),
+        "round {round}: no hint for {name}: {seen:?}"
+      );
+    }
+    harness.backend.unwatch(key);
+    harness.backend.unwatch(low_key);
+  }
 }
 
 #[test]

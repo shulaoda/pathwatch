@@ -48,17 +48,20 @@ impl Backend for WindowsBackend {
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
     let (coverage, told) = self.handles.watch(key, dir, want, &mut self.port);
     self.tell(told);
+    self.port.wait_for_closes();
     coverage
   }
 
   fn unwatch(&mut self, key: DirKey) {
     let told = self.handles.unwatch(key, &mut self.port);
     self.tell(told);
+    self.port.wait_for_closes();
   }
 
   fn commit(&mut self) -> io::Result<Vec<DirKey>> {
     let told = self.handles.commit(&mut self.port);
     self.tell(told);
+    self.port.wait_for_closes();
     Ok(mem::take(&mut self.covered))
   }
 
@@ -86,12 +89,16 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
     Raw::Read { watch, dir, extended, result } => (watch, dir, extended, result),
     Raw::Lost(keys) => return keys.into_iter().for_each(|key| hint(lost(key))),
   };
-  let Ok(bytes) = result else {
-    return handles.closed(watch).into_iter().for_each(|key| hint(lost(key)));
+  let bytes = match result {
+    Ok(bytes) => bytes,
+    Err(error) => {
+      return handles.closed(watch, &error).into_iter().for_each(|key| hint(lost(key)));
+    }
   };
   if bytes.is_empty() {
     return handles.below(&dir).into_iter().for_each(|key| hint(lost(key)));
   }
+  handles.delivered(watch);
   let mut name = Vec::new();
   let records = if extended { Records::extended(&bytes) } else { Records::new(&bytes) };
   for record in records {
@@ -314,6 +321,14 @@ mod handles {
     pub covered: Vec<DirKey>,
   }
 
+  /// What the last handle on a directory died of, and how many died there in a row.
+  #[derive(Debug)]
+  struct Death {
+    count: u8,
+    kind: io::ErrorKind,
+    text: String,
+  }
+
   #[derive(Debug, Default)]
   pub struct Handles {
     keys: FxHashMap<DirKey, Served>,
@@ -323,6 +338,8 @@ mod handles {
     unsettled: bool,
     refused: FxHashSet<DirKey>,
     waiting: FxHashMap<DirKey, PathBuf>,
+    /// The directories whose handle died before it delivered anything.
+    dead: FxHashMap<PathBuf, Death>,
   }
 
   impl Handles {
@@ -334,12 +351,12 @@ mod handles {
       system: &mut dyn System,
     ) -> (Coverage, Told) {
       let mut told = Told::default();
-      self.waiting.remove(&key);
+      let waited = self.waiting.remove(&key).is_some();
       let refused = self.refused.remove(&key);
       let want = self.keys.get(&key).map_or(want, |served| served.want.max(want));
 
       if let Some(at) = self.open.iter().position(|handle| dir.starts_with(&handle.dir)) {
-        let coverage = self.share(at, key, dir, want, system);
+        let coverage = self.share(at, key, dir, want, !(waited || refused), system);
         if matches!(coverage, Coverage::NotWatched | Coverage::Failed(_)) {
           self.drop_key(key, system, &mut told);
         }
@@ -348,6 +365,13 @@ mod handles {
       if want == Want::Names || !may_hold_a_handle(dir) {
         self.waiting.insert(key, dir.to_owned());
         return (Coverage::NotWatched, told);
+      }
+      // The handles on this directory die as soon as they are opened (a server that refuses
+      // the request): the engine polls it, and asks again at each poll.
+      if self.dead.get(dir).is_some_and(|death| death.count >= 2)
+        && let Some(death) = self.dead.remove(dir)
+      {
+        return (Coverage::Failed(io::Error::new(death.kind, death.text)), told);
       }
 
       self.remember(key, dir, want, None);
@@ -384,9 +408,17 @@ mod handles {
       told
     }
 
-    pub fn closed(&mut self, id: WatchId) -> Vec<DirKey> {
+    /// The handle died: the read on it failed. The keys it served, which are forgotten.
+    pub fn closed(&mut self, id: WatchId, error: &io::Error) -> Vec<DirKey> {
       let Some(at) = self.open.iter().position(|handle| handle.id == id) else { return Vec::new() };
-      self.open.swap_remove(at);
+      let handle = self.open.swap_remove(at);
+      let death = self.dead.entry(handle.dir).or_insert(Death {
+        count: 0,
+        kind: error.kind(),
+        text: String::new(),
+      });
+      (death.count, death.kind, death.text) =
+        (death.count.saturating_add(1), error.kind(), error.to_string());
       let served = self.keys.iter().filter(|(_, served)| served.handle == Some(id));
       let keys: Vec<DirKey> = served.map(|(&key, _)| key).collect();
       for &key in &keys {
@@ -397,6 +429,13 @@ mod handles {
 
     pub fn serves(&self, key: DirKey) -> bool {
       self.keys.get(&key).is_some_and(|served| served.handle.is_some())
+    }
+
+    /// The handle delivered records: a death before it is forgotten.
+    pub(super) fn delivered(&mut self, id: WatchId) {
+      if let Some(handle) = self.open.iter().find(|handle| handle.id == id) {
+        self.dead.remove(&handle.dir);
+      }
     }
 
     /// Every key whose directory holds `path`, the deepest first. A key above one that was
@@ -425,18 +464,24 @@ mod handles {
       below.flat_map(|(_, keys)| keys).copied().collect()
     }
 
+    /// `fresh`: the request is no second ask of a key that waited for a handle, or got none.
     fn share(
       &mut self,
       at: usize,
       key: DirKey,
       dir: &Path,
       want: Want,
+      fresh: bool,
       system: &mut dyn System,
     ) -> Coverage {
       if leads_through_a_link(system, &self.open[at].dir, dir) {
         return Coverage::NotWatched;
       }
-      if self.open[at].dir == dir
+      // A `watch` for the very directory of the handle puts a new handle there: the old one may
+      // be on a directory that was renamed away. A key that only waited, or got no handle at
+      // the last commit, takes the one that the commit just opened.
+      if fresh
+        && self.open[at].dir == dir
         && let Err(error) = self.reopen(at, system)
       {
         return Coverage::Failed(error);
@@ -446,8 +491,13 @@ mod handles {
     }
 
     fn drop_key(&mut self, key: DirKey, system: &mut dyn System, told: &mut Told) {
-      if self.forget(key).is_some_and(|gone| gone.want == Want::Contents) {
-        let _ = self.settle(system, told);
+      match self.forget(key) {
+        Some(gone) if gone.want == Want::Contents => {
+          let _ = self.settle(system, told);
+        }
+        // A handle that a failed settle kept for this key alone would stay open with no key.
+        Some(gone) if gone.handle.is_some() => self.close_unused(system),
+        _ => {}
       }
     }
 
@@ -785,6 +835,8 @@ mod port {
     iocp: Arc<Iocp>,
     commands: mpsc::Sender<Command>,
     worker: Option<thread::JoinHandle<()>>,
+    /// A close was queued since the last wait.
+    closing: bool,
   }
 
   impl Port {
@@ -794,16 +846,28 @@ mod port {
       let worker = thread::Builder::new().name("pathwatch-windows".to_owned()).spawn({
         let iocp = Arc::clone(&iocp);
         move || {
-          let watches = FxHashMap::default();
-          Worker { iocp, commands: receiver, sink, watches, next_token: 0 }.run();
+          let (watches, waiting) = (FxHashMap::default(), Vec::new());
+          Worker { iocp, commands: receiver, sink, watches, next_token: 0, waiting }.run();
         }
       })?;
-      Ok(Self { iocp, commands, worker: Some(worker) })
+      Ok(Self { iocp, commands, worker: Some(worker), closing: false })
     }
 
     fn send(&self, command: Command) -> io::Result<()> {
       self.commands.send(command).map_err(|_| stopped())?;
       self.iocp.wake()
+    }
+
+    /// Returns when every handle whose close was queued is closed: a directory above one of
+    /// them can be renamed then. A worker that stopped answers by dropping the reply.
+    pub(super) fn wait_for_closes(&mut self) {
+      if !mem::take(&mut self.closing) {
+        return;
+      }
+      let (reply, answer) = mpsc::sync_channel(1);
+      if self.send(Command::Closed { reply }).is_ok() {
+        let _ = answer.recv();
+      }
     }
   }
 
@@ -820,6 +884,7 @@ mod port {
     }
 
     fn close(&mut self, id: WatchId) {
+      self.closing = true;
       let _ = self.send(Command::Close { id });
     }
 
@@ -840,8 +905,18 @@ mod port {
   }
 
   enum Command {
-    Open { id: WatchId, dir: PathBuf, reply: mpsc::SyncSender<io::Result<()>> },
-    Close { id: WatchId },
+    Open {
+      id: WatchId,
+      dir: PathBuf,
+      reply: mpsc::SyncSender<io::Result<()>>,
+    },
+    Close {
+      id: WatchId,
+    },
+    /// Answered when no handle is closing any more.
+    Closed {
+      reply: mpsc::SyncSender<()>,
+    },
     Stop,
   }
 
@@ -853,6 +928,8 @@ mod port {
     sink: Sink<Raw>,
     watches: FxHashMap<usize, Watch>,
     next_token: usize,
+    /// The replies that wait for the closes.
+    waiting: Vec<mpsc::SyncSender<()>>,
   }
 
   impl Worker {
@@ -881,6 +958,10 @@ mod port {
             let _ = reply.send(self.open(id, &dir));
           }
           Ok(Command::Close { id }) => self.close(id),
+          Ok(Command::Closed { reply }) => {
+            self.waiting.push(reply);
+            self.answer_closed();
+          }
           Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return false,
           Err(mpsc::TryRecvError::Empty) => return true,
         }
@@ -910,20 +991,41 @@ mod port {
     fn close(&mut self, id: WatchId) {
       let found = self.watches.iter_mut().find(|(_, watch)| watch.id == id);
       let Some((&token, watch)) = found else { return };
-      watch.close();
-      if !watch.pending {
+      watch.closing = true;
+      if watch.pending {
+        watch.cancel();
+      } else {
         self.watches.remove(&token);
+      }
+      self.answer_closed();
+    }
+
+    /// The replies that wait for the closes get them once no handle is closing.
+    fn answer_closed(&mut self) {
+      if self.watches.values().any(|watch| watch.closing) {
+        return;
+      }
+      for reply in self.waiting.drain(..) {
+        let _ = reply.send(());
       }
     }
 
     fn completed(&mut self, token: usize, result: io::Result<u32>) {
       let Some(watch) = self.watches.get_mut(&token) else { return };
       watch.pending = false;
-      if watch.dir.is_none() {
+      if watch.closing {
+        // The kernel keeps the records of a handle between two reads and drops them with the
+        // handle: a read that came back whole may have left some there. One more read takes
+        // them, and the cancel ends the handle once nothing is left.
         if let Ok(len) = result {
           self.sink.raw(watch.raw(Ok(watch.records(len))));
+          if watch.read().is_ok() {
+            watch.cancel();
+            return;
+          }
         }
         self.watches.remove(&token);
+        self.answer_closed();
         return;
       }
       let records = match result {
@@ -963,7 +1065,8 @@ mod port {
 
     fn stop(mut self) {
       for watch in self.watches.values_mut() {
-        watch.close();
+        watch.closing = true;
+        watch.cancel();
       }
       self.watches.retain(|_, watch| watch.pending);
       while !self.watches.is_empty() {
@@ -989,6 +1092,8 @@ mod port {
     pending: bool,
     empty_reads: u8,
     extended: bool,
+    /// The handle is given up: it is read until nothing is left, then closed.
+    closing: bool,
   }
 
   impl Watch {
@@ -1002,6 +1107,7 @@ mod port {
         pending: false,
         empty_reads: 0,
         extended,
+        closing: false,
       }
     }
 
@@ -1049,9 +1155,12 @@ mod port {
       bytes
     }
 
-    fn close(&mut self) {
-      let Some(dir) = self.dir.take() else { return };
-      if self.pending {
+    /// Cancels the pending read. It fails when the read is over already: then its packet is
+    /// on its way, and the handle stays until it is taken.
+    fn cancel(&mut self) {
+      if self.pending
+        && let Some(dir) = &self.dir
+      {
         // SAFETY: the handle is open, and `overlapped` is the block of its pending read.
         unsafe { CancelIoEx(dir.as_raw_handle(), &raw const *self.overlapped) };
       }

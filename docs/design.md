@@ -1398,11 +1398,17 @@ What was not checked, and what is known to be missing, is in `docs/windows-open-
   above a link.
 - `Handles` keeps every served key. When a key comes or goes, the handles move to where `place`
   puts them: new handles are opened first, then old ones are closed. A key that got another
-  handle is not told: the new handle reported before the old one stopped, the last read of
-  the old one is still translated, and the read that the close cancels fails
-  (`ERROR_OPERATION_ABORTED`), so it is not taken for lost records. If one open fails,
-  nothing changes. A `watch` for the very directory of a handle puts a new handle there: the
-  old one may be on a directory that was renamed away.
+  handle is not told: the new handle reported before the old one stopped, and the old one is
+  read until the kernel holds nothing more for it, then closed; the read that the close
+  cancels fails (`ERROR_OPERATION_ABORTED`), so it is not taken for lost records. The call
+  of the backend returns when the closes are done: a directory above a closed handle can be
+  renamed then. If one open fails, nothing changes; a handle that only keys wanting names
+  still use closes with the last of them. A `watch` for the very directory of a handle puts a
+  new handle there (the old one may be on a directory that was renamed away), unless the key
+  only waited for a handle, or got none at the last commit. A handle whose read fails is
+  given up and its keys are told; when the next handle on the directory dies too before it
+  delivered anything, the ask after that is answered `Failed` with the error of the read: the
+  directory is polled, and tried again at each poll.
 - Filter: `FILE_NAME | DIR_NAME | SIZE | LAST_WRITE`. 64 KiB buffer. The bytes of a
   completed read are read on the watcher thread (`Records`, `translate`). The reads ask for
   the longer records (`ReadDirectoryChangesExW`, Windows 10 1709 and later) where Windows

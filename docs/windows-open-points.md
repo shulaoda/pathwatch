@@ -180,7 +180,10 @@ the real disk, with this backend and with polling.
   handle still takes no further read after such a failure: the fall back from the longer
   records opens a new handle with a key of its own (`Worker::open`).
 - **Network shares.** A server that cannot notify makes the first read fail. The answer is
-  `Failed`, and the engine polls the directory. A server that cannot be reached answers
+  `Failed`, and the engine polls the directory. A read that fails after the open gives the
+  handle up and tells its keys; when the next handle on the directory dies the same way
+  before it delivered anything, the ask after that is `Failed` too, and the directory is
+  polled. A server that cannot be reached answers
   `ERROR_BAD_NETPATH`, which std calls "not found": `told` makes it no answer, so the files
   on the share get no `Delete` while the server is away.
 
@@ -276,7 +279,11 @@ its limits are, is in `docs/design.md` 7.3.
 
 4. **Lost records in the last read of a closed handle.** Settled: the read that a close
    cancels fails with `ERROR_OPERATION_ABORTED` (118 of 118 closes, measured), so a last read
-   that ends with no bytes is lost records, and it is passed on like every other one.
+   that ends with no bytes is lost records, and it is passed on like every other one. A close
+   can also find the read over and its packet not taken yet (`CancelIoEx` finds nothing): the
+   kernel keeps the records that come after such a read until the handle is closed, so the
+   handle is read on and closed when a read comes back cancelled. The call that queued the
+   closes waits for them.
 
 5. **A key at the directory of a handle is asked again after it moved.** Settled: a key that
    gets another handle is not told any more.

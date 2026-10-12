@@ -361,7 +361,8 @@ mod handles {
 
     fn died(&mut self, id: WatchId) -> Vec<u32> {
       self.disk.open.retain(|(open, _)| *open != id);
-      let mut keys: Vec<u32> = self.handles.closed(id).into_iter().map(index).collect();
+      let died = io::Error::other("the read failed");
+      let mut keys: Vec<u32> = self.handles.closed(id, &died).into_iter().map(index).collect();
       keys.sort_unstable();
       keys
     }
@@ -458,6 +459,25 @@ mod handles {
     assert_eq!(fake.watch(1, "/p/link/sub", Want::Contents), Answer::NotWatched);
     assert_eq!(fake.dirs(), dirs(["/p"]));
     assert_eq!(fake.lost(), []);
+  }
+
+  /// A failed settle keeps a handle for the keys that still use it. When the last of them is a
+  /// key that wants names only, `unwatch` of it closes the handle: none stays open with no key.
+  #[test]
+  fn a_handle_kept_by_a_failed_settle_closes_with_its_last_key() {
+    let mut fake = Fake::default();
+    let id = fake.open(0, "/p");
+    assert_eq!(fake.watch(1, "/p/sub", Want::Names), Answer::Names);
+    fake.disk.broken = Some(dir("/q"));
+    let (coverage, _) = fake.handles.watch(key(2), &dir("/q"), Want::Contents, &mut fake.disk);
+    assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
+    // The settle of this `unwatch` fails on `/q`: the handle on `/p` stays for the key that
+    // wants names.
+    fake.unwatch(0);
+    assert_eq!(fake.disk.open, [(id, dir("/p"))]);
+    assert_eq!(fake.lost(), [2]);
+    fake.unwatch(1);
+    assert_eq!(fake.disk.open, []);
   }
 
   fn dirs<const N: usize>(paths: [&str; N]) -> Vec<PathBuf> {
@@ -1239,6 +1259,36 @@ mod translate {
     assert_eq!(hints(&mut handles, read(id, "/p", failed())), []);
     // The keys are forgotten too: a later read gives no hint, and a key that asks gets a new one.
     assert_eq!(hints(&mut handles, read(id, "/p", Ok(records(&[(ADDED, "sub/a")])))), []);
+    open(&mut handles, 0, "/p");
+  }
+
+  /// A handle that dies as soon as it is opened, twice in a row: the key is told once, the
+  /// engine polls the directory, and a later `watch` tries a handle again. A handle that
+  /// delivered records was no such death.
+  #[test]
+  fn a_handle_that_dies_twice_is_a_failure() {
+    let mut handles = Handles::default();
+    let mut calls = Calls::default();
+    let first = open(&mut handles, 0, "/p");
+    assert_eq!(hints(&mut handles, read(first, "/p", failed())), [changed(0, "")]);
+    // The engine asks again: a directory that was removed and made again gets its handle at
+    // once.
+    let second = open(&mut handles, 0, "/p");
+    assert_ne!(first, second);
+    assert_eq!(hints(&mut handles, read(second, "/p", failed())), [changed(0, "")]);
+    let (coverage, _) = handles.watch(key(0), &dir("/p"), Want::Contents, &mut calls);
+    let failed_with = match coverage {
+      Coverage::Failed(error) => error.kind(),
+      other => panic!("{other:?}"),
+    };
+    assert_eq!(failed_with, io::ErrorKind::PermissionDenied);
+    assert_eq!(calls.opened, None);
+
+    // The ask at the next poll tries again, and a handle that delivered starts afresh.
+    let third = open(&mut handles, 0, "/p");
+    let bytes = records(&[(ADDED, "a")]);
+    assert_eq!(hints(&mut handles, read(third, "/p", Ok(bytes))), [changed(0, "a")]);
+    assert_eq!(hints(&mut handles, read(third, "/p", failed())), [changed(0, "")]);
     open(&mut handles, 0, "/p");
   }
 
