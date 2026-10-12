@@ -507,7 +507,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       && !self.only_polled(key);
     let version = if asks_version { self.fs.version(path) } else { None };
     let hash = if (young && version.is_none()) || compare {
-      match self.content_hash(path, kind, fingerprint.size) {
+      // The reads are timed apart: the rest after a poll counts them once (design.md 5.13).
+      let started = self.fs.ticks();
+      let hashed = self.content_hash(path, kind, fingerprint.size);
+      self.read_took += self.fs.ticks().saturating_sub(started);
+      match hashed {
         Ok(hash) => hash,
         // Gone after the `lstat`: this check says nothing, and the next flush looks again.
         Err(error) if is_missing(&error) => {
@@ -565,7 +569,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// compare.
   fn content_hash(&self, path: &Path, kind: FileType, size: u64) -> io::Result<Option<u64>> {
     match kind {
-      FileType::File if size <= HASH_LIMIT => self.fs.hash(path).map(Some),
+      FileType::File if size <= HASH_LIMIT => self.fs.hash(path, HASH_LIMIT),
       FileType::Symlink => self.fs.link_target(path).map(|target| Some(hash_of(&target))),
       _ => Ok(None),
     }

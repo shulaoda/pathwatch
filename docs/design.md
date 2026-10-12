@@ -684,8 +684,12 @@ Two guards:
    future). When a young regular file is stored, the engine also stores a hash of its content.
    At the next check with an equal fingerprint the hash decides. When the file is no longer
    young, the hash is compared one last time and dropped. A link is never opened: the hash of
-   a link is the hash of its target. A file above 16 MiB is not hashed, and a file may not be
-   readable. Such a young file has nothing to compare:
+   a link is the hash of its target, and the read of a file opens the entry so that a link
+   that took the place of the file since the look is not followed, and a FIFO or a device is
+   not waited for (`O_NOFOLLOW` and `O_NONBLOCK`; on Windows a reparse point that stands for
+   another name is refused). A file above 16 MiB is not hashed, and the read stops at the
+   limit when the file grew since the look: such a file, and a file that cannot be read, has
+   nothing to compare:
    - where an OS watch covers it, an equal fingerprint counts as a change at every look while
      it is young, and at the first look that finds it old;
    - where only the poll looks at it, an equal fingerprint says nothing while it is young, and
@@ -985,7 +989,10 @@ kind of work rests for `9 × t`. So about a tenth of the time goes into it at mo
   its node until then. Every other mark is checked as always, and a hint that names a path
   with a waiting mark takes it out of the wait.
 - The poll: the next round starts after the poll interval, or after the rest, whichever is
-  longer.
+  longer. The rest of the poll is nine times the looks of the round plus the reads of young
+  files once: the looks come again at every round, a file is read for two seconds only. And
+  it is five seconds at most (`LONGEST_REST`): a round that read a burst of files written just
+  before it put the next one off for minutes (measured: 500 files, 2 to 20 s; 100,000, 153 s).
 
 The time is the time of the looks at the disk. What the backend takes to make watches live
 (`commit`) is left out: it is paid once, not at every look.

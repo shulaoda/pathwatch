@@ -39,6 +39,10 @@ const LONGEST_WAIT: Duration = Duration::from_millis(500);
 /// takes a tenth of the time at most.
 const REST: u32 = 9;
 
+/// The longest rest after a poll: a round that read a burst of young files must not put the
+/// next one off for minutes.
+const LONGEST_REST: Duration = Duration::from_secs(5);
+
 /// A flush counts for no more than this in the rest: the clock runs on while the machine
 /// sleeps, and a flush that the sleep fell into would rest for hours.
 const LONGEST_FLUSH: Duration = Duration::from_secs(60);
@@ -142,6 +146,9 @@ pub struct Engine<B: Backend, F: Fs> {
   commit_took: Duration,
   /// A watch was given back since the last commit: the backend may move its watches then.
   gave_back: bool,
+  /// How long the reads of contents took since the last tick: the rest after a poll counts them
+  /// once.
+  read_took: Duration,
   /// The nodes the flush changed: `finish` reads their events. A key can be stale.
   touched: Vec<DirKey>,
   /// The registered names whose watch target the filter ignores: the end of the flush drops
@@ -193,6 +200,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       flush_ticks: Duration::ZERO,
       commit_took: Duration::ZERO,
       gave_back: false,
+      read_took: Duration::ZERO,
       touched: Vec::new(),
       dropped: Vec::new(),
       covered: Vec::new(),
@@ -281,11 +289,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if !flush && !poll && !second_look {
       return;
     }
+    self.read_took = Duration::ZERO;
     let took = self.flush(now);
     self.finish(out);
     if poll {
-      // The next poll counts from the end of this one, after a rest for a slow one.
-      self.poll_at = Some(now + took + self.options.poll_interval.max(took * REST));
+      // The next poll counts from the end of this one, after a rest for a slow one: nine times
+      // the looks, which come again at every round, and the reads of young files once, since a
+      // file is read for two seconds only. The rest is bounded (design.md 5.13).
+      let looks = took.saturating_sub(self.read_took);
+      let rest = (looks * REST).saturating_add(self.read_took).min(LONGEST_REST);
+      self.poll_at = Some(now + took + self.options.poll_interval.max(rest));
     }
     self.stop_poll_if_idle();
   }

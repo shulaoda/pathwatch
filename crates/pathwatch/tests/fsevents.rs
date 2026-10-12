@@ -1546,8 +1546,8 @@ impl Fs for CountingFs {
     self.disk.read_dir(dir, each)
   }
 
-  fn hash(&self, path: &Path) -> io::Result<u64> {
-    self.disk.hash(path)
+  fn hash(&self, path: &Path, limit: u64) -> io::Result<Option<u64>> {
+    self.disk.hash(path, limit)
   }
 
   fn link_target(&self, path: &Path) -> io::Result<PathBuf> {

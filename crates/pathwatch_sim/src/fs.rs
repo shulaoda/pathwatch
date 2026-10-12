@@ -488,17 +488,18 @@ impl Fs for SimFs {
     Ok(())
   }
 
-  fn hash(&self, path: &Path) -> io::Result<u64> {
+  fn hash(&self, path: &Path, limit: u64) -> io::Result<Option<u64>> {
     self.enter(|calls| calls.hash += 1);
     let state = self.lock();
     let id = state.look_up(path, true)?;
     let inode = &state.inodes[&id];
     match &inode.content {
       Content::File(_) if inode.denied => Err(error(io::ErrorKind::PermissionDenied)),
+      Content::File(bytes) if u64::try_from(bytes.len()).is_ok_and(|len| len > limit) => Ok(None),
       Content::File(bytes) => {
         let mut hasher = FxHasher::default();
         hasher.write(bytes);
-        Ok(hasher.finish())
+        Ok(Some(hasher.finish()))
       }
       _ => Err(error(io::ErrorKind::IsADirectory)),
     }

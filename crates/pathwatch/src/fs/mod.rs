@@ -24,8 +24,10 @@ pub trait Fs {
   /// Calls `each` with the name of every entry of `dir`, and what the listing tells of it.
   fn read_dir(&self, dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()>;
 
-  /// A hash of the content of a regular file.
-  fn hash(&self, path: &Path) -> io::Result<u64>;
+  /// A hash of the content of the regular file at `path`, which reads up to `limit` bytes.
+  /// `None`: the file holds more than `limit` bytes, or no regular file is at the path (a link,
+  /// which is never followed; a FIFO or a device, which the open does not wait for).
+  fn hash(&self, path: &Path, limit: u64) -> io::Result<Option<u64>>;
 
   /// A number that the disk changes with every change of the regular file at `path`, a rename
   /// too; `None` where the disk has none. Where an OS watch reports writes, the engine takes
@@ -164,10 +166,11 @@ impl Fs for StdFs {
     Ok(())
   }
 
-  fn hash(&self, path: &Path) -> io::Result<u64> {
-    let mut file = File::open(literal(path)).map_err(told)?;
+  fn hash(&self, path: &Path, limit: u64) -> io::Result<Option<u64>> {
+    let Some(mut file) = open_regular(path)? else { return Ok(None) };
     let mut hasher = FxHasher::default();
     let mut buffer = [0; 16 * 1024];
+    let mut total: u64 = 0;
     loop {
       // The buffer is filled before it is hashed: the hash must not depend on how many bytes
       // one `read` call gives.
@@ -180,9 +183,15 @@ impl Fs for StdFs {
           Err(error) => return Err(error),
         }
       }
+      // The limit ends the read, not the end of the file: a file that grew since the look, or
+      // one without an end, is not read whole.
+      total = total.saturating_add(u64::try_from(filled).unwrap_or(u64::MAX));
+      if total > limit {
+        return Ok(None);
+      }
       hasher.write(&buffer[..filled]);
       if filled < buffer.len() {
-        return Ok(hasher.finish());
+        return Ok(Some(hasher.finish()));
       }
     }
   }
@@ -231,6 +240,42 @@ use self::windows::{name_on_disk, stat, told};
 fn told(error: io::Error) -> io::Error {
   error
 }
+
+/// Opens the regular file at `path` for reading, and nothing else: a link that took the place of
+/// the file since the look is not followed, and a FIFO or a device is not waited for. `None`: no
+/// regular file is at the path.
+fn open_regular(path: &Path) -> io::Result<Option<File>> {
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_NONBLOCK).open(path);
+    let file = opened.map_err(told)?;
+    // A FIFO or a device is no file to read: a regular file and nothing else is.
+    #[expect(clippy::filetype_is_file, reason = "a regular file and nothing else is read")]
+    let is_regular = file.metadata()?.file_type().is_file();
+    Ok(is_regular.then_some(file))
+  }
+  #[cfg(windows)]
+  {
+    windows::open_regular(path)
+  }
+  #[cfg(not(any(unix, windows)))]
+  {
+    let file = File::open(path).map_err(told)?;
+    #[expect(clippy::filetype_is_file, reason = "a regular file and nothing else is read")]
+    let is_regular = file.metadata()?.file_type().is_file();
+    Ok(is_regular.then_some(file))
+  }
+}
+
+/// `O_NOFOLLOW`: the open fails on a link. `O_NONBLOCK`: the open of a FIFO does not wait for a
+/// writer, and a read of a regular file is as always.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use libc::{O_NOFOLLOW, O_NONBLOCK};
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const O_NONBLOCK: i32 = 0x0004;
 
 /// Whether the error says that the entry is being deleted (Windows): its name goes when the
 /// last handle on it is closed, unless the holder takes the deletion back.

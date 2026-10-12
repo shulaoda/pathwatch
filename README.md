@@ -93,7 +93,7 @@ watcher, so it should only pass the batch on.
 | `with_debounce(d)` | 50 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch still goes out every 500 ms, or every `4 × d` if that is longer. Zero: no waiting. The most is a year, also for the poll interval. |
 | `with_delete_delay(d)` | 100 ms | How long a `Delete` waits for the path to come back. A file that is removed and written again within `d` is one `Update`; a real delete is reported `d` after the OS said that the path is gone. Zero: no waiting, and such a file is a `Delete` and a `Create`. The most is a year. |
 | `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
-| `with_poll_interval(d)` | 100 ms | The shortest pause between two rounds of polling. The least is 1 ms. On a big set of paths the pause is longer: at least nine times as long as the round took. |
+| `with_poll_interval(d)` | 100 ms | The shortest pause between two rounds of polling. The least is 1 ms. After a slow round the pause is longer: nine times as long as the looks of the round took, plus the time of the reads of the files written in the last two seconds (on Windows a read right after a write waits for the virus scanner), and five seconds at most. |
 
 The settings cannot be changed after the watcher is made.
 
@@ -172,9 +172,10 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   same step of the clock of the time stamps (1 to 16 ms), is not found by a look: the disk
   gives the file a new number only for its first write (measured on NTFS). It is reported
   when Windows reports the write itself, and at the latest when the file is closed.
-- **Windows, with polling: a file that was just written is opened and read** (up to 16 MiB,
-  for 2 s after the write). A program that opens it meanwhile and shares it with nobody is
-  refused by Windows.
+- **With polling, a file that was just written is opened and read** (up to 16 MiB, at every
+  round for 2 s after the write), on every OS. On Windows a program that opens it meanwhile
+  and shares it with nobody is refused, and the first read after a write waits for the virus
+  scanner.
 - **A write through another hard link** of a watched file is not reported.
 - **macOS: a socket or a FIFO that is made** is not reported (macOS 26; macOS 27 reports it).
   It is found when something else makes the watcher look at its directory. Its removal is
@@ -234,7 +235,9 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 - **Normally** an event comes within the quiet time (50 ms) plus what the OS takes to tell
   about a change (about 1 to 15 ms).
 - **With polling** a change is found by the next round: within the poll interval (100 ms), or
-  later on a big set of paths, because the pause is at least nine times as long as a round.
+  later after a slow round: the pause is nine times as long as the looks of the round took,
+  plus the time of the reads of the files written in the last two seconds, and five seconds
+  at most.
 - **Under a flood** of changes a batch still goes out at least every 500 ms.
 - **A `Delete`** comes one delete delay (100 ms) after the OS said that the path is gone, once
   the path was found empty twice; under a flood it comes with the next batch. It comes at once

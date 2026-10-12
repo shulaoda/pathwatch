@@ -35,9 +35,9 @@ impl Fs for Counted {
     StdFs.read_dir(dir, each)
   }
 
-  fn hash(&self, path: &Path) -> io::Result<u64> {
+  fn hash(&self, path: &Path, limit: u64) -> io::Result<Option<u64>> {
     self.0.set(self.0.get() + 1);
-    StdFs.hash(path)
+    StdFs.hash(path, limit)
   }
 
   fn link_target(&self, path: &Path) -> io::Result<PathBuf> {

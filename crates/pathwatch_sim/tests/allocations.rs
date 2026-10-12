@@ -96,8 +96,8 @@ impl Fs for PlainDisk {
     Ok(())
   }
 
-  fn hash(&self, _: &Path) -> io::Result<u64> {
-    Ok(0)
+  fn hash(&self, _: &Path, _: u64) -> io::Result<Option<u64>> {
+    Ok(Some(0))
   }
 
   fn link_target(&self, _: &Path) -> io::Result<PathBuf> {

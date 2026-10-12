@@ -468,6 +468,29 @@ fn wide_path(path: &Path) -> Vec<u16> {
   units
 }
 
+/// Opens the regular file at `path` for reading. A link or a junction (a reparse point that
+/// stands for another name) is not followed: `None`. Any other reparse point (a file of a cloud
+/// drive, a compressed file) is the file itself, and is read as such.
+pub fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
+  let path = &*literal(path);
+  let opened = OpenOptions::new()
+    .read(true)
+    .share_mode(SHARE_ALL)
+    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+    .open(path);
+  let file = opened.map_err(told)?;
+  let meta = file.metadata()?;
+  if meta.is_dir() || meta.file_type().is_symlink() {
+    return Ok(None);
+  }
+  if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+    return Ok(Some(file));
+  }
+  drop(file);
+  let file = OpenOptions::new().read(true).share_mode(SHARE_ALL).open(path).map_err(told)?;
+  Ok(file.metadata()?.is_file().then_some(file))
+}
+
 /// A name with a separator in it, which a disk that another system filled can hold: no path
 /// names such an entry, so it is left out of a listing.
 pub fn has_separator(name: &[u16]) -> bool {
