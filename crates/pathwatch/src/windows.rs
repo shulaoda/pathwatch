@@ -120,12 +120,18 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
         handles.below(&parent).into_iter().for_each(|key| hint(lost(key)));
       }
     } else {
-      handles.route(&dir.join(OsString::from_wide(&name)), &mut |key, rel| {
-        if !written {
-          hint(Hint::Changed { dir: key, rel });
-        } else if !rel.as_os_str().is_empty() {
-          hint(Hint::Written { dir: key, rel });
-        }
+      let path = dir.join(OsString::from_wide(&name));
+      // Windows says "modified" for a directory when an entry in it changes, and that entry has
+      // a record of its own.
+      if written && handles.holds_a_key(&path) {
+        continue;
+      }
+      handles.route(&path, &mut |key, rel| {
+        hint(if written {
+          Hint::Written { dir: key, rel }
+        } else {
+          Hint::Changed { dir: key, rel }
+        });
       });
     }
   }
@@ -353,6 +359,9 @@ mod handles {
       told.lost.retain(|&lost| lost != key);
       let coverage = match settled {
         Ok(()) if self.serves(key) => Coverage::WatchedTree,
+        // The handle that came to serve the key stands above a link: the key was forgotten,
+        // and not refused.
+        Ok(()) if !self.refused.contains(&key) => Coverage::NotWatched,
         Ok(()) => Coverage::Failed(watch_limit("the limit of open directory handles is reached")),
         Err(error) => Coverage::Failed(error),
       };
@@ -390,34 +399,24 @@ mod handles {
       self.keys.get(&key).is_some_and(|served| served.handle.is_some())
     }
 
+    /// Every key whose directory holds `path`, the deepest first. A key above one that was
+    /// told gets a hint it may not need, which costs one walk; left out, it would miss the
+    /// path when the tree reaches it only from above: through another spelling of a name,
+    /// or from the other letter case of the drive, which is another top node.
     pub(super) fn route(&self, path: &Path, found: &mut dyn FnMut(DirKey, &Path)) {
       let lower = lower_case(path);
-      // The directories of the keys told so far, and whether each is spelled like the record.
-      // With more than these, a key above them gets a hint too many, which costs one walk.
-      let mut told: [Option<(&Path, bool)>; 4] = [None; 4];
-      let mut count = 0;
       for (dir, lower_dir) in path.ancestors().zip(lower.ancestors()) {
         let Some(keys) = self.at.get(lower_dir) else { continue };
         let Ok(rel) = path.strip_prefix(dir) else { continue };
-        let below = count.min(told.len());
         for &key in keys {
-          let own = self.keys[&key].dir.as_path();
-          let exact = own == dir;
-          // A key below it, on the way that this key spells, was told: the engine gets there
-          // from that one. Not when only this key is spelled like the record: in a directory
-          // that tells the case of letters apart, the one below is another directory.
-          let is_covered =
-            |&(told, told_exact): &(&Path, bool)| (told_exact || !exact) && told.starts_with(own);
-          if told[..below].iter().flatten().any(is_covered) {
-            continue;
-          }
           found(key, rel);
-          if let Some(slot) = told.get_mut(count) {
-            *slot = Some((own, exact));
-          }
-          count += 1;
         }
       }
+    }
+
+    /// Whether a key stands at `path` itself, in any letter case.
+    pub(super) fn holds_a_key(&self, path: &Path) -> bool {
+      self.at.contains_key(&lower_case(path))
     }
 
     pub(super) fn below(&self, dir: &Path) -> Vec<DirKey> {
@@ -580,9 +579,14 @@ mod handles {
     dir.ancestors().take(names).any(|path| system.is_link(path))
   }
 
+  /// The path with its names in lower case: NTFS takes the two cases of a letter for one
+  /// name. A name that is no Unicode text gets the ASCII letters folded.
   fn lower_case(path: &Path) -> PathBuf {
     let lower = path.components().map(|part| match part {
-      Component::Normal(name) => Cow::Owned(name.to_ascii_lowercase()),
+      Component::Normal(name) => match name.to_str() {
+        Some(text) => Cow::Owned(text.to_lowercase().into()),
+        None => Cow::Owned(name.to_ascii_lowercase()),
+      },
       other => Cow::Borrowed(other.as_os_str()),
     });
     lower.collect()
@@ -842,7 +846,7 @@ mod port {
   }
 
   /// The handles. The port knows each by a token of its own, not by the id of the watch: a
-  /// handle whose read failed at once is given up, and a late packet for it finds no watch.
+  /// watch whose handle is opened again keeps its id, and a packet names the handle.
   struct Worker {
     iocp: Arc<Iocp>,
     commands: mpsc::Receiver<Command>,
@@ -896,8 +900,7 @@ mod port {
             self.watches.insert(token, watch);
             return Ok(());
           }
-          // The disk does not know the longer records. The handle goes with the watch: a
-          // packet for the failed read must not pass for one of the next read.
+          // The disk does not know the longer records: the plain read goes on a new handle.
           Err(error) if extended && not_supported(&error) => extended = false,
           Err(error) => return Err(error),
         }
@@ -1002,8 +1005,8 @@ mod port {
       }
     }
 
-    /// Queues one read. When it fails, no read is pending and the kernel is done with the
-    /// blocks, but a packet can still come under the token of the handle.
+    /// Queues one read. When the call fails it started no request: no read is pending, no
+    /// packet comes, and the blocks are free.
     fn read(&mut self) -> io::Result<()> {
       let Some(dir) = &self.dir else { return Err(io::Error::other("the handle is closed")) };
       *self.overlapped = OVERLAPPED::default();

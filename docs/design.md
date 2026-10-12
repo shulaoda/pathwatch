@@ -1382,7 +1382,8 @@ What was not checked, and what is known to be missing, is in `docs/windows-open-
   comes to stand at or above such a directory later, `commit` returns its key. A key that the
   commit can give no handle (no room and no allowed directory in common, or the open fails)
   gets `Changed` with an empty `rel`, the engine asks again, and that request is answered
-  `Failed` with the reason.
+  `Failed` with the reason, or `NotWatched` when the handle that came to serve it stands
+  above a link.
 - `Handles` keeps every served key. When a key comes or goes, the handles move to where `place`
   puts them: new handles are opened first, then old ones are closed. A key that got another
   handle is not told: the new handle reported before the old one stopped, the last read of
@@ -1394,14 +1395,15 @@ What was not checked, and what is known to be missing, is in `docs/windows-open-
   completed read are read on the watcher thread (`Records`, `translate`). The reads ask for
   the longer records (`ReadDirectoryChangesExW`, Windows 10 1709 and later) where Windows
   and the disk have them: they tell whether an entry is a directory.
-- **Hints.** A record goes to the deepest key whose directory holds its path, with ASCII
-  letters compared without case, and to each key above it that spells the way in another
-  manner: two watched paths that are two spellings of one directory both get it. A key that
-  is spelled like the record always gets it: in a directory that tells the case of letters
-  apart, a key below in another spelling is another directory. A record that no key holds
-  is dropped. `MODIFIED` → `Written`; it is dropped when it names a directory (the longer
-  records tell) or the directory of the key itself: Windows sends it whenever an entry in a
-  directory changes, and that entry has a record of its own. Every other record → `Changed`. A read with no bytes, and a record with no name →
+- **Hints.** A record goes to every key whose directory holds its path, the deepest first,
+  with the names compared in lower case (rule 7): two watched paths that are two spellings of
+  one directory both get it, and so does each key above. A key above gets a hint it may not
+  need, which costs one walk; without it the path would be missed where the tree reaches it
+  only from above: a second spelling of a name below, or the other letter case of the drive,
+  which is another top node of the tree. A record that no key holds is dropped. `MODIFIED` →
+  `Written`; it is dropped when it names a directory (the longer records tell) or the
+  directory of a key: Windows sends it whenever an entry in a directory changes, and that
+  entry has a record of its own. Every other record → `Changed`. A read with no bytes, and a record with no name →
   `Changed` with an empty `rel` for each key at or below the directory of the handle. Bytes
   that cannot be read → `Lost`. A read that fails → the handle is closed, `Changed` with an
   empty `rel` for each of its keys. A name that looks like a short (8.3) name → `Changed` for

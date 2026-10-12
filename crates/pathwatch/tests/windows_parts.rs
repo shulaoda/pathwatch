@@ -441,6 +441,25 @@ mod handles {
     assert_eq!(fake.dirs(), dirs(["/p"]));
   }
 
+  /// A key that got no handle is asked again at once. When the handle that comes to serve it
+  /// then stands above a link, it is not watched: that is no limit.
+  #[test]
+  fn a_refused_key_that_comes_to_lie_behind_a_link_is_not_watched() {
+    let mut fake = Fake::default();
+    fake.disk.links = vec![dir("/p/link")];
+    fake.disk.broken = Some(dir("/p/link/sub"));
+    let (coverage, _) =
+      fake.handles.watch(key(1), &dir("/p/link/sub"), Want::Contents, &mut fake.disk);
+    assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
+    assert_eq!(fake.handles.commit(&mut fake.disk).lost, [key(1)]);
+    // Before the engine asks again, the directory above is watched in the same flush.
+    let (coverage, _) = fake.handles.watch(key(0), &dir("/p"), Want::Contents, &mut fake.disk);
+    assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
+    assert_eq!(fake.watch(1, "/p/link/sub", Want::Contents), Answer::NotWatched);
+    assert_eq!(fake.dirs(), dirs(["/p"]));
+    assert_eq!(fake.lost(), []);
+  }
+
   fn dirs<const N: usize>(paths: [&str; N]) -> Vec<PathBuf> {
     paths.map(dir).into()
   }
@@ -1243,7 +1262,10 @@ mod translate {
     let high = high.unwrap();
     assert_eq!(closed, [low]);
     let bytes = encode(&[(MODIFIED, "f.js")]);
-    assert_eq!(hints(&mut handles, read(low, "/p/a", Ok(bytes))), [written(0, "f.js")]);
+    assert_eq!(
+      hints(&mut handles, read(low, "/p/a", Ok(bytes))),
+      [written(0, "f.js"), written(1, "a/f.js")]
+    );
     // Its key still stands at its directory, so the loss has a place.
     assert_eq!(hints(&mut handles, read(low, "/p/a", Ok(Vec::new()))), [changed(0, "")]);
 
@@ -1252,17 +1274,18 @@ mod translate {
     let bytes = records(&[(ADDED, "a/g.js"), (ADDED, "h.js")]);
     assert_eq!(
       hints(&mut handles, read(high, "/p", Ok(bytes))),
-      [changed(0, "g.js"), changed(1, "h.js")]
+      [changed(0, "g.js"), changed(1, "a/g.js"), changed(1, "h.js")]
     );
   }
 
+  /// Every key whose directory holds the path gets the record, the deepest first (rule 7).
   #[test]
-  fn a_record_goes_to_the_deepest_key_that_holds_its_path() {
+  fn a_record_goes_to_every_key_that_holds_its_path() {
     let mut handles = Handles::default();
     let id = open(&mut handles, 0, "/p");
     watch(&mut handles, 1, "/p/a", Want::Contents);
     watch(&mut handles, 2, "/p/a/b", Want::Names);
-    // Two keys for one directory: each can see the change (rule 7).
+    // Two keys for one directory: each can see the change.
     watch(&mut handles, 3, "/p/c", Want::Names);
     watch(&mut handles, 4, "/p/c", Want::Names);
     let bytes = records(&[
@@ -1277,13 +1300,18 @@ mod translate {
       [
         changed(0, "x.js"),
         written(1, "x.js"),
+        written(0, "a/x.js"),
         changed(2, "x.js"),
+        changed(1, "b/x.js"),
+        changed(0, "a/b/x.js"),
         written(2, "deep/x.js"),
+        written(1, "b/deep/x.js"),
+        written(0, "a/b/deep/x.js"),
         changed(0, "ab/x.js"),
       ]
     );
     let two = hints(&mut handles, read(id, "/p", Ok(records(&[(MODIFIED, "c/x.js")]))));
-    assert_eq!(sorted(two), [written(3, "x.js"), written(4, "x.js")]);
+    assert_eq!(sorted(two), [written(0, "c/x.js"), written(3, "x.js"), written(4, "x.js")]);
   }
 
   #[test]
@@ -1291,13 +1319,58 @@ mod translate {
     let mut handles = Handles::default();
     let id = open(&mut handles, 0, "/p");
     watch(&mut handles, 1, "/p/a", Want::Contents);
-    // Windows also says "modified" for a directory when an entry in it changes: that is dropped.
-    let bytes =
-      records(&[(REMOVED, "a"), (MODIFIED, "a"), (RENAMED_NEW_NAME, "a"), (MODIFIED, "a/sub")]);
+    // Windows also says "modified" for a directory when an entry in it changes: that is dropped
+    // for every key, in any letter case of the name.
+    let bytes = records(&[
+      (REMOVED, "a"),
+      (MODIFIED, "a"),
+      (MODIFIED, "A"),
+      (RENAMED_NEW_NAME, "a"),
+      (MODIFIED, "a/sub"),
+    ]);
     assert_eq!(
       hints(&mut handles, read(id, "/p", Ok(bytes))),
-      [changed(1, ""), changed(1, ""), written(1, "sub")]
+      [
+        changed(1, ""),
+        changed(0, "a"),
+        changed(1, ""),
+        changed(0, "a"),
+        written(1, "sub"),
+        written(0, "a/sub"),
+      ]
     );
+  }
+
+  /// The two letter cases of a drive are one disk, and two top nodes of the tree: the key
+  /// above reaches the path of the other case only when it is told too.
+  #[test]
+  fn a_key_with_the_drive_letter_in_the_other_case_gets_its_records_with_the_key_above() {
+    let mut handles = Handles::default();
+    let id = open(&mut handles, 0, "/p");
+    let mut calls = Calls::default();
+    let lower = PathBuf::from(r"c:\p\src");
+    let (coverage, _) = handles.watch(key(1), &lower, Want::Contents, &mut calls);
+    assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
+    assert_eq!(calls.opened, None);
+    let bytes = records(&[(ADDED, "src/a.js"), (MODIFIED, "src/a.js")]);
+    assert_eq!(
+      hints(&mut handles, read(id, "/p", Ok(bytes))),
+      [changed(1, "a.js"), changed(0, "src/a.js"), written(1, "a.js"), written(0, "src/a.js")]
+    );
+  }
+
+  /// NTFS folds more than ASCII letters: a key in the other case of such a letter shares the
+  /// handle and gets the records.
+  #[test]
+  fn a_key_in_the_other_case_of_a_letter_outside_ascii_gets_its_records() {
+    let mut handles = Handles::default();
+    let id = open(&mut handles, 0, "/p");
+    watch(&mut handles, 1, "/p/café", Want::Contents);
+    watch(&mut handles, 2, "/p/CAFÉ", Want::Contents);
+    let told = hints(&mut handles, read(id, "/p", Ok(records(&[(ADDED, "café/x.js")]))));
+    assert_eq!(sorted(told), [changed(0, "café/x.js"), changed(1, "x.js"), changed(2, "x.js")]);
+    let lost = hints(&mut handles, read(id, "/p", Ok(Vec::new())));
+    assert_eq!(sorted(lost), [changed(0, ""), changed(1, ""), changed(2, "")]);
   }
 
   #[test]
@@ -1334,21 +1407,27 @@ mod translate {
     let lost = hints(&mut handles, read(id, "/P", Ok(Vec::new())));
     assert_eq!(sorted(lost), [changed(0, ""), changed(1, "")]);
 
-    // Two spellings of one directory are two watched paths, and each has its events. A key
-    // above one that was told is left out when it spells the way as that one does; but a key
-    // that is spelled like the record is always told.
+    // Two spellings of one directory are two watched paths, and each has its events, however
+    // the record spells the way.
     watch(&mut handles, 2, "/p/src", Want::Contents);
     open(&mut handles, 3, "/p/SRC");
     let told = |handles: &mut Handles, record: &str| {
       let bytes = records(&[(ADDED, record)]);
       sorted(hints(handles, read(id, "/p", Ok(bytes))))
     };
-    let (deep, src, upper) =
-      (|| changed(0, "a.js"), || changed(2, "lib/a.js"), || changed(3, "lib/a.js"));
-    assert_eq!(told(&mut handles, "SRC/lib/a.js"), [deep(), src(), upper()]);
-    assert_eq!(told(&mut handles, "SRC/Lib/a.js"), [deep(), changed(2, "Lib/a.js")]);
-    assert_eq!(told(&mut handles, "src/lib/a.js"), [deep(), src()]);
-    assert_eq!(told(&mut handles, "Src/lib/a.js"), [deep(), src()]);
+    let deep = || changed(0, "a.js");
+    assert_eq!(
+      told(&mut handles, "SRC/lib/a.js"),
+      [deep(), changed(2, "lib/a.js"), changed(3, "lib/a.js")]
+    );
+    assert_eq!(
+      told(&mut handles, "SRC/Lib/a.js"),
+      [deep(), changed(2, "Lib/a.js"), changed(3, "Lib/a.js")]
+    );
+    assert_eq!(
+      told(&mut handles, "src/lib/a.js"),
+      [deep(), changed(2, "lib/a.js"), changed(3, "lib/a.js")]
+    );
     assert_eq!(told(&mut handles, "src/b.js"), [changed(2, "b.js"), changed(3, "b.js")]);
   }
 
