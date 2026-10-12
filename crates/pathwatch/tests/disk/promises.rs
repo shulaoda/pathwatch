@@ -830,6 +830,61 @@ fn a_name_that_windows_reads_as_another_is_reported() {
   });
 }
 
+/// Windows: a deletion that waits for the last handle to close (`FileDispositionInfo`, not the
+/// way of today's `DeleteFile`) hides the file from a look while the directory still lists
+/// it. Taken back, the file is there again and the OS says nothing: the watcher looks again.
+#[cfg(windows)]
+#[test]
+fn a_pending_deletion_that_is_taken_back() {
+  use std::{
+    io::{self, Write},
+    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+  };
+
+  use windows_sys::Win32::{
+    Foundation::{GENERIC_READ, GENERIC_WRITE},
+    Storage::FileSystem::{
+      DELETE, FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    },
+  };
+
+  each_backend(|w| {
+    w.write("d/held.txt", "1");
+    w.watch(&["d"]);
+    let mut holder = fs::OpenOptions::new()
+      .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+      .open(w.path("d/held.txt"))
+      .unwrap();
+    let dispose = |holder: &fs::File, delete: bool| {
+      let info = FILE_DISPOSITION_INFO { DeleteFile: delete };
+      let size = u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).unwrap();
+      // SAFETY: the handle is open, and `info` is one whole struct of the class.
+      let set = unsafe {
+        let (class, info) = (FileDispositionInfo, (&raw const info).cast());
+        SetFileInformationByHandle(holder.as_raw_handle(), class, info, size)
+      };
+      assert!(set != 0, "{}", io::Error::last_os_error());
+    };
+    // NTFS reports a write through an open handle when the file is closed or its cache is
+    // flushed: the flush is what makes the watcher look.
+    holder.write_all(b"22").unwrap();
+    holder.sync_all().unwrap();
+    w.expect(&[(Update, "d/held.txt")]);
+    dispose(&holder, true);
+    holder.write_all(b"333").unwrap();
+    holder.sync_all().unwrap();
+    w.expect(&[(Delete, "d/held.txt")]);
+
+    // Nothing is reported for this: the watcher looks again by itself.
+    dispose(&holder, false);
+    w.expect(&[(Create, "d/held.txt")]);
+    drop(holder);
+    w.expect(&[]);
+    w.remove("d/held.txt");
+    w.expect(&[(Delete, "d/held.txt")]);
+  });
+}
+
 /// The drive letter in the other case is another spelling of the path, and another top of
 /// the tree. A path watched that way shares the handle of the watched directory above, and
 /// the directory still gets the events of the other files in the same directory.

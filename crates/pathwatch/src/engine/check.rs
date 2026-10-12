@@ -15,7 +15,7 @@ use crate::{
   backend::{Backend, DirKey, Want},
   config::EntryKind,
   error::ErrorKind,
-  fs::{DirId, Entry, FileType, Fs, Meta},
+  fs::{DirId, Entry, FileType, Fs, Meta, is_delete_pending},
   tree::{Added, Content, Depth, Fingerprint, Kind, Mark, Spelling, Watch, nanos},
 };
 
@@ -288,12 +288,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut meta = match self.fs.lstat(path) {
       Ok(meta) => meta,
       Err(error) => {
-        // The listing named the entry a moment ago: the directory itself can be away, renamed
-        // away and back while it is read, which nothing else would report. It is listed again.
-        if listed.is_named()
+        if is_delete_pending(&error) {
+          // The deletion can be taken back, and the OS says nothing then: the node is looked at
+          // again at the next flush, until the name is gone or the file is there.
+          self.tree.mark(key, Mark::default());
+        } else if listed.is_named()
           && is_missing(&error)
           && let Some(dir) = self.tree[parent].dir_mut()
         {
+          // The listing named the entry a moment ago: the directory itself can be away, renamed
+          // away and back while it is read, which nothing else would report. It is listed again.
           dir.relist = true;
           self.tree.mark(parent, Mark::default());
         }

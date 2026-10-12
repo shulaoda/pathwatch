@@ -20,7 +20,10 @@ it is in `fs/windows.rs` now (`told` and `stat`):
   deletes it closes its handle. So does a directory that is opened as a file. The engine took
   that for a file that cannot be read: it reported `PermissionDenied`, or an `Update` right
   before the `Delete`. Only the status of the kernel (`RtlGetLastNtStatus`) tells the two
-  apart, and such an answer is "not found" now. That call is an export of `ntdll.dll` that
+  apart, and such an answer is "not found" now, with a mark on the error: the node is looked
+  at again at every flush while the deletion waits, since the holder can take it back
+  (`FileDispositionInfo` with `FALSE`), which the OS reports as little as the deletion
+  itself; the file gets its `Create` then. That call is an export of `ntdll.dll` that
   Microsoft does not document: should a Windows drop it, such an entry looks unreadable
   again, as before.
 - **The creation time is no identity.** A new entry gets the creation time of the one that
@@ -173,7 +176,9 @@ the real disk, with this backend and with polling.
   handle still takes no further read after such a failure: the fall back from the longer
   records opens a new handle with a key of its own (`Worker::open`).
 - **Network shares.** A server that cannot notify makes the first read fail. The answer is
-  `Failed`, and the engine polls the directory.
+  `Failed`, and the engine polls the directory. A server that cannot be reached answers
+  `ERROR_BAD_NETPATH`, which std calls "not found": `told` makes it no answer, so the files
+  on the share get no `Delete` while the server is away.
 
 ### More directories than handles
 

@@ -921,7 +921,9 @@ is not, or if `pkg` goes away later, the path is dropped. That is allowed. The s
 | Error | Meaning |
 |---|---|
 | not found, not a directory, invalid name | missing |
+| an entry that is being deleted (Windows: the name goes when the last handle on it is closed) | missing; the node is looked at again at each flush until the name is gone or the file is there, since the holder can take the deletion back and the OS says nothing then |
 | permission denied, link loop | missing for events; reported once; the node is polled until a scan of it has no error |
+| a server that cannot be reached (Windows `ERROR_BAD_NETPATH`, which std calls not found) | no answer |
 | anything else | no answer: the tree stays as it is, no `Delete` is told, the mark stays for the next flush; reported once; the node is polled |
 
 A failed `watch` is reported in the same way (`WatchLimit`, `PermissionDenied` or `Io`), but not

@@ -224,6 +224,20 @@ fn told(error: io::Error) -> io::Error {
   error
 }
 
+/// Whether the error says that the entry is being deleted (Windows): its name goes when the
+/// last handle on it is closed, unless the holder takes the deletion back.
+pub(crate) fn is_delete_pending(error: &io::Error) -> bool {
+  #[cfg(windows)]
+  {
+    windows::is_delete_pending(error)
+  }
+  #[cfg(not(windows))]
+  {
+    let _ = error;
+    false
+  }
+}
+
 /// Only Windows reads a name as another one than the path says.
 #[cfg(not(windows))]
 fn literal(path: &Path) -> &Path {

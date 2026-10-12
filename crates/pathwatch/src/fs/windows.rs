@@ -2,7 +2,9 @@
 
 use std::{
   borrow::Cow,
+  error::Error,
   ffi::{CStr, OsStr, OsString, c_void},
+  fmt,
   fs::{self, OpenOptions},
   io, mem,
   os::windows::{
@@ -17,7 +19,7 @@ use std::{
 
 use windows_sys::Win32::{
   Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
+    ERROR_ACCESS_DENIED, ERROR_BAD_NETPATH, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES,
     ERROR_SHARING_VIOLATION, INVALID_HANDLE_VALUE, MAX_PATH, NTSTATUS, STATUS_DELETE_PENDING,
     STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND,
     STATUS_OBJECT_PATH_NOT_FOUND,
@@ -27,8 +29,9 @@ use windows_sys::Win32::{
     FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FileAttributeTagInfo, FileIdBothDirectoryInfo,
-    FileIdBothDirectoryRestartInfo, FindClose, FindFirstFileW, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, WIN32_FIND_DATAW,
+    FileIdBothDirectoryRestartInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch,
+    FindFirstFileExW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetVolumeInformationByHandleW, WIN32_FIND_DATAW,
   },
   System::{
     IO::DeviceIoControl,
@@ -71,25 +74,46 @@ fn entry(kind: FileType, written: u64, size: u64, dir_id: DirId) -> Meta {
 
 /// "Access denied" is also what Windows says for an entry that is being deleted and for a
 /// directory opened as a file; only the status of the kernel tells these from an entry that
-/// may not be read. Call it right after the failed call, on the same thread.
+/// may not be read. Call it right after the failed call, on the same thread. A server that
+/// cannot be reached says nothing about the path, though std calls that "not found".
 pub fn told(error: io::Error) -> io::Error {
   #[link(name = "ntdll")]
   unsafe extern "system" {
     safe fn RtlGetLastNtStatus() -> NTSTATUS;
   }
 
-  if error.raw_os_error() != Some(ERROR_ACCESS_DENIED.cast_signed()) {
-    return error;
+  match error.raw_os_error().map(i32::cast_unsigned) {
+    Some(ERROR_BAD_NETPATH) => return io::Error::new(io::ErrorKind::HostUnreachable, error),
+    Some(ERROR_ACCESS_DENIED) => {}
+    _ => return error,
   }
   match RtlGetLastNtStatus() {
+    STATUS_DELETE_PENDING => io::Error::new(io::ErrorKind::NotFound, DeletePending),
     // The last two come from the listing that std asks for an entry it cannot open.
-    STATUS_DELETE_PENDING
-    | STATUS_FILE_IS_A_DIRECTORY
+    STATUS_FILE_IS_A_DIRECTORY
     | STATUS_NO_SUCH_FILE
     | STATUS_OBJECT_NAME_NOT_FOUND
     | STATUS_OBJECT_PATH_NOT_FOUND => io::ErrorKind::NotFound.into(),
     _ => error,
   }
+}
+
+/// The entry is being deleted: its name goes when the last handle on it is closed, unless the
+/// holder takes the deletion back. Not found for a look, with this mark on the error.
+#[derive(Debug)]
+struct DeletePending;
+
+impl fmt::Display for DeletePending {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str("the entry is being deleted")
+  }
+}
+
+impl Error for DeletePending {}
+
+/// Whether the error says that the entry is being deleted.
+pub fn is_delete_pending(error: &io::Error) -> bool {
+  error.get_ref().is_some_and(<dyn Error + Send + Sync>::is::<DeletePending>)
 }
 
 /// `lstat`, or `stat` with `follow`. std gives no file index and no volume, and only the
@@ -329,8 +353,9 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
         // The first answer for a directory with no entry at all: the root of an empty disk,
         // which has no `.` and no `..`.
         Some(ERROR_FILE_NOT_FOUND) if class == FileIdBothDirectoryRestartInfo => Ok(true),
-        // The answer for a handle that is open on a file.
-        Some(ERROR_INVALID_PARAMETER) => Err(io::ErrorKind::NotADirectory.into()),
+        // A disk that says "NTFS" and does not know the class (the drive of a Remote Desktop
+        // client), or a handle that is open on a file: std lists, and says what is no directory.
+        _ if class == FileIdBothDirectoryRestartInfo => Ok(false),
         _ => Err(told(error)),
       };
     }
@@ -443,15 +468,32 @@ fn wide_path(path: &Path) -> Vec<u16> {
   units
 }
 
-/// A search for the one path gives the entry as the directory holds it.
+/// A search for the one path gives the entry as the directory holds it. In a directory that
+/// may be passed but not listed the question has no answer, which says nothing against the
+/// name, as on Linux.
 pub fn name_on_disk(path: &Path) -> io::Result<OsString> {
   let wide = wide_path(path);
   // SAFETY: all zeros is a valid value of this plain struct of numbers.
   let mut found: WIN32_FIND_DATAW = unsafe { mem::zeroed() };
-  // SAFETY: `wide` ends with a NUL, and the call writes one whole struct into `found`.
-  let search = unsafe { FindFirstFileW(wide.as_ptr(), &raw mut found) };
+  // SAFETY: `wide` ends with a NUL, and the call writes one whole struct into `found`. The
+  // basic answer leaves the short name out, which the disk would have to make.
+  let search = unsafe {
+    let (basic, by_name, no_filter) = (FindExInfoBasic, FindExSearchNameMatch, std::ptr::null());
+    FindFirstFileExW(wide.as_ptr(), basic, (&raw mut found).cast(), by_name, no_filter, 0)
+  };
   if search == INVALID_HANDLE_VALUE {
-    return Err(io::Error::last_os_error());
+    let error = io::Error::last_os_error();
+    return match error.raw_os_error().map(i32::cast_unsigned) {
+      // What NTFS answers for an entry that went while the directory was searched.
+      Some(ERROR_NO_MORE_FILES) => Err(io::ErrorKind::NotFound.into()),
+      Some(ERROR_ACCESS_DENIED) => match told(error) {
+        error if error.kind() == io::ErrorKind::NotFound => Err(error),
+        _ => {
+          path.file_name().map(OsStr::to_owned).ok_or_else(|| io::ErrorKind::InvalidInput.into())
+        }
+      },
+      _ => Err(told(error)),
+    };
   }
   // SAFETY: `search` is the open handle that the call above gave, closed once.
   unsafe { FindClose(search) };
@@ -468,8 +510,20 @@ mod tests {
     process::Command,
   };
 
-  use super::{by_handle, by_name, is_odd, literal, name_on_disk, read_dir, stat, version};
-  use crate::fs::{Entry, FileType, Meta};
+  use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+
+  use windows_sys::Win32::{
+    Foundation::ERROR_BAD_NETPATH,
+    Storage::FileSystem::{
+      DELETE, FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    },
+  };
+
+  use super::{
+    SHARE_ALL, by_handle, by_name, is_delete_pending, is_odd, literal, name_on_disk, read_dir,
+    stat, told, version,
+  };
+  use crate::fs::{Entry, FileType, Fs, Meta, StdFs};
 
   fn same(a: &Meta, b: &Meta) -> bool {
     (a.kind, a.modified, a.changed, a.size, a.file_id, a.dir_id)
@@ -534,7 +588,9 @@ mod tests {
     assert_eq!(id, stat(&dir, false).unwrap().dir_id);
     assert_eq!(id, by_handle(&dir, false).unwrap().dir_id);
 
-    let error = read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap_err();
+    // A handle on a file does not take the class: std lists then, and says what is no directory.
+    assert!(!read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap());
+    let error = StdFs.read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::NotADirectory, "{error:?}");
 
     let mut writer = fs::OpenOptions::new().append(true).open(top.path().join("file")).unwrap();
@@ -562,6 +618,86 @@ mod tests {
         assert_eq!(name_on_disk(&dir.join(spelled)).unwrap(), "ReadMe.md", "{}", dir.display());
       }
     }
+  }
+
+  /// Takes the right to list a directory away from the user of the test, and gives it back.
+  struct Unlisted(std::path::PathBuf);
+
+  impl Unlisted {
+    fn new(dir: &Path) -> Self {
+      let user = std::env::var("USERNAME").unwrap();
+      let denied =
+        Command::new("icacls").arg(dir).args(["/deny", &format!("{user}:(RD)")]).output();
+      assert!(denied.is_ok_and(|output| output.status.success()), "icacls /deny failed");
+      Self(dir.to_owned())
+    }
+  }
+
+  impl Drop for Unlisted {
+    fn drop(&mut self) {
+      let user = std::env::var("USERNAME").unwrap();
+      let _ = Command::new("icacls").arg(&self.0).args(["/remove:d", &user]).output();
+    }
+  }
+
+  /// The name of an entry in a directory that may be passed but not listed: the question has
+  /// no answer, and the name is taken as given.
+  #[test]
+  fn the_name_on_disk_in_a_directory_that_may_not_be_listed() {
+    let top = tempfile::tempdir().unwrap();
+    let dir = top.path().join("closed");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("ReadMe.md"), "1").unwrap();
+    let _unlisted = Unlisted::new(&dir);
+    assert!(fs::read_dir(&dir).is_err(), "the directory can still be listed");
+    assert_eq!(stat(&dir.join("readme.md"), false).unwrap().kind, FileType::File);
+    assert_eq!(name_on_disk(&dir.join("readme.md")).unwrap(), "readme.md");
+    // The question cannot tell a name that is not there either; the look before it can.
+    assert_eq!(name_on_disk(&dir.join("gone.md")).unwrap(), "gone.md");
+    assert_eq!(stat(&dir.join("gone.md"), false).unwrap_err().kind(), io::ErrorKind::NotFound);
+  }
+
+  /// `SetFileInformationByHandle(FileDispositionInfo)`: the deletion that waits for the last
+  /// handle to close, which `DeleteFile` no longer uses on NTFS.
+  fn dispose(holder: &fs::File, delete: bool) {
+    let info = FILE_DISPOSITION_INFO { DeleteFile: delete };
+    let size = u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).unwrap();
+    // SAFETY: the handle is open, and `info` is one whole struct of the class.
+    let set = unsafe {
+      let (class, info) = (FileDispositionInfo, (&raw const info).cast());
+      SetFileInformationByHandle(holder.as_raw_handle(), class, info, size)
+    };
+    assert!(set != 0, "{}", io::Error::last_os_error());
+  }
+
+  /// A server that cannot be reached is no answer, and an entry that is being deleted is
+  /// missing, with the mark that says so.
+  #[test]
+  fn what_the_errors_of_windows_mean() {
+    let unreachable = told(io::Error::from_raw_os_error(ERROR_BAD_NETPATH.cast_signed()));
+    assert_eq!(unreachable.kind(), io::ErrorKind::HostUnreachable, "{unreachable:?}");
+    assert_eq!(told(io::Error::from_raw_os_error(2)).kind(), io::ErrorKind::NotFound);
+
+    let top = tempfile::tempdir().unwrap();
+    let file = top.path().join("held.txt");
+    fs::write(&file, "1").unwrap();
+    let holder =
+      fs::OpenOptions::new().access_mode(DELETE).share_mode(SHARE_ALL).open(&file).unwrap();
+    dispose(&holder, true);
+    for follow in [false, true] {
+      let error = stat(&file, follow).unwrap_err();
+      assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error:?}");
+      assert!(is_delete_pending(&error), "{error:?}");
+    }
+    // The directory still lists the name.
+    assert_eq!(name_on_disk(&file).unwrap(), "held.txt");
+    // Taken back: the file is there, as if nothing had happened.
+    dispose(&holder, false);
+    assert_eq!(stat(&file, false).unwrap().size, 1);
+    dispose(&holder, true);
+    drop(holder);
+    let error = stat(&file, false).unwrap_err();
+    assert!(error.kind() == io::ErrorKind::NotFound && !is_delete_pending(&error), "{error:?}");
   }
 
   #[test]
