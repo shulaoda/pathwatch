@@ -38,7 +38,9 @@ watcher.close();
 `Watcher` is `Send + Sync`.
 
 Paths (`clean` in `watcher.rs`, then `path::normalize`): a relative path is joined to the
-current directory. `.`, repeated separators and a trailing separator are dropped, and `..` takes
+current directory; on Windows a path with a drive and no root (`C:name`) too, when the current
+directory is on that drive, and a path that starts with two separators is a share or nothing,
+never joined. `.`, repeated separators and a trailing separator are dropped, and `..` takes
 away the name before it, all by text. This clean form is the watched path, and every event path
 starts with it, byte for byte. A path that is empty, has a NUL, goes above the root, or is a
 top directory (`/`, `C:\`, `\\server\share`) cannot be used: the call returns `InvalidPath`

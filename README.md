@@ -57,6 +57,9 @@ cargo run -p pathwatch --example dev_server -- path/to/project
 | `close()` | Stops the watcher and waits for its thread. Dropping the `Watcher` does the same. |
 
 `watch`, `unwatch` and `close` can be called from any thread, and from inside the handler.
+From another thread they wait until the handler has returned, the batch that the call itself
+makes included: a handler must never wait for such a caller (a lock it holds, a bounded channel
+it fills, a call into another watcher whose handler calls back), or both wait for ever.
 A handler or an ignore filter that panics ends the thread of the watcher: nothing is reported
 after that, and `watch` and `unwatch` return `Closed`.
 `watch` and `unwatch` return an error only for a path that cannot be used (`InvalidPath`) and
@@ -126,6 +129,11 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
    take as it is: one that ends with a dot or a space, or has a `:` (a stream of a file), a
    control character or one of `< > " | ? *` in it. A name of that kind that a watched
    directory holds (git, WSL and an unpacked archive make them) is a file like the others.
+   On Windows a path with a drive and no root (`C:name`) is joined to the current directory
+   when that is on the drive, and is `InvalidPath` for another drive; a `\\?\` path is taken
+   in its plain form, and so are the event paths; a path that starts with two separators is a
+   share (`\\server\share\...`, with a separator too many before the share still) or
+   `InvalidPath`, never a path on the current drive.
 9. **Calls inside the handler.** `watch`, `unwatch` and `close` work there. They take effect
    when the handler has returned.
 10. **The ignore filter.** Nothing is reported from inside an ignored directory, and the

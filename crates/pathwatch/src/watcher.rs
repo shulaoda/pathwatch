@@ -3,6 +3,7 @@
 
 use std::{
   borrow::Cow,
+  cell::Cell,
   env, io,
   marker::PhantomData,
   path::{Path, PathBuf},
@@ -11,7 +12,7 @@ use std::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
   },
-  thread::{self, JoinHandle, ThreadId},
+  thread::{self, JoinHandle},
   time::Instant,
 };
 
@@ -33,6 +34,16 @@ const QUEUE_BYTES: usize = 16 << 20;
 /// that a flood of signals cannot hold back a flush.
 const MESSAGES_PER_TURN: usize = 512;
 
+thread_local! {
+  /// The number of the watcher whose thread this is; 0 on every other thread. A cell with no
+  /// destructor: it can still be read while the thread-locals of the thread are destroyed,
+  /// where `std::thread::current` panics (a watcher dropped as the process exits).
+  static WATCHER_THREAD: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The number of the next watcher. It starts at 1.
+static NEXT_WATCHER: AtomicUsize = AtomicUsize::new(1);
+
 /// Watches paths and reports file changes: create, update, delete.
 ///
 /// A `Watcher` is `Send + Sync`: put it in an `Arc` to use it from several threads. Dropping
@@ -49,11 +60,12 @@ const MESSAGES_PER_TURN: usize = 512;
 /// # }
 /// ```
 pub struct Watcher {
+  /// The number that its thread has in `WATCHER_THREAD`.
+  number: usize,
   /// Puts a command into the queue. A closure, since the raw type differs by backend. False: the
   /// thread is gone.
   send: Box<dyn Fn(Command) -> bool + Send + Sync>,
   stop: Arc<AtomicBool>,
-  thread_id: ThreadId,
   /// `close` takes it out to wait for the thread.
   thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -76,7 +88,10 @@ impl Watcher {
   /// `handler` runs on that thread and gets `Ok(events)`, one batch (never empty, at most one
   /// event for a path, in no promised order), or `Err(error)`: something could not be watched or
   /// read, and the watcher keeps running. Send the batch to a channel and work on another thread:
-  /// a slow handler delays every check of the disk and every `watch` and `unwatch` call.
+  /// a slow handler delays every check of the disk and every `watch` and `unwatch` call. A
+  /// `watch`, `unwatch` or `close` on another thread waits until the handler has returned, so a
+  /// handler must never wait for such a caller (a lock it holds, a bounded channel it fills,
+  /// a call into another watcher whose handler calls back): both would wait for ever.
   ///
   /// A handler that panics ends the thread, and so does a filter of
   /// [`Config::with_ignored`] that panics: nothing is reported after that, and `watch` and
@@ -121,9 +136,11 @@ impl Watcher {
   /// change is; it is silent only about files that the watcher did not know already. Watching a
   /// path again does nothing.
   ///
-  /// A relative path is joined to the current directory. The path is cleaned by its text: `.`,
-  /// `..` and repeated separators, like Node does and not like the OS behind a symbolic link. No
-  /// link is resolved and no letter case is changed. Every event path starts with it.
+  /// A relative path is joined to the current directory; on Windows a path with a drive and no
+  /// root (`C:name`) too, when the current directory is on that drive. The path is cleaned by
+  /// its text: `.`, `..` and repeated separators, like Node does and not like the OS behind a
+  /// symbolic link. No link is resolved and no letter case is changed. Every event path starts
+  /// with it; a `\\?\` path of Windows is taken in its plain form.
   ///
   /// From inside the handler the call does not wait: the path is watched when the handler has
   /// returned.
@@ -184,14 +201,26 @@ impl Watcher {
   /// Stops the watcher and waits for its thread. After it the handler is not called again,
   /// nothing is watched, and `watch` and `unwatch` return [`ErrorKind::Closed`]. Events not handed
   /// over yet are dropped. It can be called many times, and from inside the handler: there it
-  /// does not wait, and the thread ends when the handler returns.
+  /// does not wait, and the thread ends when the handler returns. While the process exits
+  /// (a watcher in a thread-local, or dropped by the detach code of a DLL on Windows), the
+  /// thread was ended by the OS already, and nothing is waited for.
   pub fn close(&self) {
     self.stop.store(true, Ordering::Release);
-    // Wakes the thread up. It fails only when the thread is gone already.
-    let _ = (self.send)(Command::Stop);
-    if thread::current().id() == self.thread_id {
+    if self.on_its_thread() {
+      // Wakes the thread up: it reads the flag when the handler has returned.
+      let _ = (self.send)(Command::Stop);
       return;
     }
+    // When the process exits, Windows ends every other thread and then runs the destructors
+    // of the thread-locals and the detach code of DLLs on the exiting one. The watcher thread
+    // is gone then: it can hold the lock of the queue, and `join` would panic for it. Nothing
+    // is sent to it, and nothing is waited for.
+    #[cfg(windows)]
+    if process_is_exiting() {
+      return;
+    }
+    // Wakes the thread up. It fails only when the thread is gone already.
+    let _ = (self.send)(Command::Stop);
     // The lock is held while this thread waits: a `close` on another thread returns only
     // when the watcher thread is gone too.
     let mut thread = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
@@ -201,6 +230,24 @@ impl Watcher {
     }
   }
 
+  /// Whether this is the thread of the watcher: inside the handler, or the backend.
+  fn on_its_thread(&self) -> bool {
+    WATCHER_THREAD.get() == self.number
+  }
+}
+
+/// Whether the process is exiting: `ExitProcess` has ended every other thread.
+#[cfg(windows)]
+fn process_is_exiting() -> bool {
+  #[link(name = "ntdll")]
+  unsafe extern "system" {
+    safe fn RtlDllShutdownInProgress() -> u8;
+  }
+
+  RtlDllShutdownInProgress() != 0
+}
+
+impl Watcher {
   /// Cleans the paths and hands the usable ones to the thread as one command.
   fn command<P: AsRef<Path>>(
     &self,
@@ -220,7 +267,7 @@ impl Watcher {
         None => skipped = skipped.or_else(|| Some(path.as_ref().to_path_buf())),
       }
     }
-    if thread::current().id() == self.thread_id {
+    if self.on_its_thread() {
       // Inside the handler: the thread cannot wait for itself. It takes the command from the
       // queue when the handler has returned.
       if !(self.send)(command(usable, None)) {
@@ -281,9 +328,11 @@ impl Watcher {
     let stop = Arc::new(AtomicBool::new(false));
     let sink = sink::<B>(sender.clone(), Arc::clone(&queue));
 
+    let number = NEXT_WATCHER.fetch_add(1, Ordering::Relaxed);
     let thread = {
       let stop = Arc::clone(&stop);
       thread::Builder::new().name("pathwatch".to_owned()).spawn(move || {
+        WATCHER_THREAD.set(number);
         // The backend is made here: all of its methods run on this thread.
         match make(sink) {
           Ok(backend) => {
@@ -310,9 +359,9 @@ impl Watcher {
     })?;
 
     Ok(Self {
+      number,
       send: Box::new(move |command| sender.send(Message::Command(command)).is_ok()),
       stop,
-      thread_id: thread.thread().id(),
       thread: Mutex::new(Some(thread)),
     })
   }
@@ -487,8 +536,49 @@ fn clean(path: &Path) -> Option<PathBuf> {
   if path.as_os_str().is_empty() {
     return None;
   }
-  if path.is_absolute() {
+  #[cfg(windows)]
+  let absolute = path.is_absolute() || starts_like_a_share(path);
+  #[cfg(not(windows))]
+  let absolute = path.is_absolute();
+  if absolute {
     return normalize(path).map(Cow::into_owned);
   }
-  normalize(&env::current_dir().ok()?.join(path)).map(Cow::into_owned)
+  let current = env::current_dir().ok()?;
+  #[cfg(windows)]
+  let path = rest_of_the_drive(path, &current)?;
+  normalize(&current.join(path)).map(Cow::into_owned)
+}
+
+/// Windows: a path that starts with two separators is a share, or nothing. std sees one only in
+/// the form `\server\share`; joined to the current directory, the others would name a path on
+/// its drive.
+#[cfg(windows)]
+fn starts_like_a_share(path: &Path) -> bool {
+  use std::os::windows::ffi::OsStrExt;
+
+  let mut units = path.as_os_str().encode_wide();
+  let separator = |unit: Option<u16>| matches!(unit, Some(0x5C | 0x2F));
+  separator(units.next()) && separator(units.next())
+}
+
+/// Windows: `C:name` names `name` in the current directory of the drive, which is the current
+/// directory when that is on the drive. The rest of such a path, or the path as it is; `None`
+/// for another drive, whose current directory the watcher does not know.
+#[cfg(windows)]
+fn rest_of_the_drive<'a>(path: &'a Path, current: &Path) -> Option<&'a Path> {
+  use std::path::{Component, Prefix};
+
+  let drive = |path: &Path| match path.components().next() {
+    Some(Component::Prefix(prefix)) => match prefix.kind() {
+      Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => Some(letter),
+      _ => None,
+    },
+    _ => None,
+  };
+  let Some(letter) = drive(path) else { return Some(path) };
+  if drive(current) != Some(letter) {
+    return None;
+  }
+  let Some(Component::Prefix(prefix)) = path.components().next() else { return None };
+  path.strip_prefix(prefix.as_os_str()).ok()
 }

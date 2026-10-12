@@ -174,8 +174,13 @@ pub(crate) mod windows_rules {
   ) -> Option<&'a [U]> {
     let mut rest = text;
     clean.extend([U::from(b'\\'), U::from(b'\\')]);
-    for _ in 0..2 {
+    for is_server in [true, false] {
       let start = rest.iter().position(|&unit| !separator(unit))?;
+      // Windows refuses a third separator before the server, and takes one too many before
+      // the share.
+      if is_server && start != 0 {
+        return None;
+      }
       let name = &rest[start..];
       let end = name.iter().position(|&unit| separator(unit)).unwrap_or(name.len());
       let (name, after) = name.split_at(end);
@@ -373,6 +378,11 @@ mod tests {
       (r"\\server\share\", None),
       (r"\\?\C:\", None),
       (r"\\?\UNC\server\share\", None),
+      // A separator too many before the share, not before the server.
+      (r"\\server\\share\f", Some(r"\\server\share\f")),
+      (r"//server//share/f", Some(r"\\server\share\f")),
+      (r"\\\server\share\f", None),
+      ("///server/share/f", None),
       // No share, a device, a volume name, a `/` that a verbatim path would keep as a character.
       (r"\\server", None),
       (r"\\.\pipe\x", None),

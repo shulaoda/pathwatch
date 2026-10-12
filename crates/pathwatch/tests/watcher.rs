@@ -127,6 +127,75 @@ impl Watch {
   }
 }
 
+/// Windows: what `watch` makes of a path, seen through a filter that ignores everything, so
+/// that nothing is read. A share spelled with a separator too many is a share, not a path on the
+/// current drive; a drive with no root is joined to the current directory on that drive.
+#[cfg(windows)]
+#[test]
+fn the_paths_that_windows_takes() {
+  let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+  let config = Config::default().with_ignored({
+    let seen = Arc::clone(&seen);
+    move |path: &Path, _| {
+      seen.lock().unwrap().push(path.to_path_buf());
+      true
+    }
+  });
+  let watcher = Watcher::with_config(config, |_| {}).unwrap();
+  let current = env::current_dir().unwrap();
+  let drive = current.components().next().unwrap().as_os_str().to_owned();
+  let other_drive = if drive.eq_ignore_ascii_case("Q:") { "R:" } else { "Q:" };
+
+  watcher.watch(r"\\server\\share\f").unwrap();
+  watcher.watch("//server//share/f").unwrap();
+  let mut on_the_drive = drive.clone();
+  on_the_drive.push("name");
+  watcher.watch(&on_the_drive).unwrap();
+  watcher.watch(&drive).unwrap();
+  for bad in [r"\\\server\share\f", "///server/share/f", r"\\server", r"\\server\\share"] {
+    assert_eq!(invalid(watcher.watch(bad)), Path::new(bad), "{bad}");
+  }
+  assert_eq!(
+    invalid(watcher.watch(format!("{other_drive}name"))),
+    Path::new(other_drive).join("name")
+  );
+  watcher.close();
+
+  let seen = seen.lock().unwrap();
+  // The filter is asked as a file and as a directory, for each of the two calls.
+  let share = PathBuf::from(r"\\server\share\f");
+  assert_eq!(seen.iter().filter(|path| **path == share).count(), 4, "{seen:?}");
+  assert!(seen.contains(&current.join("name")), "{seen:?}");
+  assert!(seen.contains(&current), "{seen:?}");
+  assert!(seen.iter().all(|path| path == &share || path.starts_with(&current)), "{seen:?}");
+}
+
+/// Windows: a watcher that a thread-local holds is dropped while the process exits, when the OS
+/// has ended the watcher thread already. The exit code is the one the program asked for; a
+/// `join` of that thread would end the process with a crash code instead. The test runs itself
+/// as a child for that.
+#[cfg(windows)]
+#[test]
+#[expect(clippy::exit, reason = "the child ends the process with the watcher in a thread-local")]
+fn a_watcher_dropped_while_the_process_exits() {
+  thread_local! {
+    static HELD: std::cell::RefCell<Option<Watcher>> = const { std::cell::RefCell::new(None) };
+  }
+  if env::var_os("PATHWATCH_TEST_CHILD").is_some() {
+    let watcher = Watcher::new(|_| {}).unwrap();
+    watcher.watch(env::temp_dir().join("pathwatch-not-there")).unwrap();
+    HELD.with(|held| *held.borrow_mut() = Some(watcher));
+    std::process::exit(7);
+  }
+  let child = std::process::Command::new(env::current_exe().unwrap())
+    .args(["--exact", "a_watcher_dropped_while_the_process_exits", "--nocapture"])
+    .env("PATHWATCH_TEST_CHILD", "1")
+    .output()
+    .unwrap();
+  let code = child.status.code();
+  assert_eq!(code, Some(7), "exit code {code:#x?}: {}", String::from_utf8_lossy(&child.stderr));
+}
+
 fn invalid(result: Result<(), Error>) -> PathBuf {
   let error = result.expect_err("the path cannot be used");
   assert_eq!(error.kind(), ErrorKind::InvalidPath);
