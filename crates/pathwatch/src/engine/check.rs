@@ -87,6 +87,27 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// Brings the node in line with the disk. `path` holds the directory of the node and is left so;
   /// `listed` is what a listing of it said.
   pub(super) fn check(&mut self, key: DirKey, path: &mut PathBuf, listed: Listed, why: Mark) {
+    let mut twins = Vec::new();
+    self.check_one(key, path, listed, why, &mut twins);
+    // The twins of a node that goes are looked at now: their looks were unsure of the spelling
+    // because of this node (`Tree::has_twin`). A twin that goes has twins of its own: a list,
+    // not a recursion, since a flush can see thousands.
+    while let Some(twin) = twins.pop() {
+      if let Some(mark) = self.tree.take_mark(twin) {
+        self.check_one(twin, path, Listed::NotNamed, mark, &mut twins);
+      }
+    }
+  }
+
+  /// One check, which puts the twins that are to be looked at next on `twins`.
+  fn check_one(
+    &mut self,
+    key: DirKey,
+    path: &mut PathBuf,
+    listed: Listed,
+    why: Mark,
+    twins: &mut Vec<DirKey>,
+  ) {
     let Some(parent) = self.tree.parent(key) else { return };
     let Some(asked) = self.tree[parent].dir().map(|dir| dir.asked) else {
       return self.tree.prune(key);
@@ -121,12 +142,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
     // A registered name with no directory at it makes its directory want the contents.
     let wants_more = below_names_only && !self.tree[key].is_dir();
-    // The twins of a node that goes are looked at now: their looks were unsure of the spelling
-    // because of this node (`Tree::has_twin`).
     let can_go = !registered && matches!(self.tree[key].kind, Kind::Missing);
-    let twins = if can_go { self.tree.marked_twins(key) } else { Vec::new() };
+    let gone_twins = if can_go { self.tree.marked_twins(key) } else { Vec::new() };
     self.tree.prune(key);
-    let twins = if self.tree.get(key).is_none() { twins } else { Vec::new() };
+    if self.tree.get(key).is_none() {
+      twins.extend(gone_twins);
+    }
     // `pop` does not take a top directory (`/`, `C:\\`) away.
     if !path.pop() {
       path.clear();
@@ -140,12 +161,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       && self.tree.child(parent, &name).is_none()
     {
       let node = self.tree.insert_child(parent, &name);
-      self.check(node, path, Listed::NotAsked, Mark::DEEP);
-    }
-    for twin in twins {
-      if let Some(mark) = self.tree.take_mark(twin) {
-        self.check(twin, path, Listed::NotNamed, mark);
-      }
+      self.check_one(node, path, Listed::NotAsked, Mark::DEEP, twins);
     }
   }
 

@@ -238,25 +238,36 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// The directory is gone for good, with everything below it: the end of the flush tells the
   /// handler.
   pub(super) fn vanish(&mut self, key: DirKey) {
-    let node = &mut self.tree[key];
-    let Kind::Dir(dir) = node.kind else { return };
-    node.kind = Kind::Missing;
-    self.tree.unhold(key);
-    if dir.asked.is_some() {
-      self.unwatch_dir(key);
-    }
+    // A list, not a recursion: a tree can be deeper than the stack takes. Nothing is asked for
+    // when the node is no directory, or an empty one.
+    let first = self.touched.len();
+    let mut next = Some(key);
+    let mut stack = Vec::new();
+    let mut children = Vec::new();
+    while let Some(key) = next.take().or_else(|| stack.pop()) {
+      let node = &mut self.tree[key];
+      let Kind::Dir(dir) = node.kind else { continue };
+      node.kind = Kind::Missing;
+      self.tree.unhold(key);
+      if dir.asked.is_some() {
+        self.unwatch_dir(key);
+      }
+      self.touched.push(key);
 
-    let children: Vec<DirKey> = self.tree.children(key).collect();
-    for child in children {
-      // Nothing can be checked in a directory that is gone: a mark in it is dropped.
-      self.tree.take_mark(child);
-      match self.tree[child].kind {
-        Kind::File(_) => self.forget_file(child),
-        Kind::Dir(_) => self.vanish(child),
-        Kind::Missing => self.tree.prune(child),
+      children.clear();
+      children.extend(self.tree.children(key));
+      for &child in &children {
+        // Nothing can be checked in a directory that is gone: a mark in it is dropped.
+        self.tree.take_mark(child);
+        match self.tree[child].kind {
+          Kind::File(_) => self.forget_file(child),
+          Kind::Dir(_) => stack.push(child),
+          Kind::Missing => self.tree.prune(child),
+        }
       }
     }
-    // After the nodes below it, so that `finish` can free them from the bottom up.
-    self.touched.push(key);
+    // Each node came after the ones above it: the other way round, `finish` can free them from
+    // the bottom up.
+    self.touched[first..].reverse();
   }
 }

@@ -14,8 +14,26 @@ use pathwatch::{
 };
 use pathwatch_sim::{
   Deliver, Driver, Mode, NONE, RECURSIVE, Sim, SimFs, asked, at, caught_up, ignore_node_modules,
-  known, on_all, on_modes, os_watches, settled, taken, window,
+  known, on_a_small_stack, on_all, on_modes, os_watches, settled, taken, window,
 };
+
+/// `unwatch` of a directory above a chain deeper than the stack of a thread takes: the names
+/// below are uncovered from a list, not by a recursion down the chain.
+#[test]
+fn unwatch_above_a_chain_deeper_than_the_stack() {
+  on_a_small_stack(|| {
+    let mut d = Driver::sim(Mode::Handle, Options::default());
+    let chain = "/p".to_owned() + &"/d".repeat(1500);
+    let leaf = format!("{chain}/leaf");
+    d.fs.mkdir_all(&chain).unwrap();
+    d.fs.write(&leaf, "1").unwrap();
+    d.watch(&["/p", &leaf]);
+    d.unwatch(&["/p"]);
+    d.fs.write(&leaf, "22").unwrap();
+    assert_eq!(settled(&mut d), [format!("U {leaf}")]);
+    caught_up(&mut d);
+  });
+}
 
 /// A watched file is taken back: no event, and nothing is reported for it any more.
 #[test]

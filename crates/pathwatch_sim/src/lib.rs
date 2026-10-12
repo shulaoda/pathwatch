@@ -73,7 +73,7 @@ pub use crate::{
   caught_up::{can_be_watched, check_fingerprints, followed, is_dropped, reportable},
   driver::{
     Deliver, Driver, NONE, Sim, asked, at, caught_up, flush, ignore_node_modules, known,
-    not_caught_up, on_all, on_modes, os_watches, settled, show, sorted, taken,
+    not_caught_up, on_a_small_stack, on_all, on_modes, os_watches, settled, show, sorted, taken,
     until_delete_pending, window, window_then_settled,
   },
   fs::SimFs,

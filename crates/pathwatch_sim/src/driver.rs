@@ -389,6 +389,13 @@ pub fn on_all(options: &Options, test: impl Fn(&mut dyn Sim, &str)) {
   test(&mut Driver::<PollBackend>::poll(options.clone()), "Poll");
 }
 
+/// Runs the story on a thread with a quarter of the usual stack: a recursion through thousands
+/// of nodes does not fit on it, and a story that runs on it has none.
+pub fn on_a_small_stack(story: impl FnOnce() + Send + 'static) {
+  let thread = std::thread::Builder::new().stack_size(256 * 1024).spawn(story).unwrap();
+  thread.join().unwrap();
+}
+
 /// The end of a story. Everything settles, the engine has caught up with the disk (which
 /// [`Driver::settle`] checks), and it has nothing left to do.
 pub fn caught_up<B: Deliver>(driver: &mut Driver<B>) {

@@ -217,30 +217,38 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Forgets what the tree has at the node and below it, down to each watched path, which stays.
   /// `scan_comes`: a deep scan comes from a directory above that gave its watch back.
-  pub(super) fn uncover(&mut self, key: DirKey, tell_delete: bool, mut scan_comes: bool) {
-    let node = &mut self.tree[key];
-    if !tell_delete {
-      // Not told: the end of the call makes no `Delete` of it.
-      node.set_told(false);
-    }
-    let stays = node.is_ancestor();
-    match &mut node.kind {
-      Kind::Missing => return,
-      Kind::File(_) => return self.forget_file(key),
-      // Nothing is asked in a partial directory, so nothing would take a wrong proof back.
-      Kind::Dir(dir) => (dir.complete, dir.spelling) = (false, Spelling::Unknown),
-    }
-    if stays {
-      // Before the directories below, so that they know of the deep scan that comes from here.
-      scan_comes |= self.narrow(key, scan_comes);
-    }
-    let children: Vec<DirKey> = self.tree.children(key).collect();
-    for child in children {
-      if !self.tree[child].is_path() {
-        self.uncover(child, tell_delete, scan_comes);
+  pub(super) fn uncover(&mut self, key: DirKey, tell_delete: bool, scan_comes: bool) {
+    // A list, not a recursion: a tree can be deeper than the stack takes. The directories that
+    // go vanish afterwards, each after the ones below it.
+    let mut gone = Vec::new();
+    let mut next = Some((key, scan_comes));
+    let mut stack = Vec::new();
+    while let Some((key, mut scan_comes)) = next.take().or_else(|| stack.pop()) {
+      let node = &mut self.tree[key];
+      if !tell_delete {
+        // Not told: the end of the call makes no `Delete` of it.
+        node.set_told(false);
       }
+      let stays = node.is_ancestor();
+      match &mut node.kind {
+        Kind::Missing => continue,
+        Kind::File(_) => {
+          self.forget_file(key);
+          continue;
+        }
+        // Nothing is asked in a partial directory, so nothing would take a wrong proof back.
+        Kind::Dir(dir) => (dir.complete, dir.spelling) = (false, Spelling::Unknown),
+      }
+      if stays {
+        // Before the directories below, so that they know of the deep scan that comes from here.
+        scan_comes |= self.narrow(key, scan_comes);
+      } else {
+        gone.push(key);
+      }
+      let below = self.tree.children(key).filter(|&child| !self.tree[child].is_path());
+      stack.extend(below.map(|child| (child, scan_comes)));
     }
-    if !stays {
+    for key in gone.into_iter().rev() {
       self.vanish(key);
     }
   }

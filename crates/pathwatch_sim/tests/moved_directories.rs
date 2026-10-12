@@ -8,8 +8,8 @@ use std::{path::Path, time::Duration};
 
 use pathwatch::{ErrorKind, engine::Options};
 use pathwatch_sim::{
-  Driver, Mode, NONE, RECURSIVE, SimBackend, caught_up, flush, ignore_node_modules, known, on_all,
-  on_modes, settled, sorted, taken, window, window_then_settled,
+  Driver, Mode, NONE, RECURSIVE, SimBackend, caught_up, flush, ignore_node_modules, known,
+  on_a_small_stack, on_all, on_modes, settled, sorted, taken, window, window_then_settled,
 };
 
 fn driver(mode: Mode) -> Driver<SimBackend> {
@@ -75,6 +75,22 @@ fn a_directory_away_and_back_while_its_tree_is_read() {
       caught_up(&mut d);
     }
   }
+}
+
+/// A tree deeper than the stack of a thread takes is moved away: its nodes vanish from a list,
+/// not by a recursion down the tree.
+#[test]
+fn a_tree_deeper_than_the_stack_is_moved_away() {
+  on_a_small_stack(|| {
+    let mut d = driver(Mode::Handle);
+    let chain = "/p".to_owned() + &"/d".repeat(1500);
+    d.fs.mkdir_all(&chain).unwrap();
+    d.fs.write(format!("{chain}/leaf"), "1").unwrap();
+    d.watch(&["/p"]);
+    d.fs.rename("/p/d", "/away").unwrap();
+    assert_eq!(settled(&mut d), [format!("D {chain}/leaf")]);
+    caught_up(&mut d);
+  });
 }
 
 /// `unwatch` of the old name must not take away the watch that the new name got back.

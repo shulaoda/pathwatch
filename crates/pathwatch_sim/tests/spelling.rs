@@ -13,12 +13,40 @@ use pathwatch::{
   fs::Fs,
 };
 use pathwatch_sim::{
-  Driver, Mode, NONE, RECURSIVE, Sim, caught_up, on_all, on_modes, settled, taken, window,
+  Driver, Mode, NONE, RECURSIVE, Sim, caught_up, on_a_small_stack, on_all, on_modes, settled,
+  taken, window,
 };
 
 /// The engine is told that the disk takes two spellings of a name for one.
 fn loose() -> Options {
   Options { loose_spelling: true, ..Options::default() }
+}
+
+/// Thousands of names that are case variants of one name come and go inside one quiet time.
+/// Each node that goes hands the look on to its marked twins: from a list, not by a recursion
+/// as deep as there are twins.
+#[test]
+fn thousands_of_case_twins_that_come_and_go() {
+  on_a_small_stack(|| {
+    let mut d = Driver::sim(Mode::Inode, Options::default());
+    d.fs.mkdir_all("/p/dir").unwrap();
+    d.watch(&["/p/dir"]);
+    let name = "abcdefghijk";
+    for variant in 0..2048_u32 {
+      let spelled: String = name
+        .chars()
+        .enumerate()
+        .map(
+          |(at, letter)| if variant >> at & 1 == 1 { letter.to_ascii_uppercase() } else { letter },
+        )
+        .collect();
+      let path = format!("/p/dir/{spelled}");
+      d.fs.write(&path, "1").unwrap();
+      d.fs.remove(&path).unwrap();
+    }
+    assert_eq!(settled(&mut d), NONE);
+    caught_up(&mut d);
+  });
 }
 
 /// A single watched file, registered as `App.js` while the disk says `app.js`. Its `Update`,
