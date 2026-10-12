@@ -12,7 +12,7 @@ use pathwatch::{
   EventKind::{Create, Delete, Update},
 };
 
-use crate::{Watch, each, each_backend, each_backend_with};
+use crate::{Watch, each, each_backend, each_backend_with, symlink};
 
 /// A fixed sequence of numbers, so that a test picks the same things in every run.
 struct Random(u64);
@@ -150,12 +150,15 @@ fn a_directory_is_moved_away_changed_and_moved_back() {
 }
 
 /// A watch of macOS stands below the renamed directory and hears nothing about the renames.
-#[cfg(unix)]
 #[test]
 fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
   each_backend(|w| {
     w.write("r/x/a/changes.js", "1");
     w.write("r/x/a/goes.js", "1");
+    // Windows refuses to rename a directory above an open directory handle.
+    if cfg!(windows) && w.backend == "native" {
+      return;
+    }
     w.watch(&["r/x/a"]);
 
     w.rename("r/x", "r/away");
@@ -172,14 +175,20 @@ fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
 }
 
 /// The renamed directory is on the real path behind the link, where the watch of macOS stands.
-#[cfg(unix)]
 #[test]
 fn a_directory_above_the_target_of_a_link_is_moved_away_changed_and_moved_back() {
   each_backend(|w| {
     w.write("store/x/real/changes.js", "1");
     w.write("store/x/real/goes.js", "1");
     w.mkdir("r");
-    std::os::unix::fs::symlink(w.path("store/x/real"), w.path("r/link")).unwrap();
+    // Windows refuses to rename a directory above an open directory handle, which the handle
+    // opened through the link is.
+    if cfg!(windows) && w.backend == "native" {
+      return;
+    }
+    if !symlink(&w.path("store/x/real"), &w.path("r/link")) {
+      return;
+    }
     w.watch(&["r/link"]);
 
     w.rename("store/x", "store/away");
@@ -255,12 +264,13 @@ fn node_modules_is_ignored() {
 }
 
 /// Every change is reported once for each spelling, whichever one the writer used.
-#[cfg(unix)]
 #[test]
 fn two_spellings_of_one_directory() {
   each_backend(|w| {
     w.write("real/a.txt", "1");
-    std::os::unix::fs::symlink(w.path("real"), w.path("link")).unwrap();
+    if !symlink(&w.path("real"), &w.path("link")) {
+      return;
+    }
     w.watch(&["real", "link"]);
 
     w.write("real/b.txt", "1");
@@ -274,7 +284,6 @@ fn two_spellings_of_one_directory() {
 
 /// On a disk that takes two spellings of a name for one, the events carry the spelling that
 /// was given to `watch`.
-#[cfg(target_os = "macos")]
 #[test]
 fn watched_paths_in_another_spelling() {
   each_backend(|w| {
@@ -299,13 +308,14 @@ fn watched_paths_in_another_spelling() {
 
 /// Other programs use the real path. Every temporary directory of macOS is like this: `/var`
 /// is a link.
-#[cfg(unix)]
 #[test]
 fn watched_paths_below_a_symlinked_prefix() {
   each_backend(|w| {
     w.write("store/proj/src/a.js", "1");
     w.write("store/proj/config.json", "1");
-    std::os::unix::fs::symlink(w.path("store"), w.path("prefix")).unwrap();
+    if !symlink(&w.path("store"), &w.path("prefix")) {
+      return;
+    }
     w.watch(&["prefix/proj/src", "prefix/proj/config.json", "prefix/proj/later/x.js"]);
 
     w.write("store/proj/src/a.js", "22");
@@ -322,7 +332,7 @@ fn watched_paths_below_a_symlinked_prefix() {
     // Nothing watches a link: the poll finds that it points elsewhere now.
     w.write("other/proj/src/c.js", "1");
     w.remove("prefix");
-    std::os::unix::fs::symlink(w.path("other"), w.path("prefix")).unwrap();
+    assert!(symlink(&w.path("other"), &w.path("prefix")));
     w.expect(&[
       (Delete, "prefix/proj/src/a.js"),
       (Delete, "prefix/proj/src/sub/b.js"),

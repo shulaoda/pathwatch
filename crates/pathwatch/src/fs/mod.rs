@@ -31,7 +31,8 @@ pub trait Fs {
 
   /// A number that the disk changes with every change of the regular file at `path`, a rename
   /// too; `None` where the disk has none. Where an OS watch reports writes, the engine takes
-  /// it in place of the hash, so the file is not opened.
+  /// it in place of the hash, so the file is not read: the call opens it with no access for a
+  /// moment, and Windows refuses a rename over it meanwhile, as for every open handle.
   fn version(&self, _path: &Path) -> Option<u64> {
     None
   }

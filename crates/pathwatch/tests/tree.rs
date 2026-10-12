@@ -1,6 +1,5 @@
-//! The tree alone: the arena, the table and the way from a hint to a mark, with Unix paths.
-
-#![cfg(unix)]
+//! The tree alone: the arena, the table and the way from a hint to a mark, with Unix paths
+//! (on every OS: the tree joins names by their text, and a path is compared part by part).
 
 use std::{
   ffi::OsStr,
@@ -70,10 +69,15 @@ fn marks(tree: &Tree) -> Vec<String> {
     let flags =
       format!("{}{}", if mark.deep { "d" } else { "" }, if mark.written { "w" } else { "" });
     let parent = tree.parent(key).map(|parent| tree.path(parent)).unwrap_or_default();
-    all.push(format!("{}|{}|{flags}", parent.display(), tree.name(key).display()));
+    all.push(format!("{}|{}|{flags}", shown(&parent), tree.name(key).display()));
   }
   all.sort();
   all
+}
+
+/// The path as text, with `/` between the names on every OS.
+fn shown(path: &Path) -> String {
+  path.display().to_string().replace('\\', "/")
 }
 
 /// Takes every mark away, as a flush does.
@@ -793,7 +797,7 @@ fn mark_list(tree: &Tree) -> Vec<String> {
     let Some(mark) = node.mark() else { continue };
     let kind = if mark.deep { "deep" } else { "written" };
     let parent = tree.parent(key).map(|parent| tree.path(parent)).unwrap_or_default();
-    all.push(format!("{} {} {kind}", parent.display(), tree.name(key).display()));
+    all.push(format!("{} {} {kind}", shown(&parent), tree.name(key).display()));
   }
   all.sort();
   all

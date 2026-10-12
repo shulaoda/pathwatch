@@ -53,7 +53,7 @@ cargo run -p pathwatch --example dev_server -- path/to/project
 | `Watcher::new(handler)` | Starts a watcher with the default `Config`. Nothing is watched yet. |
 | `Watcher::with_config(config, handler)` | The same, with your `Config`. |
 | `watch(path)`, `watch_all(paths)` | Watches a path: a file, a directory (with everything below it), or a path that does not exist yet. Returns when the path is watched. Watching a path again does nothing. |
-| `unwatch(path)`, `unwatch_all(paths)` | Takes back a `watch` of this very path. Nothing is reported for it. |
+| `unwatch(path)`, `unwatch_all(paths)` | Takes back a `watch` of this very path. Nothing is reported for it, with one exception: a link inside a watched directory that this path was followed through is a plain file of that directory again, and that change is reported (promise 12). |
 | `close()` | Stops the watcher and waits for its thread. Dropping the `Watcher` does the same. |
 
 `watch`, `unwatch` and `close` can be called from any thread, and from inside the handler.
@@ -100,7 +100,12 @@ The settings cannot be changed after the watcher is made.
 ## Promises
 
 Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the first lines of
-`promises.rs` say which). The tests of 12 make symbolic links and run on Unix only.
+`promises.rs` say which). They run on every OS, with three exceptions: the test with sockets
+(1) runs on Unix only; the tests that rename a directory above a watched one (6, 13) run on
+Windows with polling only, since Windows refuses the rename while a handle is open; and a
+test that makes a symbolic link (12, and one each of 6 and 13) stops early on Windows when the
+user may not make links, as the tests with another Unicode form of a name (13) do on a disk
+that tells the forms apart (every disk but the usual one of macOS).
 
 1. **A watched path is a file, a directory or nothing.** A file is anything that is not a
    directory: also a socket, and a symbolic link inside a watched directory.
@@ -121,7 +126,9 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
    file that you were told about.
 7. **`unwatch` reports nothing.** A file that another watched path still covers stays known,
    and its changes are reported as before. A watched directory covers the names that it
-   lists: not a path that is spelled in another way than the disk has it (13).
+   lists: not a path that is spelled in another way than the disk has it (13). One exception:
+   a link inside a watched directory that the path was followed through is a plain file of
+   that directory again, and that change is reported (12).
 8. **Paths.** A relative path is joined to the current directory at the time of the call. `.`,
    `..` and repeated separators are cleaned by text; no link is resolved. A path that cannot be
    used (empty, a NUL in it, a file system root) is `InvalidPath`; the other paths of the same
@@ -131,7 +138,7 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
    directory holds (git, WSL and an unpacked archive make them) is a file like the others.
    On Windows a path with a drive and no root (`C:name`) is joined to the current directory
    when that is on the drive, and is `InvalidPath` for another drive; a `\\?\` path is taken
-   in its plain form, and so are the event paths; a path that starts with two separators is a
+   in its plain form and `/` as `\`, and so are the event paths; a path that starts with two separators is a
    share (`\\server\share\...`, with a separator too many before the share still) or
    `InvalidPath`, never a path on the current drive.
 9. **Calls inside the handler.** `watch`, `unwatch` and `close` work there. They take effect
@@ -149,7 +156,9 @@ Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the fi
 11. **Nothing beside a watched path.** A file next to a watched file is not reported.
 12. **Symbolic links.** A watched path that is a link, or that goes through one, is followed,
     and its events carry the spelling you gave. A link inside a watched directory is a file: it
-    is not followed.
+    is not followed. While a watched path is at or goes through such a link, the link is
+    followed for the directory too: the `watch` of that path reports the link as gone and the
+    files behind it as new, and the `unwatch` of it the other way round.
 13. **Spelling.** On a disk that takes two spellings of a name for one (letter case, Unicode
     form: the usual disks of macOS and Windows, and on Linux a folder of such a system, a FAT
     or SMB disk, a directory with the casefold flag), a watched path is the text you gave:
@@ -167,15 +176,22 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   same for a write through `mmap`. Linux reports no write through `mmap` at all, also after
   the file is closed: inotify has no word for it. On Windows the directory lists the new size and time only
   when the file is closed (measured on NTFS); whether the write is reported before that was
-  not checked.
+  not checked. On Windows a write through a mapped view of a file that exists is not reported
+  at all, as on Linux, also after the file is closed, and neither is a write through a handle
+  that was opened by the index of the file (`OpenFileById`); polling finds the second.
 - **Windows: a second write of the same size by a writer that keeps the file open**, in the
   same step of the clock of the time stamps (1 to 16 ms), is not found by a look: the disk
   gives the file a new number only for its first write (measured on NTFS). It is reported
   when Windows reports the write itself, and at the latest when the file is closed.
 - **With polling, a file that was just written is opened and read** (up to 16 MiB, at every
-  round for 2 s after the write), on every OS. On Windows a program that opens it meanwhile
-  and shares it with nobody is refused, and the first read after a write waits for the virus
-  scanner.
+  round for 2 s after the write), on every OS, and so is a young file wherever only the poll
+  looks at it. On Windows a program that opens it meanwhile and shares it with nobody is
+  refused, and the first read after a write waits for the virus scanner. While the read lasts,
+  Windows refuses a save by rename over the file (`MoveFileEx` with `REPLACE_EXISTING`,
+  `os.replace` of Python, `fs.rename` of Node) and a rename of a directory above it with
+  "access denied": measured next to a polling watcher, 2 to 7 % of the saves of a file that
+  is saved again within a poll interval, none for a file older than 2 s. Each directory of a
+  polled tree is opened for its listing at every round, for a moment.
 - **A write through another hard link** of a watched file is not reported.
 - **macOS: a socket or a FIFO that is made** is not reported (macOS 26; macOS 27 reports it).
   It is found when something else makes the watcher look at its directory. Its removal is
@@ -190,8 +206,8 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 - **A watched path that is spelled with a look-alike character**, where the disk has plain
   letters, or the other way round: `ß` for `ss`, the long s for `s`, the Kelvin sign for `K`,
   a ligature like `ﬁ` for `fi`, a CJK compatibility ideograph for its ideograph. The disks of
-  macOS take these for one name. Such a path gets no events on macOS and Windows. With polling
-  it works.
+  macOS take these for one name. Such a path gets no events on macOS. With polling it works.
+  NTFS takes the two for two names (measured), so nothing is missed there.
 - **Linux: a disk that takes two Unicode forms of a name for one, and tells the case of
   letters apart** (a case-sensitive volume of a Mac, shared into a Linux machine): it is taken
   for a disk that tells every spelling apart. A name below a watched directory that is renamed
@@ -201,6 +217,9 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   before `watch`.
 - **The link of a watched path changes** (it points somewhere else now): found by a poll,
   within a second, or within the poll interval when polling is on.
+- **A watched path that is a link to a file**: a write to the file behind it is found by the
+  same poll, within a second, with every backend. And a rewrite of the same size that puts the
+  old modification time back is not reported for it on Linux either.
 - **macOS, Windows: the directories above a watched path** are polled once a second. When
   one of them is made, or made again, the events can come up to a second late. On Windows the
   same holds when one is removed. On macOS a rename or a removal of such a directory is found
@@ -212,8 +231,9 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   lost. Other FSEvents users in the same process are late too.
 - **Windows: the directories above a watched directory cannot be renamed** while it is
   watched. The OS refuses it.
-- **Windows: a watched directory that is renamed** is still reported under its old name until
-  the poll of the directory above finds it gone, within a second.
+- **Windows: a watched directory that is renamed**: the `Delete` events of its files come when
+  the poll of the directory above finds it gone, up to a second late. Nothing is reported
+  under the old name meanwhile.
 - **Windows: a junction or a directory link** is made in two steps, a plain directory first,
   and the second step gives no record. A watcher that looked between the steps sees a
   directory; it looks once more at the next flush, within the poll interval, and reports the
@@ -233,7 +253,8 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 ## Timing
 
 - **Normally** an event comes within the quiet time (50 ms) plus what the OS takes to tell
-  about a change (about 1 to 15 ms).
+  about a change (about 1 to 15 ms). For a watched path that is a link to a file, a write to
+  the file behind it is found by the poll of the links: within a second.
 - **With polling** a change is found by the next round: within the poll interval (100 ms), or
   later after a slow round: the pause is nine times as long as the looks of the round took,
   plus the time of the reads of the files written in the last two seconds, and five seconds
@@ -326,10 +347,12 @@ This runs, on the machine it is called on:
 - the backend of this OS against the real watch API (`crates/pathwatch/tests/inotify.rs`,
   `fsevents.rs` or `windows.rs`),
 - the watcher thread (`tests/watcher.rs`),
+- the tree alone (`tests/tree.rs`), and on a real directory the hash of a file (`tests/hash.rs`)
+  and the poll backend with a clock that the test moves (`tests/ahead.rs`, `tests/pacing.rs`),
 - on Windows, also the parts of its backend that call no Windows (`tests/windows_parts.rs`):
   the backend is compiled there only,
 - the promises on the real disk, each once with the backend of this OS and once with polling
-  (`tests/disk`).
+  (`tests/disk`; the note above the promises says which of them run where).
 
 | Platform | How |
 |---|---|

@@ -42,7 +42,9 @@ use windows_sys::Win32::{
 
 use super::{DirId, Entry, FileType, Meta, meta};
 
-/// Other programs may still rename, delete and write what is looked at.
+/// Other programs may still write, delete and rename what is looked at. Not rename another
+/// file over it, nor a directory above it: Windows refuses that while any handle is open,
+/// whatever the handle shares.
 const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 /// From 1601 to 1970, in the steps of 100 ns that Windows counts time in.
 const TO_1970: u64 = 116_444_736_000_000_000;

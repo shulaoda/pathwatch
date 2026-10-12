@@ -8,7 +8,7 @@ mod promises;
 use std::{
   collections::{BTreeMap, BTreeSet},
   fs,
-  path::PathBuf,
+  path::{Path, PathBuf},
   sync::{
     Arc, Weak,
     mpsc::{self, Receiver, RecvTimeoutError},
@@ -61,6 +61,28 @@ fn side_by_side(run: impl Fn(bool) + Sync) {
 
 fn backend_name(polling: bool) -> &'static str {
   if polling { "polling" } else { "native" }
+}
+
+/// Makes a symbolic link at `link` to `target`, to a directory or to a file as the target is.
+/// `false`: this user may not make one (Windows without the developer mode), so the test has
+/// nothing to check.
+fn symlink(target: &Path, link: &Path) -> bool {
+  #[cfg(unix)]
+  {
+    std::os::unix::fs::symlink(target, link).unwrap();
+    true
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+    let made = if target.is_dir() { symlink_dir(target, link) } else { symlink_file(target, link) };
+    match made {
+      Ok(()) => true,
+      Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => false,
+      Err(error) => panic!("a symbolic link cannot be made: {error}"),
+    }
+  }
 }
 
 struct Watch {
@@ -122,8 +144,13 @@ impl Watch {
 
   fn remove(&self, rel: &str) {
     let path = self.path(rel);
-    // A link to a directory is removed as a file.
-    if fs::symlink_metadata(&path).unwrap().is_dir() {
+    let kind = fs::symlink_metadata(&path).unwrap().file_type();
+    // A link to a directory is removed as a file; Windows removes it as a directory.
+    #[cfg(windows)]
+    if std::os::windows::fs::FileTypeExt::is_symlink_dir(&kind) {
+      return fs::remove_dir(path).unwrap();
+    }
+    if kind.is_dir() {
       fs::remove_dir_all(path).unwrap();
     } else {
       fs::remove_file(path).unwrap();

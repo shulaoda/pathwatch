@@ -8,10 +8,13 @@ It first ran on 2026-10-10, on Windows 11 Pro (build 26200) with NTFS on a local
 - `crates/pathwatch/tests/windows.rs` (the backend with real handles): all tests pass, 20
   runs in a row. So each point below that has a test there holds on that system.
 - `crates/pathwatch/tests/windows_parts.rs` (the parts that make no Windows call: `place`,
-  `Handles`, `Records`, `translate`): all 60 tests pass (63 by now).
-- `crates/pathwatch/tests/disk` with this backend: every test passes, but one cannot run:
-  `a_directory_above_a_watched_path_is_renamed_to_another_letter_case` renames a directory
-  above an open handle, and Windows refuses that. It is skipped for this backend.
+  `Handles`, `Records`, `translate`): all 60 tests pass (72 by now).
+- `crates/pathwatch/tests/disk` with this backend: every test passes, but two cannot run with
+  it: `a_directory_above_a_watched_path_is_renamed_to_another_letter_case` and
+  `a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back` rename a directory
+  above an open handle, which Windows refuses; they run with polling only. The test with
+  sockets (`a_file_is_anything_that_is_not_a_directory`) is Unix only, and the tests with
+  symbolic links stop early when the user may not make one.
 
 That first run also found what the engine got wrong about an NTFS disk when it polls. All of
 it is in `fs/windows.rs` now (`told` and `stat`):
@@ -111,16 +114,20 @@ the real disk, with this backend and with polling.
 
 - **The spelling of a name** (`Fs::name_on_disk`, `fs/windows.rs`). On a disk that takes two
   spellings of a name for one, a look asks how the disk spells the name that `lstat` found
-  (design 5.2). Here that is `FindFirstFileW` for the path, and the name that it gives back.
-  It was only compiled. To check: it gives the name as the directory holds it, also for a
-  link; and a path of more than 260 units works (std puts such a path into `\\?\` form for
-  its own calls, this call passes the path as it is).
+  (design 5.2). Here that is `FindFirstFileExW` for the path, and the name that it gives back.
+  Checked: `fs::windows::tests::the_name_on_disk` (the name as the directory holds it, also at
+  the end of a path of more than 260 units; the call takes the `\\?\` form where std would),
+  and the disk tests of promise 13, which run on Windows too.
 - **How a name that is gone is spelled in a record.** FSEvents names a removed entry as the
   caller spelled it, and the engine is right for both spellings. Which one
   `ReadDirectoryChangesW` gives is not known.
 - **Which names the disk takes for one.** The rule for plain names (design 5.2) was measured
   on APFS. NTFS compares names through its table of upper-case letters and knows no Unicode
-  forms, so it should take fewer names for one. Not checked.
+  forms. Measured: it takes the two cases of a letter for one name, also outside ASCII
+  (`é`/`É`, `σ`/`Σ`, `ф`/`Ф`, fullwidth letters), and for two names the NFC and NFD forms,
+  `ß`/`SS`, `ſ`/`s`, the Kelvin sign/`k`, `ﬁ`/`fi`, `ı`/`I`; no character of the BMP is
+  taken for an ASCII one or for an ideograph, so `is_plain` holds on NTFS, and the only alias
+  of a plain name is its short name.
 - **How lost records show up.** Expected: the read completes with success and zero bytes. The
   error `ERROR_NOTIFY_ENUM_DIR` is taken the same way. Zero bytes mean that the buffer of this
   one handle was too small. So both become `Changed` with an empty `rel` for each key that the
@@ -211,7 +218,10 @@ the real disk, with this backend and with polling.
 ### More directories than handles
 
 When more than 64 directories want a handle, directories share a handle on a directory above
-them (`place` in `windows.rs`). All of this is new and has only run as plain code:
+them (`place` in `windows.rs`). The move up and down runs with real handles in
+`more_directories_than_handles_share_a_handle` and
+`directories_above_the_limit_and_a_junction_come_to_rest`; the rest has run as plain code
+(`windows_parts.rs`):
 
 - **The names in the records of a shared handle.** Expected: paths relative to the directory of
   the handle, with `\` between the parts, spelled as on the disk. The backend joins such a name
@@ -247,8 +257,9 @@ them (`place` in `windows.rs`). All of this is new and has only run as plain cod
   the way to the watched paths.
 
 Numbers from macOS (plain code only, release build, 2,000 directories that share one or two
-handles): all `watch` calls together take 12 to 28 ms, one `unwatch` takes 0.5 to 1 ms (each
-one works out the whole placement again), and one record takes 0.7 us to find its key.
+handles): all `watch` calls together take 12 to 28 ms, and one record takes 0.7 us to find its
+key. An `unwatch` moves no handle: the next commit works out the placement once for all of
+them.
 
 ## The tests that settle these points
 
@@ -272,24 +283,26 @@ again:
 - `a_path_longer_than_260_units` and `both_spellings_of_the_temp_directory_work`
 - `what_is_no_directory_fails` (it checks the error kinds that std gives)
 
-The other tests check the backend itself: a watch is live when `watch` returns, each kind of
+The other tests check the backend itself: a watch is live when `commit` returns, each kind of
 change makes its hint, the rules of `Handles` hold with real handles, and `drop` ends the thread.
 
 ## Known gaps
 
-These are known from reading. `windows.rs` has no comments: what the backend does, and where
+These are known from reading. `windows.rs` has few comments: what the backend does, and where
 its limits are, is in `docs/design.md` 7.3.
 
-1. **A directory behind a link below a handle is polled.** A handle does not report what is
-   behind a junction or a directory link below it, so the backend looks at each name between
-   the handle and the directory (`leads_through_a_link`) and answers `NotWatched` when one is
-   a link. The engine polls such a directory. A handle of its own on the directory would
-   report at once, but `place` knows no handle below another.
+1. **A key behind a link below a directory that has a handle anyway is polled.** A handle does
+   not report what is behind a junction or a directory link below it, so the backend looks at
+   each name between the handle and the directory (`leads_through_a_link`) and answers
+   `NotWatched` when one is a link. A directory behind a link that wants the contents gets a
+   handle of its own below the shared one (`place` knows the links); what is left to the poll
+   is a key that wants names only, or lies below a directory that has a handle of its own.
 
 2. **Hints after `unwatch`.** A record finds its key among the keys of now, so a read that was
    made before `unwatch` gives no hint with that key. One case is left: the notice "another
-   handle serves this key now" can be on its way when the key is unwatched. Rule 12 of `Backend`
-   allows a late hint, and the engine drops a hint whose key names no node.
+   handle serves this key now" can be on its way when the key is unwatched. The row of `unwatch`
+   in the table of design 6 allows a late hint, and the engine drops a hint whose key names no
+   node.
 
 3. **A short name in the directory of a key itself** becomes `Changed` with an empty `rel`.
    For the engine that means "check this directory and watch it again", so everything below is

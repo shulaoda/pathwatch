@@ -49,7 +49,9 @@ use pathwatch::{
   Watcher,
 };
 
-use crate::{Inside, PATIENCE, each, each_backend, each_backend_inside, each_backend_with};
+use crate::{
+  Inside, PATIENCE, each, each_backend, each_backend_inside, each_backend_with, symlink,
+};
 
 #[cfg(unix)]
 #[test]
@@ -568,12 +570,13 @@ fn nothing_is_reported_beside_a_watched_path() {
 
 /// Nothing watches the place a link points to: the native backend finds these changes with its
 /// poll.
-#[cfg(unix)]
 #[test]
 fn a_watched_link_to_a_file_is_followed() {
   each_backend(|w| {
     w.write("real/f.txt", "1");
-    std::os::unix::fs::symlink(w.path("real/f.txt"), w.path("link.txt")).unwrap();
+    if !symlink(&w.path("real/f.txt"), &w.path("link.txt")) {
+      return;
+    }
     w.watch(&["link.txt"]);
 
     w.write("real/f.txt", "22");
@@ -586,19 +589,18 @@ fn a_watched_link_to_a_file_is_followed() {
   });
 }
 
-#[cfg(unix)]
 #[test]
 fn a_link_inside_a_watched_directory_is_a_file() {
-  use std::os::unix::fs::symlink;
-
   each_backend(|w| {
     w.write("outside/dir/a.txt", "1");
     w.write("outside/f.txt", "1");
     w.mkdir("r");
     w.watch(&["r"]);
 
-    symlink(w.path("outside/dir"), w.path("r/to_dir")).unwrap();
-    symlink(w.path("outside/f.txt"), w.path("r/to_file")).unwrap();
+    if !symlink(&w.path("outside/dir"), &w.path("r/to_dir")) {
+      return;
+    }
+    assert!(symlink(&w.path("outside/f.txt"), &w.path("r/to_file")));
     w.expect(&[(Create, "r/to_dir"), (Create, "r/to_file")]);
 
     w.write("outside/dir/a.txt", "22");
@@ -614,8 +616,7 @@ fn a_link_inside_a_watched_directory_is_a_file() {
 }
 
 /// The disk spells it `e` and an accent, the watched path `é`: one name on the usual disk of
-/// macOS.
-#[cfg(target_os = "macos")]
+/// macOS, and two on every other disk, where there is nothing to test.
 #[test]
 fn a_watched_file_in_another_unicode_form() {
   each_backend(|w| {

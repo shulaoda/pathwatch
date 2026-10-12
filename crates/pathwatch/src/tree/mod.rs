@@ -1355,7 +1355,7 @@ impl Tree {
   }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
   use std::{
     ffi::OsStr,
@@ -1479,12 +1479,15 @@ mod tests {
   #[test]
   fn a_time_as_one_number() {
     assert_eq!(nanos(UNIX_EPOCH), 0);
-    assert_eq!(nanos(UNIX_EPOCH + Duration::new(2, 3)), 2_000_000_003);
-    assert_eq!(nanos(UNIX_EPOCH - Duration::new(2, 3)), -2_000_000_003);
-    // The year 2262 is the last one that fits.
+    // A multiple of 100 ns: the clock of Windows counts in those.
+    assert_eq!(nanos(UNIX_EPOCH + Duration::new(2, 300)), 2_000_000_300);
+    assert_eq!(nanos(UNIX_EPOCH - Duration::new(2, 300)), -2_000_000_300);
+    // The year 2262 is the last one that fits, and 1677 the first.
     let far = Duration::from_hours(400 * 365 * 24);
     assert_eq!(nanos(UNIX_EPOCH + far), i64::MAX);
-    assert_eq!(nanos(UNIX_EPOCH - far), -i64::MAX);
+    // Three hundred years back: the clock of Windows starts in 1601.
+    let back = Duration::from_hours(300 * 365 * 24);
+    assert_eq!(nanos(UNIX_EPOCH - back), -i64::MAX);
   }
 
   /// A list that is used again keeps its memory, but not when it is long.

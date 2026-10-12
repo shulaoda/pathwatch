@@ -28,7 +28,7 @@ watcher.close();
 |---|---|
 | `Watcher::new(handler)`, `with_config(config, handler)` | Start the watcher thread and the backend. They fail only when the thread cannot start. When the watch API of the OS cannot start, the handler is told once (`WatchLimit` or `Io`) and the watcher polls everything. |
 | `watch(path)`, `watch_all(paths)` | Register a batch and return when every path is watched and its state is known. What exists then is the **baseline** and is not reported. A path that is watched already is skipped. |
-| `unwatch(path)`, `unwatch_all(paths)` | Take back a `watch` of the very same path, and report nothing (5.7). |
+| `unwatch(path)`, `unwatch_all(paths)` | Take back a `watch` of the very same path, and report nothing but the change of a link inside a watched directory that is a plain file again (5.7). |
 | `close()` | Stops the backend and waits for the thread. After it the handler is not called again, and `watch` and `unwatch` return `Closed`. Dropping the watcher calls it. |
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
@@ -175,7 +175,7 @@ The words, each for one idea:
 | cover | FSEvents only: a directory that the engine watches and a stream reports | `Covers` in `fsevents.rs` |
 | stream path | FSEvents only: a directory that a stream was started for; it reports the whole tree below | `Streams::paths` in `fsevents.rs` |
 
-`tree/mod.rs` holds the data, and `engine/` has one file for each job (`mod.rs` says which).
+`tree/mod.rs` holds the data, and `engine/` has one file for each job (each file says which in its first lines).
 
 ### 5.1 The tree
 
@@ -1019,8 +1019,8 @@ The time is the time of the looks at the disk. What the backend takes to make wa
 
 `crates/pathwatch/src/backend.rs`. The engine asks a backend to watch directories, and the
 backend tells the engine where to check. A backend never says what happened: the engine reads
-the disk itself. The file has no comments: this section is the one place for what its items
-mean, and for the rules.
+the disk itself. The items of the file have short docs; this section is the one place for the
+rules.
 
 **The trait `Backend`.** Every backend writes `watch`, `unwatch` and `translate`. A backend
 type has its own `new(sink: Sink<Self::Raw>)`.
@@ -1511,17 +1511,21 @@ The test files of the simulator:
   must know exactly the files that the watched paths stand for, each with the content it has
   now, and the two checks must hold.
 - `sim`: the fixtures themselves, and that the checks above fail when they have to.
+- `allocations`: budgets for how often the engine asks for memory; a test fails when one is
+  passed.
 - `cost`: no test, a measure. It prints what the engine costs for big cases (20,000 watched
   files, a directory of 50,000 files, 100,000 hints, a polling round, `unwatch`), in time,
   allocations and bytes. Run it before and after a change of the engine and compare.
 
 **The other tests** (`crates/pathwatch`):
 
-- Private functions (a `mod tests` at the end of the file): `tree/mod.rs`, `path.rs`, `fs/mod.rs`,
-  `fs/windows.rs`, `engine/events.rs`, and helpers of the backends.
+- Private functions (a `mod tests` at the end of the file): `tree/mod.rs`, `tree/names.rs`,
+  `path.rs`, `fs/mod.rs`, `fs/windows.rs`, `engine/events.rs`, and helpers of the backends.
 - The tree alone (`tests/tree.rs`): the arena, the table, and the way from a hint to a mark.
-- The engine on a real directory with the poll backend and a clock that the test moves
-  (`tests/ahead.rs`): a file whose time is ahead of the clock (5.8). It counts the reads.
+- The engine on a real directory with the poll backend and a clock that the test moves:
+  a file whose time is ahead of the clock (`tests/ahead.rs`, 5.8; it counts the reads), and
+  the rest after a poll (`tests/pacing.rs`, 5.13). The hash of a file on the real disk
+  (`tests/hash.rs`): the limit, and that nothing but a regular file is opened (5.8).
 - Each backend alone (`tests/inotify.rs`, `fsevents.rs`, `windows.rs`, each on its OS). `windows_parts.rs` runs on Windows only. In `fsevents.rs` a test
   that makes many changes runs alone, and after the others where it can (`Turn`): a flood
   makes FSEvents report losses, and a test next to it was seen to get one too. No test there
@@ -1584,7 +1588,7 @@ Known holes of the engine:
   where it is until the streams are replaced. Nothing is missed.
 
 Known holes of the backends are in 7.1 to 7.3. The Windows backend has only run on Windows 11 with NTFS.
-Android was never built.
+Android was never run: it is set to use the same code as Linux, and only type-checked.
 
 ## 10. Words
 

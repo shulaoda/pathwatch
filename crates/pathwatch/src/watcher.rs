@@ -171,8 +171,9 @@ impl Watcher {
   ///
   /// Nothing is reported for it: the files that only this path covered are forgotten, a `Delete`
   /// that was waiting below it is dropped, and a file that another watched path still covers
-  /// stays known. It cannot cut a part out of a watched directory: use
-  /// [`Config::with_ignored`] for that.
+  /// stays known. One exception: a link inside a watched directory that this path was followed
+  /// through is a plain file of that directory again, and that change is reported. It cannot cut
+  /// a part out of a watched directory: use [`Config::with_ignored`] for that.
   ///
   /// From inside the handler the call does not wait.
   ///
