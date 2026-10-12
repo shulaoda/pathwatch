@@ -213,7 +213,10 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   watched. The OS refuses it.
 - **Windows: a watched directory that is renamed** is still reported under its old name until
   the poll of the directory above finds it gone, within a second.
-- **Windows: a junction or a directory link below a watched directory** gets no events.
+- **Windows: a junction or a directory link** is made in two steps, a plain directory first,
+  and the second step gives no record. A watcher that looked between the steps sees a
+  directory; it looks once more at the next flush, within the poll interval, and reports the
+  link then. Until then a watched path at or through the link gets no events.
 - **Windows: more than 64 directories** share handles. A watched path that is then spelled in
   another way than the disk (more than the case of letters, or a short 8.3 name) gets no
   events.

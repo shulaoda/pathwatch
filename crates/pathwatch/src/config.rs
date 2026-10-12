@@ -121,6 +121,8 @@ impl Config {
       poll_interval_alone: Some(self.poll_interval),
       // macOS and Windows: a disk takes two spellings of a name for one.
       loose_spelling: cfg!(any(target_vendor = "apple", windows)),
+      // The poll lists a directory again by itself.
+      two_step_links: cfg!(windows) && !polling,
     }
   }
 }

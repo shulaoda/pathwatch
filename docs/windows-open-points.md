@@ -167,7 +167,11 @@ the real disk, with this backend and with polling.
   often real long names look like one.
 - **Junctions and directory symlinks.** A handle opened through a link watches the target. A
   handle does not report changes that happen behind a link below it: they are reported under the
-  real path, and only if that path is below a handle too.
+  real path, and only if that path is below a handle too. A link is made in two steps: a plain
+  directory (`ADDED`, in the filter), then the reparse point on it, which is reported under
+  `FILE_NOTIFY_CHANGE_ATTRIBUTES` only, a bit the filter leaves out (an attribute change of a
+  file would be `MODIFIED`, and a `Written` that is no write). So the engine looks once more at
+  every new directory, at the next flush (`Options::two_step_links`).
 - **Closing a handle.** Expected: after `CancelIoEx` and `CloseHandle` the pending read completes
   and its packet reaches the port. Until then the buffer is kept. If the packet does not come
   within two seconds at shutdown, the buffer is leaked.

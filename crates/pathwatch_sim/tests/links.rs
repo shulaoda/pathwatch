@@ -82,6 +82,60 @@ fn a_link_watched_inside_the_quiet_time_of_a_hint_with_a_name_that_is_not_plain(
   }
 }
 
+/// Windows makes a junction or a directory link in two steps, a plain directory first, and the
+/// second step gives no record that the backend asks for. A look between the steps sees a
+/// directory; it is looked at once more at the next flush, whatever moment of the call the
+/// second step falls into: inside a watched directory, at a watched path, and on the way to one.
+#[test]
+fn a_link_made_in_two_steps() {
+  let options = Options { two_step_links: true, ..Options::default() };
+  let places: [(&str, &str, &[&str]); 3] = [
+    ("inside", "/p/w/j", &["/p/w"]),
+    ("at", "/p/b/cur", &["/p/b/cur"]),
+    ("on the way", "/p/b/mid", &["/p/b/mid/a.txt"]),
+  ];
+  for mode in Mode::ALL {
+    for (place, link, watched) in places {
+      let prepare = || {
+        let d = Driver::sim(mode, options.clone());
+        d.fs.mkdir_all("/t/sub").unwrap();
+        d.fs.write("/t/a.txt", "1").unwrap();
+        d.fs.write("/t/sub/b.txt", "1").unwrap();
+        d.fs.mkdir_all("/p/w").unwrap();
+        d.fs.mkdir_all("/p/b").unwrap();
+        // The first step: a plain directory.
+        d.fs.mkdir(link).unwrap();
+        d.fs.take_raw(usize::MAX);
+        d
+      };
+      let second_step = move |fs: &pathwatch_sim::SimFs| {
+        fs.remove_all(link).unwrap();
+        fs.symlink("/t", link).unwrap();
+      };
+      let mut d = prepare();
+      let before = d.fs.calls().total();
+      d.watch(watched);
+      let calls = d.fs.calls().total() - before;
+      caught_up(&mut d);
+
+      for moment in 0..=calls {
+        let mut d = prepare();
+        d.fs.at_call(moment, second_step);
+        d.watch(watched);
+        if d.fs.traps_run() == 0 {
+          d.fs.clear_traps();
+          second_step(&d.fs);
+        }
+        // The OS says nothing of the second step.
+        d.fs.take_raw(usize::MAX);
+        d.settle();
+        caught_up(&mut d);
+        let _ = (place, &mut d);
+      }
+    }
+  }
+}
+
 /// Nothing watches the target of a link. The poll finds a change behind it.
 #[test]
 fn a_change_behind_a_link() {

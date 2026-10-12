@@ -557,7 +557,10 @@ directory: a directory that was moved away and back keeps its inode.
 ### 5.5 `appear`, `still_there`, `scan`, `vanish`
 
 `appear(node)`: the kind of the node becomes "directory", with its identity and `complete`; ask
-the backend for its watch (`arm`, 5.10); queue a shallow scan.
+the backend for its watch (`arm`, 5.10); queue a shallow scan. With `two_step_links` (Windows,
+not under the poll) the node is also marked for one more look at the next flush, as is a
+directory that is another one than before: a junction or a directory link is a plain directory
+until its second step, which gives no record, so a look between the steps sees a directory.
 
 `still_there(node, deep)`: `arm` the node, and with `deep` also queue a deep scan. `deep` is
 true for a `deep` mark, when the directory was held, when it is another directory than before,

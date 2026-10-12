@@ -180,6 +180,7 @@ struct DiskConfig {
 }
 
 #[derive(Clone, Debug)]
+#[expect(clippy::struct_excessive_bools, reason = "each one is a switch of the engine or the disk")]
 struct Config {
   backend: Target,
   /// Bit 0: a directory named `skip` is ignored, with everything below it. Bit 1: files named
@@ -193,6 +194,8 @@ struct Config {
   /// Windows). On a disk that is not such a disk, the rule for it only costs looks: it must
   /// do no harm. Without it, the engine finds out for each directory.
   loose_spelling: bool,
+  /// A new directory is looked at once more, as on Windows for a link made in two steps.
+  two_step_links: bool,
   /// The disk is such a disk, whatever the engine takes it for. Then some changes name an
   /// entry in upper case: the entry is the same, and the OS tells about a name that is gone
   /// in the spelling of the change. Some watched paths have a name in upper case too: a
@@ -243,8 +246,10 @@ impl Config {
       loose_spelling: random.chance(25),
       ignore_case: random.chance(25),
       mount: false,
+      two_step_links: false,
     };
     config.mount = random.chance(15);
+    config.two_step_links = random.chance(25);
     config
   }
 
@@ -263,6 +268,7 @@ impl Config {
       poll_interval: self.poll_interval,
       poll_interval_alone: None,
       loose_spelling: self.loose_spelling,
+      two_step_links: self.two_step_links,
     }
   }
 }

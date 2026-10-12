@@ -830,6 +830,97 @@ fn a_name_that_windows_reads_as_another_is_reported() {
   });
 }
 
+/// Windows: a junction is made in two steps, a plain directory first, and the second step
+/// (the reparse point) gives no record the backend asks for. A look between the steps sees a
+/// directory; the watcher looks once more and reports the link: a file inside a watched
+/// directory, and what is behind it at a watched path.
+#[cfg(windows)]
+#[test]
+fn a_junction_made_in_two_steps() {
+  use std::{
+    io,
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
+  };
+
+  use windows_sys::Win32::{
+    Foundation::GENERIC_WRITE,
+    Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT},
+    System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_REPARSE_POINT},
+  };
+
+  /// `IO_REPARSE_TAG_MOUNT_POINT`: the second step of `mklink /J` on the directory `link`.
+  fn set_mount_point(link: &Path, target: &Path) {
+    let dir = fs::OpenOptions::new()
+      .access_mode(GENERIC_WRITE)
+      .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+      .open(link)
+      .unwrap();
+    let print: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let mut names: Vec<u16> = r"\??\".encode_utf16().chain(print.iter().copied()).collect();
+    let substitute = names.len();
+    names.push(0);
+    names.extend(&print);
+    names.push(0);
+    // `REPARSE_DATA_BUFFER` in the mount point form: the tag, the length of the data, reserved;
+    // the offsets and lengths of the two names in bytes; the names.
+    let bytes = |units: usize| u16::try_from(units * 2).unwrap().to_le_bytes();
+    let mut buffer: Vec<u8> = Vec::new();
+    buffer.extend(0xA000_0003_u32.to_le_bytes());
+    buffer.extend(bytes(4 + names.len()));
+    buffer.extend(0_u16.to_le_bytes());
+    buffer.extend(0_u16.to_le_bytes());
+    buffer.extend(bytes(substitute));
+    buffer.extend(bytes(substitute + 1));
+    buffer.extend(bytes(print.len()));
+    buffer.extend(names.iter().flat_map(|unit| unit.to_le_bytes()));
+    let mut returned = 0_u32;
+    // SAFETY: the handle is open, `buffer` is the whole input, and nothing is written back but
+    // the count.
+    let set = unsafe {
+      let (input, size) = (buffer.as_ptr().cast(), u32::try_from(buffer.len()).unwrap());
+      let (no_output, no_overlap) = (std::ptr::null_mut(), std::ptr::null_mut());
+      let handle = dir.as_raw_handle();
+      DeviceIoControl(
+        handle,
+        FSCTL_SET_REPARSE_POINT,
+        input,
+        size,
+        no_output,
+        0,
+        &raw mut returned,
+        no_overlap,
+      )
+    };
+    assert!(set != 0, "{}", io::Error::last_os_error());
+  }
+
+  each_backend(|w| {
+    w.write("t/a.txt", "1");
+    w.write("t/sub/b.txt", "1");
+    w.mkdir("w");
+    w.mkdir("b");
+    w.watch(&["w", "b/cur"]);
+
+    // Inside a watched directory: a directory is no event, and the link is a file.
+    w.mkdir("w/j");
+    w.expect(&[]);
+    set_mount_point(&w.path("w/j"), &w.path("t"));
+    w.expect(&[(Create, "w/j")]);
+    w.write("t/a.txt", "22");
+    w.expect(&[]);
+
+    // At a watched path: the link is followed.
+    w.mkdir("b/cur");
+    w.expect(&[]);
+    set_mount_point(&w.path("b/cur"), &w.path("t"));
+    w.expect(&[(Create, "b/cur/a.txt"), (Create, "b/cur/sub/b.txt")]);
+    w.write("t/a.txt", "333");
+    w.expect(&[(Update, "b/cur/a.txt")]);
+    fs::remove_dir(w.path("b/cur")).unwrap();
+    w.expect(&[(Delete, "b/cur/a.txt"), (Delete, "b/cur/sub/b.txt")]);
+  });
+}
+
 /// Windows: a deletion that waits for the last handle to close (`FileDispositionInfo`, not the
 /// way of today's `DeleteFile`) hides the file from a look while the directory still lists
 /// it. Taken back, the file is there again and the OS says nothing: the watcher looks again.

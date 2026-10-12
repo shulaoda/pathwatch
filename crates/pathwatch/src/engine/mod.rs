@@ -67,6 +67,10 @@ pub struct Options {
   /// Every disk takes two spellings of a name for one (macOS, Windows). Without it, a directory
   /// counts as such a disk until a look proves otherwise.
   pub loose_spelling: bool,
+  /// A junction or a directory link is a plain directory first, and the second step gives no
+  /// record (Windows): a directory that the tree did not know is looked at once more at the
+  /// next flush.
+  pub two_step_links: bool,
 }
 
 impl Default for Options {
@@ -78,6 +82,7 @@ impl Default for Options {
       poll_interval: Duration::from_secs(1),
       poll_interval_alone: None,
       loose_spelling: false,
+      two_step_links: false,
     }
   }
 }
@@ -91,6 +96,7 @@ impl fmt::Debug for Options {
       .field("poll_interval", &self.poll_interval)
       .field("poll_interval_alone", &self.poll_interval_alone)
       .field("loose_spelling", &self.loose_spelling)
+      .field("two_step_links", &self.two_step_links)
       .finish()
   }
 }

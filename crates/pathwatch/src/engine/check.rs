@@ -188,12 +188,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       (Found::Dir { id, complete, relinked }, Had::Nothing) => {
         let baseline = self.is_baseline_dir(key, relinked);
         self.appear(key, path, id, complete, baseline);
+        self.look_again_at_a_new_dir(key);
       }
       (Found::Dir { id, complete, relinked }, Had::File) => {
         let baseline = self.is_baseline_dir(key, relinked);
         // A change of kind is never an `Update`: the file is gone.
         self.forget_file(key);
         self.appear(key, path, id, complete, baseline);
+        self.look_again_at_a_new_dir(key);
       }
       (Found::Dir { id, complete, relinked }, Had::Dir { id: old, complete: was_complete }) => {
         let was_held = self.tree[key].is_held();
@@ -224,7 +226,19 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         if relist && !(why.deep || moved) {
           self.tree.queue_scan(key, Depth::Shallow);
         }
+        if id != old {
+          self.look_again_at_a_new_dir(key);
+        }
       }
+    }
+  }
+
+  /// On Windows a junction or a directory link is a plain directory first, and the second step
+  /// gives no record that the backend asks for: a directory that the tree did not know is
+  /// looked at once more at the next flush, so that a link is seen within the poll interval.
+  fn look_again_at_a_new_dir(&mut self, key: DirKey) {
+    if self.options.two_step_links {
+      self.tree.mark(key, Mark::default());
     }
   }
 
