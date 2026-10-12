@@ -466,9 +466,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       return Found::Missing;
     }
     let (kind, found) = match error.kind() {
-      io::ErrorKind::PermissionDenied => (ErrorKind::PermissionDenied, Found::Missing),
-      _ if is_link_loop(&error) => (ErrorKind::Io, Found::Missing),
-      _ => (ErrorKind::Io, Found::Unknown),
+      io::ErrorKind::PermissionDenied => (Some(ErrorKind::PermissionDenied), Found::Missing),
+      _ if is_link_loop(&error) => (Some(ErrorKind::Io), Found::Missing),
+      // Another program holds the entry for a moment (Windows: a sharing violation): nothing is
+      // wrong with the disk, so nothing is reported, and the next look decides.
+      io::ErrorKind::ResourceBusy => (None, Found::Unknown),
+      _ => (Some(ErrorKind::Io), Found::Unknown),
     };
     self.scan_had_error = true;
     if let Some(dir) = self.tree[owner].dir_mut()
@@ -476,7 +479,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     {
       dir.has_error = true;
       self.tree.list_if_polled(owner);
-      self.report(kind, Some(path.to_path_buf()), Some(error));
+      if let Some(kind) = kind {
+        self.report(kind, Some(path.to_path_buf()), Some(error));
+      }
     }
     found
   }

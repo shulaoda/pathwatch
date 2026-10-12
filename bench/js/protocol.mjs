@@ -55,9 +55,10 @@ export function ready() {
   process.stdout.write('ready\n');
 }
 
-// The ignore rule of the benchmark: the path has a part with this name.
+// The ignore rule of the benchmark: the path has a part with this name. A library may hand
+// the path over with `/` on Windows too (chokidar does), so both separators split it.
 export function hasPart(file, name) {
-  return file.split(path.sep).includes(name);
+  return file.split(/[\\/]/).includes(name);
 }
 
 // The lowest directory that holds every path of the job: for a library that watches

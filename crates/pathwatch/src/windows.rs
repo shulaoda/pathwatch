@@ -618,7 +618,13 @@ mod handles {
       self.open = kept;
       for handle in &new {
         let waiting = self.waiting.iter().filter(|(_, dir)| dir.starts_with(&handle.dir));
-        told.covered.extend(waiting.map(|(&key, _)| key));
+        // A key behind a link below the new handle is not reported by it.
+        let covered = waiting.filter(|(_, dir)| {
+          let is_link =
+            |path: &Path| *looked.entry(path.to_owned()).or_insert_with(|| system.is_link(path));
+          link_between(&handle.dir, dir.as_path(), is_link).is_none()
+        });
+        told.covered.extend(covered.map(|(&key, _)| key));
       }
       self.open.extend(new);
 
@@ -1347,6 +1353,11 @@ mod tests {
       "toolongna~1.txt",
       "backup~",
       "~$doc.docx",
+      "BACKUP~",
+      "LONGNAME~1.TAR.GZ",
+      "TOOLONGNAME~1.TXT",
+      "A~1.LONGEXT",
+      "A~1..TXT",
     ] {
       assert!(!looks_short(name), "{name}");
     }

@@ -90,7 +90,7 @@ watcher, so it should only pass the batch on.
 | `Config` method | Default | Meaning |
 |---|---|---|
 | `with_ignored(f)` | nothing is ignored | `f(path, kind) -> bool`, where `kind` is `EntryKind::File` or `EntryKind::Dir`. A path for which it returns `true` is never reported. An ignored directory is never read or watched. It must give the same answer for the same input, and if it ignores a directory it must ignore everything below it. It is asked about the paths you watch too (promise 10). |
-| `with_debounce(d)` | 50 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch still goes out every 500 ms, or every `4 × d` if that is longer. Zero: no waiting. The most is a year, also for the poll interval. |
+| `with_debounce(d)` | 50 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch goes out 500 ms after the first change since the last batch, or `4 × d` after it if that is longer, plus the time that the check of the disk takes. Zero: no waiting. The most is a year, also for the poll interval. |
 | `with_delete_delay(d)` | 100 ms | How long a `Delete` waits for the path to come back. A file that is removed and written again within `d` is one `Update`; a real delete is reported `d` after the OS said that the path is gone. Zero: no waiting, and such a file is a `Delete` and a `Create`. The most is a year. |
 | `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
 | `with_poll_interval(d)` | 100 ms | The shortest pause between two rounds of polling. The least is 1 ms. After a slow round the pause is longer: nine times as long as the looks of the round took, plus the time of the reads of the files written in the last two seconds (on Windows a read right after a write waits for the virus scanner), and five seconds at most. |
@@ -115,8 +115,14 @@ that tells the forms apart (every disk but the usual one of macOS).
 3. **`Update`.** `touch` is an `Update`; `chmod` is not. An atomic save (write a temporary
    file, rename it over) is an `Update`, with no `Delete` and no `Create`. So is a file that is
    removed and written again within the delete delay (100 ms). There can be more `Update`
-   events than writes.
-4. **What exists when `watch` returns is not reported.** Every change after that is.
+   events than writes. A file that is replaced again and again without a pause by a save that
+   leaves the name free for a moment (`ReplaceFileW`, the save of .NET's `File.Replace`) can
+   get a `Delete` and a `Create` when both looks of the delete delay fall into such moments
+   (measured on Windows: 62 of 10,000 saves).
+4. **What exists when `watch` returns is not reported.** Every change after that is. One
+   exception: a file in a directory that an earlier `watch` could not list (no permission, or
+   another program held it) is reported as `Create` by a later `watch` of a path at or below
+   it, since nothing was told of it.
 5. **The watch belongs to the path.** It keeps working when a missing path becomes a file or a
    directory, when a file becomes a directory or the other way round, when a whole chain of
    missing directories appears at once, and when a name on the way to the path changes its
@@ -192,6 +198,11 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   "access denied": measured next to a polling watcher, 2 to 7 % of the saves of a file that
   is saved again within a poll interval, none for a file older than 2 s. Each directory of a
   polled tree is opened for its listing at every round, for a moment.
+- **Windows: a listing holds the directory open for a moment.** A rename of a directory above
+  it, and the second step of another program's junction (`EBUSY` in Node), fail in that
+  moment (measured under polling: 2 to 10 % of the renames of a directory with 500
+  subdirectories in it). A directory that another program holds with no sharing is no error
+  for the watcher: it is looked at again until it can be listed.
 - **A write through another hard link** of a watched file is not reported.
 - **macOS: a socket or a FIFO that is made** is not reported (macOS 26; macOS 27 reports it).
   It is found when something else makes the watcher look at its directory. Its removal is
@@ -259,7 +270,10 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   later after a slow round: the pause is nine times as long as the looks of the round took,
   plus the time of the reads of the files written in the last two seconds, and five seconds
   at most.
-- **Under a flood** of changes a batch still goes out at least every 500 ms.
+- **Under a flood** of changes a batch goes out 500 ms after the first change since the last
+  batch, plus the time that the check of the disk takes: a check with thousands of changed
+  paths takes a second and more (measured: 30,000 files made by eight threads, the longest
+  gap 2 s).
 - **A `Delete`** comes one delete delay (100 ms) after the OS said that the path is gone, once
   the path was found empty twice; under a flood it comes with the next batch. It comes at once
   when a directory is found where the file was, or a file where the directory was, or when a

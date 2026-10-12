@@ -622,7 +622,8 @@ that holds some (5.10).
 
 **Baseline.** What `watch` finds is not reported. But there is no silence for a file that had
 to be reported before this `watch`: an older watched path or an older complete node covered it
-already. So silence is only for
+already. A complete node whose listing failed (no permission, or another program held the
+directory) covered nothing, so a path watched below it later reports what it finds as new. So silence is only for
 
 - a file at a path that this `watch` made a watched path, in a directory that was not complete
   before,
@@ -951,6 +952,7 @@ is not, or if `pkg` goes away later, the path is dropped. That is allowed. The s
 | an entry that is being deleted (Windows: the name goes when the last handle on it is closed) | missing; the node is looked at again at each flush until the name is gone or the file is there, since the holder can take the deletion back and the OS says nothing then |
 | permission denied, link loop | missing for events; reported once; the node is polled until a scan of it has no error |
 | a server that cannot be reached (Windows `ERROR_BAD_NETPATH`, which std calls not found) | no answer |
+| another program holds the entry with no sharing (Windows: a sharing or a lock violation, `ResourceBusy`) | no answer: the mark stays for the next flush and the node is polled until a scan of it has no error; not reported, since nothing is wrong with the disk and the holder lets go in a moment as a rule |
 | anything else | no answer: the tree stays as it is, no `Delete` is told, the mark stays for the next flush; reported once; the node is polled |
 
 A failed `watch` is reported in the same way (`WatchLimit`, `PermissionDenied` or `Io`), but not

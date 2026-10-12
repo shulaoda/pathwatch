@@ -264,8 +264,8 @@ impl Watcher {
     let mut skipped = None;
     for path in paths {
       match clean(path.as_ref()) {
-        Some(path) => usable.push(path),
-        None => skipped = skipped.or_else(|| Some(path.as_ref().to_path_buf())),
+        Ok(path) => usable.push(path),
+        Err(why) => skipped = skipped.or_else(|| Some((path.as_ref().to_path_buf(), why))),
       }
     }
     if self.on_its_thread() {
@@ -282,7 +282,7 @@ impl Watcher {
       // The thread drops the channel when it stops before the command is done.
       wait.recv().map_err(|_| closed())?;
     }
-    skipped.map_or(Ok(()), |path| Err(Error::new(ErrorKind::InvalidPath, Some(path), None)))
+    skipped.map_or(Ok(()), |(path, why)| Err(Error::new(ErrorKind::InvalidPath, Some(path), why)))
   }
 }
 
@@ -533,21 +533,22 @@ impl<R: Send + 'static> Backend for NoBackend<R> {
 /// The form of `path` that the engine takes: absolute and clean. `None`: it cannot be used.
 ///
 /// A relative path is joined to the current directory; [`normalize`] does the rest.
-fn clean(path: &Path) -> Option<PathBuf> {
+fn clean(path: &Path) -> Result<PathBuf, Option<io::Error>> {
   if path.as_os_str().is_empty() {
-    return None;
+    return Err(None);
   }
   #[cfg(windows)]
   let absolute = path.is_absolute() || starts_like_a_share(path);
   #[cfg(not(windows))]
   let absolute = path.is_absolute();
   if absolute {
-    return normalize(path).map(Cow::into_owned);
+    return normalize(path).map(Cow::into_owned).ok_or(None);
   }
-  let current = env::current_dir().ok()?;
+  // A relative path needs the current directory: when that cannot be read, the error says why.
+  let current = env::current_dir().map_err(Some)?;
   #[cfg(windows)]
-  let path = rest_of_the_drive(path, &current)?;
-  normalize(&current.join(path)).map(Cow::into_owned)
+  let path = rest_of_the_drive(path, &current).ok_or(None)?;
+  normalize(&current.join(path)).map(Cow::into_owned).ok_or(None)
 }
 
 /// Windows: a path that starts with two separators is a share, or nothing. std sees one only in

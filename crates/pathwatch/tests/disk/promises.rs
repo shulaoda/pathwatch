@@ -1078,3 +1078,61 @@ fn close_inside_the_handler() {
     w.watcher.close();
   });
 }
+
+/// Windows: a directory that another program holds with no sharing, for a moment, is no
+/// error: nothing is wrong with the disk, and the next look finds what is in it.
+#[cfg(windows)]
+#[test]
+fn a_directory_held_by_another_program_is_no_error() {
+  use std::os::windows::fs::OpenOptionsExt;
+
+  use windows_sys::Win32::{
+    Foundation::GENERIC_READ, Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+  };
+
+  each_backend(|w| {
+    w.mkdir("r/held");
+    w.write("r/other.txt", "1");
+    let holder = fs::OpenOptions::new()
+      .access_mode(GENERIC_READ)
+      .share_mode(0)
+      .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+      .open(w.path("r/held"))
+      .unwrap();
+    w.watch(&["r"]);
+    w.write("r/new.txt", "1");
+    w.expect(&[(Create, "r/new.txt")]);
+    drop(holder);
+    w.write("r/held/inside.txt", "1");
+    w.expect(&[(Create, "r/held/inside.txt")]);
+  });
+}
+
+/// Windows: a write by a writer that keeps the file open is reported under the poll, although
+/// the listing of the directory lags behind until the writer closes the file. The file is old,
+/// so no hash of its content hides the lag. The backend of the OS reports the write when the
+/// writer flushes.
+#[cfg(windows)]
+#[test]
+fn a_write_by_a_writer_that_keeps_the_file_open_is_reported() {
+  use std::io::Write;
+
+  each_backend(|w| {
+    w.write("r/log.txt", "1");
+    let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+    fs::File::options()
+      .write(true)
+      .open(w.path("r/log.txt"))
+      .unwrap()
+      .set_modified(an_hour_ago)
+      .unwrap();
+    w.watch(&["r"]);
+    let mut holder = fs::OpenOptions::new().append(true).open(w.path("r/log.txt")).unwrap();
+    holder.write_all(b"22").unwrap();
+    if w.backend == "native" {
+      holder.sync_all().unwrap();
+    }
+    w.expect(&[(Update, "r/log.txt")]);
+    drop(holder);
+  });
+}

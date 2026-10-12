@@ -585,6 +585,21 @@ mod handles {
     assert_eq!(fake.lost(), [101, 200]);
   }
 
+  /// A key that waits for a handle and lies behind a link below the one that comes is not told
+  /// that it is covered: the handle reports nothing behind the link.
+  #[test]
+  fn a_waiting_key_behind_a_link_is_not_covered_by_a_handle_above_the_link() {
+    let mut fake = Fake::default();
+    fake.disk.links = vec![dir("/p/link")];
+    assert_eq!(fake.watch(200, "/p/link/sub", Want::Names), Answer::NotWatched);
+    assert_eq!(fake.watch(201, "/p/plain/sub", Want::Names), Answer::NotWatched);
+    fake.open(0, "/p");
+    assert_eq!(std::mem::take(&mut fake.covered), [201]);
+    assert_eq!(fake.watch(201, "/p/plain/sub", Want::Names), Answer::Names);
+    assert_eq!(fake.watch(200, "/p/link/sub", Want::Names), Answer::NotWatched);
+    assert_eq!(fake.lost(), []);
+  }
+
   /// A key below a directory that has a handle anyway, with a link between: it is not
   /// watched, and the handles stay where they are.
   #[test]
@@ -1429,6 +1444,32 @@ mod translate {
     // The handle reads on.
     let bytes = encode(&[(ADDED, "a")]);
     assert_eq!(hints(&mut handles, read(id, "/p", Ok(bytes))), [changed(0, "a")]);
+  }
+
+  /// The keys below a directory are the ones whose path has it as a part, not as a prefix of
+  /// the text: a loss on `/p` says nothing to a key on `/pq`.
+  #[test]
+  fn a_loss_names_the_keys_below_the_directory_by_its_names() {
+    let mut handles = Handles::default();
+    let id = open(&mut handles, 0, "/p");
+    watch(&mut handles, 1, "/p/sub", Want::Names);
+    open(&mut handles, 2, "/pq");
+    watch(&mut handles, 3, "/pq/sub", Want::Names);
+    let lost = hints(&mut handles, read(id, "/p", Ok(Vec::new())));
+    assert_eq!(sorted(lost), [changed(0, ""), changed(1, "")]);
+  }
+
+  /// A read counts for its bytes in the queue of the watcher, and a loss for its keys.
+  #[test]
+  fn a_raw_notification_counts_its_bytes() {
+    use pathwatch::{
+      backend::{Backend, DirKey},
+      windows::WindowsBackend,
+    };
+    let bytes = <WindowsBackend as Backend>::raw_bytes(&read(WatchId(0), "/p", Ok(vec![0; 1000])));
+    assert!(bytes >= 1000, "{bytes}");
+    let lost = Raw::Lost(vec![DirKey::new(1, 0), DirKey::new(2, 0)]);
+    assert!(<WindowsBackend as Backend>::raw_bytes(&lost) >= 2 * size_of::<DirKey>());
   }
 
   #[test]

@@ -236,9 +236,15 @@ them (`place` in `windows.rs`). The move up and down runs with real handles in
   changes, and is dropped. If Windows sends `MODIFIED` and nothing else for a directory that
   was replaced, the replacement is only found when the engine looks.
 - **Moving the handles.** When a directory comes or goes, handles can move up to a common
-  directory or down again. The new handles are opened first, then the old ones are closed. No
+  directory or down again. The new handles are opened first, then the old ones are closed, so
+  for a moment more than 64 are open: the limit is a choice of the backend, not of Windows. No
   change is missed in between, and a change that both handles report only costs the engine a
-  second look. One open takes about 40 us (measured).
+  second look. One open takes about 40 us (measured). A move down tells the key of the directory
+  that lost the shared handle, and the engine scans deep below it: for each directory there it
+  asks again, and the handle that the move just opened is replaced by that ask (a `watch` for
+  the very directory of a handle puts a new one there). Correct, and a second set of opens.
+  A key that waits for a handle and lies behind a link below the new one is not told that it is
+  covered.
 - **A shared handle that Windows does not let us open.** A common directory can refuse
   `FILE_LIST_DIRECTORY` where the directories below it allow it. Then the request that needed
   the shared handle is answered `Failed` with that error, the handles stay where they were, and
@@ -311,7 +317,12 @@ its limits are, is in `docs/design.md` 7.3.
    can be worse: when no key is at or above the directory that holds the short name, the short
    name can be a directory on the way to any key below, so each of these keys gets that hint.
 
-4. **Lost records in the last read of a closed handle.** Settled: the read that a close
+4. **The return of `ReadDirectoryChangesW`.** Every non-zero return is taken for "a request
+   is queued": kernelbase can return non-zero for a warning status, where nothing was queued
+   (measured with a buffer that is not aligned). Then `pending` would stay set and the handle
+   would read nothing more. The aligned buffer of `Watch` rules it out today.
+
+5. **Lost records in the last read of a closed handle.** Settled: the read that a close
    cancels fails with `ERROR_OPERATION_ABORTED` (118 of 118 closes, measured), so a last read
    that ends with no bytes is lost records, and it is passed on like every other one. A close
    can also find the read over and its packet not taken yet (`CancelIoEx` finds nothing): the
@@ -319,14 +330,14 @@ its limits are, is in `docs/design.md` 7.3.
    handle is read on and closed when a read comes back cancelled. The call that queued the
    closes waits for them.
 
-5. **A key at the directory of a handle is asked again after it moved.** Settled: a key that
+6. **A key at the directory of a handle is asked again after it moved.** Settled: a key that
    gets another handle is not told any more.
 
-6. **Above the limit, path order decides.** When more than 64 handles are needed and the
+7. **Above the limit, path order decides.** When more than 64 handles are needed and the
    directories have only a top directory or a home directory in common, the last directories in
    path order get no handle. So a new directory can take the handle of one that was watched
    before. That one is told, asks again, and is answered `Failed` with the watch limit error.
 
-7. **`unwatch` can open handles.** When a key goes and there is room again, shared handles move
-   down. If one of the new handles cannot be opened, the handles stay where they were: correct,
-   but higher than needed.
+8. **The commit after an `unwatch` can open handles.** When a key goes and there is room again,
+   shared handles move down at the next commit. If one of the new handles cannot be opened, the
+   handles stay where they were: correct, but higher than needed.

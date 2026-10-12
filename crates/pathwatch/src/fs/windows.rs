@@ -19,10 +19,10 @@ use std::{
 
 use windows_sys::Win32::{
   Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_BAD_NETPATH, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES,
-    ERROR_SHARING_VIOLATION, INVALID_HANDLE_VALUE, MAX_PATH, NTSTATUS, STATUS_DELETE_PENDING,
-    STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND,
-    STATUS_OBJECT_PATH_NOT_FOUND,
+    ERROR_ACCESS_DENIED, ERROR_BAD_NETPATH, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION,
+    ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION, INVALID_HANDLE_VALUE, MAX_PATH, NTSTATUS,
+    STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
   },
   Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -86,6 +86,11 @@ pub fn told(error: io::Error) -> io::Error {
 
   match error.raw_os_error().map(i32::cast_unsigned) {
     Some(ERROR_BAD_NETPATH) => return io::Error::new(io::ErrorKind::HostUnreachable, error),
+    // Another program holds the entry with no sharing, for a moment as a rule: no answer, and
+    // nothing is wrong with the disk.
+    Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION) => {
+      return io::Error::new(io::ErrorKind::ResourceBusy, error);
+    }
     Some(ERROR_ACCESS_DENIED) => {}
     _ => return error,
   }
@@ -222,7 +227,8 @@ fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
     Err(error) => {
       // A system file in use cannot be opened. Its listing still tells of it, without an index.
       let code = error.raw_os_error().map(i32::cast_unsigned);
-      if !matches!(code, Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)) {
+      let in_use = error.kind() == io::ErrorKind::ResourceBusy;
+      if !in_use && !matches!(code, Some(ERROR_ACCESS_DENIED)) {
         return Err(error);
       }
       let metadata = if follow { fs::metadata(path) } else { fs::symlink_metadata(path) };
@@ -544,9 +550,10 @@ mod tests {
   use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
 
   use windows_sys::Win32::{
-    Foundation::ERROR_BAD_NETPATH,
+    Foundation::{ERROR_BAD_NETPATH, ERROR_SHARING_VIOLATION, GENERIC_READ},
     Storage::FileSystem::{
-      DELETE, FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+      DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FileDispositionInfo,
+      SetFileInformationByHandle,
     },
   };
 
@@ -708,6 +715,25 @@ mod tests {
     let unreachable = told(io::Error::from_raw_os_error(ERROR_BAD_NETPATH.cast_signed()));
     assert_eq!(unreachable.kind(), io::ErrorKind::HostUnreachable, "{unreachable:?}");
     assert_eq!(told(io::Error::from_raw_os_error(2)).kind(), io::ErrorKind::NotFound);
+    let busy = told(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION.cast_signed()));
+    assert_eq!(busy.kind(), io::ErrorKind::ResourceBusy, "{busy:?}");
+
+    // A directory that another program holds with no sharing: its listing is no answer, and
+    // the look at the directory itself still works.
+    let top = tempfile::tempdir().unwrap();
+    let held = top.path().join("held");
+    fs::create_dir(&held).unwrap();
+    let holder = fs::OpenOptions::new()
+      .access_mode(GENERIC_READ)
+      .share_mode(0)
+      .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+      .open(&held)
+      .unwrap();
+    let listing = StdFs.read_dir(&held, &mut |_, _| {}).unwrap_err();
+    assert_eq!(listing.kind(), io::ErrorKind::ResourceBusy, "{listing:?}");
+    assert_eq!(stat(&held, false).unwrap().kind, FileType::Dir);
+    drop(holder);
+    StdFs.read_dir(&held, &mut |_, _| {}).unwrap();
 
     let top = tempfile::tempdir().unwrap();
     let file = top.path().join("held.txt");
@@ -797,6 +823,26 @@ mod tests {
       assert_eq!(seen, ["x.txt"]);
     }
     assert_eq!(stat(&dir.join("x.txt"), false).unwrap().size, 1);
+  }
+
+  /// The clock of the time stamps is the clock of now, and a file that is removed and written
+  /// again has another identity, with the same content and inside the same step of the clock.
+  #[test]
+  fn the_time_is_of_now_and_a_file_made_again_is_another_file() {
+    let top = tempfile::tempdir().unwrap();
+    let file = top.path().join("file");
+    fs::write(&file, "one").unwrap();
+    let first = stat(&file, false).unwrap();
+    let now = std::time::SystemTime::now();
+    let age = now.duration_since(first.modified).unwrap_or_default();
+    assert!(age < std::time::Duration::from_secs(5), "{age:?}");
+    assert!(first.modified <= now + std::time::Duration::from_secs(5));
+
+    fs::remove_file(&file).unwrap();
+    fs::write(&file, "one").unwrap();
+    let again = stat(&file, false).unwrap();
+    assert_ne!(first.file_id, again.file_id);
+    assert_eq!(StdFs.lstat(&file).unwrap().file_id, again.file_id);
   }
 
   #[test]
