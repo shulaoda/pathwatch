@@ -168,11 +168,10 @@ the real disk, with this backend and with polling.
 - **Closing a handle.** Expected: after `CancelIoEx` and `CloseHandle` the pending read completes
   and its packet reaches the port. Until then the buffer is kept. If the packet does not come
   within two seconds at shutdown, the buffer is leaked.
-- **A read that cannot be queued.** When `ReadDirectoryChangesW` returns `FALSE`, the read is
-  over and the kernel is done with the buffer. A completion packet can still come for it, under
-  the key of the handle, when a file system driver failed the request. So a handle takes no
-  further read after such a failure: the fall back from the longer records opens a new handle
-  with a key of its own (`Worker::open`), and a packet for the old one finds no watch.
+- **A read that cannot be queued.** When `ReadDirectoryChangesW` returns `FALSE`, no request
+  was started: the kernel is done with the buffer, and no completion packet comes for it. A
+  handle still takes no further read after such a failure: the fall back from the longer
+  records opens a new handle with a key of its own (`Worker::open`).
 - **Network shares.** A server that cannot notify makes the first read fail. The answer is
   `Failed`, and the engine polls the directory.
 
@@ -183,11 +182,10 @@ them (`place` in `windows.rs`). All of this is new and has only run as plain cod
 
 - **The names in the records of a shared handle.** Expected: paths relative to the directory of
   the handle, with `\` between the parts, spelled as on the disk. The backend joins such a name
-  to the path of the handle and looks for the deepest key whose directory holds it. The
-  directory of a key is spelled as the engine got it. If the two differ in the case of ASCII
-  letters, the key is still found. Not checked: how often they differ in another way on a real
-  machine (a letter that is not ASCII in another case, a short name in the watched path). Such a
-  key gets no hints while it shares a handle.
+  to the path of the handle and looks for every key whose directory holds it. The directory
+  of a key is spelled as the engine got it. If the two differ in the case of letters, the key
+  is still found. Not checked: how often a watched path holds a short name on a real machine.
+  Such a key gets no hints while it shares a handle.
 - **A record for the directory of a key itself.** A handle above reports when a directory below
   it is added, removed or renamed. Expected actions: `ADDED`, `REMOVED`, `RENAMED_OLD_NAME`,
   `RENAMED_NEW_NAME` with the path of that directory. They become `Changed` with an empty `rel`

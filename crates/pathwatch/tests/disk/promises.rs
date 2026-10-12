@@ -830,6 +830,34 @@ fn a_name_that_windows_reads_as_another_is_reported() {
   });
 }
 
+/// The drive letter in the other case is another spelling of the path, and another top of
+/// the tree. A path watched that way shares the handle of the watched directory above, and
+/// the directory still gets the events of the other files in the same directory.
+#[cfg(windows)]
+#[test]
+fn a_watched_path_with_the_drive_letter_in_the_other_case() {
+  each_backend(|w| {
+    w.write("p/src/a.js", "1");
+    w.write("p/src/b.js", "1");
+    w.watch(&["p"]);
+    let text = w.path("p/src/a.js").to_str().unwrap().to_owned();
+    assert_eq!(&text[1..2], ":", "{text}");
+    let drive = &text[..1];
+    let other = if drive == drive.to_ascii_uppercase() {
+      drive.to_ascii_lowercase()
+    } else {
+      drive.to_ascii_uppercase()
+    };
+    w.watcher.watch_all([format!("{other}{}", &text[1..])]).unwrap();
+
+    w.write("p/src/b.js", "22");
+    w.write("p/src/c.js", "1");
+    w.expect(&[(Update, "p/src/b.js"), (Create, "p/src/c.js")]);
+    w.remove("p/src/b.js");
+    w.expect(&[(Delete, "p/src/b.js")]);
+  });
+}
+
 /// `close` inside the handler, also with the backend of the OS: its threads end, and the
 /// `close` of the test, which waits for the thread of the watcher, comes back.
 #[test]

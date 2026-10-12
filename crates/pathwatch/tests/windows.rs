@@ -295,8 +295,9 @@ fn a_directory_below_a_handle_gets_no_handle_of_its_own() {
   fs::write(sub.join("f.txt"), "1").unwrap();
   fs::write(top.join("marker"), "1").unwrap();
   let seen = harness.hints_until(|hint| hint.names(key, "marker"));
+  // The key above gets the change too: the tree reaches `sub` from it (rule 7).
   assert!(seen.iter().any(|hint| hint.names(sub_key, "f.txt")), "{seen:?}");
-  assert!(seen.iter().all(|hint| !hint.names(key, r"sub\f.txt")), "{seen:?}");
+  assert!(seen.iter().any(|hint| hint.names(key, r"sub\f.txt")), "{seen:?}");
   // With a handle on `sub` Windows would refuse this rename.
   fs::rename(&top, temp.path().join("top 2")).unwrap();
 }
