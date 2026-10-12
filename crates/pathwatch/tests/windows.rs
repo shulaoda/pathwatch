@@ -787,3 +787,42 @@ fn a_listed_name_that_reads_as_a_drive_stays_in_its_directory() {
   }
   assert_eq!(tree.path(top), Path::new(r"C:\"));
 }
+
+/// More directories than handles, and one of them is a junction: the others share a handle
+/// above them, the directory behind the link keeps a handle of its own, and nothing is told
+/// again and again. A change behind the link reaches its key, and one next to it reaches the
+/// key of its directory.
+#[test]
+fn directories_above_the_limit_and_a_junction_come_to_rest() {
+  let temp = scratch();
+  let project = make_dir(temp.path().join("project"));
+  let target = make_dir(temp.path().join("target"));
+  let mut harness = Harness::new();
+  let keys: Vec<DirKey> =
+    (0..MAX_HANDLES).map(|n| harness.handle(&make_dir(project.join(format!("d{n}"))))).collect();
+  let link = project.join("link");
+  junction(&link, &target);
+  let link_key = harness.handle(&link);
+  // The engine would ask again for every key that is told. None is.
+  let mut seen = Vec::new();
+  while let Ok(Signal::Raw(raw)) = harness.signals.recv_timeout(Duration::from_millis(500)) {
+    seen.extend(harness.hints_of(raw));
+  }
+  let is_a_loss_report = |hint: &Seen| match hint {
+    Seen::Changed { rel, .. } => rel.as_os_str().is_empty(),
+    Seen::Written { .. } => false,
+    Seen::Lost => true,
+  };
+  assert!(!seen.iter().any(is_a_loss_report), "{seen:?}");
+  for key in keys.iter().chain([&link_key]) {
+    assert!(harness.backend.serves(*key));
+  }
+
+  fs::write(target.join("behind.txt"), "1").unwrap();
+  harness.hints_until(|hint| hint.names(link_key, "behind.txt"));
+  fs::write(project.join("d5").join("next.txt"), "1").unwrap();
+  harness.hints_until(|hint| hint.names(keys[5], "next.txt"));
+  harness.backend.unwatch(link_key);
+  harness.backend.commit().unwrap();
+  fs::remove_dir(&link).unwrap();
+}

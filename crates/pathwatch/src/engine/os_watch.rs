@@ -320,6 +320,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(super) fn unwatch_dir(&mut self, key: DirKey) {
     if let Some(backend) = &mut self.backend {
       backend.unwatch(key);
+      self.gave_back = true;
     }
   }
 

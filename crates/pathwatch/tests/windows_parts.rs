@@ -82,10 +82,20 @@ mod place {
 
   /// The placement of these directories; the key of each one is its position in the list.
   fn placed(wanted: &[(&str, Want)], max: usize) -> Vec<(PathBuf, Vec<u32>)> {
+    placed_with_links(wanted, max, &[])
+  }
+
+  /// `placed`, on a disk where these directories are junctions.
+  fn placed_with_links(
+    wanted: &[(&str, Want)],
+    max: usize,
+    links: &[&str],
+  ) -> Vec<(PathBuf, Vec<u32>)> {
     let dirs: Vec<PathBuf> = wanted.iter().map(|(path, _)| dir(path)).collect();
     let wanted: Vec<_> =
       (0..).zip(wanted).zip(&dirs).map(|((at, (_, want)), dir)| (key(at), &**dir, *want)).collect();
-    let places = place(&wanted, max);
+    let links: Vec<PathBuf> = links.iter().map(|link| dir(link)).collect();
+    let places = place(&wanted, max, &mut |path| links.iter().any(|link| link == path));
     places
       .into_iter()
       .map(|place| (place.dir, place.keys.into_iter().map(index).collect()))
@@ -172,8 +182,58 @@ mod place {
     turned.reverse();
     turned.swap(1, 4);
     for max in 0..=5 {
-      assert_eq!(place(&wanted, max), place(&turned, max), "{max}");
+      assert_eq!(place(&wanted, max, &mut |_| false), place(&turned, max, &mut |_| false), "{max}");
     }
+  }
+
+  /// A handle reports nothing behind a junction below it: a directory with a link on the way
+  /// down from the common directory keeps a handle of its own, and the others share without
+  /// it. The handle of its own can stand below the shared one.
+  #[test]
+  fn a_directory_behind_a_link_is_not_joined_above_the_link() {
+    let wanted = [("/p/a", Contents), ("/p/link", Contents), ("/p/b", Contents)];
+    // Without the link, all three share `/p`.
+    assert_eq!(placed(&wanted, 1), [at("/p", &[0, 2, 1])]);
+    assert_eq!(
+      placed_with_links(&wanted, 2, &["/p/link"]),
+      [at("/p", &[0, 2]), at("/p/link", &[1])]
+    );
+    // A link above the directory, not the directory itself.
+    let wanted = [("/p/a", Contents), ("/p/link/x", Contents), ("/p/link/y", Contents)];
+    assert_eq!(
+      placed_with_links(&wanted, 2, &["/p/link"]),
+      [at("/p/a", &[0]), at("/p/link", &[1, 2])]
+    );
+    // The deepest handle at or above a directory serves it, and a key that wants names only
+    // goes with it.
+    let wanted =
+      [("/p/a", Contents), ("/p/link", Contents), ("/p/b", Contents), ("/p/link/n", Names)];
+    assert_eq!(
+      placed_with_links(&wanted, 2, &["/p/link"]),
+      [at("/p", &[0, 2]), at("/p/link", &[1, 3])]
+    );
+    // Directories that were joined below a link are not taken above it with their neighbours.
+    let wanted =
+      [("/p/a/b/c1", Contents), ("/p/a/b/c2", Contents), ("/p/a/d", Contents), ("/p/e", Contents)];
+    assert_eq!(
+      placed_with_links(&wanted, 3, &["/p/a/b"]),
+      [at("/p/a/b", &[0, 1]), at("/p/a/d", &[2]), at("/p/e", &[3])]
+    );
+    assert_eq!(
+      placed_with_links(&wanted, 2, &["/p/a/b"]),
+      [at("/p", &[2, 3]), at("/p/a/b", &[0, 1])]
+    );
+    // Two links next to each other never share.
+    let wanted = [
+      ("/p/src/1", Contents),
+      ("/p/src/2", Contents),
+      ("/p/nm/a", Contents),
+      ("/p/nm/b", Contents),
+    ];
+    assert_eq!(
+      placed_with_links(&wanted, 3, &["/p/nm/a", "/p/nm/b"]),
+      [at("/p/nm/a", &[2]), at("/p/nm/b", &[3]), at("/p/src", &[0, 1])]
+    );
   }
 
   #[test]
@@ -342,19 +402,46 @@ mod handles {
       self.id(path)
     }
 
+    /// `unwatch`, and the commit that the engine makes after a flush that gave a watch back.
     fn unwatch(&mut self, index: u32) {
+      self.unwatch_only(index);
+      self.commit();
+    }
+
+    /// `unwatch` alone, as the engine calls it for each directory of a flush.
+    fn unwatch_only(&mut self, index: u32) {
       let told = self.handles.unwatch(key(index), &mut self.disk);
+      self.told(told);
+    }
+
+    fn commit(&mut self) {
+      let told = self.handles.commit(&mut self.disk);
       self.told(told);
     }
 
     /// Keeps what a call told, and checks what holds after every call: no handle is below
     /// another, and there are never too many.
+    /// Keeps what a call told, and checks what holds after every call: no handle is below
+    /// another unless a link lies between them, and there are never too many.
     fn told(&mut self, told: Told) {
       self.lost.extend(told.lost.into_iter().map(index));
       self.covered.extend(told.covered.into_iter().map(index));
       for (_, above) in &self.disk.open {
-        let below = self.disk.open.iter().filter(|(_, dir)| dir.starts_with(above)).count();
-        assert_eq!(below, 1, "{} in {:?}", above.display(), self.disk.open);
+        for (_, below) in &self.disk.open {
+          if below == above || !below.starts_with(above) {
+            continue;
+          }
+          let on_the_way = below.ancestors().take_while(|path| *path != above.as_path());
+          let is_link = |path: &Path| self.disk.links.iter().any(|link| link == path);
+          let through_a_link = on_the_way.into_iter().any(is_link);
+          assert!(
+            through_a_link,
+            "{} is below {} in {:?}",
+            below.display(),
+            above.display(),
+            self.disk.open
+          );
+        }
       }
       assert!(self.disk.open.len() <= MAX_HANDLES);
     }
@@ -459,6 +546,101 @@ mod handles {
     assert_eq!(fake.watch(1, "/p/link/sub", Want::Contents), Answer::NotWatched);
     assert_eq!(fake.dirs(), dirs(["/p"]));
     assert_eq!(fake.lost(), []);
+  }
+
+  /// More directories than handles, and one of them is a junction: the others share a handle
+  /// above, and the directory behind the link keeps one of its own. Nothing is told, the key
+  /// of the directory above is covered, and the commits that follow move nothing: the handles
+  /// come to rest.
+  #[test]
+  fn a_directory_behind_a_link_keeps_a_handle_of_its_own_above_the_limit() {
+    let mut fake = Fake::default();
+    fake.disk.links = vec![dir("/p/link")];
+    assert_eq!(fake.watch(200, "/p", Want::Names), Answer::NotWatched);
+    let count = u32::try_from(MAX_HANDLES).unwrap();
+    for index in 0..count {
+      fake.open(index, &format!("/p/{index}"));
+    }
+    assert_eq!(fake.watch(100, "/p/link", Want::Contents), Answer::Tree);
+    assert_eq!(fake.dirs(), dirs(["/p", "/p/link"]));
+    assert_eq!(fake.lost(), []);
+    assert_eq!(std::mem::take(&mut fake.covered), [200]);
+    let opened = fake.disk.ids.len();
+    // The engine asks again for the key that is covered now, and commits at each flush.
+    assert_eq!(fake.watch(200, "/p", Want::Names), Answer::Names);
+    for _ in 0..3 {
+      fake.commit();
+    }
+    assert_eq!(fake.disk.ids.len(), opened);
+    assert_eq!(fake.dirs(), dirs(["/p", "/p/link"]));
+    assert_eq!(fake.lost(), []);
+    // A key below the directory behind the link is served by the handle of its own.
+    assert_eq!(fake.watch(101, "/p/link/sub", Want::Names), Answer::Names);
+    assert_eq!(fake.disk.ids.len(), opened);
+    // Without it the others fit as they are, and the keys that only the shared handle served
+    // are told.
+    fake.unwatch(100);
+    assert_eq!(fake.disk.open.len(), MAX_HANDLES);
+    assert!(!fake.dirs().contains(&dir("/p")) && !fake.dirs().contains(&dir("/p/link")));
+    assert_eq!(fake.lost(), [101, 200]);
+  }
+
+  /// A key below a directory that has a handle anyway, with a link between: it is not
+  /// watched, and the handles stay where they are.
+  #[test]
+  fn a_key_behind_a_link_below_a_shared_handle_is_not_watched() {
+    let mut fake = Fake::default();
+    fake.disk.links = vec![dir("/p/5/link")];
+    let count = u32::try_from(MAX_HANDLES).unwrap();
+    for index in 0..count {
+      fake.open(index, &format!("/p/{index}"));
+    }
+    assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Tree);
+    assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
+    let opened = fake.disk.ids.len();
+    assert_eq!(fake.watch(101, "/p/5/link/sub", Want::Contents), Answer::NotWatched);
+    assert_eq!(fake.watch(101, "/p/5/link/sub", Want::Contents), Answer::NotWatched);
+    assert_eq!(fake.disk.ids.len(), opened);
+    assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
+    assert_eq!(fake.lost(), []);
+  }
+
+  /// `unwatch` of the keys of a shared handle moves nothing: the handle goes with its last key,
+  /// and where the handles stand is worked out once at the next commit, not for each key.
+  #[test]
+  fn unwatch_moves_the_handles_once_at_the_commit() {
+    let mut fake = Fake::default();
+    let count = u32::try_from(MAX_HANDLES).unwrap();
+    for index in 0..count {
+      fake.open(index, &format!("/p/{index}"));
+    }
+    assert_eq!(fake.watch(count, "/p/last", Want::Contents), Answer::Tree);
+    assert_eq!(fake.dirs(), dirs(["/p"]));
+    let opened = fake.disk.ids.len();
+    // Two keys go: with the commit, each of the rest gets a handle of its own, opened once.
+    for index in [3, 4] {
+      fake.unwatch_only(index);
+    }
+    assert_eq!(fake.dirs(), dirs(["/p"]));
+    assert_eq!(fake.disk.ids.len(), opened);
+    fake.commit();
+    assert_eq!(fake.disk.open.len(), MAX_HANDLES - 1);
+    assert_eq!(fake.disk.ids.len(), opened + MAX_HANDLES - 1);
+    assert_eq!(fake.lost(), []);
+    // All of them go, one by one: nothing is opened, and the last one closes its handle.
+    let mut fake = Fake::default();
+    for index in 0..count {
+      fake.open(index, &format!("/p/{index}"));
+    }
+    assert_eq!(fake.watch(count, "/p/last", Want::Contents), Answer::Tree);
+    let opened = fake.disk.ids.len();
+    for index in 0..=count {
+      fake.unwatch_only(index);
+      assert_eq!(fake.disk.open.len(), usize::from(index < count), "{index}");
+    }
+    assert_eq!(fake.disk.ids.len(), opened);
+    fake.commit();
+    assert_eq!(fake.disk.open, []);
   }
 
   /// A failed settle keeps a handle for the keys that still use it. When the last of them is a
@@ -909,7 +1091,7 @@ mod handles {
         .map(|((at, dir), _)| (key(at), &**dir, Want::Contents))
         .collect();
       let placed: Vec<PathBuf> =
-        place(&wanted, MAX_HANDLES).into_iter().map(|place| place.dir).collect();
+        place(&wanted, MAX_HANDLES, &mut |_| false).into_iter().map(|place| place.dir).collect();
       assert_eq!(fake.dirs(), placed, "step {step}");
     }
   }

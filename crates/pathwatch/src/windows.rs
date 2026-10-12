@@ -186,7 +186,16 @@ mod place {
     pub keys: Vec<DirKey>,
   }
 
-  pub fn place(wanted: &[(DirKey, &Path, Want)], max: usize) -> Vec<Place> {
+  /// Where the handles go for these keys, at most `max` of them. `is_link`: whether the
+  /// directory is a junction or a directory link. A handle reports nothing behind a link below
+  /// it, so a directory with a link on the way down from a common directory is not joined
+  /// there: it keeps a handle of its own, and the others share without it. Such a handle can
+  /// stand below a shared one; a key goes to the deepest handle at or above its directory.
+  pub fn place(
+    wanted: &[(DirKey, &Path, Want)],
+    max: usize,
+    is_link: &mut dyn FnMut(&Path) -> bool,
+  ) -> Vec<Place> {
     let mut wanted: Vec<_> =
       wanted.iter().copied().filter(|&(_, dir, _)| may_hold_a_handle(dir)).collect();
     wanted.sort_by(|a, b| a.1.cmp(b.1));
@@ -217,9 +226,25 @@ mod place {
           break 'deepest_first;
         }
         if shared[at..end].contains(&depth) && may_hold_a_handle(&first_parts(tops[at], depth)) {
-          for joined in &mut joined[at..end] {
-            count -= usize::from(!*joined);
-            *joined = true;
+          // A directory with a link between the common directory and itself cannot be served
+          // from there, and neither can the ones it was joined with deeper down.
+          let mut blocked: Vec<bool> =
+            tops[at..=end].iter().map(|top| leads_through(top, depth, is_link)).collect();
+          for pair in at..end {
+            if joined[pair] && blocked[pair - at] {
+              blocked[pair - at + 1] = true;
+            }
+          }
+          for pair in (at..end).rev() {
+            if joined[pair] && blocked[pair - at + 1] {
+              blocked[pair - at] = true;
+            }
+          }
+          for pair in at..end {
+            if !joined[pair] && !blocked[pair - at] && !blocked[pair - at + 1] {
+              joined[pair] = true;
+              count -= 1;
+            }
           }
         }
         at = end;
@@ -237,23 +262,34 @@ mod place {
       places.push(Place { dir, keys: Vec::new() });
       first += pairs + 1;
     }
-
-    let mut at = 0;
+    // A place can lie below another one: the deepest at or above a directory serves it.
+    places.sort_by(|a, b| a.dir.cmp(&b.dir));
+    let (mut at, mut above) = (0, Vec::new());
     for &(key, dir, _) in &wanted {
-      while places
-        .get(at)
-        .is_some_and(|place| place.dir.as_path() < dir && !dir.starts_with(&place.dir))
-      {
+      while places.get(at).is_some_and(|place| place.dir.as_path() <= dir) {
+        while above.last().is_some_and(|&top: &usize| !places[at].dir.starts_with(&places[top].dir))
+        {
+          above.pop();
+        }
+        above.push(at);
         at += 1;
       }
-      if let Some(place) = places.get_mut(at)
-        && dir.starts_with(&place.dir)
-      {
-        place.keys.push(key);
+      while above.last().is_some_and(|&top| !dir.starts_with(&places[top].dir)) {
+        above.pop();
+      }
+      if let Some(&top) = above.last() {
+        places[top].keys.push(key);
       }
     }
     places.truncate(max);
     places
+  }
+
+  /// Whether a link lies on the way from the directory `depth` parts up to `dir`, `dir` itself
+  /// included.
+  fn leads_through(dir: &Path, depth: usize, is_link: &mut dyn FnMut(&Path) -> bool) -> bool {
+    let below = dir.components().count().saturating_sub(depth);
+    dir.ancestors().take(below).any(is_link)
   }
 
   fn common_parts(a: &Path, b: &Path) -> usize {
@@ -355,10 +391,13 @@ mod handles {
       let refused = self.refused.remove(&key);
       let want = self.keys.get(&key).map_or(want, |served| served.want.max(want));
 
-      if let Some(at) = self.open.iter().position(|handle| dir.starts_with(&handle.dir)) {
+      // The deepest handle at or above the directory: one can stand below another, behind a
+      // link.
+      let above = self.open.iter().enumerate().filter(|(_, handle)| dir.starts_with(&handle.dir));
+      if let Some((at, _)) = above.max_by_key(|(_, handle)| handle.dir.as_os_str().len()) {
         let coverage = self.share(at, key, dir, want, !(waited || refused), system);
         if matches!(coverage, Coverage::NotWatched | Coverage::Failed(_)) {
-          self.drop_key(key, system, &mut told);
+          self.drop_key(key, system);
         }
         return (coverage, told);
       }
@@ -393,11 +432,10 @@ mod handles {
     }
 
     pub fn unwatch(&mut self, key: DirKey, system: &mut dyn System) -> Told {
-      let mut told = Told::default();
       self.waiting.remove(&key);
       self.refused.remove(&key);
-      self.drop_key(key, system, &mut told);
-      told
+      self.drop_key(key, system);
+      Told::default()
     }
 
     pub fn commit(&mut self, system: &mut dyn System) -> Told {
@@ -490,14 +528,19 @@ mod handles {
       if want == Want::Contents { Coverage::WatchedTree } else { Coverage::Watched }
     }
 
-    fn drop_key(&mut self, key: DirKey, system: &mut dyn System, told: &mut Told) {
-      match self.forget(key) {
-        Some(gone) if gone.want == Want::Contents => {
-          let _ = self.settle(system, told);
-        }
-        // A handle that a failed settle kept for this key alone would stay open with no key.
-        Some(gone) if gone.handle.is_some() => self.close_unused(system),
-        _ => {}
+    /// The key is forgotten. A handle that it alone used closes now (rule 6: the OS watch goes
+    /// with its last key); where the handles stand is worked out once, at the next commit, not
+    /// for each key that goes.
+    fn drop_key(&mut self, key: DirKey, system: &mut dyn System) {
+      let Some(gone) = self.forget(key) else { return };
+      if gone.want == Want::Contents {
+        self.unsettled = true;
+      }
+      if let Some(id) = gone.handle
+        && !self.keys.values().any(|served| served.handle == Some(id))
+      {
+        self.open.retain(|handle| handle.id != id);
+        system.close(id);
       }
     }
 
@@ -517,7 +560,38 @@ mod handles {
     fn move_handles(&mut self, system: &mut dyn System, told: &mut Told) -> io::Result<()> {
       let wanted: Vec<(DirKey, &Path, Want)> =
         self.keys.iter().map(|(&key, served)| (key, &*served.dir, served.want)).collect();
-      let places = place(&wanted, MAX_HANDLES);
+      // The links are found where a key would come to lie behind one, and the placement is
+      // made again with them known, until no new one turns up: a directory behind a link then
+      // has a handle of its own. A key that still lies behind a link (below a directory that
+      // has a handle anyway) is not served.
+      let mut links: Vec<PathBuf> = Vec::new();
+      let mut looked: FxHashMap<PathBuf, bool> = FxHashMap::default();
+      let (places, behind_a_link) = loop {
+        let places = place(&wanted, MAX_HANDLES, &mut |path| links.iter().any(|link| link == path));
+        let mut behind = Vec::new();
+        let mut found_more = false;
+        for place in &places {
+          let id = self.open.iter().find(|handle| handle.dir == place.dir).map(|handle| handle.id);
+          for &key in &place.keys {
+            let served = &self.keys[&key];
+            if id.is_some() && id == served.handle {
+              continue;
+            }
+            let is_link =
+              |path: &Path| *looked.entry(path.to_owned()).or_insert_with(|| system.is_link(path));
+            if let Some(link) = link_between(&place.dir, &served.dir, is_link) {
+              behind.push(key);
+              if !links.contains(&link) {
+                links.push(link);
+                found_more = true;
+              }
+            }
+          }
+        }
+        if !found_more {
+          break (places, behind);
+        }
+      };
 
       let mut new = Vec::new();
       for place in &places {
@@ -555,21 +629,12 @@ mod handles {
         };
         place_of.extend(place.keys.iter().map(|&key| (key, at)));
       }
-      let mut behind_a_link = Vec::new();
       for (key, served) in &mut self.keys {
-        let handle = place_of.get(key).map(|&at| &self.open[at]);
-        let id = handle.map(|handle| handle.id);
-        if id != served.handle
-          && handle.is_some_and(|handle| leads_through_a_link(system, &handle.dir, &served.dir))
-        {
-          behind_a_link.push(*key);
-        }
-        served.handle = id;
+        served.handle = place_of.get(key).map(|&at| self.open[at].id);
       }
       for key in behind_a_link {
         self.forget(key);
         told.lost.push(key);
-        self.unsettled = true;
       }
       Ok(())
     }
@@ -625,8 +690,17 @@ mod handles {
   }
 
   fn leads_through_a_link(system: &mut dyn System, top: &Path, dir: &Path) -> bool {
+    link_between(top, dir, |path| system.is_link(path)).is_some()
+  }
+
+  /// The deepest link on the way from `top` down to `dir`, `dir` itself included.
+  fn link_between(
+    top: &Path,
+    dir: &Path,
+    mut is_link: impl FnMut(&Path) -> bool,
+  ) -> Option<PathBuf> {
     let names = dir.strip_prefix(top).map_or(0, |below| below.components().count());
-    dir.ancestors().take(names).any(|path| system.is_link(path))
+    dir.ancestors().take(names).find(|path| is_link(path)).map(Path::to_owned)
   }
 
   /// The path with its names in lower case: NTFS takes the two cases of a letter for one

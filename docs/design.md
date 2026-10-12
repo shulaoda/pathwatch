@@ -1403,7 +1403,13 @@ What was not checked, and what is known to be missing, is in `docs/windows-open-
   directory above it, gets a handle. It serves every key at or below its directory. With more
   than 64 handles, handles go up to a directory that they have in common and become one: the
   deepest common directory first, until at most 64 are left. No handle goes on `C:\`,
-  `C:\Users` or `C:\Users\<name>`.
+  `C:\Users` or `C:\Users\<name>`. A handle reports nothing behind a junction or a directory
+  link below it, so a directory with a link on the way down from the common directory is not
+  joined there (nor is any directory it was joined with deeper down): it keeps a handle of its
+  own, which can stand below the shared one, and the others share without it. A key goes to
+  the deepest handle at or above its directory. The links are found where a key would come to
+  lie behind one (`System::is_link`, one look for each name on the way, once per settle), and
+  the placement is made again with them known, before a handle moves.
 - **Answers.** A key that wants the contents and that a handle serves: `WatchedTree`. A key
   that wants names only and that a handle serves: `Watched` (after `WatchedTree` the engine
   would take back the watches of the directories below, and only a key that wants the
@@ -1415,7 +1421,10 @@ What was not checked, and what is known to be missing, is in `docs/windows-open-
   `Failed` with the reason, or `NotWatched` when the handle that came to serve it stands
   above a link.
 - `Handles` keeps every served key. When a key comes or goes, the handles move to where `place`
-  puts them: new handles are opened first, then old ones are closed. A key that got another
+  puts them, once at the next `commit` for all the keys of a flush: `unwatch` only closes a
+  handle that no key uses any more (rule 6: the OS watch goes with its last key), and the
+  engine commits after every flush that gave a watch back, also one that queued no scan. New
+  handles are opened first, then old ones are closed. A key that got another
   handle is not told: the new handle reported before the old one stopped, and the old one is
   read until the kernel holds nothing more for it, then closed; the read that the close
   cancels fails (`ERROR_OPERATION_ABORTED`), so it is not taken for lost records. The call
@@ -1446,8 +1455,10 @@ What was not checked, and what is known to be missing, is in `docs/windows-open-
   the directory that holds it.
 - Directories are compared by path text, and a handle reports nothing for what is behind a
   junction or a directory link below it. So each name between a handle and a key that it
-  would serve is looked at (`leads_through_a_link`), and a key behind a link is answered
-  `NotWatched`: the engine polls it.
+  would serve is looked at (`leads_through_a_link`), and a key behind a link, below a
+  directory that has a handle anyway, is answered `NotWatched`: the engine polls it. A
+  directory behind a link that wants the contents gets a handle of its own (above), so such
+  a key never makes the handles move back and forth.
 
 ### 7.4 Poll (`poll.rs`)
 

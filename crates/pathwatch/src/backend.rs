@@ -12,7 +12,8 @@ pub trait Backend: Send + 'static {
   /// [`commit`](Backend::commit).
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage;
 
-  /// Takes the watch of `key` back.
+  /// Takes the watch of `key` back. A watch that other keys share stays; where the watches
+  /// stand is worked out again at the next [`commit`](Backend::commit).
   fn unwatch(&mut self, key: DirKey);
 
   /// Whether `Written` names a write to the file and nothing else. `false`: the backend says it

@@ -813,3 +813,20 @@ fn rounds_of_watch_and_unwatch_leave_no_list_of_the_timer() {
     rounds(&mut Driver::<PollBackend>::poll(Options::default()), keep);
   }
 }
+
+/// A flush that gave a watch back and queued no scan commits all the same: the backend moves
+/// its watches at the commit, not for each key that goes.
+#[test]
+fn a_watch_that_is_given_back_is_followed_by_a_commit() {
+  on_modes(&Mode::ALL, &Options::default(), |d, on| {
+    d.fs().mkdir_all("/p/a").unwrap();
+    d.fs().mkdir_all("/p/b").unwrap();
+    assert_eq!(d.watch(&["/p/a", "/p/b"]), NONE, "{on}");
+    let before = d.fs().calls();
+    assert_eq!(d.unwatch(&["/p/a"]), NONE, "{on}");
+    let after = d.fs().calls();
+    assert!(after.unwatch > before.unwatch, "{on}: no watch was given back");
+    assert!(after.commit > before.commit, "{on}: no commit followed");
+    d.caught_up();
+  });
+}

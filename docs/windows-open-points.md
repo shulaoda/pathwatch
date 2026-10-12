@@ -182,7 +182,13 @@ the real disk, with this backend and with polling.
   make such a name, so only the joining is tested (`windows::a_listed_name_that_reads_as_a_drive_stays_in_its_directory`).
 - **Junctions and directory symlinks.** A handle opened through a link watches the target. A
   handle does not report changes that happen behind a link below it: they are reported under the
-  real path, and only if that path is below a handle too. A link is made in two steps: a plain
+  real path, and only if that path is below a handle too. So with more directories than handles,
+  a directory behind a link is not joined with its neighbours above the link: it keeps a handle
+  of its own below the shared one (measured: 64 directories and a junction next to them come to
+  rest with two handles, `directories_above_the_limit_and_a_junction_come_to_rest`; before, the
+  commit joined the junction with the others, found it behind the link, gave it up and moved the
+  handles back, and the engine asked again: two to four thousand handle opens in ten idle
+  seconds). A link is made in two steps: a plain
   directory (`ADDED`, in the filter), then the reparse point on it, which is reported under
   `FILE_NOTIFY_CHANGE_ATTRIBUTES` only, a bit the filter leaves out (an attribute change of a
   file would be `MODIFIED`, and a `Written` that is no write). So the engine looks once more at

@@ -140,6 +140,8 @@ pub struct Engine<B: Backend, F: Fs> {
   flush_ticks: Duration,
   /// How long the backend took to make watches live.
   commit_took: Duration,
+  /// A watch was given back since the last commit: the backend may move its watches then.
+  gave_back: bool,
   /// The nodes the flush changed: `finish` reads their events. A key can be stale.
   touched: Vec<DirKey>,
   /// The registered names whose watch target the filter ignores: the end of the flush drops
@@ -190,6 +192,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       flush_time: SystemTime::UNIX_EPOCH,
       flush_ticks: Duration::ZERO,
       commit_took: Duration::ZERO,
+      gave_back: false,
       touched: Vec::new(),
       dropped: Vec::new(),
       covered: Vec::new(),
@@ -330,7 +333,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut path = mem::take(&mut self.path);
     loss_scans_ran |= self.check_marks(&mut path, rest_is_over);
     let mut names = mem::take(&mut self.names);
-    while !self.tree.to_scan.is_empty() {
+    // A flush that only gave watches back commits too: the backend moves its watches then.
+    while !self.tree.to_scan.is_empty() || self.gave_back {
       self.round(&mut path, &mut names);
     }
     (self.path, self.names) = (path, emptied(names));
@@ -390,6 +394,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// directory.
   fn round(&mut self, path: &mut PathBuf, names: &mut Vec<ScanEntry>) {
     let now_watched = self.commit();
+    self.gave_back = false;
     let mut scans = mem::take(&mut self.scans);
     self.tree.take_scans(&mut scans);
     // After `take_scans`: what these two queue waits for the next commit.
