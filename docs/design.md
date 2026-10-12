@@ -568,8 +568,11 @@ directory: each entry that the tree has no node for yet gets one, and is checked
 from the listing. A **partial** node lists nothing: its children are its registered names. In
 a deep scan each check gets a `deep` mark, so every directory below is watched again and
 scanned deep too. Nothing is scanned below a held node. If the listing fails because the
-directory is gone, its parent checks its name. If the disk does not answer, the node gets a
-deep mark for the next flush.
+directory is gone, its parent checks its name; when that look finds the same directory again,
+the node gets a deep mark for the next flush. If the disk does not answer, the node gets a
+deep mark for the next flush. An entry that the listing named and that is not there when it is
+looked at makes the directory list again at the next flush (`relist`): it can have been renamed
+away and back while it was read, which the Windows backend does not report.
 
 `vanish(node)`: the directory is gone for good, or a file took its place. The kind of the node
 becomes "nothing"; `backend.unwatch` if the backend was asked for this node. For each child:
@@ -588,8 +591,10 @@ That scan checks the child directories in the same way, so this goes all the way
 **`watch`** (`engine/watched_paths.rs`). A path that the filter ignores as a file and as a directory
 is left out (5.11). For each other new path: walk down from the root; make the missing
 nodes; make the last one a watched path, which makes every node above it registered; put a
-deep mark on the deepest node on the way that has only directories on disk above it. Then run
-one flush right away, without the quiet time, and return when it is done.
+deep mark on the deepest node on the way that has only directories on disk above it (unless a
+scan that checks every name of its directory is queued already: a scan of the names alone
+skips what the listing names). Then run one flush right away, without the quiet time, and
+return when it is done.
 
 The whole batch is registered before the flush, and each node is checked once in a flush. So
 a batch costs one `watch` call for a directory and one `lstat` for a name (the test

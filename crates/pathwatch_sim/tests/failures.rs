@@ -9,11 +9,48 @@ use std::io;
 use pathwatch::{ErrorKind, backend::Signal, engine::Options};
 use pathwatch_sim::{
   Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, caught_up, flush, on_all, on_modes, settled,
-  taken, window, window_then_settled,
+  sorted, taken, window, window_then_settled,
 };
 
 fn driver(mode: Mode) -> Driver<SimBackend> {
   Driver::sim(mode, Options::default())
+}
+
+/// A look that gets no answer is tried again deep. An older watched directory below the path,
+/// served by the tree watch of a directory between, is unwatched while the disk gives no
+/// answer: it stays complete, and the look that gets an answer scans it.
+#[test]
+fn a_look_that_got_no_answer_is_tried_again_deep() {
+  // inotify watches `old` itself: the tree watch of `R` serves it with the other two.
+  for mode in [Mode::Prefix, Mode::Handle] {
+    let mut d = driver(mode);
+    d.fs.mkdir_all("/p/R/sub/old").unwrap();
+    d.fs.write("/p/R/top.js", "1").unwrap();
+    d.fs.write("/p/R/sub/old/a.js", "1").unwrap();
+    d.fs.write("/p/R/sub/old/b.js", "1").unwrap();
+    d.watch(&["/p/R/top.js"]);
+    d.watch(&["/p/R/sub/old"]);
+
+    d.fs.set_offline(Some(io::ErrorKind::Other));
+    d.watch(&["/p"]);
+    d.unwatch(&["/p/R/sub/old"]);
+    d.fs.write("/p/R/sub/old/a.js", "22").unwrap();
+    d.fs.remove("/p/R/sub/old/b.js").unwrap();
+    d.fs.write("/p/R/sub/old/new.js", "1").unwrap();
+    // A few looks that get no answer.
+    for _ in 0..3 {
+      d.deliver(usize::MAX);
+      d.step();
+    }
+    assert_eq!(taken(&mut d), NONE, "{mode:?}");
+    d.fs.set_offline(None);
+    assert_eq!(
+      sorted(settled(&mut d)),
+      ["C /p/R/sub/old/new.js", "D /p/R/sub/old/b.js", "U /p/R/sub/old/a.js"],
+      "{mode:?}"
+    );
+    caught_up(&mut d);
+  }
 }
 
 /// Every notification is lost and the queue says so: the scan of everything finds all of it.

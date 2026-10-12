@@ -9,7 +9,7 @@ use crate::{
   config::EntryKind,
   fs::Fs,
   path::split_top,
-  tree::{Added, Kind, Mark, Spelling, Tree},
+  tree::{Added, Depth, Kind, Mark, Spelling, Tree},
 };
 
 /// The baseline: what a `watch` call finds is known without an event, unless an older watched
@@ -77,8 +77,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     if let Some(anchor) = anchor
       && let Some(parent) = self.tree.parent(anchor)
-      // A directory that is scanned anyway checks the node then.
-      && self.tree[parent].dir().is_some_and(|dir| dir.scan.is_none())
+      // A directory whose every name is checked anyway checks the node then. A scan of the
+      // names alone skips what the listing names.
+      && self.tree[parent].dir().is_some_and(|dir| dir.scan.is_none_or(|depth| depth == Depth::Names))
     {
       self.tree.mark(anchor, Mark::DEEP);
     }

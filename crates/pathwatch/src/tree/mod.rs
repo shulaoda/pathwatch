@@ -183,6 +183,9 @@ pub struct Dir {
   pub has_error: bool,
   /// The node is queued for a scan.
   pub scan: Option<Depth>,
+  /// An entry that the listing named was not there when it was looked at: the next check lists
+  /// the directory again, since it can have been away and back.
+  pub relist: bool,
   /// What the looks found out about the disk under this directory ([`Tree::is_loose`]).
   pub spelling: Spelling,
 }
@@ -203,7 +206,8 @@ impl Dir {
   pub fn new(id: DirId, complete: bool) -> Self {
     let (asked, scan) = (None, None);
     let spelling = Spelling::Unknown;
-    Self { id, complete, asked, watch: Watch::None, has_error: false, scan, spelling }
+    let (has_error, relist) = (false, false);
+    Self { id, complete, asked, watch: Watch::None, has_error, scan, relist, spelling }
   }
 
   /// Whether the timer has to look at the directory: no OS watch tells about it, or it had an

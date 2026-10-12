@@ -8,7 +8,7 @@ use std::{path::Path, time::Duration};
 
 use pathwatch::{ErrorKind, engine::Options};
 use pathwatch_sim::{
-  Driver, Mode, NONE, RECURSIVE, SimBackend, caught_up, flush, ignore_node_modules, on_all,
+  Driver, Mode, NONE, RECURSIVE, SimBackend, caught_up, flush, ignore_node_modules, known, on_all,
   on_modes, settled, sorted, taken, window, window_then_settled,
 };
 
@@ -32,6 +32,48 @@ fn a_renamed_directory_keeps_its_watch() {
     d.fs.write(format!("/p/r/{to}/deep/new"), "1").unwrap();
     assert_eq!(settled(&mut d), [format!("C /p/r/{to}/deep/new"), format!("C /p/r/{to}/new")]);
     caught_up(&mut d);
+  }
+}
+
+/// The watched directory is renamed away and back while its tree is read, at every moment of
+/// the call. The listing that fails finds the directory again from above, and nothing below it
+/// is lost: the handle of Windows reports no rename of its own directory, so nothing else
+/// would bring the scan back.
+#[test]
+fn a_directory_away_and_back_while_its_tree_is_read() {
+  for mode in Mode::ALL {
+    let prepare = || {
+      let d = driver(mode);
+      d.fs.mkdir_all("/p/r/sub/deep").unwrap();
+      d.fs.write("/p/r/a", "1").unwrap();
+      d.fs.write("/p/r/sub/b", "1").unwrap();
+      d.fs.write("/p/r/sub/deep/c", "1").unwrap();
+      d
+    };
+    let mut d = prepare();
+    let before = d.fs.calls().total();
+    d.watch(&["/p/r"]);
+    let calls = d.fs.calls().total() - before;
+    caught_up(&mut d);
+
+    for moment in 0..calls {
+      let mut d = prepare();
+      d.fs.at_call(moment, |fs| fs.rename("/p/r", "/p/away").unwrap());
+      d.fs.at_call(moment + 1, |fs| fs.rename("/p/away", "/p/r").unwrap());
+      d.watch(&["/p/r"]);
+      if d.fs.traps_run() < 2 {
+        d.fs.clear_traps();
+        d.fs.rename("/p/away", "/p/r").unwrap();
+      }
+      let mut events = taken(&mut d);
+      events.append(&mut settled(&mut d));
+      assert!(
+        events.iter().all(|event| !event.starts_with('D')),
+        "{mode:?}, call {moment}: {events:?}"
+      );
+      assert_eq!(known(&d), ["/p/r/a", "/p/r/sub/b", "/p/r/sub/deep/c"], "{mode:?}, call {moment}");
+      caught_up(&mut d);
+    }
   }
 }
 

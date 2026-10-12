@@ -55,6 +55,33 @@ fn linked_prefixes_keep_the_registered_spelling() {
   });
 }
 
+/// A hint with a name that is not plain queues a scan of the names of its directory. A link
+/// watched inside the quiet time of that hint still gets its first look: the scan of the names
+/// skips what the listing names, so it would not follow the link.
+#[test]
+fn a_link_watched_inside_the_quiet_time_of_a_hint_with_a_name_that_is_not_plain() {
+  for mode in Mode::ALL {
+    let mut d = driver(mode);
+    d.fs.mkdir_all("/p/dir").unwrap();
+    d.fs.mkdir_all("/shared/real").unwrap();
+    d.fs.write("/shared/real/c.js", "1").unwrap();
+    // A link inside a watched directory is a file like the others, until a watched path goes
+    // through it.
+    d.fs.symlink("/shared/real", "/p/dir/link").unwrap();
+    d.watch(&["/p/dir"]);
+
+    d.fs.write("/p/dir/café.js", "1").unwrap();
+    d.deliver(usize::MAX);
+    d.watch(&["/p/dir/link/c.js"]);
+    let events = settled(&mut d);
+    assert!(events.contains(&"C /p/dir/café.js".to_owned()), "{mode:?}: {events:?}");
+
+    d.fs.write("/shared/real/c.js", "22").unwrap();
+    assert_eq!(settled(&mut d), ["U /p/dir/link/c.js"], "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
 /// Nothing watches the target of a link. The poll finds a change behind it.
 #[test]
 fn a_change_behind_a_link() {

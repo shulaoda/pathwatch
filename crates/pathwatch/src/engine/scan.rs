@@ -112,7 +112,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.tree.prune(new);
     }
     if is_missing(&error) {
-      self.check_from_parent(key, path);
+      if self.check_from_parent(key, path) {
+        // The directory is there after all (away and back while it was read): the deep mark
+        // keeps the work for the next flush, as when the disk gives no answer.
+        self.tree.mark(key, Mark::DEEP);
+      }
       return Listing::Stop;
     }
     if matches!(self.disk_error(key, path, error), Found::Unknown) {
@@ -172,11 +176,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// The directory is gone: its parent finds out what is at its path now.
-  fn check_from_parent(&mut self, key: DirKey, path: &mut PathBuf) {
-    let Some(parent) = self.tree.parent(key) else { return };
+  /// The directory is gone: its parent finds out what is at its path now. True: the same
+  /// directory is still there, not held, and no scan of it is queued.
+  fn check_from_parent(&mut self, key: DirKey, path: &mut PathBuf) -> bool {
+    let Some(parent) = self.tree.parent(key) else { return false };
     self.tree.path_into(parent, path);
     self.check(key, path, Listed::NotAsked, Mark::default());
+    let Some(node) = self.tree.get(key) else { return false };
+    !node.is_held() && node.dir().is_some_and(|dir| dir.scan.is_none())
   }
 }
 

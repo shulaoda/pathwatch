@@ -153,7 +153,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// design.md 5.4.
   fn apply(&mut self, key: DirKey, path: &mut PathBuf, found: Found, had: Had, why: Mark) {
     match (found, had) {
-      (Found::Unknown, _) => self.tree.mark(key, why),
+      // No answer: the look is tried again, deep, since the tree below can be behind meanwhile.
+      (Found::Unknown, _) => self.tree.mark(key, Mark { deep: true, ..why }),
 
       (Found::Missing, Had::Nothing) => {}
       (Found::Missing, Had::File | Had::Dir { .. }) => self.missing(key, why.since),
@@ -203,6 +204,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         // Scan deep when nothing tells what happened in it meanwhile.
         let moved = was_held || id != old || relinked;
         self.still_there(key, path, why.deep || moved);
+        let relist = self.tree[key].dir_mut().is_some_and(|dir| mem::take(&mut dir.relist));
+        if relist && !(why.deep || moved) {
+          self.tree.queue_scan(key, Depth::Shallow);
+        }
       }
     }
   }
@@ -266,7 +271,18 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     let mut meta = match self.fs.lstat(path) {
       Ok(meta) => meta,
-      Err(error) => return self.disk_error(parent, path, error),
+      Err(error) => {
+        // The listing named the entry a moment ago: the directory itself can be away, renamed
+        // away and back while it is read, which nothing else would report. It is listed again.
+        if listed.is_named()
+          && is_missing(&error)
+          && let Some(dir) = self.tree[parent].dir_mut()
+        {
+          dir.relist = true;
+          self.tree.mark(parent, Mark::default());
+        }
+        return self.disk_error(parent, path, error);
+      }
     };
     // A registered name is an entry of the directory above only under this very name: asked
     // before a link is followed.
