@@ -81,6 +81,11 @@ impl SimBackend {
 }
 
 impl Backend for SimBackend {
+  /// inotify says "written" for a file that was created or moved in too.
+  fn written_is_a_write(&self) -> bool {
+    !matches!(self.mode, Mode::Inode)
+  }
+
   type Raw = SimRaw;
 
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {

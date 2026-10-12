@@ -16,7 +16,9 @@ use crate::{
   config::EntryKind,
   error::ErrorKind,
   fs::{DirId, Entry, FileType, Fs, Meta, is_delete_pending},
-  tree::{Added, Content, Depth, Fingerprint, Kind, Mark, Spelling, Watch, nanos},
+  tree::{
+    Added, Content, Depth, Fingerprint, Kind, Mark, Spelling, Watch, nanos, push_name, with_name,
+  },
 };
 
 /// A file is young this long: two writes inside it can leave one modification time.
@@ -121,7 +123,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       Kind::Dir(dir) => Had::Dir { id: dir.id, complete: dir.complete },
     };
 
-    path.push(self.tree.name(key));
+    push_name(path, self.tree.name(key));
     let found = self.read_entry(parent, key, path, listed);
     // An ignored watch target drops the paths below the name at the end of the flush, if the
     // directory is still there (design.md 5.11).
@@ -148,7 +150,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.tree.get(key).is_none() {
       twins.extend(gone_twins);
     }
-    // `pop` does not take a top directory (`/`, `C:\\`) away.
+    // `pop` does not take a top directory (`/`, `C:\`) away.
     if !path.pop() {
       path.clear();
     }
@@ -428,7 +430,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       return None;
     }
     let other: String = name.chars().map(swap_case).collect();
-    match self.fs.lstat(&path.with_file_name(other)) {
+    match self.fs.lstat(&with_name(path, other)) {
       Ok(found) if found.file_id == meta.file_id => return Some(false),
       Ok(_) => {}
       Err(error) if error.kind() == io::ErrorKind::NotFound => {}

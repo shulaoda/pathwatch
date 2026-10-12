@@ -6,7 +6,7 @@
 
 #![cfg(unix)]
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use pathwatch::{
   engine::{Ignored, Options},
@@ -944,6 +944,31 @@ fn a_name_with_a_letter_outside_ascii() {
     d.fs().remove("/p/R/CAF\u{e9}.js").unwrap();
     d.fs().write("/p/R/CAF\u{e9}.js", "22").unwrap();
     assert_eq!(d.settled(), ["C /p/R/CAF\u{e9}.js", "D /p/R/caf\u{e9}.js"], "{on}");
+    d.caught_up();
+  });
+}
+
+/// A rewrite that leaves the fingerprint as it was (the same size, in the same step of the
+/// clock): the backend says "written", under the spelling of the disk. The watched path in
+/// another spelling gets its `Update` like the one spelled as on the disk, also through a
+/// directory in another spelling on the way. Only on Windows: FSEvents never says "written",
+/// and inotify says it for a file that was moved in too, so there the look decides.
+#[test]
+fn a_rewrite_in_place_under_another_spelling() {
+  on_modes(&[Mode::Handle], &loose(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().set_time_step(Duration::from_secs(3600));
+    d.fs().mkdir_all("/p/src/components/ui").unwrap();
+    d.fs().write("/p/src/main.js", "1").unwrap();
+    d.fs().write("/p/src/app.js", "1").unwrap();
+    d.fs().write("/p/src/components/ui/App.js", "1").unwrap();
+    let paths = ["/p/src/main.js", "/p/src/App.js", "/p/src/Components/UI/App.js"];
+    assert_eq!(d.watch(&paths), NONE, "{on}");
+
+    d.fs().write("/p/src/app.js", "1").unwrap();
+    assert_eq!(d.window(), ["U /p/src/App.js"], "{on}");
+    d.fs().write("/p/src/components/ui/App.js", "1").unwrap();
+    assert_eq!(d.window(), ["U /p/src/Components/UI/App.js"], "{on}");
     d.caught_up();
   });
 }

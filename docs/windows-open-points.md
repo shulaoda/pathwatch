@@ -164,7 +164,22 @@ the real disk, with this backend and with polling.
   looks like one (`LONGFI~1.TXT`) becomes a `Changed` hint for the directory that holds it. A
   name with a lower-case letter (`v1~1.txt`) is never taken for one: Windows makes short names
   in upper case only. Not checked: which parts of a reported path can be short names, and how
-  often real long names look like one.
+  often real long names look like one. The other way round: a watched path that holds the short
+  name of an entry (`d\LONGFI~1.JSO`, or `d\LONGDI~1\file.js`) gets records that carry the
+  long name, which match no registered name. The tree keeps the registered names that look like
+  short names on a list for each directory, and a hint with a long name marks all of them, as a
+  guess that the look decides (`design.md` 5.2). Measured: a watched file with a short name, and
+  a watched file below a directory with one, get `Update`, `Delete` and `Create` through the
+  long names (`disk::promises::a_watched_path_with_a_short_name`). Still open: a key whose own
+  directory holds a short name and shares a handle above it is found by the text of its path,
+  which the long name in the record does not match (README, "more than 64 directories").
+- **Names that no path can hold.** A disk that another system filled (an NTFS volume written
+  from Linux, a share without name mangling) can list a name with `\` or `/` in it, or one that
+  reads as a drive (`C:`, `Q:x`). `PathBuf::push` would start the path anew for the second kind,
+  so a name is appended to a path by its text (`tree::push_name`), and `pop` takes it off again.
+  A name with a separator in it is left out of every listing (`fs::has_separator`): no Win32
+  path names such an entry, and nothing about it can be reported. Not run: this host cannot
+  make such a name, so only the joining is tested (`windows::a_listed_name_that_reads_as_a_drive_stays_in_its_directory`).
 - **Junctions and directory symlinks.** A handle opened through a link watches the target. A
   handle does not report changes that happen behind a link below it: they are reported under the
   real path, and only if that path is below a handle too. A link is made in two steps: a plain

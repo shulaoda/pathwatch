@@ -365,7 +365,7 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
       let read = record(rest, u64::from(serial), &mut name);
       let (next, told) = read.ok_or_else(|| io::Error::other("a listing gave no entry"))?;
       let own = OsString::from_wide(&name);
-      if own != "." && own != ".." {
+      if own != "." && own != ".." && !has_separator(&name) {
         each(&own, told);
       }
       match next {
@@ -466,6 +466,12 @@ fn wide_path(path: &Path) -> Vec<u16> {
   let mut units = verbatim(path, is_odd(path));
   units.push(0);
   units
+}
+
+/// A name with a separator in it, which a disk that another system filled can hold: no path
+/// names such an entry, so it is left out of a listing.
+pub fn has_separator(name: &[u16]) -> bool {
+  name.iter().any(|&unit| unit == u16::from(b'\\') || unit == u16::from(b'/'))
 }
 
 /// A search for the one path gives the entry as the directory holds it. In a directory that

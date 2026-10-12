@@ -12,7 +12,7 @@ use crate::{
   config::EntryKind,
   error::{ErrorKind, context},
   fs::{FileType, Fs},
-  tree::{Depth, Kind, Mark, Node, Tree, Watch},
+  tree::{Depth, Kind, Mark, Node, Tree, Watch, push_name},
 };
 
 /// Watch, commit, then scan: every ask queues a scan for after the next commit.
@@ -208,7 +208,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if !node.is_path() || !matches!(node.kind, Kind::Missing) {
         continue;
       }
-      path.push(self.tree.name(child));
+      push_name(path, self.tree.name(child));
       let is_dir = self.is_dir_on_disk(child, path);
       path.pop();
       if !is_dir {

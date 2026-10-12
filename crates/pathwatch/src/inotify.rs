@@ -117,6 +117,11 @@ impl InotifyBackend {
 }
 
 impl Backend for InotifyBackend {
+  /// `Written` is also said for a file that was created or moved in (`NEW_CONTENT`).
+  fn written_is_a_write(&self) -> bool {
+    false
+  }
+
   type Raw = Vec<u8>;
 
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {

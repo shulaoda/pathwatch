@@ -3,7 +3,7 @@
 #![cfg(windows)]
 
 use std::{
-  ffi::OsString,
+  ffi::{OsStr, OsString},
   fs, io,
   os::windows::ffi::{OsStrExt, OsStringExt},
   path::{Path, PathBuf},
@@ -765,4 +765,25 @@ fn open_point_a_change_made_through_a_short_name() {
     .hints_until(|hint| hint.names(key, "a long file name.txt") || hint.names_the_directory(key));
   let short = short.to_string_lossy();
   assert!(seen.iter().all(|hint| !hint.names(key, &short)), "{seen:?}");
+}
+
+/// A disk that another system filled can list a name that reads as a drive (`C:`, `Q:evil`):
+/// the path of such a node stays below its directory, and so do the paths of the names after
+/// it. (`PathBuf::push` would start the path anew.)
+#[test]
+fn a_listed_name_that_reads_as_a_drive_stays_in_its_directory() {
+  use pathwatch::tree::Tree;
+  let mut tree = Tree::new();
+  let top = tree.insert_child(Tree::ROOT, OsStr::new(r"C:\"));
+  let dir = tree.insert_child(top, OsStr::new("dir"));
+  for name in ["C:", "Q:evil", "a:b", "plain.txt"] {
+    let key = tree.insert_child(dir, OsStr::new(name));
+    let path = tree.path(key);
+    assert_eq!(path.as_os_str(), OsStr::new(&format!(r"C:\dir\{name}")), "{name}");
+    assert!(path.starts_with(r"C:\dir"), "{name}: {}", path.display());
+    let mut popped = path.clone();
+    assert!(popped.pop());
+    assert_eq!(popped, Path::new(r"C:\dir"), "{name}");
+  }
+  assert_eq!(tree.path(top), Path::new(r"C:\"));
 }

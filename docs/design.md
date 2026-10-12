@@ -271,6 +271,14 @@ every engine call):
      it. The mark is `written` when the hint is `Written` and `c` is the last name. In every
      other case it is `deep`. So a hint from deep inside a place the tree does not know (a tree
      that was moved in, an ignored directory) ends at the highest name that is not known.
+   - At each `X`, the other children that `c` can mean (below) are marked too, or walked into
+     when `c` is not the last name. A child that differs from `c` in the case of ASCII letters
+     only is the entry that was written, when every disk is loose and the backend says
+     "written" for a write and nothing else (`Tree::twins_share_writes`, from
+     `Options::loose_spelling` and `Backend::written_is_a_write`): its mark says `written` as
+     the hint does, so a rewrite that leaves the fingerprint as it was is an `Update` under
+     every watched spelling. inotify says "written" for a file that was created or moved in
+     too, so there, and for every other child (a guess), the look decides.
 
 Two marks for one node become one. `Lost` sets a flag: the next flush that the pacing allows
 (5.13) scans everything. A hint that left work moves the flush to one quiet time later (5.13).
@@ -401,6 +409,12 @@ hint costs one lookup more, however many children the directory has: 18 ns next 
 registered ones, where comparing with each child took 53 µs. The rest is for loose
 directories only. The registered names that are not plain are on a list for each directory
 (`Tree::not_plain`), and a hint with such a name marks all of them: one look for each. The
+registered names that look like a short (8.3) name of Windows (`LONGFI~1.JSO`: upper case, `~`
+and digits at the end of at most eight units, at most three after the dot) are on the same list:
+Windows names an entry by its long name in a record, which no table can match to the short
+name, so a hint with a long name marks each of them, as a guess that the look decides. A
+registered name with a lower-case letter is no short name (Windows makes them in upper case),
+and a hint whose name is a short name in any case means no long name. The
 other children of a complete directory are on no list, and there can be many. So when a hint
 names a name that is not plain, and the tree does
 not have it as an entry (`Node::is_entry`), the flush compares the names of the directory
@@ -804,8 +818,12 @@ next commit. The watch state of the node:
   `Polled`, and everything is scanned.
 
 **The poll.** The tree keeps a list of the directories that the timer looks at
-(`Tree::polled`), so a poll does not walk every node. On the poll timer, for each node on the
-list whose directory is on disk:
+(`Tree::polled`), so a poll does not walk every node. A directory is put on it when the
+backend answers for it and when its scan ends, and a stale key stays until a tidy: each poll
+tidies the list, and so does a push that finds it longer than twice the arena, and the end of
+the poll when nothing is watched any more. So a `watch` and `unwatch` of ever new paths, each
+shorter than the poll interval, cannot grow it without bound. On the poll timer, for each node
+on the list whose directory is on disk:
 
 - `Failed`: ask the backend again (it may have room now),
 - `Polled`, or a scan of it had an error: queue a shallow scan,

@@ -6,10 +6,15 @@ use super::{Engine, check::swap_case};
 use crate::{
   backend::{Backend, DirKey, Want},
   fs::Fs,
-  tree::{Added, Fingerprint, Kind, Node, Spelling, Tree, Watch},
+  tree::{Added, Fingerprint, Kind, Node, Spelling, Tree, Watch, with_name},
 };
 
 impl<B: Backend, F: Fs> Engine<B, F> {
+  /// How long the list of the directories that the timer looks at is, stale keys included.
+  pub fn polled_len(&self) -> usize {
+    self.tree.polled.len()
+  }
+
   /// Every file the handler believes to exist, a file whose `Delete` waits too.
   pub fn view(&self) -> BTreeSet<PathBuf> {
     let told = self.tree.nodes().filter(|(_, node)| node.told());
@@ -66,7 +71,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
             .and_then(|name| name.to_str())
             .map(|name| name.chars().map(swap_case).collect());
           let (Ok(meta), Some(other)) = (self.fs.lstat(&path), other) else { continue };
-          let folded = self.fs.lstat(&path.with_file_name(&other)).is_ok_and(|found| {
+          let folded = self.fs.lstat(&with_name(&path, &other)).is_ok_and(|found| {
             found.file_id == meta.file_id
               && path.file_name().is_some_and(|name| name != other.as_str())
           });

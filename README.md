@@ -217,9 +217,11 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   and the second step gives no record. A watcher that looked between the steps sees a
   directory; it looks once more at the next flush, within the poll interval, and reports the
   link then. Until then a watched path at or through the link gets no events.
-- **Windows: more than 64 directories** share handles. A watched path that is then spelled in
-  another way than the disk (more than the case of letters, or a short 8.3 name) gets no
-  events.
+- **Windows: more than 64 directories** share handles. A watched path whose directory is then
+  spelled in another way than the disk (more than the case of letters, or a short 8.3 name)
+  gets no events.
+- **Windows: a name with `\` or `/` in it**, which only a disk that another system filled can
+  hold, is not reported: no path names such an entry.
 - **Where the OS watches are put depends on what was watched and unwatched before.** A stream of
   macOS stays where it is until the streams are replaced, or until nothing watched is left below
   it. Nothing is missed.

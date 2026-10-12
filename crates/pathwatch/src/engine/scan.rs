@@ -10,7 +10,7 @@ use super::{
 use crate::{
   backend::{Backend, DirKey},
   fs::{DirId, Entry, FileType, Fs},
-  tree::{Depth, Dir, Kind, Mark, Spelling, Watch},
+  tree::{Depth, Dir, Kind, Mark, Spelling, Watch, push_name, with_name},
 };
 
 /// One node to check in a scan, with what the listing said about it.
@@ -152,11 +152,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let (mut tried, mut found) = (false, None);
     for (name, other) in to_try.take(tries) {
       tried = true;
-      path.push(&name);
+      push_name(path, &name);
       let entry = self.fs.lstat(path);
       found = match &entry {
         Ok(entry) if was_strict => {
-          let other = self.fs.lstat(&path.with_file_name(other));
+          let other = self.fs.lstat(&with_name(path, &other));
           other.is_ok_and(|other| other.file_id == entry.file_id).then_some(false)
         }
         Ok(entry) => self.tells_spellings_apart(path, entry),

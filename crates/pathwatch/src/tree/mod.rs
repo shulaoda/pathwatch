@@ -12,7 +12,7 @@ use std::{
   iter::Peekable,
   mem,
   ops::{Index, IndexMut},
-  path::{Component, Components, Path, PathBuf},
+  path::{Component, Components, MAIN_SEPARATOR_STR, Path, PathBuf, is_separator},
   time::{Instant, SystemTime},
 };
 
@@ -282,6 +282,8 @@ pub struct Tree {
   ahead: FxHashMap<DirKey, Instant>,
   /// The registered nodes whose names are not plain, by the slot of their parent: the table does
   /// not find them under another spelling, so a hint looks here ([`Tree::others_meant`]).
+  /// The registered children of each directory whose other spellings the table cannot find:
+  /// the names that are not plain, and the ones that look like short (8.3) names.
   not_plain: FxHashMap<u32, Vec<u32>>,
   /// The nodes with a mark, each with the time of the hint that made it, if a hint did: the
   /// delete delay counts from it. A key can be stale.
@@ -297,6 +299,10 @@ pub struct Tree {
   pub lost: bool,
   /// Every disk takes two spellings of a name for one (`Options::loose_spelling`).
   pub loose_spelling: bool,
+  /// A `Written` hint is a write to the one entry that the name and its twins (the registered
+  /// names that differ in the case of ASCII letters only) all are: every disk is loose, and the
+  /// backend says "written" for a write and nothing else (`Backend::written_is_a_write`).
+  pub twins_share_writes: bool,
 }
 
 /// The nodes: finding them, adding and freeing them, their paths, and which are watched paths.
@@ -326,6 +332,7 @@ impl Tree {
       polled: vec![Self::ROOT],
       lost: false,
       loose_spelling: false,
+      twins_share_writes: false,
     }
   }
 
@@ -583,7 +590,7 @@ impl Tree {
     let node = linked(&self.slots, index);
     if node.parent != NONE {
       self.push_names(node.parent, path);
-      path.push(name_of(&self.names, node));
+      push_name(path, name_of(&self.names, node));
     }
   }
 
@@ -625,7 +632,8 @@ impl Tree {
   /// Puts the node in slot `child` on the `not_plain` list of its parent, or takes it off.
   fn list_not_plain(&mut self, child: u32, registered: bool) {
     let node = linked(&self.slots, child);
-    if is_plain(name_of(&self.names, node)) {
+    let name = name_of(&self.names, node);
+    if is_plain(name) && !looks_short(name) {
       return;
     }
     let parent = node.parent;
@@ -737,6 +745,29 @@ fn child_hash(parent: u32, name: &OsStr) -> u64 {
 /// The most bytes of a list that are kept between two uses.
 pub(crate) const KEPT: usize = 16 * 1024;
 
+/// Appends `name` to `path` as one more name, by its text: `PathBuf::push` would start the path
+/// anew for a name that reads as a drive or a root (`C:`, `\\a`), which a disk that another system
+/// filled can list on Windows. `pop` takes such a name off again; a name with a separator in it
+/// never reaches the tree (`fs::read_dir` leaves it out).
+pub(crate) fn push_name(path: &mut PathBuf, name: &OsStr) {
+  let text = path.as_mut_os_string();
+  let last = text.as_encoded_bytes().last().copied();
+  if !text.is_empty() && !last.is_some_and(|byte| byte.is_ascii() && is_separator(char::from(byte)))
+  {
+    text.push(MAIN_SEPARATOR_STR);
+  }
+  text.push(name);
+}
+
+/// The path of `name` next to `path`: `Path::with_file_name` with the name appended by its text
+/// (`push_name`).
+pub(crate) fn with_name(path: &Path, name: impl AsRef<OsStr>) -> PathBuf {
+  let mut other = path.to_path_buf();
+  other.pop();
+  push_name(&mut other, name.as_ref());
+  other
+}
+
 /// Empties a list for its next use and keeps its memory, unless it is long: a `watch` of 20,000
 /// paths must not leave its lists behind for ever.
 pub(crate) fn emptied<T>(mut list: Vec<T>) -> Vec<T> {
@@ -811,11 +842,13 @@ impl Tree {
       let is_complete = parent.is_complete();
       let is_seen = below.is_some_and(Node::is_registered) || is_complete;
       // The table finds the other spellings of a plain name only; the registered ones that are not
-      // plain are on a list, and a listing shows the rest.
-      let not_in_table = self.is_loose_dir(parent)
+      // plain, and the short names, are on a list, and a listing shows the rest.
+      let loose = self.is_loose_dir(parent);
+      let not_in_table = loose
         && (!self.not_plain.is_empty() || (is_complete && !below.is_some_and(Node::is_entry)));
-      if has_other || (not_in_table && !is_plain(name)) {
-        found |= self.mark_others(at, name, child, &parts);
+      let has_short = loose && !could_be_short(name) && self.has_short_names(at);
+      if has_other || (not_in_table && !is_plain(name)) || has_short {
+        found |= self.mark_others(at, name, child, &parts, written);
       }
       if !is_seen {
         return found;
@@ -839,8 +872,10 @@ impl Tree {
     found
   }
 
-  /// The walk of `mark_path` for the other children that `name` can mean. Their marks never say
-  /// `written`: the hint was for another name.
+  /// The walk of `mark_path` for the other children that `name` can mean. A twin of the name
+  /// (`twins_share_writes`) is the entry that was written: its mark says `written` as the hint
+  /// does. Every other child is a guess (a name that is not plain, a short name), and its look
+  /// decides.
   #[cold]
   fn mark_others(
     &mut self,
@@ -848,24 +883,37 @@ impl Tree {
     name: &OsStr,
     exact: Option<u32>,
     rest: &Peekable<Components<'_>>,
+    written: bool,
   ) -> bool {
     let last = rest.clone().peek().is_none();
     let mut found = false;
     let parent = linked(&self.slots, at);
     let is_entry = exact.is_some_and(|exact| linked(&self.slots, exact).is_entry());
+    let one_entry = written && self.twins_share_writes;
     if self.is_loose_dir(parent) && parent.is_complete() && !is_entry && !is_plain(name) {
       // A name that is not plain can be another spelling of each child that is not plain.
       self.queue_scan(self.key(at), Depth::Names);
     }
     for other in self.others_meant(at, name, exact) {
-      if !last && linked(&self.slots, other).is_dir() {
-        found |= self.mark_path(other, rest.clone(), false);
+      let node = linked(&self.slots, other);
+      let is_dir = node.is_dir();
+      let written = one_entry && name_of(&self.names, node).eq_ignore_ascii_case(name);
+      if !last && is_dir {
+        found |= self.mark_path(other, rest.clone(), written);
       } else {
-        self.mark(self.key(other), Mark::DEEP);
+        let written = written && last;
+        self.mark(self.key(other), Mark { deep: !written, written, lost: false, since: None });
         found = true;
       }
     }
     found
+  }
+
+  /// Whether a registered child of slot `at` looks like a short (8.3) name: a record of the OS
+  /// names the entry by its long name, which the table cannot find.
+  fn has_short_names(&self, at: u32) -> bool {
+    let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
+    listed.iter().any(|&child| looks_short(name_of(&self.names, linked(&self.slots, child))))
   }
 
   /// Adds a mark to a node. Two marks for one node become one.
@@ -927,9 +975,15 @@ impl Tree {
   }
 
   /// Puts the directory on the list of the timer if it has to be polled now. Also while held.
+  /// A directory is listed more than once (the answer of the backend, the end of its scan), and
+  /// a stale key stays until a tidy: the list is tidied when it outgrows the arena twice over,
+  /// so a `watch` and `unwatch` of ever new paths cannot grow it without bound.
   pub fn list_if_polled(&mut self, key: DirKey) {
     if matches!(self[key].kind, Kind::Dir(dir) if dir.is_polled()) {
       self.polled.push(key);
+      if self.polled.len() > 2 * self.slots.len() + 16 {
+        self.tidy_polled();
+      }
     }
   }
 
@@ -947,13 +1001,17 @@ impl Tree {
     }
   }
 
-  /// Puts the list of the timer in order: each polled directory once, and nothing else.
+  /// Puts the list of the timer in order: each polled directory once, and nothing else. A long
+  /// list that shrank gives its memory back.
   pub fn tidy_polled(&mut self) {
     let mut polled = mem::take(&mut self.polled);
     polled.sort_unstable_by_key(|key| (key.index(), key.generation()));
     polled.dedup();
     let is_polled = |node: &Node| matches!(node.kind, Kind::Dir(dir) if dir.is_polled());
     polled.retain(|&key| self.get(key).is_some_and(is_polled));
+    if polled.capacity() > 2 * polled.len() + 16 {
+      polled.shrink_to(polled.len() + polled.len() / 8 + 16);
+    }
     self.polled = polled;
   }
 
@@ -1004,10 +1062,23 @@ impl Tree {
         && can_be_one_name(name_of(&self.names, node), name)
     };
     if is_plain(name) {
-      self.index.iter_hash(child_hash(at, name)).copied().filter(is_meant).collect()
+      let mut meant: Vec<u32> =
+        self.index.iter_hash(child_hash(at, name)).copied().filter(is_meant).collect();
+      // A long name can be the one of a registered short name on an NTFS volume.
+      if loose && !could_be_short(name) {
+        let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
+        let short = |&child: &u32| {
+          Some(child) != exact && looks_short(name_of(&self.names, linked(&self.slots, child)))
+        };
+        meant.extend(listed.iter().copied().filter(short));
+      }
+      meant
     } else if loose {
       let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
-      listed.iter().copied().filter(|&child| Some(child) != exact).collect()
+      let not_plain = |&child: &u32| {
+        Some(child) != exact && !is_plain(name_of(&self.names, linked(&self.slots, child)))
+      };
+      listed.iter().copied().filter(not_plain).collect()
     } else {
       Vec::new()
     }
@@ -1081,6 +1152,32 @@ fn can_be_one_name(a: &OsStr, b: &OsStr) -> bool {
 /// Whether every other spelling of `name` is known: only ASCII and Han ideographs, which have no
 /// case and no second form. The few characters that a disk folds to plain ones (`ß`, the Kelvin
 /// sign, ligatures, compatibility ideographs) are not covered: design.md 9.
+/// Whether the name looks like a short (8.3) name of Windows: at most eight units before the
+/// dot with `~` and digits at their end, at most three after it, and no lower case letter.
+/// Windows makes them in upper case, so `v1~1.txt` is a long name. The same rule is in the
+/// Windows backend (`before_short_name`).
+fn looks_short(name: &OsStr) -> bool {
+  could_be_short(name) && !name.as_encoded_bytes().iter().any(u8::is_ascii_lowercase)
+}
+
+/// `looks_short` in any case of letters: a hint with such a name, on a loose disk, is for the
+/// short name itself, so it means no long name.
+fn could_be_short(name: &OsStr) -> bool {
+  let bytes = name.as_encoded_bytes();
+  if !bytes.is_ascii() {
+    return false;
+  }
+  let dot = bytes.iter().position(|&byte| byte == b'.').unwrap_or(bytes.len());
+  let (base, extension) = bytes.split_at(dot);
+  let digits = base.iter().rev().take_while(|byte| byte.is_ascii_digit()).count();
+  let tilde = base.len().checked_sub(digits + 1).filter(|&at| at > 0 && base[at] == b'~');
+  digits > 0
+    && tilde.is_some()
+    && base.len() <= 8
+    && extension.len() <= 4
+    && !extension[extension.len().min(1)..].contains(&b'.')
+}
+
 fn is_plain(name: &OsStr) -> bool {
   let is_plain = |letter: char| {
     letter.is_ascii()
@@ -1230,17 +1327,19 @@ impl Tree {
     if reached != live || self.index.len() + 1 != live {
       return Err("a node is in no list of children, or not in the table".to_owned());
     }
+    let is_listed = |name: &OsStr| !is_plain(name) || looks_short(name);
     let listed = |(parent, children): (&u32, &Vec<u32>)| {
       !children.is_empty()
         && children.iter().all(|&child| {
           let node = self.slots.get(child as usize).and_then(Slot::node);
           node.is_some_and(|node| {
-            node.parent == *parent && node.is_registered() && !is_plain(name_of(&self.names, node))
+            node.parent == *parent && node.is_registered() && is_listed(name_of(&self.names, node))
           })
         })
     };
-    let registered = |node: &Node| node.is_registered() && !is_plain(name_of(&self.names, node));
+    let registered = |node: &Node| node.is_registered() && is_listed(name_of(&self.names, node));
     let on_lists: usize = self.not_plain.values().map(Vec::len).sum();
+    // The names on the list: not plain, or looking like a short name.
     if !self.not_plain.iter().all(listed)
       || on_lists != self.nodes().filter(|(_, node)| registered(node)).count()
     {

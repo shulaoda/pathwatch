@@ -15,6 +15,13 @@ pub trait Backend: Send + 'static {
   /// Takes the watch of `key` back.
   fn unwatch(&mut self, key: DirKey);
 
+  /// Whether `Written` names a write to the file and nothing else. `false`: the backend says it
+  /// also for a file that was created or moved in (inotify: `IN_CREATE`, `IN_MOVED_TO`), so the
+  /// engine trusts it for the hinted name only, and not for a watched twin of that name.
+  fn written_is_a_write(&self) -> bool {
+    true
+  }
+
   /// Makes the watches asked for since the last commit live. Gives the keys that were answered
   /// `NotWatched` before and that an OS watch reports now.
   fn commit(&mut self) -> io::Result<Vec<DirKey>> {

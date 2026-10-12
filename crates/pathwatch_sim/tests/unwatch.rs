@@ -787,3 +787,29 @@ fn unwatch_leaves_what_a_new_watcher_has() {
     same_as_a_new_watcher(&|| Driver::<PollBackend>::poll(ignore_node_modules()), &kept, &taken);
   }
 }
+
+/// Rounds of `watch` and `unwatch` of a path, each shorter than the poll interval: the list of
+/// the directories that the timer looks at does not grow with the rounds, with and without
+/// another path that stays watched.
+#[test]
+fn rounds_of_watch_and_unwatch_leave_no_list_of_the_timer() {
+  fn rounds<B: Deliver>(d: &mut Driver<B>, keep: bool) {
+    d.fs.mkdir_all("/p/a/b/c").unwrap();
+    d.fs.write("/p/a/b/c/f", "1").unwrap();
+    d.fs.write("/p/other", "1").unwrap();
+    if keep {
+      d.watch(&["/p/other"]);
+    }
+    for _ in 0..2000 {
+      d.watch(&["/p/a/b/c/f"]);
+      d.unwatch(&["/p/a/b/c/f"]);
+    }
+    assert!(d.engine.polled_len() < 64, "{} keys on the list", d.engine.polled_len());
+    caught_up(d);
+  }
+  for keep in [false, true] {
+    rounds(&mut Driver::sim(Mode::Handle, Options::default()), keep);
+    rounds(&mut Driver::sim(Mode::Inode, Options::default()), keep);
+    rounds(&mut Driver::<PollBackend>::poll(Options::default()), keep);
+  }
+}

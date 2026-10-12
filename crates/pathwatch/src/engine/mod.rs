@@ -174,6 +174,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     options.poll_interval_alone = options.poll_interval_alone.map(|time| time.min(LONGEST_SETTING));
     let mut tree = Tree::new();
     tree.loose_spelling = options.loose_spelling;
+    tree.twins_share_writes = options.loose_spelling && backend.written_is_a_write();
     Self {
       backend: Some(backend),
       fs,
@@ -289,6 +290,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   fn stop_poll_if_idle(&mut self) {
     if !self.tree[Tree::ROOT].is_registered() {
       self.poll_at = None;
+      // Only a poll tidies the list of the timer: without one, every `watch` would leave its
+      // directories on it.
+      self.tree.tidy_polled();
     }
   }
 

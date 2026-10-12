@@ -142,6 +142,14 @@ impl Fs for StdFs {
     }
     for entry in fs::read_dir(literal(dir)).map_err(told)? {
       let entry = entry.map_err(told)?;
+      #[cfg(windows)]
+      {
+        use std::os::windows::ffi::OsStrExt;
+        let name: Vec<u16> = entry.file_name().encode_wide().collect();
+        if windows::has_separator(&name) {
+          continue;
+        }
+      }
       let kind = entry.file_type().ok().map(|file_type| {
         if file_type.is_dir() {
           FileType::Dir
