@@ -336,7 +336,8 @@ fn name_on_disk(path: &Path) -> io::Result<OsString> {
   other_case.or(same_inode).ok_or_else(|| io::ErrorKind::NotFound.into())
 }
 
-/// Everywhere else a name has one spelling.
+/// Everywhere else a name has one spelling. (WASI: the inode of an entry is not in stable
+/// std, so the listing cannot be read as on Linux.)
 #[cfg(not(any(unix, windows)))]
 fn name_on_disk(path: &Path) -> io::Result<OsString> {
   fs::symlink_metadata(path)?;
@@ -345,8 +346,22 @@ fn name_on_disk(path: &Path) -> io::Result<OsString> {
 
 #[cfg(not(windows))]
 fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
-  let metadata = if follow { fs::metadata(path) } else { fs::symlink_metadata(path) }?;
-  Ok(meta(&metadata, ids(&metadata)))
+  let metadata = if follow { fs::metadata(path) } else { fs::symlink_metadata(path) };
+  match metadata {
+    Ok(metadata) => Ok(meta(&metadata, ids(&metadata))),
+    // WASI: the directories that the program may use (the preopens) lie below `/`, which is
+    // none of them as a rule. It is the top directory of every path all the same.
+    #[cfg(target_os = "wasi")]
+    Err(_) if path == Path::new("/") => Ok(Meta {
+      kind: FileType::Dir,
+      modified: SystemTime::UNIX_EPOCH,
+      changed: SystemTime::UNIX_EPOCH,
+      size: 0,
+      file_id: 0,
+      dir_id: DirId::default(),
+    }),
+    Err(error) => Err(error),
+  }
 }
 
 fn meta(metadata: &Metadata, (file_id, dir_id): (u64, DirId)) -> Meta {
@@ -399,7 +414,8 @@ fn ids(metadata: &Metadata) -> (u64, DirId) {
 
 #[cfg(not(any(unix, windows)))]
 fn ids(metadata: &Metadata) -> (u64, DirId) {
-  // WASI has no inode, so a directory has no identity: a replaced one is found by the listing.
+  // The inode is not in stable std here (WASI), so a directory has no identity: a replaced
+  // one is found by the listing. A file is told from the next one at its path by its birth.
   (metadata.created().map_or(0, nanos), DirId::default())
 }
 

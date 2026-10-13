@@ -312,7 +312,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 | Linux, Android | inotify | One kernel watch for each directory, so a big tree needs a high `fs.inotify.max_user_watches`. At the limit the handler gets `WatchLimit` and the directory is polled once a second. When inotify cannot start at all, the handler is told once and the watcher polls everything. Changes made on another machine (NFS, a folder shared with a VM) are not reported: use polling there. |
 | macOS | FSEvents | See "Holes". A process can run 512 streams; one watcher most often keeps 8 or fewer, and at most about 70: a `watch` call that needs new ones adds up to 8, and from 64 on all of them are replaced. It also keeps one file open for each directory at and above a place that a stream watches (about ten for a project; 64 such places, and more only for paths that have no directory in common where a stream may stand), and stops at half of what the process may open: beyond that the handler gets `WatchLimit` and the directories are polled once a second. |
 | Windows | `ReadDirectoryChangesW` | Tested on Windows 11 with NTFS only (`docs/windows-open-points.md`). At most 64 handles; more directories share a handle on a directory above them, and a directory behind a junction keeps one of its own. No handle is put on `C:\`, `C:\Users` or `C:\Users\<name>`: what could only be watched from there is polled. |
-| every other target | none: always polling | The cost grows with the number of watched files. |
+| every other target | none: always polling | The cost grows with the number of watched files. On WASI (`wasm32-wasip1-threads`) the directories that the program may use lie below `/`, which is none of them: `/` counts as a directory all the same, so a path below a preopened directory is watched. |
 
 The Rust toolchain is the one in `rust-toolchain.toml`.
 
@@ -376,8 +376,7 @@ This runs, on the machine it is called on:
 | macOS | `cargo test --workspace` |
 | Linux | `cargo test --workspace`. From macOS with OrbStack: `orb bash -c 'source $HOME/.cargo/env; cd <this directory> && CARGO_TARGET_DIR=$HOME/pathwatch-target-inotify cargo test --workspace'`. The tests use the temporary directory of the VM, because inotify does not see changes that macOS makes on the shared folder. |
 | Windows | `cargo test --workspace` on a Windows machine. Done on Windows 11 with NTFS; `docs/windows-open-points.md` says what was not tried. From another OS only a type check is possible: `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` |
-| Android | Only a type check, as on CI: `cargo clippy -p pathwatch --all-targets --target aarch64-linux-android` |
-| WASI | Only a type check: `cargo check -p pathwatch --target wasm32-wasip1-threads` |
+| Android, WASI, FreeBSD, musl, 32-bit Linux | Only a lint of the crate and its tests, as on CI: `cargo clippy -p pathwatch --all-targets --target aarch64-linux-android`, and the same with `wasm32-wasip1-threads`, `x86_64-unknown-freebsd`, `x86_64-unknown-linux-musl` or `i686-unknown-linux-gnu`. The engine with the poll backend was run once under wasmtime on a preopened directory (a probe, not a test). |
 
 The fuzzer (`crates/pathwatch_sim/tests/fuzz.rs`):
 

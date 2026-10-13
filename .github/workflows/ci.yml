@@ -17,12 +17,15 @@ env:
   RUSTFLAGS: -D warnings
   RUSTDOCFLAGS: -D warnings
 
+# Every job installs the toolchain of `rust-toolchain.toml` itself: rustup no longer promises
+# to do that on the first `cargo` call.
 jobs:
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+      - run: rustup toolchain install
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo doc -p pathwatch --no-deps
@@ -35,6 +38,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+      - run: rustup toolchain install
       - run: cargo check --workspace --all-targets --locked
         working-directory: bench
 
@@ -48,23 +52,35 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - run: rustup toolchain install
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # The backend of each OS has docs of its own.
       - run: cargo doc -p pathwatch --no-deps
       - run: cargo test --workspace --no-fail-fast --locked
+      # The tests of a limit of the OS run alone, after the others.
+      - if: runner.os == 'macOS'
+        run: cargo test -p pathwatch --test fsevents -- --ignored failed_start
+      - if: runner.os == 'Linux'
+        run: unshare -Ur sh -c 'echo 8 > /proc/sys/user/max_inotify_watches && cargo test -p pathwatch --test inotify -- --ignored'
+      # The engine as a release build runs it: the quick fuzz, once without the debug checks.
+      - if: runner.os == 'Linux'
+        run: cargo test --release -p pathwatch_sim --test fuzz
 
-  wasi:
+  # The targets that no runner has: the crate and its tests are linted for each of them.
+  targets:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - i686-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - x86_64-unknown-freebsd
+          - aarch64-linux-android
+          - wasm32-wasip1-threads
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - run: rustup target add wasm32-wasip1-threads
-      - run: cargo check -p pathwatch --target wasm32-wasip1-threads
-
-  android:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v5
-      - run: rustup target add aarch64-linux-android
-      - run: cargo clippy -p pathwatch --all-targets --target aarch64-linux-android -- -D warnings
+      - run: rustup toolchain install
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo clippy -p pathwatch --all-targets --target ${{ matrix.target }} -- -D warnings

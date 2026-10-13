@@ -291,8 +291,10 @@ fn is<U: Unit>(unit: U, byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+  #[cfg(any(unix, windows))]
+  use super::normalize;
   use super::{
-    MAX_NAME, normalize, unix, unix_is_clean,
+    MAX_NAME, unix, unix_is_clean,
     windows_rules::{windows, windows_is_clean},
   };
 

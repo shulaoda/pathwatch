@@ -16,6 +16,7 @@ use crate::{
 /// One node to check in a scan, with what the listing said about it.
 pub(super) type ScanEntry = (DirKey, Listed);
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ScanEntry>() == 40);
 
 impl<B: Backend, F: Fs> Engine<B, F> {

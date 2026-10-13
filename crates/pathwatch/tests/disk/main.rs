@@ -83,6 +83,11 @@ fn symlink(target: &Path, link: &Path) -> bool {
       Err(error) => panic!("a symbolic link cannot be made: {error}"),
     }
   }
+  #[cfg(not(any(unix, windows)))]
+  {
+    let _ = (target, link);
+    false
+  }
 }
 
 struct Watch {
