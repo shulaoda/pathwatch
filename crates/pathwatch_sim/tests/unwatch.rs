@@ -854,3 +854,18 @@ fn unwatch_below_a_name_whose_spelling_the_directory_above_has_not_told_yet() {
     d.caught_up();
   });
 }
+
+/// `unwatch` of a path below a chain of missing names: the directory that stays wants less now,
+/// since its other watched path is a directory, also when the directory that held the path went
+/// with the chain.
+#[test]
+fn unwatch_narrows_the_directory_that_stays() {
+  let mut d = Driver::sim(Mode::Inode, Options::default());
+  d.fs.mkdir_all("/a/b/x/y").unwrap();
+  d.watch(&["/a/b/c/d", "/a/b/x/y"]);
+  // `c` is missing: `b` tells its contents.
+  assert!(os_watches(&d.fs).contains(&at("/a/b", Contents)));
+  d.unwatch(&["/a/b/c/d"]);
+  assert!(os_watches(&d.fs).contains(&at("/a/b", Names)));
+  caught_up(&mut d);
+}

@@ -27,7 +27,8 @@ fn a_stopped_backend_is_polled_at_the_interval_of_the_settings() {
   let mut engine = Engine::new(backend, StdFs, options);
   let (start, mut out) = (Instant::now(), Output::default());
   engine.watch(vec![dir.path().to_owned()], start, &mut out);
-  assert_eq!(engine.deadline(), Some(start + hour), "only the poll is due, in an hour");
+  let first_poll = engine.deadline().expect("only the poll is due, in an hour");
+  assert!(first_poll >= start + hour && first_poll < start + hour + Duration::from_secs(1));
 
   engine.signal(Signal::Failed(io::Error::other("gone")), start);
   fs::write(dir.path().join("a.txt"), "1").unwrap();

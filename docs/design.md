@@ -666,9 +666,11 @@ both fields, so a look that had to be tried again after the call reports what it
   disk. What another watched path still covers stays as it is.
 - The nodes that nothing needs any more are freed, and the backend forgets each directory
   among them. A directory that stays, because a watched path lies below it, is partial.
-- A directory that stays may want less than it was asked for (`narrow`). A watch that was
-  asked for `Contents` is given back when the tree says that names are enough (every
-  registered name in it is a directory on disk), and the backend is asked again, for names.
+- A directory that stays may want less than it was asked for (`narrow`): the nearest one
+  above what went, asked once at the end of the call, however many paths went out of it. A
+  watch that was asked for `Contents` is given back when the tree says that names are enough
+  (every registered name in it is a directory on disk), and the backend is asked again, for
+  names.
   After a `WatchedTree` watch, everything that stays below is scanned deep, so each node that
   relied on the watch asks for one of its own. After a watch for the one directory (inotify),
   the scan that every ask queues looks at its registered names. Before, such a watch was left
@@ -776,7 +778,8 @@ is not told at once.
 - The first look that finds nothing where the tree has a file or a directory only **holds** the
   node, with the time of its second look: 100 ms after the hint that asked for the first look,
   so the quiet time before the look does not add to the delay; 100 ms after the look where no
-  hint asked for it (a poll, a scan). A first look that comes later than that, as under a
+  hint asked for it (a poll, a scan), the time of the look itself and not of the start of the
+  flush, which can be long before it. A first look that comes later than that, as under a
   flood, gets its second look at once, in the next flush. Nothing else changes: the
   fingerprint stays, and under a directory every node stays as it is. A directory that vanishes
   with 50,000 files is one held node. The backend forgets the watch of a held directory at once.
@@ -1000,8 +1003,15 @@ hold back a flush.
 leaves work moves the flush to one quiet time after it. So a save in several steps is one
 batch. Hints that keep coming do not hold a batch back for ever: counted from the first hint
 after the last flush, the flush comes after 500 ms at the latest, or after four quiet times if
-that is longer. `watch` and `unwatch` flush at once. The delete delay is not touched by this:
-it counts from the look that found nothing.
+that is longer. The marks of hints wait for that time, and nothing else takes them: the quiet
+time can be longer than the poll interval, and a poll or a second look that runs before it
+checks its own work and leaves them. Two exceptions, each because a look is made anyway: a
+`watch` or `unwatch` call ends the quiet time, since its baseline is decided by a tree that
+is in line with the hints; a hint for a directory above a held node is checked with the
+second look of that node, since the directory decides for it. And a check that a scan makes
+takes the mark that waits on its node with it: the look is made now, and what the hint said of
+the node (`written`) holds. The delete delay is not touched by any of this: it counts from the
+hint, or from the look that found nothing.
 
 **Pacing.** Two kinds of work are asked for by no hint that names a path, and can come again
 and again: a poll, and the scans after a loss report. After such work that took `t`, the same

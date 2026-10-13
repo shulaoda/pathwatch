@@ -4,12 +4,22 @@
 
 #![cfg(unix)]
 
-use std::io;
+use std::{
+  io,
+  sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+  },
+};
 
-use pathwatch::{ErrorKind, backend::Signal, engine::Options};
+use pathwatch::{
+  ErrorKind,
+  backend::Signal,
+  engine::{Options, Output},
+};
 use pathwatch_sim::{
-  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, caught_up, flush, on_all, on_modes, settled,
-  sorted, taken, window, window_then_settled,
+  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, caught_up, flush, not_caught_up, on_all,
+  on_modes, settled, sorted, taken, window, window_then_settled,
 };
 
 fn driver(mode: Mode) -> Driver<SimBackend> {
@@ -595,4 +605,27 @@ fn a_path_that_the_os_does_not_take() {
     assert_eq!(d.settled(), ["C /p/f"], "{on}");
     d.caught_up();
   });
+}
+
+/// `close` does not wait for a flush that reads thousands of files: once the watcher says
+/// stop, the flush ends at the next check or scan, with the tree as it is.
+#[test]
+fn a_stopped_engine_ends_its_flush() {
+  let mut d = Driver::poll(Options::default());
+  d.fs.mkdir_all("/p/r").unwrap();
+  for file in 0..200 {
+    d.fs.write(format!("/p/r/f{file}"), "1").unwrap();
+  }
+  d.watch(&["/p/r"]);
+  let stop = Arc::new(AtomicBool::new(false));
+  d.engine.stop_with(Arc::clone(&stop));
+  d.fs.at_call(8, move |_| stop.store(true, Ordering::Relaxed));
+
+  let before = d.fs.calls();
+  let deadline = d.engine.deadline().unwrap();
+  d.advance(deadline - d.now);
+  d.engine.tick(d.now, &mut Output::default());
+  assert_eq!(d.fs.traps_run(), 1);
+  assert!(d.fs.calls().lstat - before.lstat < 20);
+  not_caught_up(&mut d, "the engine was stopped in the middle of a flush");
 }

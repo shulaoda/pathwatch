@@ -460,3 +460,34 @@ fn nothing_is_due_when_nothing_is_watched() {
   }
   story(Driver::<PollBackend>::poll(ignore_node_modules()), "Poll");
 }
+
+/// The quiet time can be longer than the poll interval. A poll that runs meanwhile checks the
+/// directories that no OS watch tells about; the changes that hints told of wait for the quiet
+/// time.
+#[test]
+fn a_quiet_time_longer_than_the_poll_interval() {
+  let options = Options { debounce: Duration::from_secs(3), ..Options::default() };
+  for mode in Mode::ALL {
+    let mut d = Driver::sim(mode, options.clone());
+    d.fs.mkdir_all("/p/r").unwrap();
+    d.fs.mkdir_all("/p/other").unwrap();
+    d.fs.write("/p/r/a", "1").unwrap();
+    d.watch(&["/p/r"]);
+    d.fs.write("/p/r/a", "22").unwrap();
+    d.deliver(usize::MAX);
+    let hint_at = d.now;
+
+    // Two polls, a second apart, report nothing of it.
+    let flush_at = hint_at + Duration::from_secs(3);
+    for _ in 0..2 {
+      assert!(d.step());
+      assert!(d.now < flush_at, "{mode:?}");
+      assert_eq!(taken(&mut d), NONE, "{mode:?}");
+    }
+    // The flush comes three seconds after the hint.
+    assert!(d.step());
+    assert_eq!(d.now, flush_at, "{mode:?}");
+    assert_eq!(taken(&mut d), ["U /p/r/a"], "{mode:?}");
+    caught_up(&mut d);
+  }
+}

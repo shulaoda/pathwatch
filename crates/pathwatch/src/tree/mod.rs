@@ -921,10 +921,12 @@ impl Tree {
     listed.iter().any(|&child| looks_short(name_of(&self.names, linked(&self.slots, child))))
   }
 
-  /// Adds a mark to a node. Two marks for one node become one.
+  /// Adds a mark to a node. Two marks for one node become one. The time of the mark is the one
+  /// it carries, else the time of the hint that is being turned into marks, if one is.
   pub fn mark(&mut self, key: DirKey, mark: Mark) {
+    let since = mark.since.or(self.hint_time);
     if self[key].add_mark(mark) {
-      self.marked.push((key, self.hint_time));
+      self.marked.push((key, since));
     }
   }
 
@@ -1267,6 +1269,11 @@ impl Tree {
     {
       node.set_held(false);
       self.holds.remove(&key);
+      // Many holds at once (a tree removed file by file) must not keep their room for ever.
+      let (len, capacity) = (self.holds.len(), self.holds.capacity());
+      if capacity > 64 && len * 4 < capacity {
+        self.holds.shrink_to(len * 2);
+      }
     }
   }
 

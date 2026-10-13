@@ -47,8 +47,27 @@ impl fmt::Display for Error {
   }
 }
 
-pub(crate) fn context(what: &str, error: &io::Error) -> io::Error {
-  io::Error::new(error.kind(), format!("{what}: {error}"))
+/// `what: error`, with `error` kept as the source: its OS error code stays readable.
+pub(crate) fn context(what: &str, error: io::Error) -> io::Error {
+  io::Error::new(error.kind(), Context { what: what.to_owned(), error })
+}
+
+#[derive(Debug)]
+struct Context {
+  what: String,
+  error: io::Error,
+}
+
+impl fmt::Display for Context {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "{}: {}", self.what, self.error)
+  }
+}
+
+impl error::Error for Context {
+  fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+    Some(&self.error)
+  }
 }
 
 impl error::Error for Error {

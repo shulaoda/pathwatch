@@ -54,7 +54,7 @@ cargo run -p pathwatch --example dev_server -- path/to/project
 | `Watcher::with_config(config, handler)` | The same, with your `Config`. |
 | `watch(path)`, `watch_all(paths)` | Watches a path: a file, a directory (with everything below it), or a path that does not exist yet. Returns when the path is watched. Watching a path again does nothing. |
 | `unwatch(path)`, `unwatch_all(paths)` | Takes back a `watch` of this very path. Nothing is reported for it, with one exception: a link inside a watched directory that this path was followed through is a plain file of that directory again, and that change is reported (promise 12). |
-| `close()` | Stops the watcher and waits for its thread. Dropping the `Watcher` does the same. |
+| `close()` | Stops the watcher and waits for its thread: a check of the disk that runs ends at its next step. Dropping the `Watcher` does the same. |
 
 `watch`, `unwatch` and `close` can be called from any thread, and from inside the handler.
 From another thread they wait until the handler has returned, the batch that the call itself
@@ -90,7 +90,7 @@ watcher, so it should only pass the batch on.
 | `Config` method | Default | Meaning |
 |---|---|---|
 | `with_ignored(f)` | nothing is ignored | `f(path, kind) -> bool`, where `kind` is `EntryKind::File` or `EntryKind::Dir`. A path for which it returns `true` is never reported. An ignored directory is never read or watched. It must give the same answer for the same input, and if it ignores a directory it must ignore everything below it. It is asked about the paths you watch too (promise 10). |
-| `with_debounce(d)` | 50 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch goes out 500 ms after the first change since the last batch, or `4 × d` after it if that is longer, plus the time that the check of the disk takes. Zero: no waiting. The most is a year, also for the poll interval. |
+| `with_debounce(d)` | 50 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch goes out 500 ms after the first change since the last batch, or `4 × d` after it if that is longer, plus the time that the check of the disk takes. Zero: no waiting. The most is a year, also for the poll interval. A `watch` or `unwatch` call ends the quiet time; a poll that runs meanwhile does not, but a change it finds by itself is reported. Under polling there is no quiet time: a change is found by the next round. |
 | `with_delete_delay(d)` | 100 ms | How long a `Delete` waits for the path to come back. A file that is removed and written again within `d` is one `Update`; a real delete is reported `d` after the OS said that the path is gone. Zero: no waiting, and such a file is a `Delete` and a `Create`. The most is a year. |
 | `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
 | `with_poll_interval(d)` | 100 ms | The shortest pause between two rounds of polling. The least is 1 ms. After a slow round the pause is longer: nine times as long as the looks of the round took, plus the time of the reads of the files written in the last two seconds (on Windows a read right after a write waits for the virus scanner), and five seconds at most. |

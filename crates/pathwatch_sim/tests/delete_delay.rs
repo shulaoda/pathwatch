@@ -833,10 +833,11 @@ fn a_pending_delete_and_a_change_of_kind() {
 
 /// Hints keep coming, and a file is removed. The quiet time does not stretch the delete delay:
 /// the look at the longest wait finds nothing, the delay since the hint is over by then, and
-/// the `Delete` goes out with the next batch.
+/// the `Delete` goes out with the next batch. The hints wait for their quiet time meanwhile:
+/// the log gets its next `Update` at the longest wait, after the last of them.
 #[test]
 fn the_delete_delay_holds_while_hints_keep_coming() {
-  // No poll comes in between: a poll checks what waits, too.
+  // No poll comes in between.
   let options = Options { poll_interval: Duration::from_secs(60), ..Options::default() };
   let mut d = Driver::sim(Mode::Inode, options);
   d.fs.mkdir_all("/p/logs").unwrap();
@@ -859,10 +860,10 @@ fn the_delete_delay_holds_while_hints_keep_coming() {
   }
   // The look at 501 ms finds nothing at `/p/a.js`, 100 ms after its hint are long over: the
   // second look is due at once, and the next tick makes it, whatever the hints do.
-  let log = "U /p/logs/x.log".to_owned();
-  let delete = vec!["D /p/a.js".to_owned(), log.clone()];
-  assert_eq!(batches, [(501, vec![log]), (504, delete)]);
-  settled(&mut d);
+  let log = vec!["U /p/logs/x.log".to_owned()];
+  let delete = vec!["D /p/a.js".to_owned()];
+  assert_eq!(batches, [(501, log.clone()), (504, delete)]);
+  assert_eq!(settled(&mut d), log);
   caught_up(&mut d);
 }
 
@@ -974,4 +975,25 @@ fn case_e_remove_and_copy_again() {
     );
     d.caught_up();
   });
+}
+
+/// The delay of a `Delete` that no hint asked for counts from the look that found nothing, not
+/// from the start of the flush: a flush can take long before it reaches the file.
+#[test]
+fn the_delay_counts_from_the_look() {
+  let mut d = Driver::poll(Options::default());
+  d.fs.mkdir_all("/p/r").unwrap();
+  d.fs.write("/p/r/a", "1").unwrap();
+  d.watch(&["/p/r"]);
+
+  d.fs.remove("/p/r/a").unwrap();
+  // The disk takes 300 ms before the first look of the poll.
+  d.fs.at_call(0, |fs| fs.advance(Duration::from_millis(300)));
+  assert!(d.step());
+  assert_eq!(taken(&mut d), NONE);
+  assert_eq!(d.engine.pending_deletes().len(), 1);
+  // The second look comes 100 ms after the first, which was 300 ms into the flush.
+  assert_eq!(d.engine.deadline(), Some(d.now + Duration::from_millis(400)));
+  assert_eq!(settled(&mut d), ["D /p/r/a"]);
+  caught_up(&mut d);
 }

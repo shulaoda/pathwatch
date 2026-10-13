@@ -667,8 +667,10 @@ fn masks_map_to_hints() {
     let raw = event(wd, mask | libc::IN_ISDIR, "n");
     assert_eq!(h.translate(raw), [changed(key, "n")], "{mask:#x}");
   }
-  assert_eq!(h.translate(event(wd, libc::IN_ATTRIB | libc::IN_ISDIR, "n")), []);
-  assert_eq!(h.translate(event(wd, libc::IN_ATTRIB | libc::IN_ISDIR, "")), []);
+  for mask in [libc::IN_ATTRIB, libc::IN_MODIFY] {
+    assert_eq!(h.translate(event(wd, mask | libc::IN_ISDIR, "n")), [], "{mask:#x}");
+    assert_eq!(h.translate(event(wd, mask | libc::IN_ISDIR, "")), [], "{mask:#x}");
+  }
 
   // The watched directory itself. A move leaves the watch, a delete ends it.
   for mask in [libc::IN_MOVE_SELF, libc::IN_MOVE_SELF | libc::IN_ISDIR] {

@@ -9,7 +9,7 @@ use crate::{
   config::EntryKind,
   fs::Fs,
   path::split_top,
-  tree::{Added, Depth, Kind, Mark, Spelling, Tree},
+  tree::{Added, Depth, Kind, Mark, Spelling, Tree, emptied},
 };
 
 /// The baseline: what a `watch` call finds is known without an event, unless an older watched
@@ -164,7 +164,20 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         self.forget(path, true);
       }
     }
+    self.narrow_all();
     any
+  }
+
+  /// Asks each directory that a `forget` of this call left on the list whether it wants less
+  /// now: once for each, however many paths went out of it.
+  pub(super) fn narrow_all(&mut self) {
+    let mut dirs = std::mem::take(&mut self.narrowing);
+    dirs.sort_unstable();
+    dirs.dedup();
+    for dir in dirs.drain(..) {
+      self.narrow(dir, false);
+    }
+    self.narrowing = emptied(dirs);
   }
 
   /// The node of `path`, if the tree has one.
@@ -214,8 +227,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         }
       }
     }
-    // The directory that held the path may want less now.
-    self.narrow(parent, false);
+    // The directory that held what went may want less now: the one that stays, at the end of
+    // the call (`narrow_all`).
+    self.narrowing.push(if at == key { parent } else { at });
   }
 
   /// Forgets what the tree has at the node and below it, down to each watched path, which stays.

@@ -201,7 +201,8 @@ impl Watcher {
 
   /// Stops the watcher and waits for its thread. After it the handler is not called again,
   /// nothing is watched, and `watch` and `unwatch` return [`ErrorKind::Closed`]. Events not handed
-  /// over yet are dropped. It can be called many times, and from inside the handler: there it
+  /// over yet are dropped, and a check of the disk that runs ends at its next step: the wait is
+  /// one look at most. It can be called many times, and from inside the handler: there it
   /// does not wait, and the thread ends when the handler returns. While the process exits
   /// (a watcher in a thread-local, or dropped by the detach code of a DLL on Windows), the
   /// thread was ended by the OS already, and nothing is waited for.
@@ -337,7 +338,9 @@ impl Watcher {
         // The backend is made here: all of its methods run on this thread.
         match make(sink) {
           Ok(backend) => {
-            run(Engine::new(backend, StdFs, options), handler, &receiver, &queue, &stop);
+            let mut engine = Engine::new(backend, StdFs, options);
+            engine.stop_with(Arc::clone(&stop));
+            run(engine, handler, &receiver, &queue, &stop);
           }
           Err(error) => {
             // A limit says by itself what is missing and that the watcher polls.
@@ -345,17 +348,18 @@ impl Watcher {
               (ErrorKind::WatchLimit, error)
             } else {
               let what = "the OS watcher did not start, so every path is polled";
-              (ErrorKind::Io, context(what, &error))
+              (ErrorKind::Io, context(what, error))
             };
             handler(Err(Error::new(kind, None, Some(error))));
-            let engine = Engine::new(NoBackend::<B::Raw>(PhantomData), StdFs, fallback);
+            let mut engine = Engine::new(NoBackend::<B::Raw>(PhantomData), StdFs, fallback);
+            engine.stop_with(Arc::clone(&stop));
             run(engine, handler, &receiver, &queue, &stop);
           }
         }
       })
     };
     let thread = thread.map_err(|error| {
-      let error = context("the thread of the watcher did not start", &error);
+      let error = context("the thread of the watcher did not start", error);
       Error::new(ErrorKind::Io, None, Some(error))
     })?;
 

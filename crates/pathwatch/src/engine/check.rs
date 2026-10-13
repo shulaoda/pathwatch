@@ -102,7 +102,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// One check, which puts the twins that are to be looked at next on `twins`. `followed`: the
-  /// check came from one that found its entry under this name.
+  /// check came from one that found its entry under this name. A mark that waits on the node is
+  /// taken into the check: the look is made now, and what the hint said of the node holds.
   fn check_one(
     &mut self,
     key: DirKey,
@@ -112,6 +113,15 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     twins: &mut Vec<DirKey>,
     followed: bool,
   ) {
+    let why = match self.tree.take_mark(key) {
+      Some(pending) => Mark {
+        deep: why.deep || pending.deep,
+        written: why.written || pending.written,
+        lost: why.lost && pending.lost,
+        since: why.since,
+      },
+      None => why,
+    };
     let Some(parent) = self.tree.parent(key) else { return };
     let Some(asked) = self.tree[parent].dir().map(|dir| dir.asked) else {
       return self.tree.prune(key);
@@ -328,17 +338,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut other = None;
     let mut relinked = false;
     if registered {
-      // The flag is an answer of the disk: it is written when the disk was asked, or when the
-      // listing of the running scan named this very spelling.
       if unsure {
         other = match self.other_spelling(parent, key, path, &meta, is_new) {
           Ok(other) => other,
           Err(error) => return self.disk_error(parent, path, error),
         };
-        self.tree[key].set_unlisted(other.is_some());
-      } else if listed.is_named() {
-        self.tree[key].set_unlisted(false);
       }
+      let was_unlisted = self.tree[key].is_unlisted();
+      self.tree[key].set_unlisted(other.is_some());
       // Only a registered node is followed.
       let link = (meta.kind == FileType::Symlink).then(|| self.real_place(path));
       let old = self.tree.link(key);
@@ -350,8 +357,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           Err(error) => {
             let found = self.disk_error(parent, path, error);
             if matches!(found, Found::Unknown) {
-              // No answer: the stored link stays, or a watch by path is never made again.
+              // No answer: the tree stays as it was. The stored link stays, or a watch by
+              // path is never made again.
               self.tree.set_link(key, old);
+              self.tree[key].set_unlisted(was_unlisted);
             }
             return match found {
               // The link itself is an entry of the directory above, under another name.

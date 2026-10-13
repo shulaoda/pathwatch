@@ -59,6 +59,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
     let why = if depth == Depth::Deep { Mark::DEEP } else { Mark::default() };
     for (index, &(child, listed)) in names.iter().enumerate() {
+      if self.stopped() {
+        return;
+      }
       let listed = match listed {
         Listed::NotAsked if names_are_known => {
           self.listed.get(&child).copied().unwrap_or(Listed::NotNamed)

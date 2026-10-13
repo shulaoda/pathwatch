@@ -318,10 +318,11 @@ fn name_on_disk(path: &Path) -> io::Result<OsString> {
   let (Some(given), Some(dir)) = (path.file_name(), path.parent()) else {
     return Err(io::ErrorKind::InvalidInput.into());
   };
-  // A listing that cannot be read says nothing against the name.
+  // A listing that cannot be read, or that fails on the way, says nothing against the name.
   let Ok(entries) = fs::read_dir(dir) else { return Ok(given.to_owned()) };
   let (mut other_case, mut same_inode) = (None, None);
-  for entry in entries.flatten() {
+  for entry in entries {
+    let Ok(entry) = entry else { return Ok(given.to_owned()) };
     let name = entry.file_name();
     if name == given {
       return Ok(name);

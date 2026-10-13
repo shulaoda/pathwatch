@@ -100,7 +100,8 @@ fn pause_after_a_poll(files: usize, listing: Duration, read: Duration) -> Durati
   engine.watch(vec![dir.clone()], now, &mut out);
   assert!(out.events.is_empty() && out.errors.is_empty(), "{out:?}");
 
-  now += INTERVAL;
+  // The first poll: the interval after the flush of `watch`, which paid for its reads too.
+  now = engine.deadline().expect("a poll is due");
   engine.tick(now, &mut out);
   assert!(out.errors.is_empty(), "{:?}", out.errors);
   let next = engine.deadline().expect("a poll is due");

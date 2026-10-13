@@ -294,11 +294,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// A mark can come through a watch whose directory moved. Where only a poll checks the parent,
   /// the parent checks that directory in this flush too, before the mark (design.md 5.10).
-  pub(super) fn check_moved(&mut self) {
+  pub(super) fn check_moved(&mut self, hints_due: bool) {
     // Only the marks that are there now: the ones that this loop adds are not looked at.
     for index in 0..self.tree.marked.len() {
-      let (key, _) = self.tree.marked[index];
-      if !self.tree.get(key).is_some_and(Node::is_marked) {
+      let (key, since) = self.tree.marked[index];
+      if (since.is_some() && !hints_due) || !self.tree.get(key).is_some_and(Node::is_marked) {
         continue;
       }
       let Some(parent) = self.tree.parent(key) else { continue };
@@ -329,7 +329,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.backend.take().is_none() {
       return;
     }
-    let error = context("the OS watcher stopped, so every path is polled", error);
+    let error = context("the OS watcher stopped, so every path is polled", same(error));
     self.report(ErrorKind::Io, None, Some(error));
     // The poll is all there is now: it runs as often as a watcher that only polls.
     if let Some(alone) = self.options.poll_interval_alone {

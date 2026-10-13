@@ -38,15 +38,18 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// decides (design.md 5.9). The delay counts from the hint that asked for the look, `since`.
   pub(super) fn missing(&mut self, key: DirKey, since: Option<Instant>) {
     let now = self.now.expect("a check runs inside a flush");
+    // The time of this look, not of the start of the flush: a flush can take long before it
+    // reaches the node.
+    let looked = now + self.fs.ticks().saturating_sub(self.flush_ticks);
     let delay = self.options.delete_delay;
     let node = &self.tree[key];
     // The handler does not know the file, so there is no `Delete` to hold back.
     let unknown_file = matches!(node.kind, Kind::File(_)) && !node.told();
     match self.tree.held_until(key) {
-      Some(until) if until > now => {}
+      Some(until) if until > looked => {}
       None if !delay.is_zero() && !unknown_file => {
         // A first look that came late gets its second look at once, in the next flush.
-        self.hold(key, (since.unwrap_or(now) + delay).max(now));
+        self.hold(key, (since.unwrap_or(looked) + delay).max(looked));
       }
       _ => self.gone(key),
     }
@@ -100,8 +103,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       // Another time, or none: the hold ended, or the node was held again later.
       if self.tree.held_until(key) == Some(until) {
         self.tree.mark(key, Mark::default());
+        self.due_holds.push(key);
         any = true;
       }
+    }
+    // Many holds at once (a tree removed file by file) must not keep their room for ever.
+    let (len, capacity) = (self.hold_queue.len(), self.hold_queue.capacity());
+    if capacity > 64 && len * 4 < capacity {
+      self.hold_queue.shrink_to(len * 2);
     }
     any
   }

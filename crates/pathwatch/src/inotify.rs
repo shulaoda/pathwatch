@@ -109,6 +109,11 @@ impl InotifyBackend {
       keys.remove();
       ffi::remove_watch(&self.fds.inotify, wd);
     }
+    self.shrink();
+  }
+
+  /// The two tables are given back when most of their keys are gone.
+  fn shrink(&mut self) {
     if self.wd_by_key.len() < self.wd_by_key.capacity() / 4 {
       self.wd_by_key.shrink_to_fit();
       self.keys_by_wd.shrink_to_fit();
@@ -169,11 +174,14 @@ impl Backend for InotifyBackend {
           self.wd_by_key.remove(&key);
           hint(Hint::Changed { dir: key, rel: Path::new("") });
         }
+        self.shrink();
         continue;
       }
       let Some(keys) = self.keys_by_wd.get(&event.wd) else { continue };
       let is_dir = event.mask & libc::IN_ISDIR != 0;
-      let is_touched_dir = is_dir && event.mask & libc::IN_ATTRIB != 0;
+      // A directory that was touched (`ATTRIB`) or "modified" (`MODIFY`, which some tools get
+      // for a directory): its entries that came or went have records of their own.
+      let is_touched_dir = is_dir && event.mask & (libc::IN_ATTRIB | libc::IN_MODIFY) != 0;
       if is_touched_dir {
         continue;
       }
