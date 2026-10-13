@@ -401,17 +401,26 @@ fn behind(out: &mut String, report: &Report) {
     near_best[0], near_best[1]
   );
 
+  let ours = |run: &&Run| OURS.contains(&run.adapter.as_str());
   let mut wrong = Vec::new();
-  for run in middle_runs(&report.runs).iter().filter(|run| OURS.contains(&run.adapter.as_str())) {
+  // Every run, not the middle one: a run that failed is left out of the middle.
+  let mut numbers: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+  for run in report.runs.iter().filter(ours) {
+    let number = numbers.entry((&run.scenario, &run.adapter)).or_default();
+    *number += 1;
     if run.status != "ok" || run.errors > 0 {
+      let which =
+        if report.settings.repeat > 1 { format!(" (run {number})") } else { String::new() };
       wrong.push(format!(
-        "{} {}: {}, {} errors",
+        "{} {}{which}: {}, {} errors",
         run.scenario.to_uppercase(),
         run.adapter,
         run.status,
         run.errors
       ));
     }
+  }
+  for run in middle_runs(&report.runs).iter().filter(ours) {
     for phase in &run.phases {
       let quiet_events =
         if phase.changes == 0 { phase.duplicates + phase.late + phase.dir_events } else { 0 };

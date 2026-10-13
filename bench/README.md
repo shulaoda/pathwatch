@@ -51,7 +51,7 @@ How the numbers are read:
 | --- | --- | --- |
 | `pathwatch` | this repository | `Watcher::with_config` with a handler that sends each batch to a channel, and `watch_all`. Default settings (50 ms debounce). |
 | `pathwatch-0` | this repository | The same with `with_debounce(Duration::ZERO)`. |
-| `notify-fork` | `rolldown-notify` from `github.com/rolldown/notify` | The way rolldown uses it today: `RecommendedWatcher::new` with a `Config`, `paths_mut()`, every path with `Recursive` and `TrackPath`. Ignore: `Config::with_ignored`. Polling: `PollWatcher`. |
+| `notify-fork` | `rolldown-notify` from `github.com/rolldown/notify` | The way rolldown uses it today: `RecommendedWatcher::new` with a `Config`, `paths_mut()`, every path with `Recursive` and `TrackPath`. Ignore: `Config::with_ignored`. Polling: `PollWatcher`, and `ready` waits for its first scan: the watcher answers a call only after it. |
 | `chokidar` | chokidar 5 | `chokidar.watch(paths, { ignoreInitial: true })` and the `all` event. Ignore: a function for `ignored`. Polling: `usePolling` with `interval` and `binaryInterval`. |
 | `fs-watch` | Node itself | `fs.watch(dir, { recursive: true })`, once, for the lowest directory that holds all paths. It is the floor: no library. Polling: `fs.watchFile` for each path. It has no ignore rule. |
 | `fsnotify` | fsnotify 1 (Go) | `NewWatcher` and `Add`, for each directory of a tree and for each new one, as its README shows: it watches one directory, not what is below it. Ignore: such directories are not added, and their events are dropped. It has no polling mode. On macOS it uses kqueue, with one open file for each watched file. |

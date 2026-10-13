@@ -6,7 +6,7 @@
 //! rolldown puts its own code on top of this (a file check for every event and a walk of each
 //! new directory). The adapter does not: it prints what the library gives.
 
-use std::sync::mpsc;
+use std::{path::Path, sync::mpsc};
 
 use adapters::{Out, exit_when_stdin_closes, has_part, read_job};
 use notify_fork::{
@@ -49,6 +49,12 @@ fn main() {
   }
   if failed > 0 {
     out.error(&format!("watch failed for {failed} of {} paths", job.paths.len()));
+  }
+  // The poll watcher takes its first look at the files at the next turn of its loop, and
+  // answers the next call after that look: so `ready` comes with the baseline, and the first
+  // edit is not taken for a part of it.
+  if job.poll.is_some() {
+    let _ = watcher.unwatch(Path::new("/pathwatch-bench-is-not-watched"));
   }
   // The thread for stdin is started before `ready`, so the memory at `ready` holds
   // everything that the adapter needs.
