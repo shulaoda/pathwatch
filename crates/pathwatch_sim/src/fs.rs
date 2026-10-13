@@ -947,7 +947,7 @@ fn error(kind: io::ErrorKind) -> io::Error {
 fn link_loop() -> io::Error {
   if cfg!(any(target_os = "linux", target_os = "android")) {
     io::Error::from_raw_os_error(40)
-  } else if cfg!(target_vendor = "apple") {
+  } else if cfg!(any(target_vendor = "apple", target_os = "freebsd")) {
     io::Error::from_raw_os_error(62)
   } else {
     io::Error::other("too many levels of symbolic links")

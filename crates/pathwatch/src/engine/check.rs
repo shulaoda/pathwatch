@@ -726,23 +726,26 @@ pub(super) fn is_missing(error: &io::Error) -> bool {
   matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }
 
-/// Whether the error is a link loop. Its kind (`FilesystemLoop`) has no stable name, so the
-/// number of the OS is read where it is known.
+/// Whether the error is a link loop. Its kind (`FilesystemLoop`) is not stable yet, so the
+/// number of the OS is read where it is known; elsewhere a loop is an error like any other.
 fn is_link_loop(error: &io::Error) -> bool {
   #[cfg(any(target_os = "linux", target_os = "android"))]
   const LINK_LOOP: Option<i32> = Some(libc::ELOOP);
-  #[cfg(target_vendor = "apple")]
+  #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
   const LINK_LOOP: Option<i32> = Some(62);
   #[cfg(windows)]
   const LINK_LOOP: Option<i32> =
     Some(windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME.cast_signed());
-  #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple", windows)))]
+  #[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    windows
+  )))]
   const LINK_LOOP: Option<i32> = None;
 
-  match LINK_LOOP {
-    Some(code) => error.raw_os_error() == Some(code),
-    None => format!("{:?}", error.kind()) == "FilesystemLoop",
-  }
+  LINK_LOOP.is_some_and(|code| error.raw_os_error() == Some(code))
 }
 
 fn nanos_of(time: Duration) -> i64 {
