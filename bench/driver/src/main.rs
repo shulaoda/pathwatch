@@ -150,7 +150,7 @@ fn main() {
   let mut bases = BTreeMap::new();
   for adapter in ADAPTERS {
     let wanted = adapters.iter().any(|chosen| chosen.name == adapter.name);
-    // Node with no watcher is the base of every Node adapter.
+    // Node with no watcher stands in the table of the bases next to the Node adapters.
     let node_base = adapter.name == "node-idle" && adapters.iter().any(|chosen| chosen.is_node());
     if wanted || node_base {
       // The first start of a program is slow (macOS checks a file that it has not seen, and

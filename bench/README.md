@@ -23,7 +23,9 @@ that it watches, and then prints one line for each event that the library gives:
 the kind, and the path. The protocol is at the top of `adapters/src/lib.rs`.
 
 The **driver** makes a tree of files in a temporary directory, starts ONE adapter as a child
-process, changes files, and reads the lines. It knows nothing about the library behind the
+process, changes files, and reads the lines. Every name of a tree is longer than 8.3
+(`group-003/directory-017/module-04.js`), so Windows gives each entry a short name too: a
+library that asks for short names pays for them, as in a real project. It knows nothing about the library behind the
 adapter, so every library is measured in the same way:
 
 | What | How the driver measures it |
@@ -31,13 +33,14 @@ adapter, so every library is measured in the same way:
 | setup | The time from the start of the process to the `ready` line. |
 | memory | The resident size (RSS) of the adapter process at `ready` and after all phases, its highest value, and the memory that belongs to the process alone ("footprint"). The same adapter is also started with no path at all: that is its base. |
 | CPU | User plus system time of the adapter process: up to `ready`, in each phase, and in a quiet phase where nothing changes. |
-| latency | The driver writes one file and takes the time until the first line for that path comes. Many single changes give the median (p50), the 95th percentile (p95) and the worst (max). |
+| latency | The driver writes one file and takes the time until the first line for that path comes. Many single changes give the median (p50: the lower middle of an even count), the 95th percentile (p95) and the worst (max). |
 | bursts | Many changes at once. Every path counts its time from the start of the burst, so `max` is the time until the events for ALL paths came. |
 | right or wrong | The changed paths that got no event (`missed`), and the events for paths that should have none (`extra`). |
 
 How the numbers are read:
 
-- macOS: `proc_pid_rusage` (CPU time in nanoseconds, resident size, physical footprint).
+- macOS: `proc_pid_rusage` (CPU time in nanoseconds, resident size, physical footprint). The
+  highest resident size is `ru_maxrss` of `wait4`, known when the adapter has ended.
 - Linux: the CPU clock of the process (`clock_getcpuclockid`, nanoseconds) and
   `/proc/<pid>/smaps_rollup` (resident size, private pages). The highest resident size is
   `VmHWM` of `/proc/<pid>/status`.
@@ -88,11 +91,11 @@ Full sizes. `--scale` multiplies them, `--quick` is `--scale 0.05` with a quiet 
 | | Tree | Watched | Phases |
 | --- | --- | --- | --- |
 | S1 module files | 20,000 files in 2,000 directories | every file by its own path | first edit right after `ready`; quiet; 200 single edits; 50 single atomic saves (write a temporary file, rename it over the file) and one edit of each saved file after; a burst of 2,000 edits; 200 files removed; the same files written again |
-| S2 project directory | 50,000 files in 5,000 directories | the one directory | first edit; quiet; 200 single edits; 5,000 new files in 500 new directories; a tree of 5,000 files removed; a tree of 5,000 files moved in by one rename, and moved out by one rename |
+| S2 project directory | 50,000 files in 5,000 directories | the one directory | first edit; quiet; 200 single edits; 5,000 new files in 500 new directories; a tree of 5,500 files removed (one group, with its 500 new files); a tree of 5,000 files moved in by one rename, and moved out by one rename |
 | S3 noise | as S1 | as S1 | 100 single edits while another process writes 50,000 files in `project/dist` again and again (`--noise-outside`: in a directory next to the project) |
-| S4 ignored directory | 5,000 files in `src`, and `node_modules` | the project directory, with a rule that ignores `node_modules` | 30,000 files are written into `node_modules`, then one edit in `src` right after; 20 single edits |
+| S4 ignored directory | 5,000 files in `src`, and `node_modules` | the project directory, with a rule that ignores `node_modules` | first edit; 30,000 files are written into `node_modules`, then one edit in `src` right after; 20 single edits |
 | S5 polling | as S1 | as S1, with the polling mode of each library at 100 ms | first edit; quiet; 50 single edits |
-| S6 missing paths | an empty directory | 1,000 paths that do not exist, in directories that do not exist | quiet; all paths are made; 20 single edits of them |
+| S6 missing paths | an empty directory | 1,000 paths that do not exist, in directories that do not exist | quiet (3 s at most); all paths are made; 20 single edits of them |
 | S7 big directory | 20,000 files in one directory | the one directory | first edit; 100 single edits; 100 single new files; a burst of 2,000 new files; 100 files removed one by one |
 
 S7 is there for a watcher that lists a directory when something in it changes: it pays for
@@ -249,7 +252,9 @@ A quiet phase has only the CPU time and the number of events (none is right).
 The rules of the driver:
 
 - An event of the kind `access` (a file was opened or read; only `notify-fork` and `watchdog`
-  give it) is counted apart and never used for a time.
+  give it) is counted apart and never used for a time. The close of a file after a write,
+  which Linux reports besides the write (`close-write`, from the same two), is an event of
+  the file like any other.
 - After a single change the driver waits until the adapter printed nothing for 10 ms, and
   30 ms at the most, before the next one. A phase is over when the adapter printed nothing for
   250 ms (at most 3 s).

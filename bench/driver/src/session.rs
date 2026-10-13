@@ -235,6 +235,10 @@ impl Session {
         break;
       }
     }
+    // The phase is over when the adapter is silent: what still comes belongs to it.
+    let mut late = Tally::new(&[], &self.root);
+    self.drain(&mut late);
+    late.add_to(&mut phase, &mut times, phase_start, &mut self.earlier);
     self.finish_phase(phase, times, phase_start, before);
   }
 

@@ -292,12 +292,30 @@ fn locked(lock: &str, name: &str) -> Option<String> {
   Some(version)
 }
 
-/// The commit that the repository is at, read from its files (no git command is run).
+/// The commit that the repository is at, read from its files (no git command is run). A
+/// worktree has a file `.git` that names its directory, and the refs are in the common
+/// directory; a branch whose file was packed is in `packed-refs`.
 fn commit(repository: &Path) -> Option<String> {
-  let head = fs::read_to_string(repository.join(".git/HEAD")).ok()?;
+  let dot_git = repository.join(".git");
+  let git_dir = match fs::read_to_string(&dot_git) {
+    Ok(text) => repository.join(text.trim().strip_prefix("gitdir: ")?),
+    Err(_) => dot_git,
+  };
+  let common = match fs::read_to_string(git_dir.join("commondir")) {
+    Ok(text) => git_dir.join(text.trim()),
+    Err(_) => git_dir.clone(),
+  };
+  let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
   let head = head.trim();
   let hash = match head.strip_prefix("ref: ") {
-    Some(name) => fs::read_to_string(repository.join(".git").join(name)).ok()?,
+    Some(name) => match fs::read_to_string(common.join(name)) {
+      Ok(hash) => hash,
+      Err(_) => {
+        let packed = fs::read_to_string(common.join("packed-refs")).ok()?;
+        let line = packed.lines().find(|line| line.split_whitespace().nth(1) == Some(name))?;
+        line.split_whitespace().next()?.to_owned()
+      }
+    },
     None => head.to_owned(),
   };
   Some(hash.trim().chars().take(8).collect())

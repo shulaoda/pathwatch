@@ -108,11 +108,12 @@ pub fn sample(pid: i32) -> Option<Sample> {
 }
 
 /// The highest resident size of a running process so far, in KiB, where the system tells it
-/// for a running process.
+/// for a running process: Windows and Linux. macOS tells it for a process that ended only
+/// (`ru_maxrss` of `wait4`, see `ended`).
 ///
-/// Linux and Windows. On Linux, the number that `wait4` gives for a child (`ru_maxrss`) also
-/// counts the memory of the driver, from the moment before the child became another program:
-/// it said 6.4 MiB for an adapter that never had more than 2.7 MiB.
+/// On Linux, the number that `wait4` gives for a child (`ru_maxrss`) also counts the memory of
+/// the driver, from the moment before the child became another program: it said 6.4 MiB for
+/// an adapter that never had more than 2.7 MiB.
 #[cfg(target_os = "windows")]
 #[must_use]
 pub fn peak_rss_kb(pid: i32) -> Option<u64> {
@@ -121,12 +122,19 @@ pub fn peak_rss_kb(pid: i32) -> Option<u64> {
 }
 
 /// See the Windows form above.
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn peak_rss_kb(pid: i32) -> Option<u64> {
   let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
   let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
   line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// See the Windows form above.
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[must_use]
+pub fn peak_rss_kb(_pid: i32) -> Option<u64> {
+  None
 }
 
 /// What the system says about a child process that ended.

@@ -16,14 +16,15 @@ from watchdog.observers.polling import PollingObserver
 
 from protocol import common_directory, event, line, read_job, start_writer, stdin, write
 
-# The words of the library, and the words of the benchmark for them. Opening and closing a
-# file is not a change (Linux reports both).
+# The words of the library, and the words of the benchmark for them. Opening a file, and
+# closing one that was not written, is not a change (Linux reports both). The close after a
+# write is an event of the file, as notify-fork reports the same event of Linux.
 WORDS = {
     "created": "create",
     "modified": "update",
     "deleted": "delete",
     "opened": "access",
-    "closed": "access",
+    "closed": "close-write",
     "closed_no_write": "access",
 }
 

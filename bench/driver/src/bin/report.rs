@@ -190,6 +190,12 @@ fn middle_run(all: &[&Run]) -> Run {
     total_cpu_ms: time(|run| run.total_cpu_ms),
     ..(*first).clone()
   };
+  // A note of any run: the system refused a change in one of them, say.
+  for note in runs.iter().flat_map(|run| &run.notes) {
+    if !run.notes.contains(note) {
+      run.notes.push(note.clone());
+    }
+  }
   if runs.len() < all.len() {
     run.notes.push(format!(
       "{} of {} runs failed and are left out",
@@ -235,6 +241,8 @@ fn middle_phase(phases: &[&Phase]) -> Phase {
     write_ms: time(|phase| phase.write_ms),
     wall_ms: time(|phase| phase.wall_ms),
     cpu_ms: time(|phase| phase.cpu_ms),
+    // The full count: a run that stopped early is said by `abandoned`.
+    changes: count(|phase| phase.changes),
     abandoned: phases.iter().any(|phase| phase.abandoned),
     info: info.into_iter().map(|(name, numbers)| (name, middle(numbers))).collect(),
     ..phases[0].clone()
@@ -307,7 +315,7 @@ fn numbers(report: &Report) -> Vec<Number> {
 /// and every place where pathwatch itself was wrong.
 fn behind(out: &mut String, report: &Report) {
   const OURS: [&str; 2] = ["pathwatch", "pathwatch-0"];
-  if !report.runs.iter().any(|run| run.adapter == OURS[0]) {
+  if !report.runs.iter().any(|run| OURS.contains(&run.adapter.as_str())) {
     return;
   }
   let _ = writeln!(out, "## Where pathwatch is behind\n");
@@ -422,17 +430,23 @@ fn behind(out: &mut String, report: &Report) {
   }
   for run in middle_runs(&report.runs).iter().filter(ours) {
     for phase in &run.phases {
-      let quiet_events =
-        if phase.changes == 0 { phase.duplicates + phase.late + phase.dir_events } else { 0 };
-      if phase.missed + phase.extra + quiet_events > 0 || phase.abandoned {
+      // In a quiet phase every event is one too many.
+      let quiet = phase.changes == 0;
+      let events = phase.extra + phase.duplicates + phase.late + phase.dir_events;
+      let what = if quiet {
+        (events > 0).then(|| format!("{events} events in a quiet time"))
+      } else {
+        (phase.missed + phase.extra > 0 || phase.abandoned).then(|| {
+          let early = if phase.abandoned { ", stopped early" } else { "" };
+          format!("{} missed, {} extra{early}", phase.missed, phase.extra)
+        })
+      };
+      if let Some(what) = what {
         wrong.push(format!(
-          "{} {}, {}: {} missed, {} extra, {} events in a quiet time",
+          "{} {}, {}: {what}",
           run.scenario.to_uppercase(),
           run.adapter,
-          phase.name,
-          phase.missed,
-          phase.extra,
-          quiet_events
+          phase.name
         ));
       }
     }
