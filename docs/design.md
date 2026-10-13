@@ -666,20 +666,11 @@ Two guards:
      sure to come there, and a write that leaves the time stamp as it is can only come while
      the file is young.
 
-   **A version in place of the hash** (`Fs::version`, Windows). NTFS keeps a number for each
-   file that moves when it is changed (the place of its last record in the change journal).
-   Not with every write: while a writer keeps the file open, only its first write moves the
-   number, and the close does (measured: three writes through one handle, one number). So a
-   second write of the same size inside one step of the clock, by a writer that keeps the
-   file open, is not found by a look (section 9). Where an OS watch covers a young file, the engine stores that number and not a
-   hash, and the same number at the next look says that nothing was written. The file is not
-   opened for reading: on Windows that waits for the virus scanner when the file was just
-   written (2 ms, and 14 ms for one in ten, measured; the number takes 0.04 ms). The number
-   also moves when the file is renamed, gets other attributes, or is closed by its writer,
-   and each of these counts as a change at that look: more `Update` events, never fewer. So
-   it is not asked where only the poll looks at a file: there nothing else tells a write from
-   a `chmod`, and the hash decides as before. A disk without a journal has no number, and the
-   hash is taken.
+   On Windows the read of a file that was just written waits for the virus scanner (2 ms,
+   and 14 ms for one in ten, measured). (A number that NTFS keeps for each file, the place of
+   its last record in the change journal, stood in for the hash there for a while: 0.04 ms
+   instead of the read. It does not move for a second write through a handle that stays
+   open, which was a hole of its own, and it was one more thing to keep. Taken out.)
 
 | The modification time | Young for |
 |---|---|
@@ -1556,8 +1547,6 @@ Known holes of the engine:
   delete delay, replaced by another one of the same size and time on a file system that uses
   the inode number again (ext4); a second write of the same size inside one step of a file
   system that counts time in steps between 20 ms and 1 s.
-- Windows: a second write of the same size, inside one step of the clock of the time stamps,
-  by a writer that keeps the file open: the version of the disk does not move (5.8).
 - A write through another hard link of a watched file. A mount over a watched directory.
 - FSEvents and Windows: after `rm -r` of the directories above a watched path, the engine
   learns that an upper directory is gone only at the next poll.
@@ -1608,7 +1597,7 @@ the order in which a change meets them.
   decide the event at the end of a flush.
 - **Baseline.** What a `watch` call finds: known to the handler without an event.
 - **Young.** A file whose modification time is so recent that another write could leave it as it
-  is. Its content, or the version number of the disk, is kept to compare at the next look.
+  is. A hash of its content is kept to compare at the next look.
 - **Fingerprint.** The modification time, the size and the id of a file: what tells one state of
   it from the next without reading it.
 - **Held.** A look found nothing where the tree has a file or a directory. The node waits for a

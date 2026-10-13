@@ -1107,8 +1107,6 @@ fn is_plain(name: &OsStr) -> bool {
 pub enum Content {
   /// This hash of the content decides.
   Hash(u64),
-  /// This number of the disk (`Fs::version`) decides: the same number says nothing was written.
-  Version(u64),
   /// No hash (the file is too big or unreadable): an equal fingerprint counts as a change.
   Unknown,
 }

@@ -33,11 +33,7 @@ use windows_sys::Win32::{
     FindFirstFileExW, GetFileInformationByHandle, GetFileInformationByHandleEx,
     GetVolumeInformationByHandleW, WIN32_FIND_DATAW,
   },
-  System::{
-    IO::DeviceIoControl,
-    Ioctl::{FSCTL_READ_FILE_USN_DATA, USN_RECORD_V2, USN_RECORD_V3},
-    LibraryLoader::{GetModuleHandleW, GetProcAddress},
-  },
+  System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
 };
 
 use super::{DirId, Entry, FileType, Meta, meta};
@@ -271,43 +267,6 @@ fn wide(high: u32, low: u32) -> u64 {
 /// The room for one answer of the system. The records in it start at multiples of eight.
 #[repr(C, align(8))]
 struct Aligned<const N: usize>([u8; N]);
-
-/// The place of the last record about the file in the change journal of its disk: it moves
-/// with every write, and also with a rename, other attributes, and the close of a writer.
-/// `None`: the disk keeps no journal. A read of the content for a hash waits for the virus
-/// scanner right after a write (2 ms, 14 ms for one in ten); this call takes 0.04 ms.
-pub fn version(path: &Path) -> io::Result<Option<u64>> {
-  // A directory cannot be opened in this way: it is no file to compare (see `told`).
-  let opened = OpenOptions::new().access_mode(0).share_mode(SHARE_ALL).open(literal(path));
-  let file = opened.map_err(told)?;
-  // The longest record: its fixed part and a name of 255 units.
-  let mut record = Aligned([0; 1024]);
-  let size = u32::try_from(record.0.len()).unwrap_or(u32::MAX);
-  let mut filled = 0;
-  // SAFETY: the handle is open. The call reads no input, writes at most `size` bytes into
-  // `record`, and their count into `filled`.
-  let read = unsafe {
-    let (no_input, wait) = (std::ptr::null(), std::ptr::null_mut());
-    let (answer, filled) = ((&raw mut record).cast(), &raw mut filled);
-    let handle = file.as_raw_handle();
-    DeviceIoControl(handle, FSCTL_READ_FILE_USN_DATA, no_input, 0, answer, size, filled, wait)
-  };
-  if read == 0 {
-    return Ok(None);
-  }
-  let bytes = record.0.get(..filled as usize).unwrap_or_default();
-  let major = bytes.get(mem::offset_of!(USN_RECORD_V2, MajorVersion)..);
-  let at = match major.and_then(|major| major.first_chunk()).map(|major| u16::from_ne_bytes(*major))
-  {
-    Some(2) => mem::offset_of!(USN_RECORD_V2, Usn),
-    Some(3) => mem::offset_of!(USN_RECORD_V3, Usn),
-    _ => return Ok(None),
-  };
-  let usn = bytes.get(at..).and_then(|usn| usn.first_chunk());
-  // Zero: the journal has no record about the file (it is off, or younger than the file), so
-  // the number would stay the same over a write.
-  Ok(usn.map(|usn| u64::from_ne_bytes(*usn)).filter(|&usn| usn != 0))
-}
 
 // A record is read from its bytes at these offsets, each checked against the answer.
 const NEXT: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, NextEntryOffset);
@@ -559,7 +518,7 @@ mod tests {
 
   use super::{
     SHARE_ALL, by_handle, by_name, is_delete_pending, is_odd, literal, name_on_disk, read_dir,
-    stat, told, version,
+    stat, told,
   };
   use crate::fs::{Entry, FileType, Fs, Meta, StdFs};
 
@@ -810,7 +769,6 @@ mod tests {
       let found = stat(&path, false).unwrap();
       assert_eq!((found.kind, found.size), (FileType::File, name.len() as u64), "{name}");
       assert_eq!(name_on_disk(&path).unwrap(), name);
-      assert!(version(&path).is_ok(), "{name}");
       assert_eq!(fs::read(literal(&path)).unwrap(), name.as_bytes());
     }
     fs::create_dir(verbatim.join("dir.")).unwrap();
@@ -843,25 +801,5 @@ mod tests {
     let again = stat(&file, false).unwrap();
     assert_ne!(first.file_id, again.file_id);
     assert_eq!(StdFs.lstat(&file).unwrap().file_id, again.file_id);
-  }
-
-  #[test]
-  fn the_version_changes_with_a_write() {
-    let top = tempfile::tempdir().unwrap();
-    let file = top.path().join("file");
-    fs::write(&file, "one").unwrap();
-    // A disk without a change journal.
-    let Some(first) = version(&file).unwrap() else { return };
-    assert_eq!(fs::read(&file).unwrap(), b"one");
-    assert_eq!(stat(&file, false).unwrap().size, 3);
-    assert_eq!(version(&file).unwrap(), Some(first));
-
-    // The same size, and most often the same time stamp.
-    fs::write(&file, "two").unwrap();
-    assert_ne!(version(&file).unwrap(), Some(first));
-
-    for path in [top.path().to_owned(), top.path().join("none")] {
-      assert_eq!(version(&path).unwrap_err().kind(), io::ErrorKind::NotFound);
-    }
   }
 }

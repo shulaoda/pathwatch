@@ -29,14 +29,6 @@ pub trait Fs {
   /// which is never followed; a FIFO or a device, which the open does not wait for).
   fn hash(&self, path: &Path, limit: u64) -> io::Result<Option<u64>>;
 
-  /// A number that the disk changes with every change of the regular file at `path`, a rename
-  /// too; `None` where the disk has none. Where an OS watch reports writes, the engine takes
-  /// it in place of the hash, so the file is not read: the call opens it with no access for a
-  /// moment, and Windows refuses a rename over it meanwhile, as for every open handle.
-  fn version(&self, _path: &Path) -> Option<u64> {
-    None
-  }
-
   /// Where the symbolic link at `path` points: the text that is stored in the link.
   fn link_target(&self, path: &Path) -> io::Result<PathBuf>;
 
@@ -220,11 +212,6 @@ impl Fs for StdFs {
 
   fn listing_lags(&self) -> bool {
     cfg!(windows)
-  }
-
-  #[cfg(windows)]
-  fn version(&self, path: &Path) -> Option<u64> {
-    windows::version(path).ok().flatten()
   }
 }
 

@@ -488,13 +488,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // Compared when the fingerprint is the same, and one last time when the file is old.
     let kept = old.and_then(|(old, content)| content.filter(|_| old == fingerprint));
     let compare = matches!(kept, Some(Content::Hash(_)));
-    // The version of the disk stands in for the hash where an OS watch reports writes. Not
-    // under the poll: the version also moves with what is no write.
-    let asks_version = kind == FileType::File
-      && (young || matches!(kept, Some(Content::Version(_))))
-      && !self.only_polled(key);
-    let version = if asks_version { self.fs.version(path) } else { None };
-    let hash = if (young && version.is_none()) || compare {
+    let hash = if young || compare {
       // The reads are timed apart: the rest after a poll counts them once (design.md 5.13).
       let started = self.fs.ticks();
       let hashed = self.content_hash(path, kind, fingerprint.size);
@@ -522,7 +516,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         || match content {
           None => false,
           Some(Content::Hash(old)) => hash != Some(old),
-          Some(Content::Version(old)) => version != Some(old),
           Some(Content::Unknown) => !update_waits,
         }
     } else {
@@ -544,12 +537,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if node.is_held() {
       self.tree.unhold(key);
     }
-    let content = match (version, hash) {
-      _ if !young => None,
-      (Some(version), _) => Some(Content::Version(version)),
-      (None, Some(hash)) => Some(Content::Hash(hash)),
-      (None, None) => Some(Content::Unknown),
-    };
+    let content = young.then(|| hash.map_or(Content::Unknown, Content::Hash));
     self.tree.set_content(key, content);
   }
 

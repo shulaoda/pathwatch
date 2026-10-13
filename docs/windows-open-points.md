@@ -62,9 +62,10 @@ Then the two numbers in which the backend was far behind (`bench/BENCHMARK.md`):
     through another name. So the engine takes it only in a directory that an OS watch covers
     (`Fs::listing_lags`): there the close of the writer makes a record. A directory that is
     polled asks each file by itself, as before.
-- **The time from a write to its event.** A young file was opened and hashed, and on Windows
-  an open for reading waits for the virus scanner when the file was just written. The engine
-  takes the number that NTFS keeps for the file in its place (`Fs::version`, design 5.8).
+- **The time from a write to its event.** A young file is opened and hashed, and on Windows
+  an open for reading waits for the virus scanner when the file was just written (2 ms, and
+  14 ms for one in ten, measured). The number that NTFS keeps for each file stood in for the
+  hash for a while and was taken out again (design 5.8).
 
 And three more, from a look at where the time of a setup goes:
 

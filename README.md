@@ -184,10 +184,6 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   not checked. On Windows a write through a mapped view of a file that exists is not reported
   at all, as on Linux, also after the file is closed, and neither is a write through a handle
   that was opened by the index of the file (`OpenFileById`); polling finds the second.
-- **Windows: a second write of the same size by a writer that keeps the file open**, in the
-  same step of the clock of the time stamps (1 to 16 ms), is not found by a look: the disk
-  gives the file a new number only for its first write (measured on NTFS). It is reported
-  when Windows reports the write itself, and at the latest when the file is closed.
 - **With polling, a file that was just written is opened and read** (up to 16 MiB, at every
   round for 2 s after the write), on every OS, and so is a young file wherever only the poll
   looks at it. On Windows a program that opens it meanwhile and shares it with nobody is
