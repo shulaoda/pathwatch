@@ -44,6 +44,17 @@ pub(super) enum Found {
   Unknown,
 }
 
+/// What the disk says of the spelling of a name.
+enum Spelled {
+  /// As the node has it.
+  Same,
+  /// Under this other name.
+  Other(OsString),
+  /// Not now: the node goes, and the listing of its directory that this look queued brings
+  /// the name back, as it does every new entry.
+  Later,
+}
+
 /// What a listing of the directory said about a node whose check runs in a scan.
 #[derive(Clone, Copy)]
 pub(super) enum Listed {
@@ -138,7 +149,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     };
 
     push_name(path, self.tree.name(key));
-    let found = self.read_entry(parent, key, path, listed);
+    let found = self.read_entry(parent, key, path, listed, !followed);
     // An ignored watch target drops the paths below the name at the end of the flush, if the
     // directory is still there (design.md 5.11).
     if registered
@@ -285,8 +296,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Reads what is at the node and applies what counts: an entry that no watched path covers, or
-  /// that the filter ignores, is missing.
-  fn read_entry(&mut self, parent: DirKey, key: DirKey, path: &Path, listed: Listed) -> Found {
+  /// that the filter ignores, is missing. `may_wait`: a new name may wait for a listing of its
+  /// directory instead of asking the disk how it is spelled.
+  fn read_entry(
+    &mut self,
+    parent: DirKey,
+    key: DirKey,
+    path: &Path,
+    listed: Listed,
+    may_wait: bool,
+  ) -> Found {
     let node = &self.tree[key];
     let (registered, is_ancestor, is_path) =
       (node.is_registered(), node.is_ancestor(), node.is_path());
@@ -339,8 +358,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut relinked = false;
     if registered {
       if unsure {
-        other = match self.other_spelling(parent, key, path, &meta, is_new) {
-          Ok(other) => other,
+        other = match self.other_spelling(parent, key, path, &meta, is_new, false) {
+          Ok(Spelled::Same | Spelled::Later) => None,
+          Ok(Spelled::Other(name)) => Some(name),
           Err(error) => return self.disk_error(parent, path, error),
         };
       }
@@ -385,9 +405,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     };
     // Asked after the filter: an ignored entry costs no question.
     if !registered && unsure {
-      match self.other_spelling(parent, key, path, &meta, is_new) {
-        Ok(None) => {}
-        Ok(Some(name)) => return Found::OtherSpelling(name),
+      match self.other_spelling(parent, key, path, &meta, is_new, may_wait) {
+        Ok(Spelled::Same) => {}
+        Ok(Spelled::Other(name)) => return Found::OtherSpelling(name),
+        Ok(Spelled::Later) => return Found::Missing,
         Err(error) => return self.disk_error(parent, path, error),
       }
     }
@@ -428,7 +449,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     path: &Path,
     meta: &Meta,
     is_new: bool,
-  ) -> io::Result<Option<OsString>> {
+    may_wait: bool,
+  ) -> io::Result<Spelled> {
     let spelling = self.tree[parent].dir().map(|dir| dir.spelling);
     let can_be_strict = !self.options.loose_spelling;
     if can_be_strict && spelling != Some(Spelling::Loose) {
@@ -436,7 +458,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       match can_tell.then(|| self.tells_spellings_apart(path, meta)).flatten() {
         Some(true) => {
           self.set_spelling(parent, Spelling::Strict);
-          return Ok(None);
+          return Ok(Spelled::Same);
         }
         Some(false) => self.set_spelling(parent, Spelling::Loose),
         None if spelling == Some(Spelling::Unknown) => {
@@ -446,12 +468,27 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         None => {}
       }
     }
+    // A burst of new names in a loose directory: the disk is asked how it spells the first one
+    // (on Linux the question lists the directory), and one listing of the directory spells the
+    // others. Not inside a scan of the directory: it listed it, or it could not.
+    if may_wait
+      && is_new
+      && self.scanning != Some(parent)
+      && self.tree[parent].is_complete()
+      && self.tree.is_loose(parent)
+    {
+      if self.spelling_asked == Some(parent) {
+        self.tree.queue_scan(parent, Depth::Names);
+        return Ok(Spelled::Later);
+      }
+      self.spelling_asked = Some(parent);
+    }
     let name = self.fs.name_on_disk(path)?;
     let other = Some(name).filter(|name| name != self.tree.name(key));
     if can_be_strict && other.is_some() {
       self.set_spelling(parent, Spelling::Loose);
     }
-    Ok(other)
+    Ok(other.map_or(Spelled::Same, Spelled::Other))
   }
 
   /// Keeps what a look found out. A proof of strict that is taken back costs one listing: the

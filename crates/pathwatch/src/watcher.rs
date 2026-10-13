@@ -70,6 +70,9 @@ pub struct Watcher {
   /// Puts a command into the queue. A closure, since the raw type differs by backend. False: the
   /// thread is gone.
   send: Box<dyn Fn(Command) -> bool + Send + Sync>,
+  /// The commands from inside the handler: the thread takes them when the handler has returned,
+  /// before the next message of the queue.
+  inside: Sender<Command>,
   stop: Arc<AtomicBool>,
   /// `close` takes it out to wait for the thread.
   thread: Mutex<Option<JoinHandle<()>>>,
@@ -275,9 +278,9 @@ impl Watcher {
       }
     }
     if self.on_its_thread() {
-      // Inside the handler: the thread cannot wait for itself. It takes the command from the
-      // queue when the handler has returned.
-      if !(self.send)(command(usable, None)) {
+      // Inside the handler: the thread cannot wait for itself. It takes the command when the
+      // handler has returned.
+      if self.inside.send(command(usable, None)).is_err() {
         return Err(closed());
       }
     } else {
@@ -331,6 +334,7 @@ impl Watcher {
     H: FnMut(Result<Vec<Event>, Error>) + Send + 'static,
   {
     let (sender, receiver) = mpsc::channel::<Message<B::Raw>>();
+    let (inside, from_inside) = mpsc::channel::<Command>();
     let queue = Arc::new(Queue::default());
     let stop = Arc::new(AtomicBool::new(false));
     let sink = sink::<B>(sender.clone(), Arc::clone(&queue));
@@ -345,7 +349,7 @@ impl Watcher {
           Ok(backend) => {
             let mut engine = Engine::new(backend, StdFs, options);
             engine.stop_with(Arc::clone(&stop));
-            run(engine, handler, &receiver, &queue, &stop);
+            run(engine, handler, &receiver, &from_inside, &queue, &stop);
           }
           Err(error) => {
             // A limit says by itself what is missing and that the watcher polls.
@@ -358,7 +362,7 @@ impl Watcher {
             handler(Err(Error::new(kind, None, Some(error))));
             let mut engine = Engine::new(NoBackend::<B::Raw>(PhantomData), StdFs, fallback);
             engine.stop_with(Arc::clone(&stop));
-            run(engine, handler, &receiver, &queue, &stop);
+            run(engine, handler, &receiver, &from_inside, &queue, &stop);
           }
         }
       })
@@ -371,6 +375,7 @@ impl Watcher {
     Ok(Self {
       number,
       send: Box::new(move |command| sender.send(Message::Command(command)).is_ok()),
+      inside,
       stop,
       thread: Mutex::new(Some(thread)),
     })
@@ -438,6 +443,7 @@ fn run<B: Backend>(
   mut engine: Engine<B, StdFs>,
   mut handler: impl FnMut(Result<Vec<Event>, Error>),
   receiver: &Receiver<Message<B::Raw>>,
+  inside: &Receiver<Command>,
   queue: &Queue,
   stop: &AtomicBool,
 ) {
@@ -480,7 +486,7 @@ fn run<B: Backend>(
         Message::Command(Command::Stop) => return,
         Message::Wake => None,
       };
-      deliver(&mut out, &mut handler, stop);
+      deliver(&mut engine, &mut out, &mut handler, inside, stop);
       if let Some(done) = done {
         // The caller may be gone.
         let _ = done.send(());
@@ -501,25 +507,43 @@ fn run<B: Backend>(
     let now = Instant::now();
     if engine.deadline().is_some_and(|deadline| deadline <= now) {
       engine.tick(now, &mut out);
-      deliver(&mut out, &mut handler, stop);
+      deliver(&mut engine, &mut out, &mut handler, inside, stop);
     }
   }
 }
 
-/// Hands the output of the engine to the handler. After a `close` (the handler can call it)
-/// the handler is not called again.
-fn deliver(
+/// Hands the output of the engine to the handler, and does what the handler asked for on the
+/// way: a `watch` or `unwatch` from inside it takes effect when it has returned, before the
+/// next message of the queue. After a `close` (the handler can call it) the handler is not
+/// called again.
+fn deliver<B: Backend>(
+  engine: &mut Engine<B, StdFs>,
   out: &mut Output,
   handler: &mut impl FnMut(Result<Vec<Event>, Error>),
+  inside: &Receiver<Command>,
   stop: &AtomicBool,
 ) {
-  for error in out.errors.drain(..) {
-    if !stop.load(Ordering::Acquire) {
-      handler(Err(error));
+  loop {
+    for error in out.errors.drain(..) {
+      if !stop.load(Ordering::Acquire) {
+        handler(Err(error));
+      }
     }
-  }
-  if !out.events.is_empty() && !stop.load(Ordering::Acquire) {
-    handler(Ok(std::mem::take(&mut out.events)));
+    if !out.events.is_empty() && !stop.load(Ordering::Acquire) {
+      handler(Ok(std::mem::take(&mut out.events)));
+    }
+    let mut asked = false;
+    while let Ok(command) = inside.try_recv() {
+      asked = true;
+      match command {
+        Command::Watch(paths, _) => engine.watch(paths, Instant::now(), out),
+        Command::Unwatch(paths, _) => engine.unwatch(paths, Instant::now(), out),
+        Command::Stop => {}
+      }
+    }
+    if !asked || stop.load(Ordering::Acquire) {
+      return;
+    }
   }
 }
 

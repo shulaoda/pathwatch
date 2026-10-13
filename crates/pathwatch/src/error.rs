@@ -5,6 +5,12 @@ use std::{
 
 /// What went wrong. The handler gets one error of a kind for a batch, with one path that shows
 /// the problem, and the watcher keeps running after every error.
+///
+/// Its text is the kind, the path and the source in a row, each once. [`source`] gives the
+/// source once more, for code that looks at the error of the OS: a report that prints the text
+/// and then every source would say the last part twice.
+///
+/// [`source`]: std::error::Error::source
 #[derive(Debug)]
 pub struct Error {
   kind: ErrorKind,

@@ -23,6 +23,54 @@ fn loose() -> Options {
   Options { loose_spelling: true, ..Options::default() }
 }
 
+/// A burst of new names in a loose directory: the disk is asked how it spells the first one
+/// (on Linux the question lists the directory), and one listing of the directory spells the
+/// rest.
+#[test]
+fn a_burst_of_new_names_in_a_loose_directory_lists_it_once() {
+  let mut d = Driver::sim(Mode::Inode, Options::default());
+  d.fs.set_ignore_case(true);
+  d.fs.mkdir_all("/p/dir").unwrap();
+  d.fs.write("/p/dir/Old", "1").unwrap();
+  d.watch(&["/p/dir"]);
+  let before = d.fs.calls();
+  for n in 0..50 {
+    d.fs.write(format!("/p/dir/New{n}"), "1").unwrap();
+  }
+  let events = settled(&mut d);
+  assert_eq!(events.len(), 50, "{events:?}");
+  assert!(events.iter().all(|event| event.starts_with("C /p/dir/New")), "{events:?}");
+  let calls = d.fs.calls();
+  assert_eq!(calls.name_on_disk - before.name_on_disk, 1);
+  assert_eq!(calls.read_dir - before.read_dir, 1);
+  caught_up(&mut d);
+}
+
+/// The listing that the burst waits for cannot be made (the directory cannot be listed): the
+/// names after the first wait for the listing that can be, and the engine does not spin.
+#[test]
+fn a_burst_of_new_names_in_a_loose_directory_that_cannot_be_listed() {
+  let mut d = Driver::sim(Mode::Inode, Options::default());
+  d.fs.set_ignore_case(true);
+  d.fs.mkdir_all("/p/dir").unwrap();
+  d.fs.write("/p/dir/Old", "1").unwrap();
+  d.watch(&["/p/dir"]);
+  d.fs.set_unlistable("/p/dir", true).unwrap();
+  d.fs.write("/p/dir/New0", "1").unwrap();
+  d.fs.write("/p/dir/New1", "1").unwrap();
+  d.deliver(usize::MAX);
+  // The flush, the polls of the directory that cannot be listed: the engine comes back from
+  // each of them.
+  for _ in 0..20 {
+    d.step();
+  }
+  assert_eq!(taken(&mut d), ["C /p/dir/New0"]);
+  assert_eq!(d.errors.len(), 1);
+  d.fs.set_unlistable("/p/dir", false).unwrap();
+  assert_eq!(settled(&mut d), ["C /p/dir/New1"]);
+  caught_up(&mut d);
+}
+
 /// Thousands of names that are case variants of one name come and go inside one quiet time.
 /// Each node that goes hands the look on to its marked twins: from a list, not by a recursion
 /// as deep as there are twins.

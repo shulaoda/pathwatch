@@ -444,7 +444,11 @@ asks the disk for the name of that entry when
 
 A look is sure, and asks nothing, for a name that the listing of the running scan gave, and
 for an entry that the tree knows and that has no other spelling in the tree: the edit of a
-file that the tree knows costs what it costs on any disk.
+file that the tree knows costs what it costs on any disk. On Linux the question lists the
+directory (`name_on_disk`): so of a burst of new names that hints bring into a loose
+directory, the first one in a flush is asked of the disk, and the others go until one names
+scan of the directory, whose listing brings every new entry back, spelled. A name that a call
+registered is asked as before.
 
 When the disk spells the name in another way, the directory has no entry of this name.
 
@@ -741,6 +745,11 @@ Two guards:
 | is a whole second (the file system counts in seconds) | 2 s |
 | any, and only the poll looks at the file | 2 s |
 
+The clock is the clock of the watcher (`Fs::now`), not of the disk: a disk whose clock is
+behind it (a network disk) has no young files, and a second write of the same size inside one
+step of its time stamps is found only where the OS reports writes (README, "Holes"). A disk
+whose clock is ahead is the next case.
+
 **A time far ahead of the clock** (more than 2 s: the clock of another machine, a time that a
 tool set) never gets old by the clock. Such a file was young for ever: with polling, each
 round read every such file again (measured: 5 files of 4 MiB, 420 MiB read in 20 rounds). A
@@ -998,7 +1007,9 @@ is). A signal that would make it more is dropped and a flag is set, which the en
 lost notifications (`overflow`). The drop that sets the flag also sends one message that only
 wakes the thread, so the flag is read at once. Commands (`watch`, `unwatch`) are never dropped
 and not counted. The loop takes at most 512 messages, then does what is due, so a flood cannot
-hold back a flush.
+hold back a flush. A command from inside the handler goes a way of its own: the thread takes
+it when the handler has returned, before the next message of the queue, so what the handler
+asked for is in place before anything that came in meanwhile.
 
 **The debounce.** The disk is checked when no hint came for the quiet time: every hint that
 leaves work moves the flush to one quiet time after it. So a save in several steps is one
@@ -1028,8 +1039,12 @@ kind of work rests for `9 × t`. So about a tenth of the time goes into it at mo
   it is five seconds at most (`LONGEST_REST`): a round that read a burst of files written just
   before it put the next one off for minutes (measured: 500 files, 2 to 20 s; 100,000, 153 s).
 
-The time is the time of the looks at the disk. What the backend takes to make watches live
-(`commit`) is left out: it is paid once, not at every look.
+The time is the time of the looks at the disk, of the whole flush that the poll or the scans
+ran in: the checks that hints asked for in the same flush count with it. What the backend
+takes to make watches live (`commit`) is left out: it is paid once, not at every look. And a
+flush counts for a minute at most (`LONGEST_FLUSH`): the clock runs on while the machine
+sleeps, and a flush that the sleep fell into would rest for hours. So a round that really
+takes more than a minute rests nine minutes, not nine times its length.
 
 ### 5.14 Symbolic links
 

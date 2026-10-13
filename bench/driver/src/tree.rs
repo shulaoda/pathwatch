@@ -7,7 +7,8 @@ use std::{
 };
 
 /// A tree of `groups` directories, each with `dirs` directories, each with `files` files:
-/// `<root>/g03/d017/m4.js`.
+/// `<root>/group-003/directory-017/module-04.js`. Every name is longer than 8.3, so Windows
+/// gives each entry a short name too: a library that asks for short names pays for them.
 #[derive(Clone, Copy)]
 pub struct Shape {
   pub groups: usize,
@@ -30,7 +31,7 @@ impl Shape {
 
   #[must_use]
   pub fn group(root: &Path, group: usize) -> PathBuf {
-    root.join(format!("g{group:02}"))
+    root.join(format!("group-{group:03}"))
   }
 
   /// The paths of all files, in a fixed order. Nothing is made.
@@ -39,8 +40,8 @@ impl Shape {
     let mut paths = Vec::with_capacity(self.count());
     for group in 0..self.groups {
       for dir in 0..self.dirs {
-        let dir = Self::group(root, group).join(format!("d{dir:03}"));
-        paths.extend((0..self.files).map(|file| dir.join(format!("m{file}.js"))));
+        let dir = Self::group(root, group).join(format!("directory-{dir:03}"));
+        paths.extend((0..self.files).map(|file| dir.join(format!("module-{file:02}.js"))));
       }
     }
     paths

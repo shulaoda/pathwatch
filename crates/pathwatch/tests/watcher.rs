@@ -815,6 +815,63 @@ fn a_dropped_signal_wakes_the_thread() {
   assert_eq!(batch.unwrap(), [Event { path, kind: EventKind::Create }]);
 }
 
+/// A `watch` from inside the handler takes effect when the handler has returned, before the
+/// messages that came into the queue meanwhile.
+#[test]
+fn a_watch_inside_the_handler_comes_before_the_queue() {
+  let dir = tempfile::tempdir().unwrap();
+  let other = tempfile::tempdir().unwrap();
+  fs::write(other.path().join("old.txt"), "1").unwrap();
+  let (entered, enter) = mpsc::channel();
+  let (open, gate) = mpsc::channel::<()>();
+  let (sender, results) = mpsc::channel();
+  let (sink_out, sink_in) = mpsc::channel::<Sink<Vec<u8>>>();
+  let (in_handler, handler_waits) = mpsc::channel::<()>();
+  let (go, may_go) = mpsc::channel::<()>();
+  let slot: Arc<OnceLock<Watcher>> = Arc::default();
+  let backend = Silent { polled: true, translated: Arc::default(), entered, gate };
+  let watcher = {
+    let (slot, other) = (Arc::clone(&slot), other.path().to_owned());
+    Watcher::with_backend(
+      quick(),
+      move |result: Result<Vec<Event>, Error>| {
+        let events = result.unwrap();
+        if events.iter().any(|event| event.path.ends_with("a.txt")) {
+          in_handler.send(()).unwrap();
+          may_go.recv().unwrap();
+          slot.get().expect("the slot is filled").watch(&other).unwrap();
+        }
+        let _ = sender.send(events);
+      },
+      move |sink| {
+        sink_out.send(sink).unwrap();
+        Ok(backend)
+      },
+    )
+    .unwrap()
+  };
+  let sink = sink_in.recv().unwrap();
+  watcher.watch(dir.path()).unwrap();
+  assert!(slot.set(watcher).is_ok());
+
+  fs::write(dir.path().join("a.txt"), "1").unwrap();
+  handler_waits.recv_timeout(PATIENCE).expect("the handler runs");
+  // Two notifications come into the queue while the handler runs; each holds the thread.
+  sink.raw(vec![1]);
+  sink.raw(vec![1]);
+  go.send(()).unwrap();
+  // The thread holds at the first one: the watch of `other` is done by then, or it waits
+  // behind them, and the file written now would be in its baseline.
+  enter.recv_timeout(PATIENCE).expect("the thread took the first notification");
+  let path = other.path().join("new.txt");
+  fs::write(&path, "1").unwrap();
+  open.send(()).unwrap();
+  enter.recv_timeout(PATIENCE).expect("the thread took the second notification");
+  open.send(()).unwrap();
+  let created = Event { path, kind: EventKind::Create };
+  while !results.recv_timeout(PATIENCE).expect("the new file is reported").contains(&created) {}
+}
+
 /// The delete delay is a setting: with zero, a file that is removed and written again is a
 /// `Delete` and a `Create`, not one `Update`.
 #[test]

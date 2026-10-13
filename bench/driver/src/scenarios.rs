@@ -154,12 +154,12 @@ fn s2(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
   session.quiet("quiet", settings.quiet);
   session.single_edits("single edits", &spread(&files, settings.size(200, 10)), PATIENCE);
 
-  // New files in new directories, spread over the groups: `g03/new017/m4.js`.
+  // New files in new directories, spread over the groups: `group-003/new-directory-017/module-04.js`.
   let new_dirs = settings.size(500, 5);
   let new_files: Vec<PathBuf> = (0..new_dirs)
     .flat_map(|dir| {
-      let dir = Shape::group(&project, dir % shape.groups).join(format!("new{dir:03}"));
-      (0..10).map(move |file| dir.join(format!("m{file}.js")))
+      let dir = Shape::group(&project, dir % shape.groups).join(format!("new-directory-{dir:03}"));
+      (0..10).map(move |file| dir.join(format!("module-{file:02}.js")))
     })
     .collect();
   session.burst("new files in new directories", &new_files, || write_all(&new_files));
@@ -270,11 +270,11 @@ pub fn write_noise(dir: &Path, files: usize) {
       if STOP.load(Ordering::Relaxed) {
         break 'all;
       }
-      let dir = dir.join(format!("n{:04}", file / 100));
+      let dir = dir.join(format!("noise-{:04}", file / 100));
       if file % 100 == 0 {
         let _ = fs::create_dir_all(&dir);
       }
-      let _ = write(&dir.join(format!("f{:02}.txt", file % 100)));
+      let _ = write(&dir.join(format!("noise-file-{:02}.txt", file % 100)));
       writes += 1;
     }
   }
@@ -378,7 +378,7 @@ fn s7(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
   let named = |name: &str, count: usize| -> Vec<PathBuf> {
     (0..count).map(|file| project.join(format!("{name}{file:05}.js"))).collect()
   };
-  let files = named("m", settings.size(20_000, 500));
+  let files = named("module-", settings.size(20_000, 500));
   write_all(&files).expect("the tree can be made");
   sizes(&mut run, &[("files", files.len()), ("dirs", 1), ("watched", 1)]);
   thread::sleep(SETTLE);
@@ -390,8 +390,8 @@ fn s7(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
   };
   session.single_edits("first edit, right after ready", &files[..1], PATIENCE);
   session.single_edits("single edits", &spread(&files, settings.size(100, 10)), PATIENCE);
-  session.single_edits("single new files", &named("new", settings.size(100, 10)), PATIENCE);
-  let burst = named("burst", settings.size(2000, 50));
+  session.single_edits("single new files", &named("new-file-", settings.size(100, 10)), PATIENCE);
+  let burst = named("burst-file-", settings.size(2000, 50));
   session.burst("burst of new files", &burst, || write_all(&burst));
   let removed = spread(&files[1..], settings.size(100, 10));
   session.single_changes("single files removed", &removed, PATIENCE, |file| fs::remove_file(file));

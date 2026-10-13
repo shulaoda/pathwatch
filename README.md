@@ -210,6 +210,10 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   reported.
 - **A rewrite of the same size that puts the old modification time back** is not reported on
   macOS and with polling. Linux reports it.
+- **A disk whose clock is behind the clock of the watcher** (a network disk, a shared folder
+  of a VM) has no young files: a file written just now looks old by the time of the watcher.
+  A second write of the same size inside one step of the time stamps of that disk is not
+  found by a look there; the OS reports it where it reports writes (Linux, Windows).
 - **A mount over a watched directory** is not noticed until something else makes the watcher
   look there.
 - **A path longer than the OS allows** gets no events: `watch` takes it, the handler is told
