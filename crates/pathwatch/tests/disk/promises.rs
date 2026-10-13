@@ -37,8 +37,8 @@
 //!     on Windows also `a_watched_path_with_a_short_name`.
 
 use std::{
-  env, fs,
-  path::{Component, Path, PathBuf},
+  fs,
+  path::{Path, PathBuf},
   sync::{Arc, Mutex, mpsc::RecvTimeoutError},
   time::{Duration, Instant, SystemTime},
 };
@@ -50,7 +50,8 @@ use pathwatch::{
 };
 
 use crate::{
-  Inside, PATIENCE, each, each_backend, each_backend_inside, each_backend_with, symlink,
+  Inside, PATIENCE, each, each_backend, each_backend_inside, each_backend_with, relative_scratch,
+  symlink,
 };
 
 #[cfg(unix)]
@@ -185,8 +186,10 @@ fn a_missing_chain_that_appears_at_once_is_reported_promptly() {
       w.wait(&each(Create, &files[..=chain]));
     }
     let took = start.elapsed();
-    // With the poll, every chain takes a second.
-    assert!(took < Duration::from_secs(5), "{}: {CHAINS} chains took {took:?}", w.backend);
+    // The poll of the missing places runs once a second: the chains in turn would take ten. A
+    // watcher that only polls rests after a slow round (design.md 5.13): no bound for it.
+    let bounded = w.backend == "native";
+    assert!(!bounded || took < Duration::from_secs(5), "{CHAINS} chains took {took:?}");
     w.expect(&each(Create, &files));
   });
 }
@@ -256,22 +259,9 @@ fn unwatch_keeps_what_another_watched_path_covers() {
 #[test]
 fn a_relative_path_with_dot_dot() {
   each_backend(|w| {
-    let here = env::current_dir().unwrap();
-    // On Windows the temporary directory can be on another drive, and no relative path leads
-    // there. The directory of the build is on the drive of the current directory, unless
-    // `CARGO_TARGET_DIR` says otherwise.
-    if here.components().next() != w.path("").components().next() {
-      w.dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    }
-    let dir = w.path("");
-    if here.components().next() != dir.components().next() {
-      return;
-    }
     // From the current directory up to the root, and down to the temporary directory.
-    let is_name = |part: &Component| matches!(part, Component::Normal(_));
-    let mut rel: PathBuf =
-      here.components().filter(is_name).map(|_| Component::ParentDir).collect();
-    rel.extend(dir.components().filter(is_name));
+    let (dir, rel) = relative_scratch();
+    w.dir = dir;
     assert!(rel.is_relative());
 
     w.watcher.watch(rel.join("a.txt")).unwrap();

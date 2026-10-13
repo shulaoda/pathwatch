@@ -384,7 +384,7 @@ The fuzzer (`crates/pathwatch_sim/tests/fuzz.rs`):
 # The quick run: 250 seeds for each backend. It is a part of `cargo test --workspace`.
 cargo test -p pathwatch_sim --test fuzz
 
-# The long run, with a range of seeds of your choice.
+# The long run, with a range of seeds of your choice. CI runs it on the seeds of the day.
 PATHWATCH_FUZZ_FIRST=100000 PATHWATCH_FUZZ_SEEDS=20000 \
   cargo test --release -p pathwatch_sim --test fuzz big -- --ignored
 

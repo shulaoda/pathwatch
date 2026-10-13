@@ -1,29 +1,14 @@
 //! The behavior contract: one test for each row S1 to S14 of the table in `docs/design.md`.
 //! `r` is the watched path.
 
-use std::{
-  sync::{Arc, mpsc},
-  time::Duration,
-};
+use std::time::{Duration, SystemTime};
 
-// The backend for the watch API of this system.
-#[cfg(target_os = "macos")]
-use pathwatch::fsevents::FsEventsBackend as Native;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use pathwatch::inotify::InotifyBackend as Native;
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
-use pathwatch::poll::PollBackend as Native;
-#[cfg(windows)]
-use pathwatch::windows::WindowsBackend as Native;
 use pathwatch::{
   Config, EntryKind,
   EventKind::{Create, Delete, Update},
-  Watcher,
-  engine::Options,
-  poll::PollBackend,
 };
 
-use crate::{POLL_INTERVAL, Watch, backend_name, each_backend, each_backend_with, side_by_side};
+use crate::{each_backend, each_backend_with};
 
 #[test]
 fn s1_a_write_in_place() {
@@ -36,6 +21,34 @@ fn s1_a_write_in_place() {
     // The same size, and most likely the same time stamp.
     w.write("r.txt", "33");
     w.expect(&[(Update, "r.txt")]);
+  });
+}
+
+/// A write that keeps the time stamp and the size, as inside one step of a coarse clock: a
+/// young file is read, so every backend finds it. An old one is found where the OS reports the
+/// write itself (not FSEvents, not the poll: README, "Holes").
+#[test]
+fn s1_a_write_in_place_that_keeps_the_time_and_the_size() {
+  each_backend(|w| {
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    let whole = SystemTime::UNIX_EPOCH + Duration::from_secs(now.as_secs() + 1);
+    let old = whole - Duration::from_secs(3600);
+    w.write("r.txt", "1");
+    w.set_modified("r.txt", whole);
+    w.watch(&["r.txt"]);
+
+    w.write("r.txt", "2");
+    w.set_modified("r.txt", whole);
+    w.expect(&[(Update, "r.txt")]);
+
+    w.write("r.txt", "3");
+    w.set_modified("r.txt", old);
+    w.expect(&[(Update, "r.txt")]);
+    if w.backend == "native" && !cfg!(target_os = "macos") {
+      w.write("r.txt", "4");
+      w.set_modified("r.txt", old);
+      w.expect(&[(Update, "r.txt")]);
+    }
   });
 }
 
@@ -68,41 +81,16 @@ fn s3_deleted_and_created_again() {
 
 #[test]
 fn s3_deleted_and_created_again_inside_the_delete_delay() {
-  // A delay of 100 ms is too short for a slow machine, and no public setting changes it: the
-  // watchers are built by hand.
+  // A delay of 100 ms is too short for a slow machine.
   const DELETE_DELAY: Duration = Duration::from_secs(2);
 
-  side_by_side(|polling| {
-    let options = Options {
-      debounce: Duration::from_millis(50),
-      delete_delay: DELETE_DELAY,
-      poll_interval: if polling { POLL_INTERVAL } else { Duration::from_secs(1) },
-      loose_spelling: cfg!(any(target_vendor = "apple", windows)),
-      ..Options::default()
-    };
-    let (sender, results) = mpsc::channel();
-    let handler = move |result| {
-      // The test may be over already.
-      let _ = sender.send(result);
-    };
-    let watcher = if polling {
-      Watcher::with_backend(options, handler, PollBackend::new)
-    } else {
-      Watcher::with_backend(options, handler, Native::new)
-    };
-    let mut w = Watch {
-      watcher: Arc::new(watcher.unwrap()),
-      results,
-      dir: tempfile::tempdir().unwrap(),
-      events: Vec::new(),
-      passing: Vec::new(),
-      backend: backend_name(polling),
-    };
-
+  each_backend_with(&Config::default().with_delete_delay(DELETE_DELAY), |w| {
     w.write("r.txt", "1");
     w.watch(&["r.txt"]);
 
     w.remove("r.txt");
+    // The watcher saw the file gone before it is back.
+    w.sync();
     w.write("r.txt", "1");
     w.expect(&[(Update, "r.txt")]);
     // A `Delete` that still waited would come when the delay is over.

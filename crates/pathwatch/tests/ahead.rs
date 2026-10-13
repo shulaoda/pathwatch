@@ -56,6 +56,12 @@ impl Fs for Counted {
     StdFs.now()
   }
 
+  /// The looks take no time on this clock: no rest after a slow poll moves the next one past
+  /// the step of the test.
+  fn ticks(&self) -> Duration {
+    Duration::ZERO
+  }
+
   fn listing_lags(&self) -> bool {
     StdFs.listing_lags()
   }

@@ -3,7 +3,7 @@
 use std::{
   collections::BTreeSet,
   env, fs, io,
-  path::{Path, PathBuf},
+  path::{Component, Path, PathBuf},
   sync::{
     Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
@@ -52,6 +52,20 @@ struct Watch {
 
 fn watch() -> Watch {
   watch_in(tempfile::tempdir().unwrap())
+}
+
+/// A temporary directory and a relative path to it from the current directory: in the target
+/// directory, or in the current one when the target is on another drive (Windows).
+fn relative_scratch() -> (TempDir, PathBuf) {
+  let here = env::current_dir().unwrap();
+  let mut dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+  if here.components().next() != dir.path().components().next() {
+    dir = tempfile::tempdir_in(&here).unwrap();
+  }
+  let is_name = |part: &Component| matches!(part, Component::Normal(_));
+  let mut rel: PathBuf = here.components().filter(is_name).map(|_| Component::ParentDir).collect();
+  rel.extend(dir.path().components().filter(is_name));
+  (dir, rel)
 }
 
 fn watch_in(dir: TempDir) -> Watch {
@@ -222,8 +236,10 @@ fn with_handler(
   slot
 }
 
-/// Watches everything, hints nothing. A raw notification with no bytes holds the watcher thread.
+/// Hints nothing: it watches everything, or nothing, so that the poll looks. A raw notification
+/// of one byte holds the watcher thread; every other one is counted.
 struct Silent {
+  polled: bool,
   translated: Arc<AtomicUsize>,
   entered: Sender<()>,
   gate: Receiver<()>,
@@ -233,13 +249,13 @@ impl Backend for Silent {
   type Raw = Vec<u8>;
 
   fn watch(&mut self, _key: DirKey, _dir: &Path, _want: Want) -> Coverage {
-    Coverage::Watched
+    if self.polled { Coverage::NotWatched } else { Coverage::Watched }
   }
 
   fn unwatch(&mut self, _key: DirKey) {}
 
   fn translate(&mut self, raw: Self::Raw, _hint: &mut dyn FnMut(Hint<'_>)) {
-    if raw.is_empty() {
+    if raw == [1] {
       self.entered.send(()).unwrap();
       self.gate.recv().unwrap();
     } else {
@@ -320,9 +336,8 @@ fn unwatch_takes_a_watch_back() {
 /// The event path is absolute: joined to the current directory.
 #[test]
 fn a_relative_path() {
-  let here = env::current_dir().unwrap();
-  let mut w = watch_in(tempfile::tempdir_in(&here).unwrap());
-  let rel = w.dir.path().strip_prefix(&here).unwrap().to_path_buf();
+  let (dir, rel) = relative_scratch();
+  let mut w = watch_in(dir);
   assert!(rel.is_relative());
   w.watcher.watch(rel.join("a.txt")).unwrap();
   w.watcher.watch(Path::new(".").join(&rel).join("b.txt")).unwrap();
@@ -637,7 +652,7 @@ fn the_queue_is_bounded_by_bytes() {
   let (open, gate) = mpsc::channel::<()>();
   let (sender, results) = mpsc::channel();
   let (sink_out, sink_in) = mpsc::channel::<Sink<Vec<u8>>>();
-  let backend = Silent { translated: Arc::clone(&translated), entered, gate };
+  let backend = Silent { polled: false, translated: Arc::clone(&translated), entered, gate };
   let watcher = Watcher::with_backend(
     quick(),
     move |result: Result<Vec<Event>, Error>| {
@@ -653,7 +668,7 @@ fn the_queue_is_bounded_by_bytes() {
   watcher.watch(dir.path()).unwrap();
   // Holds the watcher thread, lets `while_held` run, then lets the thread go.
   let hold = |while_held: &dyn Fn()| {
-    sink.raw(Vec::new());
+    sink.raw(vec![1]);
     enter.recv_timeout(PATIENCE).expect("the watcher thread took the empty notification");
     while_held();
     open.send(()).unwrap();
@@ -690,19 +705,82 @@ fn the_queue_is_bounded_by_bytes() {
   wait_for(100_015);
   assert_eq!(translated.load(Ordering::Relaxed), 100_015);
 
+  // The queue is filled to the last byte: a message with no bytes of its own fits as long as
+  // any message does. So the word that the backend died is dropped too, and kept all the same.
   hold(&|| {
     flood(20, MIB);
+    flood(100_000, 0);
     sink.failed(io::Error::other("the backend thread stopped"));
   });
   loop {
     match results.recv_timeout(PATIENCE).expect("the error comes") {
-      Err(error) if error.kind() == ErrorKind::Io => break,
+      Err(error) if error.kind() == ErrorKind::Io => {
+        assert!(error.to_string().contains("the backend thread stopped"), "{error}");
+        break;
+      }
       _ => {}
     }
   }
   // The backend held the other end of this channel.
   assert_eq!(enter.recv_timeout(PATIENCE), Err(RecvTimeoutError::Disconnected));
+  let total = translated.load(Ordering::Relaxed);
+  assert!(total > 100_030 && total < 200_030, "{total}: not every empty message fits");
   drop(watcher);
+}
+
+/// A flood of notifications does not starve the engine: after 512 messages the thread does what
+/// is due before it takes the next one.
+#[test]
+fn a_turn_takes_at_most_512_messages() {
+  const TURN: usize = 512;
+  const FLOOD: usize = 600;
+
+  let dir = tempfile::tempdir().unwrap();
+  let (entered, enter) = mpsc::channel();
+  let (open, gate) = mpsc::channel::<()>();
+  let (sender, results) = mpsc::channel();
+  let (sink_out, sink_in) = mpsc::channel::<Sink<Vec<u8>>>();
+  let backend = Silent { polled: true, translated: Arc::default(), entered, gate };
+  let watcher = Watcher::with_backend(
+    quick(),
+    move |result: Result<Vec<Event>, Error>| {
+      let _ = sender.send(result);
+    },
+    move |sink| {
+      sink_out.send(sink).unwrap();
+      Ok(backend)
+    },
+  )
+  .unwrap();
+  // Dropped before the watcher: a failed test ends the held thread instead of waiting for it.
+  let open = open;
+  let sink = sink_in.recv().unwrap();
+  watcher.watch(dir.path()).unwrap();
+
+  // Each one holds the thread until the test lets it go on.
+  for _ in 0..FLOOD {
+    sink.raw(vec![1]);
+  }
+  let pass = || {
+    enter.recv_timeout(PATIENCE).expect("the watcher thread took the next notification");
+    open.send(()).unwrap();
+  };
+  // Nothing hints at this file: the poll finds it, which comes due while the first
+  // notification holds the thread.
+  let path = dir.path().join("a.txt");
+  fs::write(&path, "1").unwrap();
+  enter.recv_timeout(PATIENCE).expect("the watcher thread took the first notification");
+  thread::sleep(quick().poll_interval * 4);
+  open.send(()).unwrap();
+  for _ in 1..TURN {
+    pass();
+  }
+  // The next notification waits: the poll runs first.
+  let batch = results.recv_timeout(PATIENCE).expect("the poll runs between two turns");
+  assert_eq!(batch.unwrap(), [Event { path, kind: EventKind::Create }]);
+  for _ in TURN..FLOOD {
+    pass();
+  }
 }
 
 #[test]
@@ -712,7 +790,7 @@ fn a_dropped_signal_wakes_the_thread() {
   let (_open, gate) = mpsc::channel::<()>();
   let (sender, results) = mpsc::channel();
   let (sink_out, sink_in) = mpsc::channel::<Sink<Vec<u8>>>();
-  let backend = Silent { translated: Arc::default(), entered, gate };
+  let backend = Silent { polled: false, translated: Arc::default(), entered, gate };
   let watcher = Watcher::with_backend(
     // Nothing else wakes the thread: the next poll is an hour away.
     Options { poll_interval: Duration::from_secs(3600), ..quick() },

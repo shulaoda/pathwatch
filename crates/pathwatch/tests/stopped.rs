@@ -31,6 +31,13 @@ fn a_stopped_backend_is_polled_at_the_interval_of_the_settings() {
   assert!(first_poll >= start + hour && first_poll < start + hour + Duration::from_secs(1));
 
   engine.signal(Signal::Failed(io::Error::other("gone")), start);
+  // The loss is reported, and everything is looked at once: that is no poll.
+  let looked = engine.deadline().expect("the look is due");
+  engine.tick(looked, &mut out);
+  assert_eq!(out.errors.len(), 1);
+  assert_eq!(out.errors[0].kind(), ErrorKind::Io);
+  assert!(out.events.is_empty(), "{:?}", out.events);
+
   fs::write(dir.path().join("a.txt"), "1").unwrap();
   // No backend tells of the file: only a poll finds it.
   while out.events.is_empty() {
@@ -38,8 +45,6 @@ fn a_stopped_backend_is_polled_at_the_interval_of_the_settings() {
     assert!(now < start + Duration::from_secs(1), "no poll came in a second");
     engine.tick(now, &mut out);
   }
-  assert_eq!(out.errors.len(), 1);
-  assert_eq!(out.errors[0].kind(), ErrorKind::Io);
   assert_eq!(out.events.len(), 1);
   assert_eq!(
     (out.events[0].kind, &out.events[0].path),

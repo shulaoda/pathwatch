@@ -1458,6 +1458,8 @@ struct Failure {
 
 thread_local! {
   static QUIET_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// Where the last caught panic was raised: a panic that is no rule of this file says so.
+  static PANIC_AT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 /// A failing run panics, and cutting it down panics hundreds of times. Those panics are caught
@@ -1467,7 +1469,10 @@ fn silence_caught_panics() {
   HOOK.call_once(|| {
     let default = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
-      if !QUIET_PANICS.get() {
+      if QUIET_PANICS.get() {
+        let at = info.location().map(|at| format!("{}:{}", at.file(), at.line()));
+        PANIC_AT.set(at.unwrap_or_default());
+      } else {
         default(info);
       }
     }));
@@ -1506,9 +1511,9 @@ fn play(config: &Config, ops: &[Op]) -> Result<(), Failure> {
       .cloned()
       .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
       .unwrap_or_else(|| "a panic without a message".to_owned());
-    let tag = match message.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
-      Some((tag, _)) => tag.to_owned(),
-      None => "panic".to_owned(),
+    let (tag, message) = match message.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
+      Some((tag, _)) => (tag.to_owned(), message),
+      None => ("panic".to_owned(), format!("{message} (at {})", PANIC_AT.take())),
     };
     let trace = lock(&shared.trace).clone();
     Failure { tag, message, trace, reached: shared.reached.load(Ordering::Relaxed) }
@@ -1566,7 +1571,8 @@ fn report(seed: u64, config: &Config, mut ops: Vec<Op>, failure: &Failure) -> St
 }
 
 fn number(name: &str) -> Option<u64> {
-  std::env::var(name).ok().and_then(|value| value.parse().ok())
+  let value = std::env::var(name).ok()?;
+  Some(value.parse().unwrap_or_else(|_| panic!("{name}={value:?} is no number")))
 }
 
 /// Runs `seeds` seeds from `first` on. The first failure is cut down and reported.

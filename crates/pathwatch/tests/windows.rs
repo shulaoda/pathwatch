@@ -457,6 +457,11 @@ fn drop_ends_the_thread() {
     let coverage = backend.watch(DirKey::new(n, 0), &dir, Want::Contents);
     assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
   }
+  // The handles open at the commit.
+  backend.commit();
+  for n in 0..4 {
+    assert!(backend.serves(DirKey::new(n, 0)), "{n}");
+  }
 
   drop(backend);
   // The thread owned the only other copy of the sink.

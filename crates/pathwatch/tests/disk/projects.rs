@@ -1,9 +1,8 @@
 //! What editors, package managers and big projects do.
 
 use std::{
-  collections::BTreeSet,
+  collections::{BTreeMap, BTreeSet},
   fs,
-  path::{Path, PathBuf},
   time::{Duration, Instant},
 };
 
@@ -12,7 +11,12 @@ use pathwatch::{
   EventKind::{Create, Delete, Update},
 };
 
-use crate::{Watch, each, each_backend, each_backend_with, symlink};
+use crate::{Watch, each, each_backend, each_backend_with, files_at, symlink};
+
+/// A delete delay that the changes of a test fit into on a slow machine.
+fn slow_delete() -> Config {
+  Config::default().with_delete_delay(Duration::from_secs(2))
+}
 
 /// A fixed sequence of numbers, so that a test picks the same things in every run.
 struct Random(u64);
@@ -25,7 +29,8 @@ impl Random {
 }
 
 /// One change at a random place. Many fail (the place is missing, or a file is in the way).
-fn random_change(w: &Watch, random: &mut Random) {
+/// A write puts `serial` into the file: its own content.
+fn random_change(w: &Watch, random: &mut Random, serial: usize) {
   let kind = random.below(10);
   let mut place = |least: usize| {
     let mut path = w.path(["r", "r", "r", "alone", "outside"][random.below(5)]);
@@ -38,7 +43,7 @@ fn random_change(w: &Watch, random: &mut Random) {
     0..4 => {
       let file = place(1);
       let _ = fs::create_dir_all(file.parent().unwrap());
-      let _ = fs::write(file, "1");
+      let _ = fs::write(file, serial.to_string());
     }
     4 => drop(fs::create_dir_all(place(1))),
     5 | 6 => {
@@ -46,17 +51,6 @@ fn random_change(w: &Watch, random: &mut Random) {
       let _ = if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
     }
     _ => drop(fs::rename(place(0), place(0))),
-  }
-}
-
-/// Puts into `files` what a watched path at `path` stands for.
-fn files_at(path: &Path, files: &mut BTreeSet<PathBuf>) {
-  if path.is_file() {
-    files.insert(path.to_path_buf());
-  } else if let Ok(entries) = fs::read_dir(path) {
-    for entry in entries {
-      files_at(&entry.unwrap().path(), files);
-    }
   }
 }
 
@@ -129,7 +123,7 @@ fn a_big_tree_is_moved_in_and_out() {
 /// The same directory comes back, with other content.
 #[test]
 fn a_directory_is_moved_away_changed_and_moved_back() {
-  each_backend(|w| {
+  each_backend_with(&slow_delete(), |w| {
     w.write("r/sub/stays.txt", "1");
     w.write("r/sub/goes.txt", "1");
     w.write("r/sub/deep/changes.txt", "1");
@@ -152,7 +146,7 @@ fn a_directory_is_moved_away_changed_and_moved_back() {
 /// A watch of macOS stands below the renamed directory and hears nothing about the renames.
 #[test]
 fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
-  each_backend(|w| {
+  each_backend_with(&slow_delete(), |w| {
     w.write("r/x/a/changes.js", "1");
     w.write("r/x/a/goes.js", "1");
     // Windows refuses to rename a directory above an open directory handle.
@@ -177,7 +171,7 @@ fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
 /// The renamed directory is on the real path behind the link, where the watch of macOS stands.
 #[test]
 fn a_directory_above_the_target_of_a_link_is_moved_away_changed_and_moved_back() {
-  each_backend(|w| {
+  each_backend_with(&slow_delete(), |w| {
     w.write("store/x/real/changes.js", "1");
     w.write("store/x/real/goes.js", "1");
     w.mkdir("r");
@@ -344,9 +338,11 @@ fn watched_paths_below_a_symlinked_prefix() {
 }
 
 /// Whatever the events are, each fits what the handler knows, and in the end it knows exactly
-/// the files on the disk.
+/// the files on the disk, with their content.
 #[test]
 fn random_changes_end_in_the_state_of_the_disk() {
+  const CHANGES: usize = 150;
+
   each_backend(|w| {
     w.mkdir("r");
     w.mkdir("outside");
@@ -354,12 +350,12 @@ fn random_changes_end_in_the_state_of_the_disk() {
     w.watch(&watched);
 
     let mut random = Random(2);
-    let mut known = BTreeSet::new();
-    for _round in 0..5 {
-      for _change in 0..150 {
-        random_change(w, &mut random);
+    let mut known = BTreeMap::new();
+    for round in 0..5 {
+      for change in 0..CHANGES {
+        random_change(w, &mut random, round * CHANGES + change);
       }
-      let mut on_disk = BTreeSet::new();
+      let mut on_disk = BTreeMap::new();
       for path in watched {
         files_at(&w.path(path), &mut on_disk);
       }

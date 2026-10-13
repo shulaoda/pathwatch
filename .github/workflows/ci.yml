@@ -62,9 +62,10 @@ jobs:
         run: cargo test -p pathwatch --test fsevents -- --ignored failed_start
       - if: runner.os == 'Linux'
         run: unshare -Ur sh -c 'echo 8 > /proc/sys/user/max_inotify_watches && cargo test -p pathwatch --test inotify -- --ignored'
-      # The engine as a release build runs it: the quick fuzz, once without the debug checks.
+      # The big fuzz runs on seeds of the day, as a release build: new seeds every day, and the
+      # engine once without the debug checks. A failure names its seed.
       - if: runner.os == 'Linux'
-        run: cargo test --release -p pathwatch_sim --test fuzz
+        run: PATHWATCH_FUZZ_FIRST=$(( $(date +%s) / 86400 * 100000 )) cargo test --release -p pathwatch_sim --test fuzz big -- --ignored
 
   # The targets that no runner has: the crate and its tests are linted for each of them.
   targets:

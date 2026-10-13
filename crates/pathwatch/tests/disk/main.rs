@@ -7,14 +7,14 @@ mod promises;
 
 use std::{
   collections::{BTreeMap, BTreeSet},
-  fs,
-  path::{Path, PathBuf},
+  env, fs,
+  path::{Component, Path, PathBuf},
   sync::{
     Arc, Weak,
     mpsc::{self, Receiver, RecvTimeoutError},
   },
   thread,
-  time::{Duration, Instant},
+  time::{Duration, Instant, SystemTime},
 };
 
 use pathwatch::{Config, Error, Event, EventKind, Watcher};
@@ -63,6 +63,20 @@ fn backend_name(polling: bool) -> &'static str {
   if polling { "polling" } else { "native" }
 }
 
+/// A temporary directory and a relative path to it from the current directory: in the target
+/// directory, or in the current one when the target is on another drive (Windows).
+fn relative_scratch() -> (TempDir, PathBuf) {
+  let here = env::current_dir().unwrap();
+  let mut dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+  if here.components().next() != dir.path().components().next() {
+    dir = tempfile::tempdir_in(&here).unwrap();
+  }
+  let is_name = |part: &Component| matches!(part, Component::Normal(_));
+  let mut rel: PathBuf = here.components().filter(is_name).map(|_| Component::ParentDir).collect();
+  rel.extend(dir.path().components().filter(is_name));
+  (dir, rel)
+}
+
 /// Makes a symbolic link at `link` to `target`, to a directory or to a file as the target is.
 /// `false`: this user may not make one (Windows without the developer mode), so the test has
 /// nothing to check.
@@ -91,11 +105,16 @@ fn symlink(target: &Path, link: &Path) -> bool {
 }
 
 struct Watch {
-  // Dropped before `dir`, so the removal of the directory is not watched.
+  // Dropped before the directories, so their removal is not watched.
   watcher: Arc<Watcher>,
   results: Receiver<Result<Vec<Event>, Error>>,
   /// Not made canonical: on macOS it lies behind a link, and event paths must be the given ones.
   dir: TempDir,
+  /// A directory of its own for the markers of `sync`, watched from the start.
+  markers: TempDir,
+  /// The number of the last marker written, and of the last one reported.
+  written: usize,
+  reported: usize,
   /// The events since the last `expect`.
   events: Vec<Event>,
   /// The paths of `may_pass`.
@@ -105,6 +124,40 @@ struct Watch {
 
 /// The events of each path, in the order in which they came.
 type History = BTreeMap<PathBuf, Vec<EventKind>>;
+
+/// Files with their content.
+type Files = BTreeMap<PathBuf, Vec<u8>>;
+
+/// What a handler reads at the path: nothing for a path that is gone or a directory.
+fn content(path: &Path) -> Vec<u8> {
+  fs::read(path).unwrap_or_default()
+}
+
+/// Puts into `files` what a watched path at `path` stands for.
+fn files_at(path: &Path, files: &mut Files) {
+  if path.is_file() {
+    files.insert(path.to_path_buf(), content(path));
+  } else if let Ok(entries) = fs::read_dir(path) {
+    for entry in entries {
+      files_at(&entry.unwrap().path(), files);
+    }
+  }
+}
+
+fn unknown(known: &Files, on_disk: &Files) -> String {
+  let other = |these: &Files, those: &Files| -> Vec<PathBuf> {
+    these
+      .iter()
+      .filter(|(path, content)| those.get(*path) != Some(content))
+      .map(|(path, _)| path.clone())
+      .collect()
+  };
+  format!(
+    "the handler does not know these files as they are: {:?}, and it knows these, which are gone or other: {:?}",
+    other(on_disk, known),
+    other(known, on_disk)
+  )
+}
 
 impl Watch {
   fn start(config: Config, inside: Option<Inside>, backend: &'static str) -> Self {
@@ -121,7 +174,19 @@ impl Watch {
       .unwrap()
     });
     let dir = tempfile::tempdir().unwrap();
-    Self { watcher, results, dir, events: Vec::new(), passing: Vec::new(), backend }
+    let markers = tempfile::tempdir().unwrap();
+    watcher.watch(markers.path()).unwrap();
+    Self {
+      watcher,
+      results,
+      dir,
+      markers,
+      written: 0,
+      reported: 0,
+      events: Vec::new(),
+      passing: Vec::new(),
+      backend,
+    }
   }
 
   fn path(&self, rel: &str) -> PathBuf {
@@ -166,6 +231,25 @@ impl Watch {
     fs::rename(self.path(from), self.path(to)).unwrap();
   }
 
+  fn set_modified(&self, rel: &str, time: SystemTime) {
+    fs::File::options().write(true).open(self.path(rel)).unwrap().set_modified(time).unwrap();
+  }
+
+  /// Returns when every event of the changes made before the call has come: a marker file is
+  /// reported, twice, since the poll that finds the first one may have started before the
+  /// changes and looked at their places already. The second one starts after that poll.
+  fn sync(&mut self) {
+    for _ in 0..2 {
+      self.written += 1;
+      fs::write(self.markers.path().join(self.written.to_string()), "").unwrap();
+      let end = Instant::now() + PATIENCE;
+      while self.reported < self.written {
+        let left = end.saturating_duration_since(Instant::now());
+        assert!(self.receive(left), "{}: marker {} is not reported", self.backend, self.written);
+      }
+    }
+  }
+
   /// The file at `rel` comes and goes between two `expect` calls: a `Create` and a `Delete` of
   /// it are fine, and so is nothing.
   fn may_pass(&mut self, rel: &str) {
@@ -186,6 +270,7 @@ impl Watch {
   /// `wait`, and then nothing else may come for a quiet time. The events start empty after it.
   fn expect(&mut self, expected: &[(EventKind, &str)]) {
     self.wait(expected);
+    self.sync();
     let end = Instant::now() + QUIET;
     while self.receive(end.saturating_duration_since(Instant::now())) {}
     let expected = self.expected(expected);
@@ -194,39 +279,44 @@ impl Watch {
     self.events.clear();
   }
 
-  /// For a test that cannot tell which events come: every event must fit `known` and is applied
-  /// to it, until `known` is `on_disk` and stays so for a quiet time.
-  fn expect_known(&mut self, known: &mut BTreeSet<PathBuf>, on_disk: &BTreeSet<PathBuf>) {
+  /// For a test that cannot tell which events come: every event must fit what the handler
+  /// knows, with the content it read when the event came, until that is `on_disk` and stays so
+  /// for a quiet time. An `Update` that never came leaves the content the handler read before.
+  fn expect_known(&mut self, known: &mut Files, on_disk: &Files) {
     let patience = Instant::now() + PATIENCE;
-    let mut end = patience;
-    let mut settled = false;
     loop {
-      for event in self.events.drain(..) {
-        let fits = match event.kind {
-          EventKind::Create => known.insert(event.path.clone()),
-          EventKind::Update => known.contains(&event.path),
-          EventKind::Delete => known.remove(&event.path),
-        };
-        assert!(fits, "{}: {event:?} does not fit what the handler knows", self.backend);
-      }
-      // Events still on their way can take `known` away from `on_disk` again: the quiet time
-      // starts anew.
+      self.learn(known);
       if known != on_disk {
-        (settled, end) = (false, patience);
-      } else if !settled {
-        (settled, end) = (true, Instant::now() + QUIET);
+        let left = patience.saturating_duration_since(Instant::now());
+        assert!(self.receive(left), "{}: {}", self.backend, unknown(known, on_disk));
+        continue;
       }
-      if !self.receive(end.saturating_duration_since(Instant::now())) {
-        break;
+      // Events still on their way can take `known` away from `on_disk` again.
+      self.sync();
+      self.learn(known);
+      if known != on_disk {
+        continue;
+      }
+      let end = Instant::now() + QUIET;
+      while self.receive(end.saturating_duration_since(Instant::now())) {
+        self.learn(known);
+      }
+      if known == on_disk {
+        return;
       }
     }
-    assert!(
-      known == on_disk,
-      "{}: the handler does not know these files: {:?}, and it knows these, which are gone: {:?}",
-      self.backend,
-      on_disk.difference(known).collect::<Vec<_>>(),
-      known.difference(on_disk).collect::<Vec<_>>()
-    );
+  }
+
+  /// Takes the events since the last call into what the handler knows.
+  fn learn(&mut self, known: &mut Files) {
+    for event in self.events.drain(..) {
+      let fits = match event.kind {
+        EventKind::Create => known.insert(event.path.clone(), content(&event.path)).is_none(),
+        EventKind::Update => known.insert(event.path.clone(), content(&event.path)).is_some(),
+        EventKind::Delete => known.remove(&event.path).is_some(),
+      };
+      assert!(fits, "{}: {event:?} does not fit what the handler knows", self.backend);
+    }
   }
 
   fn expected(&self, expected: &[(EventKind, &str)]) -> History {
@@ -255,7 +345,7 @@ impl Watch {
     history
   }
 
-  /// Takes the next batch. False: none came in time.
+  /// Takes the next batch, with the markers taken out. False: none came in time.
   fn receive(&mut self, timeout: Duration) -> bool {
     match self.results.recv_timeout(timeout) {
       Ok(Ok(events)) => {
@@ -268,7 +358,15 @@ impl Watch {
           "{}: a batch has one event for a path: {events:?}",
           self.backend
         );
-        self.events.extend(events);
+        for event in events {
+          match event.path.strip_prefix(self.markers.path()) {
+            Ok(marker) => {
+              let number = marker.to_str().and_then(|text| text.parse().ok()).expect("a marker");
+              self.reported = self.reported.max(number);
+            }
+            Err(_) => self.events.push(event),
+          }
+        }
         true
       }
       Ok(Err(error)) => panic!("{}: the watcher reported: {error}", self.backend),
