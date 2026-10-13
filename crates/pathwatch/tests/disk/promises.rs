@@ -18,10 +18,7 @@
 //! 9. Calls inside the handler: `watch_and_unwatch_inside_the_handler`,
 //!    `close_inside_the_handler`.
 //! 10. The ignore filter: `c::s14`, `an_ignored_directory_is_not_read`,
-//!     `an_ignored_directory_comes_and_goes`, `a_watched_path_that_the_filter_ignores`,
-//!     `a_watched_path_that_is_ignored_for_both_kinds_gets_nothing`,
-//!     `a_watched_file_in_an_ignored_directory_gets_nothing`,
-//!     `an_ignored_watched_directory_is_reported_when_a_file_takes_its_place`.
+//!     `an_ignored_directory_comes_and_goes`, `a_watched_path_is_never_filtered`.
 //! 11. Nothing beside a watched path: `nothing_is_reported_beside_a_watched_path`.
 //! 12. Symbolic links: `p::two_spellings_of_one_directory`,
 //!     `p::watched_paths_below_a_symlinked_prefix`, `a_watched_link_to_a_file_is_followed`,
@@ -372,35 +369,6 @@ fn an_ignored_directory_is_not_read() {
   assert!(asked.iter().any(|path| path.ends_with("r/src/b.js")));
 }
 
-/// A watched path that the filter ignores counts as missing.
-#[test]
-fn a_watched_path_that_the_filter_ignores() {
-  let config = Config::default().with_ignored(|path, kind| {
-    path.ends_with("secret.txt")
-      || path.ends_with("hidden")
-      || (kind == EntryKind::File && path.extension().is_some_and(|extension| extension == "log"))
-  });
-  each_backend_with(&config, |w| {
-    w.write("hidden/a.txt", "1");
-    w.write("r/old.log", "1");
-    w.watch(&["secret.txt", "hidden", "r", "r/new.log"]);
-
-    w.write("secret.txt", "1");
-    w.write("hidden/a.txt", "22");
-    w.write("hidden/b.txt", "1");
-    w.write("r/old.log", "22");
-    w.write("r/new.log", "1");
-    w.write("r/seen.txt", "1");
-    w.expect(&[(Create, "r/seen.txt")]);
-
-    w.remove("secret.txt");
-    w.remove("hidden");
-    w.remove("r/old.log");
-    w.remove("r/seen.txt");
-    w.expect(&[(Delete, "r/seen.txt")]);
-  });
-}
-
 /// By a rename and step by step: nothing is reported, and the filter is never asked about a
 /// name inside.
 #[test]
@@ -445,87 +413,35 @@ fn an_ignored_directory_comes_and_goes() {
   assert!(asked.iter().any(|path| path.ends_with("r/node_modules")));
 }
 
-/// `watch` does not take it, nothing is reported, and `unwatch` of it does nothing.
+/// The filter is asked about the entries of a watched directory, and not about the paths that
+/// are watched: a watched file in an ignored directory, and a watched file that the filter
+/// would ignore, are reported; the same names as entries of a watched directory are not.
 #[test]
-fn a_watched_path_that_is_ignored_for_both_kinds_gets_nothing() {
-  let config = Config::default()
-    .with_ignored(|path, _kind| path.components().any(|part| part.as_os_str() == "node_modules"));
+fn a_watched_path_is_never_filtered() {
+  let config = Config::default().with_ignored(|path, kind| {
+    path.components().any(|part| part.as_os_str() == "node_modules")
+      || (kind == EntryKind::File && path.extension().is_some_and(|extension| extension == "log"))
+  });
   each_backend_with(&config, |w| {
     w.write("p/node_modules/pkg/index.js", "1");
-    w.write("p/seen.js", "1");
-    w.watch(&[
-      "p/node_modules",
-      "p/node_modules/pkg/index.js",
-      "p/node_modules/new.js",
-      "p/seen.js",
+    w.write("r/old.log", "1");
+    w.watch(&["p/node_modules/pkg/index.js", "p/node_modules", "r", "r/new.log"]);
+
+    w.write("p/node_modules/pkg/index.js", "22");
+    w.write("p/node_modules/other.js", "1");
+    w.write("r/old.log", "22");
+    w.write("r/new.log", "1");
+    w.write("r/seen.txt", "1");
+    w.expect(&[
+      (Update, "p/node_modules/pkg/index.js"),
+      (Create, "r/new.log"),
+      (Create, "r/seen.txt"),
     ]);
 
-    w.write("p/node_modules/pkg/index.js", "22");
-    w.write("p/node_modules/new.js", "1");
-    w.write("p/seen.js", "22");
-    w.expect(&[(Update, "p/seen.js")]);
-
-    // A directory where the file was, and a file where the directory was.
     w.remove("p/node_modules/pkg/index.js");
-    w.write("p/node_modules/pkg/index.js/deep.js", "1");
-    w.write("p/seen.js", "333");
-    w.expect(&[(Update, "p/seen.js")]);
-    w.remove("p/node_modules");
-    w.write("p/node_modules", "a file now");
-    w.unwatch(&["p/node_modules", "p/node_modules/new.js"]);
-    w.remove("p/seen.js");
-    w.expect(&[(Delete, "p/seen.js")]);
-  });
-}
-
-/// Only the directory that holds the file is asked: a watched file one level further down is
-/// reported.
-#[test]
-fn a_watched_file_in_an_ignored_directory_gets_nothing() {
-  let config = Config::default()
-    .with_ignored(|path, kind| kind == EntryKind::Dir && path.ends_with("node_modules"));
-  each_backend_with(&config, |w| {
-    w.write("p/node_modules/top.js", "1");
-    w.write("p/node_modules/pkg/index.js", "1");
-    w.watch(&["p/node_modules/top.js", "p/node_modules/later.js", "p/node_modules/pkg/index.js"]);
-
-    w.write("p/node_modules/top.js", "22");
-    w.write("p/node_modules/later.js", "1");
-    w.write("p/node_modules/pkg/index.js", "22");
-    w.expect(&[(Update, "p/node_modules/pkg/index.js")]);
-
-    w.remove("p/node_modules/top.js");
-    w.remove("p/node_modules/later.js");
-    w.write("p/node_modules/top.js", "333");
-    w.remove("p/node_modules/pkg/index.js");
-    w.expect(&[(Delete, "p/node_modules/pkg/index.js")]);
-  });
-}
-
-/// While a directory is there the path counts as missing; a file in its place is reported.
-#[test]
-fn an_ignored_watched_directory_is_reported_when_a_file_takes_its_place() {
-  let config =
-    Config::default().with_ignored(|path, kind| kind == EntryKind::Dir && path.ends_with("dist"));
-  each_backend_with(&config, |w| {
-    w.write("p/dist/a.js", "1");
-    w.write("p/seen.js", "1");
-    w.watch(&["p/dist", "p/seen.js"]);
-
-    w.write("p/dist/a.js", "22");
-    w.write("p/dist/b.js", "1");
-    w.write("p/seen.js", "22");
-    w.expect(&[(Update, "p/seen.js")]);
-
-    w.remove("p/dist");
-    w.write("p/dist", "a file now");
-    w.expect(&[(Create, "p/dist")]);
-    w.write("p/dist", "written");
-    w.expect(&[(Update, "p/dist")]);
-
-    w.remove("p/dist");
-    w.write("p/dist/a.js", "1");
-    w.expect(&[(Delete, "p/dist")]);
+    w.remove("r/new.log");
+    w.remove("r/old.log");
+    w.expect(&[(Delete, "p/node_modules/pkg/index.js"), (Delete, "r/new.log")]);
   });
 }
 

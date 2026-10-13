@@ -138,17 +138,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     push_name(path, self.tree.name(key));
     let mut listed_as = None;
     let found = self.read_entry(parent, key, path, listed, &mut listed_as);
-    // An ignored watch target drops the paths below the name at the end of the flush, if the
-    // directory is still there (design.md 5.11).
-    if registered
-      && matches!(found, Found::Missing | Found::File(..))
-      && self.is_ignored_target(parent)
-      && self.is_on_disk(parent, path)
-    {
-      self.dropped.push(key);
-      path.pop();
-      return;
-    }
     // The directory lists the entry under another name: a name that is not registered is gone
     // under this one, a registered name stays, and the other name is looked at below.
     let on_disk = match &found {
@@ -169,7 +158,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if !path.pop() {
       path.clear();
     }
-    if wants_more && !self.is_ignored_target(parent) {
+    if wants_more {
       // The ask queues a scan: the name is looked at again when the wider watch is live.
       self.ask(parent, path, Want::Contents);
     }
@@ -213,12 +202,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
 
       (Found::Dir { id, complete, relinked }, Had::Nothing) => {
-        let baseline = self.is_baseline_dir(key, relinked);
+        let baseline = self.is_baseline_dir(key, path, relinked);
         self.appear(key, path, id, complete, baseline);
         self.look_again_at_a_new_dir(key);
       }
       (Found::Dir { id, complete, relinked }, Had::File) => {
-        let baseline = self.is_baseline_dir(key, relinked);
+        let baseline = self.is_baseline_dir(key, path, relinked);
         // A change of kind is never an `Update`: the file is gone.
         self.forget_file(key);
         self.appear(key, path, id, complete, baseline);
@@ -239,7 +228,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         }
         let unlisted = self.tree[key].is_unlisted();
         if complete && !was_complete {
-          self.make_complete(key, relinked);
+          self.make_complete(key, path, relinked);
         } else if !complete && unlisted && (was_complete || !was_unlisted) {
           // The directory above lists it under another name now: only what a watched path covers
           // stays. Also in a partial node, whose entries were covered through this name.
@@ -273,8 +262,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// The partial node tracks every entry of its directory from now on.
-  fn make_complete(&mut self, key: DirKey, relinked: bool) {
-    let baseline = self.is_baseline_dir(key, relinked);
+  fn make_complete(&mut self, key: DirKey, path: &Path, relinked: bool) {
+    let baseline = self.is_baseline_dir(key, path, relinked);
     let node = &mut self.tree[key];
     node.set_baseline(baseline);
     if let Some(dir) = node.dir_mut() {
@@ -379,7 +368,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
     let inside = is_path || (in_complete && other.is_none());
     let kind = entry_kind(meta.kind);
-    let visible = inside && !self.ignores(key, path, kind);
+    // A watched path is never filtered (design.md 5.11).
+    let visible = inside && (is_path || !self.ignores(key, path, kind));
     let found = match kind {
       // A directory on the way to a watched path is never filtered.
       EntryKind::Dir if is_ancestor || visible => {
@@ -538,7 +528,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     } else {
       // The handler may believe in a file the tree forgot earlier in this flush: nothing says it
       // is the same one.
-      let baseline = self.is_baseline_file(key);
+      let baseline = self.is_baseline_file(key, path);
       let node = &mut self.tree[key];
       node.set_baseline(baseline);
       node.told()
@@ -598,13 +588,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     let whole_seconds = modified >= 0 && modified % nanos_of(Duration::from_secs(1)) == 0;
     whole_seconds || self.only_polled(key)
-  }
-
-  /// Whether the directory the tree has at the node is on disk now. `path` names an entry in it.
-  fn is_on_disk(&self, key: DirKey, path: &Path) -> bool {
-    let id = self.tree[key].dir().map(|dir| dir.id);
-    let now = path.parent().and_then(|dir| self.fs.stat(dir).ok());
-    now.is_some_and(|now| now.kind == FileType::Dir && Some(now.dir_id) == id)
   }
 
   /// Whether only the poll looks at the entry: its directory is polled, or it is a link.

@@ -217,8 +217,8 @@ watcher, and the arena twice for a moment each time it grows. The lists of a flu
 memory for the next flush only up to 16 KiB each (`emptied`): a longer one is given back when
 the flush ends.
 
-**`complete` is a rule.** A directory node is complete when its path is a watched path that the
-filter does not ignore, or when its parent is complete and the filter does not ignore it. Every
+**`complete` is a rule.** A directory node is complete when its path is a watched path, or
+when its parent is complete and the filter does not ignore it. Every
 check that finds the directory on disk works it out. The tree can be behind the rule for a
 while: a directory that becomes a watched path is complete in the tree after its next look.
 Where it matters, the rule itself is asked (`Engine::tracks_every_entry`): in `unwatch`, and in
@@ -495,10 +495,12 @@ Only what was measured to be the same as `lstat` is taken:
 
 **What counts.** "Inside" means: the node is a watched path, or its parent is complete.
 
-- A **file** counts if it is inside and the filter does not ignore `(path, File)`.
-- A **directory** counts if it is inside and the filter does not ignore `(path, Dir)`: then its
-  node is complete. It also counts if a watched path lies below it: such a directory is never
-  filtered, and its node is partial unless the first rule holds too.
+- A **file** counts if it is a watched path, or if it is inside and the filter does not ignore
+  `(path, File)`.
+- A **directory** counts if it is a watched path, or if it is inside and the filter does not
+  ignore `(path, Dir)`: then its node is complete. It also counts if a watched path lies below
+  it: such a directory is never filtered, and its node is partial unless the first rule holds
+  too.
 - What does not count is missing.
 
 `check` makes no event. It changes the node and puts it on the list `touched`; the end of the
@@ -522,10 +524,6 @@ every file below the directory, is in the same batch as what came in its place.
 After that, the node is freed if nothing needs it any more. And if the node is a registered
 name with no directory at it now, and its directory was asked for names only, the directory is
 asked for `Contents` (5.10).
-
-One thing comes before the table: the directory above a registered name with a file or nothing
-at it is the watch target of that name. If the filter ignores that directory, the table is
-not used: the name is dropped when the flush ends (5.11).
 
 The identity of a directory is never a reason to skip the check when a hint names the
 directory: a directory that was moved away and back keeps its inode.
@@ -573,8 +571,7 @@ That scan checks the child directories in the same way, so this goes all the way
 
 ### 5.7 `watch` and the baseline, `unwatch`
 
-**`watch`** (`engine/watched_paths.rs`). A path that the filter ignores as a file and as a directory
-is left out (5.11). For each other new path: walk down from the root; make the missing
+**`watch`** (`engine/watched_paths.rs`). For each new path: walk down from the root; make the missing
 nodes; make the last one a watched path, which makes every node above it registered; put a
 deep mark on the deepest node on the way that has only directories on disk above it, each
 listed by the directory above it (unless a scan that checks every name of its directory is
@@ -755,8 +752,7 @@ is not told at once.
 
 - `Contents` if the node is complete, or if one of its registered names has a file or nothing
   at it. A file there is written, and where nothing is, a file can come, or a directory with
-  everything below it at once. Not for a registered name when the filter ignores the
-  directory (5.11).
+  everything below it at once.
 - `Names` otherwise: every registered name in it is a directory. Such a directory asks for a
   watch of its own. So `watch("/home/me/project")` puts a stream on the project, not on the
   home directory with everything else in it.
@@ -858,69 +854,44 @@ the parent checks it first.
 `ignored(path, kind)` with `kind` = `File` or `Dir`. The engine asks (`engine/filter.rs`); a
 backend never sees the filter, so the result is the same on every backend.
 
-**The contract of a filter.** It gives the same answer for the same path and kind. And if it
-ignores a directory, it ignores everything below it. Such a filter is called **closed**.
+**What is asked.** The entries of a watched directory, and nothing else: not a path given to
+`watch`, and not a directory on the way to one. The watcher reports what it was asked to
+watch, and the filter cuts entries out of a watched directory. So a watched path that the
+filter would ignore (`watch("/p/node_modules/x.js")` next to a filter for `node_modules`) is
+reported like any other, and a watched directory that it would ignore is listed, with each
+entry asked as usual: with a filter that ignores everything below `node_modules`, nothing in
+it is reported, and the directory is read once at each scan and watched for nothing below.
 
-**The kind is always known.** It comes from `lstat`, from a listing, or from rule 2. An entry
-that is gone is never asked about: what the tree stored decides. The path has the registered
-spelling.
+**The contract of a filter.** It gives the same answer for the same path and kind. It should
+ignore everything below a directory that it ignores (a **closed** filter): then the files
+that a watched directory stands for do not depend on which other paths are watched. A filter
+that only looks at the last name is allowed: `/p/node_modules/pkg/x.js` is then reported when
+`/p/node_modules/pkg` is given to `watch`, since nothing on the way to a watched path is
+filtered, and not when only `/p` is, since the entry `node_modules` of `/p` is. The stories in
+`pathwatch_sim/tests/filter.rs` pin it; the fuzzer uses a closed filter and one for a name.
+
+**The kind is always known.** It comes from `lstat` or from a listing. An entry that is gone
+is never asked about: what the tree stored decides. The path has the registered spelling.
 
 **The answer is kept with the node**, one for each kind (`Engine::ignores`). So an entry is
 asked once when it is found and again when its kind changes, not at every check. An ignored
 entry inside a watched directory keeps no node, so each listing of its directory asks about it
 again.
 
-Three things are asked:
+**An entry inside a watched directory** (`read_entry`). An ignored entry is missing. An
+ignored directory is never listed and never watched, and nothing below it is asked. Hints
+from inside it end at its parent and cost one `lstat` in a flush. A directory that goes is
+decided at the directory: one `Delete` for each told file, and no question. A directory that
+comes is asked once, and then each entry in it once. A directory on the way to a watched path
+is never filtered as an entry: if the filter ignores it, its node is partial, and it tracks
+only its registered names.
 
-1. **An entry inside a watched directory** (`read_entry`). An ignored entry is missing. An
-   ignored directory is never listed and never watched, and nothing below it is asked. Hints
-   from inside it end at its parent and cost one `lstat` in a flush. A directory that goes is
-   decided at the directory: one `Delete` for each told file, and no question. A directory that
-   comes is asked once, and then each entry in it once.
-2. **A path given to `watch`** (`register`), for both kinds, whatever is on disk. If both are
-   ignored, the path can never be reported: it gets no node and costs no watch, no look and
-   no poll, and `unwatch` of it does nothing. Every other path becomes a watched path. When it
-   exists, it is asked with its kind like every entry. While the answer is "ignored" it counts
-   as missing: nothing is listed or watched for it, and it is asked again when its kind
-   changes.
-3. **The watch target of a registered name** (`is_ignored_target`). A registered name with a
-   file or nothing at it is served by the watch of the directory above it: that directory is
-   asked for `Contents` because of the name (5.10). It is the directory that holds a watched
-   file, or the lowest directory that exists above a missing path. Before the engine asks the
-   backend for that, it asks the filter about the directory, as a directory. If the filter
-   ignores it:
-   - the directory is not asked for `Contents` because of its registered names. It keeps the
-     `Names` ask of a directory that leads to a watched path;
-   - a registered name in it with a file or nothing at it is **dropped**: the look that finds
-     it puts it on a list (`Engine::dropped`), and the end of the flush forgets every watched
-     path at the name and below it with the code of `unwatch` (`drop_ignored`). The look asks
-     the disk first whether the ignored directory is still the one that the tree has there:
-     a look at a name can come before the look that finds its directory gone, and then the
-     watch target is a directory further up, which the filter may not ignore. The nodes
-     that nothing else needs are freed, and their watches are given back. One thing differs
-     from `unwatch`: each file there that the handler was told about, and that no other
-     watched path still covers, gets its `Delete` in the same batch, also one whose `Delete`
-     was waiting for the delete delay. Such a file is gone from the disk (a name with a
-     file below it has a directory at it, and is not dropped), and without the `Delete` the
-     handler would keep it for ever. No delete delay applies;
-   - nothing wakes a dropped path up. `unwatch` of it does nothing, and `watch` of it
-     registers it anew and looks again.
-
-   When a chain of missing directories appears step by step, each new directory is the watch
-   target in turn, and it is asked when it appears. The chain stops at an ignored one. A
-   directory that only leads to a watched path (asked for `Names`) is not asked: nothing walks
-   up to the root.
-
-A directory on the way to a watched path is never filtered as an entry. If the filter ignores
-it, its node is partial: it tracks only its registered names.
-
-**Closed or not.** With a closed filter, rule 3 never changes an event: a path below an ignored
-directory is ignored for both kinds, so rule 2 leaves it out, and an ignored directory has no
-registered name in it. With a filter that only looks at the last name, the result of rule 3
-depends on which directories exist when a name is looked at: `/p/node_modules/x.js` is never
-reported, and `/p/node_modules/pkg/x.js` is reported only if `pkg` is there at that look. If it
-is not, or if `pkg` goes away later, the path is dropped. That is allowed. The stories in
-`pathwatch_sim/tests/filter.rs` pin it; the fuzzer uses a closed filter.
+(Before, the filter was asked about each watched path too, for both kinds, and about the
+"watch target" of a path: the directory that holds a watched file, or the lowest directory
+that exists above a missing path. A path whose target the filter ignored was dropped with the
+code of `unwatch`, with a `Delete` for each of its files, and nothing woke it up. That was 120
+lines of the engine, the longest promise of the README, and a rule under which a filter that
+is not closed gave results that depended on which directories existed. Taken out.)
 
 ### 5.12 Errors from the disk
 

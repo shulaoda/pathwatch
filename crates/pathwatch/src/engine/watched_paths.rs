@@ -16,13 +16,9 @@ use crate::{
 /// path covered it already (design.md 5.7).
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Puts the path into the tree, a registered node for each name, and marks where the disk has
-  /// to be checked. A path ignored as a file and as a directory is left out.
+  /// to be checked.
   pub(super) fn register(&mut self, path: &Path) {
     let Some((top, rest)) = split_top(path) else { return };
-    let ignored_file = self.ignored(path, EntryKind::File);
-    if ignored_file && self.ignored(path, EntryKind::Dir) {
-      return;
-    }
 
     // The anchor: the deepest node with only directories on disk above it, each listed by the
     // directory above it. The way ends at a held node, since nothing is on disk below it, and
@@ -52,12 +48,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
     }
 
-    // The first look does not ask the filter again.
-    let node = &mut self.tree[at];
-    node.set_ignored(EntryKind::File, ignored_file);
-    if ignored_file {
-      node.set_ignored(EntryKind::Dir, false);
-    }
     if !self.tree.make_path(at) {
       return;
     }
@@ -68,13 +58,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     let Some(parent) = self.tree.parent(at) else { return };
     // A directory asked for names only must tell more when no directory is at the new path.
-    // Not when the filter ignores it: it is no watch target.
     if below_directories
       && self.tells_names_only(parent)
-      && self.tree[parent].ignored(EntryKind::Dir) != Some(true)
-      && !self.is_dir_on_disk(at, path)
+      && !self.is_dir_on_disk(path)
       && let Some(parent_path) = path.parent()
-      && !self.is_ignored_target(parent)
     {
       self.ask(parent, parent_path, Want::Contents);
     }
@@ -89,16 +76,23 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Whether a new file at the node is part of the baseline of the running `watch`.
-  pub(super) fn is_baseline_file(&self, key: DirKey) -> bool {
-    !self.reported_before(key)
+  pub(super) fn is_baseline_file(&mut self, key: DirKey, path: &Path) -> bool {
+    !self.reported_before(key) || self.is_ignored_entry(key, path, EntryKind::File)
   }
 
   /// Whether what is in a directory that appears, or becomes complete, is the baseline.
   /// `relinked`: the node is a link that was none at the last check.
-  pub(super) fn is_baseline_dir(&self, key: DirKey, relinked: bool) -> bool {
+  pub(super) fn is_baseline_dir(&mut self, key: DirKey, path: &Path, relinked: bool) -> bool {
     // A link that the running call follows for the first time: nobody read its target before.
     let new_link = relinked && self.tree[key].added() == Added::Registered;
-    new_link || !self.reported_before(key)
+    new_link || !self.reported_before(key) || self.is_ignored_entry(key, path, EntryKind::Dir)
+  }
+
+  /// Whether the directory above reported nothing at a name that the running call made a
+  /// watched path, although it is complete: the filter ignores the entry. The question is
+  /// about the entry of the directory, not about the watched path (design.md 5.11).
+  fn is_ignored_entry(&mut self, key: DirKey, path: &Path, kind: EntryKind) -> bool {
+    self.tree[key].added() != Added::No && self.ignores(key, path, kind)
   }
 
   /// Whether what is at the node had to be reported before the running `watch`.
@@ -134,38 +128,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 }
 
-/// The way back: `unwatch` forgets what only the path covered and reports nothing. A drop by
-/// the filter reports a `Delete` for each forgotten file the handler knows (design.md 5.7).
+/// The way back: `unwatch` forgets what only the path covered and reports nothing (design.md
+/// 5.7).
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Makes `path` a path like any other again. A path that is not watched is left alone.
   pub(super) fn unregister(&mut self, path: &Path) {
     if let Some(key) = self.find(path) {
-      self.forget(key, false);
+      self.forget(key);
     }
-  }
-
-  /// Forgets every watched path at or below a dropped name, with a `Delete` for each file the
-  /// handler knows. `true`: there was one.
-  pub(super) fn drop_ignored(&mut self) -> bool {
-    let any = !self.dropped.is_empty();
-    // `forget` can find one more.
-    while let Some(key) = self.dropped.pop() {
-      let mut paths = Vec::new();
-      let mut below = vec![key];
-      while let Some(at) = below.pop() {
-        // No node: the name is on the list twice.
-        let Some(node) = self.tree.get(at) else { continue };
-        if node.is_path() {
-          paths.push(at);
-        }
-        below.extend(self.tree.children(at));
-      }
-      for path in paths {
-        self.forget(path, true);
-      }
-    }
-    self.narrow_all();
-    any
   }
 
   /// Asks each directory that a `forget` of this call left on the list whether it wants less
@@ -190,42 +160,24 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     Some(at)
   }
 
-  /// The node is no watched path any more. `tell_delete`: the handler hears of each forgotten
-  /// file.
-  fn forget(&mut self, key: DirKey, tell_delete: bool) {
+  /// The node is no watched path any more, and the handler hears nothing of what is forgotten.
+  fn forget(&mut self, key: DirKey) {
     if !self.tree.drop_path(key) {
       return;
     }
     let Some(parent) = self.tree.parent(key) else { return };
     // What is at the path can still count as an entry of a watched directory above: only then it
     // stays.
-    if self.tree[key].is_registered() && !self.is_inside(key) {
-      self.uncover(key, tell_delete, false);
+    if self.tree[key].is_registered() && !self.stays_as_an_entry(key) {
+      self.uncover(key, false, false);
     }
     // With no watched path below, the node is let go, and the nodes above that only led to it.
     let mut at = key;
     while !self.tree[at].is_registered()
       && let Some(parent) = self.tree.parent(at)
     {
-      self.let_go(at, tell_delete);
+      self.let_go(at);
       at = parent;
-    }
-    // The walk ended at a watched path that the filter ignores as a directory: its node was kept
-    // for what was below, and counts as missing now.
-    let node = &self.tree[at];
-    let kept_for_below = node.is_path() && !node.is_ancestor() && matches!(node.kind, Kind::Dir(_));
-    if kept_for_below && !self.tracks_every_entry(at) {
-      self.uncover(at, tell_delete, false);
-      // A watched path with nothing at it makes its directory tell more; an ignored directory
-      // drops the path instead.
-      if let Some(parent) = self.tree.parent(at) {
-        if self.is_ignored_target(parent) {
-          self.dropped.push(at);
-        } else if self.tells_names_only(parent) {
-          let path = self.tree.path(parent);
-          self.ask(parent, &path, Want::Contents);
-        }
-      }
     }
     // The directory that held what went may want less now: the one that stays, at the end of
     // the call (`narrow_all`).
@@ -271,9 +223,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// The node is not registered any more: an entry like the others inside a watched directory,
   /// and nothing anywhere else.
-  fn let_go(&mut self, key: DirKey, tell_delete: bool) {
+  fn let_go(&mut self, key: DirKey) {
     let Some(parent) = self.tree.parent(key) else { return };
     let inside = self.is_inside(key);
+    // Asked while the node still says that the directory above lists it under another name.
+    let stays = self.stays_as_an_entry(key);
     self.tree[key].set_unlisted(false);
     // Only a registered node is followed: the link itself is the entry now, and a look must see
     // it.
@@ -283,17 +237,26 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         self.tree.mark(key, Mark::default());
       }
     }
-    let is_entry = inside
-      && match self.tree[key].kind {
-        Kind::Missing => false,
-        Kind::File(_) => true,
-        // Not when the filter ignores the directory: its node was kept, as a partial one,
-        // for the watched path below it.
-        Kind::Dir(_) => self.tracks_every_entry(key),
-      };
-    if !is_entry {
-      self.uncover(key, tell_delete, false);
+    if !stays {
+      self.uncover(key, false, false);
     }
     self.tree.prune(key);
+  }
+
+  /// Whether what is at the node stays as an entry of the directory above when the node is no
+  /// watched path any more: that directory tracks every entry, and the filter does not ignore
+  /// this one. Whatever the node says of itself: a watched directory that is taken back is an
+  /// entry like the others now.
+  fn stays_as_an_entry(&mut self, key: DirKey) -> bool {
+    let kind = match self.tree[key].kind {
+      Kind::Missing => return false,
+      Kind::File(_) => EntryKind::File,
+      Kind::Dir(_) => EntryKind::Dir,
+    };
+    if !self.is_inside(key) {
+      return false;
+    }
+    let path = self.tree.path(key);
+    !self.ignores(key, &path, kind)
   }
 }

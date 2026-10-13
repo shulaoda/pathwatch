@@ -17,10 +17,7 @@ use pathwatch::{
   poll::PollBackend,
 };
 
-use crate::{
-  Mode, SimBackend, SimFs, SimRaw, WatchCall, can_be_watched, check_fingerprints, is_dropped,
-  reportable,
-};
+use crate::{Mode, SimBackend, SimFs, SimRaw, WatchCall, check_fingerprints, reportable};
 
 /// An engine on a [`SimFs`], with a clock that only the test moves.
 ///
@@ -164,7 +161,6 @@ impl<B: Deliver> Driver<B> {
       }
     }
     self.advance(end - self.now);
-    self.drop_ignored();
     self.check_caught_up();
   }
 
@@ -214,36 +210,20 @@ impl<B: Deliver> Driver<B> {
     self.errors.append(&mut out.errors);
   }
 
-  /// The drop rule, told a second time: a watched path that the watcher drops when it looks
-  /// now is no watched path any more. The handler forgets nothing here: a drop tells `Delete`
-  /// for each file that goes with it, and a file that went without one fails the story.
-  ///
-  /// The filter is asked here, so this runs only when everything settles. A story where the
-  /// engine dropped a path at an earlier look, and the disk is another one now, has to end
-  /// before the next settle.
-  fn drop_ignored(&mut self) {
-    let Some(ignored) = &self.ignored else { return };
-    let fs = &self.fs;
-    self.watched.retain(|path| !fs.quiet(|| is_dropped(fs, &**ignored, path)));
-  }
-
   /// Panics when the engine has not caught up with the disk: a stored fingerprint is not the
   /// one on disk, or the handler knows other files than a walk of the disk finds.
   fn check_caught_up(&self) {
     let ignored = |path: &Path, kind: EntryKind| {
       self.ignored.as_ref().is_some_and(|ignored| ignored(path, kind))
     };
-    // What `watch` did not take is no watched path.
-    let watched: BTreeSet<PathBuf> =
-      self.watched.iter().filter(|path| can_be_watched(&ignored, path)).cloned().collect();
     let stored = self.engine.fingerprints();
-    if let Err(stale) = check_fingerprints(&self.fs, &watched, &stored) {
+    if let Err(stale) = check_fingerprints(&self.fs, &self.watched, &stored) {
       panic!("not caught up: {stale}");
     }
     if let Err(wrong) = self.fs.quiet(|| self.engine.check_spellings()) {
       panic!("not caught up: {wrong}");
     }
-    let on_disk = reportable(&self.fs, &ignored, &watched);
+    let on_disk = reportable(&self.fs, &ignored, &self.watched);
     assert_eq!(self.known, on_disk, "not caught up: the handler does not know the files on disk");
   }
 }

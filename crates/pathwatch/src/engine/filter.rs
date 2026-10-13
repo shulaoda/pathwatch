@@ -1,17 +1,14 @@
 //! The questions to the ignore filter (`Options::ignored`): what is asked, when, and what a node
 //! keeps of the answer (design.md 5.11).
 
-use std::{
-  iter,
-  path::{Path, PathBuf},
-};
+use std::{iter, path::Path};
 
 use super::Engine;
 use crate::{
   backend::{Backend, DirKey},
   config::EntryKind,
   fs::Fs,
-  tree::{Kind, Tree},
+  tree::Kind,
 };
 
 impl<B: Backend, F: Fs> Engine<B, F> {
@@ -25,27 +22,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     answer
   }
 
-  /// Whether the filter ignores the directory as a watch target (design.md 5.11, rule 3).
-  pub(super) fn is_ignored_target(&mut self, key: DirKey) -> bool {
-    // The root node has no path, and is no target.
-    if key == Tree::ROOT || self.options.ignored.is_none() {
-      return false;
-    }
-    if let Some(answer) = self.tree[key].ignored(EntryKind::Dir) {
-      return answer;
-    }
-    let mut path = PathBuf::with_capacity(128);
-    self.tree.path_into(key, &mut path);
-    self.ignores(key, &path, EntryKind::Dir)
-  }
-
   /// Whether the directory above covers the node: it tracks every entry, and the node is one.
   pub(super) fn is_inside(&self, key: DirKey) -> bool {
     !self.tree[key].is_unlisted()
       && self.tree.parent(key).is_some_and(|parent| self.tracks_every_entry(parent))
   }
 
-  /// The rule for a complete node: a watched path, or inside one, and not ignored. The tree can be
+  /// The rule for a complete node: a watched path, or inside one and not ignored. The tree can be
   /// behind it until the next look (design.md 5.1).
   pub(super) fn tracks_every_entry(&self, key: DirKey) -> bool {
     match self.tree[key].kind {
@@ -65,11 +48,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     !self.is_ignored_on_the_way(key, levels)
   }
 
-  /// Whether the filter ignores the directory or one of the `levels` above it, asked from the top
-  /// down so nothing is asked below an ignored one.
+  /// Whether the filter ignores the directory or one of the `levels - 1` above it, below the
+  /// watched path `levels` above, which is never asked about. Asked from the top down, so
+  /// nothing is asked below an ignored one.
   pub(super) fn is_ignored_on_the_way(&self, key: DirKey, levels: usize) -> bool {
     let parent = |&at: &DirKey| self.tree.parent(at);
-    let way: Vec<DirKey> = iter::successors(Some(key), parent).take(levels + 1).collect();
+    let way: Vec<DirKey> = iter::successors(Some(key), parent).take(levels).collect();
     way.iter().rev().any(|&at| {
       let kept = self.tree[at].ignored(EntryKind::Dir);
       kept.unwrap_or_else(|| self.ignored(&self.tree.path(at), EntryKind::Dir))

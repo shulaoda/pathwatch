@@ -424,8 +424,8 @@ fn a_loss_report_waits_and_the_directory_above_goes_away() {
 }
 
 /// A watcher that watches nothing has nothing due: no poll wakes its thread. That is so before
-/// the first `watch`, after `unwatch` of every watched path, and after every watched path was
-/// dropped. The next `watch` brings the poll back.
+/// the first `watch` and after `unwatch` of every watched path. The next `watch` brings the
+/// poll back.
 #[test]
 fn nothing_is_due_when_nothing_is_watched() {
   fn story<B: Deliver>(mut d: Driver<B>, on: &str) {
@@ -441,12 +441,13 @@ fn nothing_is_due_when_nothing_is_watched() {
     d.watch(&["/p/a.js", "/p/node_modules/pkg/x.js"]);
     assert_eq!(d.engine.deadline(), Some(d.now + second), "{on}");
     let poll = d.engine.deadline();
-    // One watched path is left: the poll stays.
+    // One watched path is left: the poll stays, also when nothing is at the path any more.
     d.unwatch(&["/p/a.js"]);
     assert_eq!(d.engine.deadline(), poll, "{on}");
-    // The ignored directory is its watch target now: the last watched path is dropped.
     d.fs.remove_all("/p/node_modules/pkg").unwrap();
     assert_eq!(settled(&mut d), ["D /p/node_modules/pkg/x.js"], "{on}");
+    assert!(d.engine.deadline().is_some(), "{on}");
+    d.unwatch(&["/p/node_modules/pkg/x.js"]);
     assert_eq!(d.engine.deadline(), None, "{on}");
 
     d.watch(&["/p/a.js"]);

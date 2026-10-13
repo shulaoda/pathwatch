@@ -156,9 +156,6 @@ pub struct Engine<B: Backend, F: Fs> {
   read_took: Duration,
   /// The nodes the flush changed: `finish` reads their events. A key can be stale.
   touched: Vec<DirKey>,
-  /// The registered names whose watch target the filter ignores: the end of the flush drops
-  /// the watched paths below them.
-  dropped: Vec<DirKey>,
   /// The directories that give their own watch back after the next commit.
   covered: Vec<DirKey>,
   /// The directories that may want less after an `unwatch` or a drop: asked once at the end of
@@ -213,7 +210,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       gave_back: false,
       read_took: Duration::ZERO,
       touched: Vec::new(),
-      dropped: Vec::new(),
       covered: Vec::new(),
       narrowing: Vec::new(),
       stop: None,
@@ -394,13 +390,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.listed.shrink_to(KEPT / size_of::<ScanEntry>());
 
     let took = self.fs.ticks().saturating_sub(self.flush_ticks);
-    let mut took = took.saturating_sub(self.commit_took).min(LONGEST_FLUSH);
+    let took = took.saturating_sub(self.commit_took).min(LONGEST_FLUSH);
     if loss_scans_ran {
       self.rest_until = Some(now + took + took * REST);
-    }
-    // A drop can leave work, like `unwatch`: one more flush does it.
-    if self.drop_ignored() {
-      took += self.flush(now, take_hints);
     }
     took
   }

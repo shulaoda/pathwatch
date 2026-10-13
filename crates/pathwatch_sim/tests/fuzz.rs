@@ -25,9 +25,7 @@ use pathwatch::{
   fs::{FileType, Fs},
   poll::PollBackend,
 };
-use pathwatch_sim::{
-  Deliver, Mode, SimBackend, SimFs, can_be_watched, check_fingerprints, followed,
-};
+use pathwatch_sim::{Deliver, Mode, SimBackend, SimFs, check_fingerprints, followed};
 
 // ---- random numbers ----
 
@@ -587,11 +585,13 @@ fn reportable(fs: &SimFs, filter: u8, watched: &BTreeSet<PathBuf>) -> BTreeSet<P
 }
 
 /// Whether the handler keeps a file at `path` that it knows when the watched paths are
-/// `watched`: the path is a watched path, or it is in a watched directory with no ignored
-/// directory on the way down. This is read from the text of the paths alone: `unwatch` looks at
-/// no disk to decide what it forgets.
+/// `watched`: the path is a watched path, or it is an entry that the filter does not ignore
+/// in a watched directory with no ignored directory on the way down. This is read from the
+/// text of the paths alone: `unwatch` looks at no disk to decide what it forgets.
 fn covered(filter: u8, watched: &BTreeSet<PathBuf>, path: &Path) -> bool {
-  watched.contains(path) || path.parent().is_some_and(|dir| tracked(filter, watched, dir))
+  watched.contains(path)
+    || (path.parent().is_some_and(|dir| tracked(filter, watched, dir))
+      && !ignored(filter, path, EntryKind::File))
 }
 
 /// Whether `path`, or a directory on the way down to it from the watched directory above, was
@@ -607,10 +607,12 @@ fn through_registered(
   on_the_way.any(|at| before.iter().any(|old| old.starts_with(at)))
 }
 
-/// Whether a directory at `dir` would track every entry.
+/// Whether a directory at `dir` would track every entry: a watched path, or an entry of such a
+/// directory that the filter does not ignore.
 fn tracked(filter: u8, watched: &BTreeSet<PathBuf>, dir: &Path) -> bool {
-  let inside = watched.contains(dir) || dir.parent().is_some_and(|up| tracked(filter, watched, up));
-  inside && !ignored(filter, dir, EntryKind::Dir)
+  watched.contains(dir)
+    || (dir.parent().is_some_and(|up| tracked(filter, watched, up))
+      && !ignored(filter, dir, EntryKind::Dir))
 }
 
 /// What a handler reads at a path when it gets an event for it.
@@ -990,9 +992,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
       };
       let respell = valid && self.config.folds();
       let text = if respell { self.in_the_way_of_a_caller(&text) } else { text };
-      // A path that the filter ignores for both kinds does not become a watched path.
-      let filter = self.config.filter;
-      if valid && can_be_watched(&|path, kind| ignored(filter, path, kind), Path::new(&text)) {
+      if valid {
         // The registered form of these paths is the text itself.
         new_watched.insert(PathBuf::from(&text));
       }

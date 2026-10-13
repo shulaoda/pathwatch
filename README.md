@@ -89,7 +89,7 @@ watcher, so it should only pass the batch on.
 
 | `Config` method | Default | Meaning |
 |---|---|---|
-| `with_ignored(f)` | nothing is ignored | `f(path, kind) -> bool`, where `kind` is `EntryKind::File` or `EntryKind::Dir`. A path for which it returns `true` is never reported. An ignored directory is never read or watched. It must give the same answer for the same input, and if it ignores a directory it must ignore everything below it. It is asked about the paths you watch too (promise 10). |
+| `with_ignored(f)` | nothing is ignored | `f(path, kind) -> bool`, where `kind` is `EntryKind::File` or `EntryKind::Dir`. An entry of a watched directory for which it returns `true` is never reported, and an ignored directory is never read or watched. It must give the same answer for the same input, and should ignore everything below a directory that it ignores. It is not asked about the paths you watch (promise 10). |
 | `with_debounce(d)` | 50 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch goes out 500 ms after the first change since the last batch, or `4 × d` after it if that is longer, plus the time that the check of the disk takes. Zero: no waiting. The most is a year, also for the poll interval. A `watch` or `unwatch` call ends the quiet time; a poll that runs meanwhile does not, but a change it finds by itself is reported. Under polling there is no quiet time: a change is found by the next round. |
 | `with_delete_delay(d)` | 100 ms | How long a `Delete` waits for the path to come back. A file that is removed and written again within `d` is one `Update`; a real delete is reported `d` after the OS said that the path is gone. Zero: no waiting, and such a file is a `Delete` and a `Create`. The most is a year. |
 | `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
@@ -150,15 +150,14 @@ that tells the forms apart (every disk but the usual one of macOS).
 9. **Calls inside the handler.** `watch`, `unwatch` and `close` work there. They take effect
    when the handler has returned.
 10. **The ignore filter.** Nothing is reported from inside an ignored directory, and the
-    directory is not read or watched. The filter applies to watched paths too. A watched path
-    that it ignores as a file and as a directory is not watched at all: no events, no error,
-    no cost. A watched path that it ignores only for the kind that is there now counts as
-    missing until its kind changes. A watched path is dropped when the filter ignores the
-    directory that holds it or, while directories above it are missing, the lowest one that
-    exists: a file that was reported for it gets its `Delete`, then the path is forgotten as
-    `unwatch` of it would do it; `watch` it again to have it looked at again. A filter must ignore everything below a directory that it
-    ignores: then no path is ever dropped. One that only looks at the last name of the path
-    gives results that depend on which directories exist.
+    directory is not read or watched. The filter is asked about the entries of a watched
+    directory, and not about the paths you watch, nor about the directories on the way to
+    them: a watched path is reported whatever the filter says of it, and a watched directory
+    that the filter would ignore is listed like any other, with its entries asked as usual.
+    A filter should ignore everything below a directory that it ignores. One that only looks
+    at the last name of the path gives results that depend on which paths are watched:
+    `/p/node_modules/pkg/x.js` is reported when `/p/node_modules/pkg` is watched, and not
+    when only `/p` is.
 11. **Nothing beside a watched path.** A file next to a watched file is not reported.
 12. **Symbolic links.** A watched path that is a link, or that goes through one, is followed,
     and its events carry the spelling you gave. A link inside a watched directory is a file: it
@@ -302,7 +301,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 | watch | `watch(path)`, `watch_all(paths)` | Offered. There is no recursive mode: a directory is always watched with everything below it. A path may be a file, or not exist yet. No globs. |
 | unwatch | `unwatch(path)`, `unwatch_all(paths)` | Offered differently: it takes back a `watch` of the same path. It cannot cut a part out of a watched directory; use the ignore filter. |
 | close | `close()`, or drop the watcher | Offered. |
-| ignored | `Config::with_ignored(f)` | Offered differently: one function, set when the watcher is made. No glob list, no change later. It is asked about watched paths too: a path that it ignores as a file and as a directory is not watched. It must ignore everything below a directory that it ignores. |
+| ignored | `Config::with_ignored(f)` | Offered differently: one function, set when the watcher is made. No glob list, no change later. It is asked about the entries of a watched directory, not about the paths you watch. |
 | polling | `with_polling`, `with_poll_interval` | Offered. On top of that, a directory that the OS cannot watch is polled without an option, and so is everything when the watch API cannot start or stops: then at the poll interval of the settings. |
 | debounce | `with_debounce` | Offered, and built in. Left out: waiting until a file stops growing (chokidar `awaitWriteFinish`). A slow writer gives more than one `Update`. |
 | atomic writes | `with_delete_delay(d)` | Offered differently: an atomic save (write a temporary file, rename it over) is always one `Update`, with no option. A file that is removed and back within the delete delay (100 ms, as chokidar's `atomic`) is one `Update` too. |

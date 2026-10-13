@@ -542,11 +542,11 @@ fn unwatch_a_file_below_an_ignored_directory() {
   });
 }
 
-/// A watched path that the filter ignores counts as missing. While a watched path lies below
-/// it, its directory has a partial node all the same. When that path is taken back, the node
-/// has nothing to track: the directory counts as missing again, and its watch is given back.
+/// A watched directory that the filter would ignore is watched all the same, and it covers the
+/// watched file below it: when that path is taken back, the file stays known through the
+/// directory.
 #[test]
-fn unwatch_below_a_watched_path_that_the_filter_ignores() {
+fn unwatch_below_a_watched_directory_that_the_filter_would_ignore() {
   on_all(&pathwatch_sim::ignore_node_modules(), |d, on| {
     d.fs().mkdir_all("/p/node_modules/pkg").unwrap();
     d.fs().write("/p/node_modules/pkg/x.js", "1").unwrap();
@@ -554,13 +554,10 @@ fn unwatch_below_a_watched_path_that_the_filter_ignores() {
     assert_eq!(d.known(), ["/p/node_modules/pkg/x.js"], "{on}");
 
     assert_eq!(d.unwatch(&["/p/node_modules/pkg/x.js"]), NONE, "{on}");
-    assert_eq!(d.known(), NONE, "{on}");
-    let below: Vec<_> =
-      os_watches(d.fs()).into_iter().filter(|(dir, _)| dir.contains("node_modules")).collect();
-    assert_eq!(below, [], "{on}");
+    assert_eq!(d.known(), ["/p/node_modules/pkg/x.js"], "{on}");
     d.fs().write("/p/node_modules/pkg/x.js", "22").unwrap();
     d.fs().write("/p/node_modules/new.js", "1").unwrap();
-    assert_eq!(d.settled(), NONE, "{on}");
+    assert_eq!(d.settled(), ["C /p/node_modules/new.js", "U /p/node_modules/pkg/x.js"], "{on}");
     d.caught_up();
   });
 }
