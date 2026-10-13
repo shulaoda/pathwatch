@@ -370,12 +370,6 @@ hint costs one lookup more, however many children the directory has: 18 ns next 
 registered ones, where comparing with each child took 53 µs. The rest is for loose
 directories only. The registered names that are not plain are on a list for each directory
 (`Tree::not_plain`), and a hint with such a name marks all of them: one look for each. The
-registered names that look like a short (8.3) name of Windows (`LONGFI~1.JSO`: upper case, `~`
-and digits at the end of at most eight units, at most three after the dot) are on the same list:
-Windows names an entry by its long name in a record, which no table can match to the short
-name, so a hint with a long name marks each of them, as a guess that the look decides. A
-registered name with a lower-case letter is no short name (Windows makes them in upper case),
-and a hint whose name is a short name in any case means no long name. The
 other children of a complete directory are on no list, and there can be many. So when a hint
 names a name that is not plain, and the tree does
 not have it as an entry (`Node::is_entry`), the flush compares the names of the directory
@@ -1473,8 +1467,9 @@ What was not checked, and what is known to be missing, is in `docs/windows-open-
   entry has a record of its own. Every other record → `Changed`. A read with no bytes, and a record with no name →
   `Changed` with an empty `rel` for each key at or below the directory of the handle. Bytes
   that cannot be read → `Lost`. A read that fails → the handle is closed, `Changed` with an
-  empty `rel` for each of its keys. A name that looks like a short (8.3) name → `Changed` for
-  the directory that holds it.
+  empty `rel` for each of its keys. A short (8.3) name in a record is a name like any other:
+  below a watched directory the engine asks the disk how it spells a name it does not know,
+  and finds the entry under its long name; one that no key holds is dropped (README, "Holes").
 - Directories are compared by path text, and a handle reports nothing for what is behind a
   junction or a directory link below it. So each name between a handle and a key that it
   would serve is looked at (`leads_through_a_link`), and a key behind a link, below a

@@ -33,8 +33,7 @@
 //!     `a_directory_is_renamed_to_another_letter_case`,
 //!     `every_watched_spelling_of_a_file_gets_its_events`,
 //!     `watched_paths_through_another_spelling_inside_a_watched_directory`,
-//!     `a_directory_above_a_watched_path_is_renamed_to_another_letter_case`;
-//!     on Windows also `a_watched_path_with_a_short_name`.
+//!     `a_directory_above_a_watched_path_is_renamed_to_another_letter_case`.
 
 use std::{
   fs,
@@ -819,56 +818,6 @@ fn a_name_that_windows_reads_as_another_is_reported() {
       (Delete, "w/aux.c"),
       (Delete, "w/dir./x.txt"),
     ]);
-  });
-}
-
-/// The short (8.3) name of the last name of the path, if the volume makes one.
-#[cfg(windows)]
-fn short_name(path: &Path) -> Option<String> {
-  use std::os::windows::ffi::{OsStrExt, OsStringExt};
-  use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
-
-  let long: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-  let mut short = vec![0; 32 * 1024];
-  let room = u32::try_from(short.len()).unwrap();
-  // SAFETY: `long` ends with a NUL, and `short` has room for `room` units.
-  let len = unsafe { GetShortPathNameW(long.as_ptr(), short.as_mut_ptr(), room) };
-  assert!(len > 0 && len < room, "GetShortPathNameW: {}", std::io::Error::last_os_error());
-  let short = PathBuf::from(std::ffi::OsString::from_wide(&short[..len as usize]));
-  let name = short.file_name()?;
-  (Some(name) != path.file_name()).then(|| name.to_str().unwrap().to_owned())
-}
-
-/// Windows: a watched path that holds the short (8.3) name of a file, or of a directory on the
-/// way, gets its events, although the records name the entry by its long name. Another watched
-/// file in the directory puts the handle above the short name.
-#[cfg(windows)]
-#[test]
-fn a_watched_path_with_a_short_name() {
-  each_backend(|w| {
-    w.write("d/longfilename.config.json", "1");
-    w.write("d/other.txt", "1");
-    w.mkdir("d/longdirectoryname");
-    // A volume that makes no short names (`NtfsDisable8dot3NameCreation`) has nothing to test.
-    let Some(file) = short_name(&w.path("d/longfilename.config.json")) else { return };
-    let file = format!("d/{file}");
-    let below = format!("d/{}/file.js", short_name(&w.path("d/longdirectoryname")).unwrap());
-    w.watch(&[&file, &below, "d/other.txt"]);
-
-    w.write("d/longfilename.config.json", "22");
-    w.expect(&[(Update, &file)]);
-    w.write("d/longdirectoryname/file.js", "1");
-    w.expect(&[(Create, &below)]);
-    w.write("d/longdirectoryname/file.js", "22");
-    w.expect(&[(Update, &below)]);
-    w.remove("d/longfilename.config.json");
-    w.expect(&[(Delete, &file)]);
-    w.write("d/longfilename.config.json", "1");
-    w.expect(&[(Create, &file)]);
-    w.remove("d/longdirectoryname");
-    w.expect(&[(Delete, &below)]);
-    w.write("d/longdirectoryname/file.js", "1");
-    w.expect(&[(Create, &below)]);
   });
 }
 

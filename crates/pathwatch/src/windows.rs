@@ -116,63 +116,16 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
     if written && record.is_dir == Some(true) {
       continue;
     }
-    if let Some(parent) = before_short_name(&name) {
-      let parent = dir.join(OsString::from_wide(parent));
-      let mut found = false;
-      handles.route(&parent, &mut |key, rel| {
-        found = true;
-        hint(Hint::Changed { dir: key, rel });
-      });
-      if !found {
-        handles.below(&parent).into_iter().for_each(|key| hint(lost(key)));
-      }
-    } else {
-      let path = dir.join(OsString::from_wide(&name));
-      // Windows says "modified" for a directory when an entry in it changes, and that entry has
-      // a record of its own.
-      if written && handles.holds_a_key(&path) {
-        continue;
-      }
-      handles.route(&path, &mut |key, rel| {
-        hint(if written {
-          Hint::Written { dir: key, rel }
-        } else {
-          Hint::Changed { dir: key, rel }
-        });
-      });
+    let path = dir.join(OsString::from_wide(&name));
+    // Windows says "modified" for a directory when an entry in it changes, and that entry has
+    // a record of its own.
+    if written && handles.holds_a_key(&path) {
+      continue;
     }
+    handles.route(&path, &mut |key, rel| {
+      hint(if written { Hint::Written { dir: key, rel } } else { Hint::Changed { dir: key, rel } });
+    });
   }
-}
-
-const BACKSLASH: u16 = 0x5C;
-const DOT: u16 = 0x2E;
-const TILDE: u16 = 0x7E;
-const DIGITS: std::ops::RangeInclusive<u16> = 0x30..=0x39;
-const LOWER_CASE: std::ops::RangeInclusive<u16> = 0x61..=0x7A;
-
-fn before_short_name(name: &[u16]) -> Option<&[u16]> {
-  let mut start = 0_usize;
-  for part in name.split(|&unit| unit == BACKSLASH) {
-    if looks_short(part) {
-      return Some(&name[..start.saturating_sub(1)]);
-    }
-    start += part.len() + 1;
-  }
-  None
-}
-
-fn looks_short(part: &[u16]) -> bool {
-  let dot = part.iter().position(|&unit| unit == DOT).unwrap_or(part.len());
-  let (base, extension) = part.split_at(dot);
-  let digits = base.iter().rev().take_while(|unit| DIGITS.contains(unit)).count();
-  let tilde = base.len().checked_sub(digits + 1).filter(|&at| at > 0 && base[at] == TILDE);
-  // Windows makes 8.3 names in upper case: `v1~1.txt` is a long name.
-  digits > 0
-    && tilde.is_some()
-    && base.len() <= 8
-    && extension.len() <= 4
-    && !extension[extension.len().min(1)..].contains(&DOT)
-    && !part.iter().any(|unit| LOWER_CASE.contains(unit))
 }
 
 mod place {
@@ -1323,43 +1276,5 @@ mod port {
 
   fn stopped() -> io::Error {
     io::Error::other("the thread of the Windows backend has stopped")
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::looks_short;
-
-  #[test]
-  fn what_looks_like_a_short_name() {
-    let looks_short = |name: &str| looks_short(&name.encode_utf16().collect::<Vec<_>>());
-    for name in ["PROGRA~1", "LONGFI~1.TXT", "A~1", "AB12CD~9.JS", "ABCD~123.X", "A~1."] {
-      assert!(looks_short(name), "{name}");
-    }
-    for name in [
-      "",
-      "a.txt",
-      "~1",
-      "~1.txt",
-      "a~.txt",
-      "a~b.txt",
-      "a~1b.txt",
-      "file.txt~1",
-      "a~1.json",
-      "a~1.b.c",
-      "v1~1.txt",
-      "a~1.c",
-      "api~2.md",
-      "toolongna~1.txt",
-      "backup~",
-      "~$doc.docx",
-      "BACKUP~",
-      "LONGNAME~1.TAR.GZ",
-      "TOOLONGNAME~1.TXT",
-      "A~1.LONGEXT",
-      "A~1..TXT",
-    ] {
-      assert!(!looks_short(name), "{name}");
-    }
   }
 }

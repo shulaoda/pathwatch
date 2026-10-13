@@ -268,8 +268,6 @@ pub struct Tree {
   ahead: FxHashMap<DirKey, Instant>,
   /// The registered nodes whose names are not plain, by the slot of their parent: the table does
   /// not find them under another spelling, so a hint looks here ([`Tree::others_meant`]).
-  /// The registered children of each directory whose other spellings the table cannot find:
-  /// the names that are not plain, and the ones that look like short (8.3) names.
   not_plain: FxHashMap<u32, Vec<u32>>,
   /// The nodes with a mark, each with the time of the hint that made it, if a hint did: the
   /// delete delay counts from it. A key can be stale.
@@ -618,8 +616,7 @@ impl Tree {
   /// Puts the node in slot `child` on the `not_plain` list of its parent, or takes it off.
   fn list_not_plain(&mut self, child: u32, registered: bool) {
     let node = linked(&self.slots, child);
-    let name = name_of(&self.names, node);
-    if is_plain(name) && !looks_short(name) {
+    if is_plain(name_of(&self.names, node)) {
       return;
     }
     let parent = node.parent;
@@ -819,12 +816,10 @@ impl Tree {
       let is_complete = parent.is_complete();
       let is_seen = below.is_some_and(Node::is_registered) || is_complete;
       // The table finds the other spellings of a plain name only; the registered ones that are not
-      // plain, and the short names, are on a list, and a listing shows the rest.
-      let loose = self.loose_spelling;
-      let not_in_table = loose
+      // plain are on a list, and a listing shows the rest.
+      let not_in_table = self.loose_spelling
         && (!self.not_plain.is_empty() || (is_complete && !below.is_some_and(Node::is_entry)));
-      let has_short = loose && !could_be_short(name) && self.has_short_names(at);
-      if has_other || (not_in_table && !is_plain(name)) || has_short {
+      if has_other || (not_in_table && !is_plain(name)) {
         found |= self.mark_others(at, name, child, &parts, written);
       }
       if !is_seen {
@@ -851,8 +846,7 @@ impl Tree {
 
   /// The walk of `mark_path` for the other children that `name` can mean. A twin of the name
   /// (`twins_share_writes`) is the entry that was written: its mark says `written` as the hint
-  /// does. Every other child is a guess (a name that is not plain, a short name), and its look
-  /// decides.
+  /// does. Every other child is a guess (a name that is not plain), and its look decides.
   #[cold]
   fn mark_others(
     &mut self,
@@ -884,13 +878,6 @@ impl Tree {
       }
     }
     found
-  }
-
-  /// Whether a registered child of slot `at` looks like a short (8.3) name: a record of the OS
-  /// names the entry by its long name, which the table cannot find.
-  fn has_short_names(&self, at: u32) -> bool {
-    let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
-    listed.iter().any(|&child| looks_short(name_of(&self.names, linked(&self.slots, child))))
   }
 
   /// Adds a mark to a node. Two marks for one node become one. The time of the mark is the one
@@ -1041,17 +1028,7 @@ impl Tree {
         && can_be_one_name(name_of(&self.names, node), name)
     };
     if is_plain(name) {
-      let mut meant: Vec<u32> =
-        self.index.iter_hash(child_hash(at, name)).copied().filter(is_meant).collect();
-      // A long name can be the one of a registered short name on an NTFS volume.
-      if loose && !could_be_short(name) {
-        let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
-        let short = |&child: &u32| {
-          Some(child) != exact && looks_short(name_of(&self.names, linked(&self.slots, child)))
-        };
-        meant.extend(listed.iter().copied().filter(short));
-      }
-      meant
+      self.index.iter_hash(child_hash(at, name)).copied().filter(is_meant).collect()
     } else if loose {
       let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
       let not_plain = |&child: &u32| {
@@ -1116,32 +1093,6 @@ fn can_be_one_name(a: &OsStr, b: &OsStr) -> bool {
 /// Whether every other spelling of `name` is known: only ASCII and Han ideographs, which have no
 /// case and no second form. The few characters that a disk folds to plain ones (`ß`, the Kelvin
 /// sign, ligatures, compatibility ideographs) are not covered: design.md 9.
-/// Whether the name looks like a short (8.3) name of Windows: at most eight units before the
-/// dot with `~` and digits at their end, at most three after it, and no lower case letter.
-/// Windows makes them in upper case, so `v1~1.txt` is a long name. The same rule is in the
-/// Windows backend (`before_short_name`).
-fn looks_short(name: &OsStr) -> bool {
-  could_be_short(name) && !name.as_encoded_bytes().iter().any(u8::is_ascii_lowercase)
-}
-
-/// `looks_short` in any case of letters: a hint with such a name, on a loose disk, is for the
-/// short name itself, so it means no long name.
-fn could_be_short(name: &OsStr) -> bool {
-  let bytes = name.as_encoded_bytes();
-  if !bytes.is_ascii() {
-    return false;
-  }
-  let dot = bytes.iter().position(|&byte| byte == b'.').unwrap_or(bytes.len());
-  let (base, extension) = bytes.split_at(dot);
-  let digits = base.iter().rev().take_while(|byte| byte.is_ascii_digit()).count();
-  let tilde = base.len().checked_sub(digits + 1).filter(|&at| at > 0 && base[at] == b'~');
-  digits > 0
-    && tilde.is_some()
-    && base.len() <= 8
-    && extension.len() <= 4
-    && !extension[extension.len().min(1)..].contains(&b'.')
-}
-
 fn is_plain(name: &OsStr) -> bool {
   let is_plain = |letter: char| {
     letter.is_ascii()
@@ -1296,19 +1247,18 @@ impl Tree {
     if reached != live || self.index.len() + 1 != live {
       return Err("a node is in no list of children, or not in the table".to_owned());
     }
-    let is_listed = |name: &OsStr| !is_plain(name) || looks_short(name);
     let listed = |(parent, children): (&u32, &Vec<u32>)| {
       !children.is_empty()
         && children.iter().all(|&child| {
           let node = self.slots.get(child as usize).and_then(Slot::node);
           node.is_some_and(|node| {
-            node.parent == *parent && node.is_registered() && is_listed(name_of(&self.names, node))
+            node.parent == *parent && node.is_registered() && !is_plain(name_of(&self.names, node))
           })
         })
     };
-    let registered = |node: &Node| node.is_registered() && is_listed(name_of(&self.names, node));
+    let registered = |node: &Node| node.is_registered() && !is_plain(name_of(&self.names, node));
     let on_lists: usize = self.not_plain.values().map(Vec::len).sum();
-    // The names on the list: not plain, or looking like a short name.
+    // The names on the list: the registered ones that are not plain.
     if !self.not_plain.iter().all(listed)
       || on_lists != self.nodes().filter(|(_, node)| registered(node)).count()
     {

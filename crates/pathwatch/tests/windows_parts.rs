@@ -1722,38 +1722,21 @@ mod translate {
     assert_eq!(hints(&mut handles, read(id, "/p", Ok(bytes))), [changed(0, ""), written(0, "a")]);
   }
 
+  /// A short (8.3) name in a record is a name like any other: the engine asks the disk how it
+  /// spells a name it does not know. One that matches no key is dropped (README, "Holes").
   #[test]
-  fn a_short_name_names_the_directory_that_holds_it() {
+  fn a_short_name_is_a_name_like_any_other() {
     let mut handles = Handles::default();
     let id = open(&mut handles, 0, "/p");
-    let bytes = encode(&[
-      (MODIFIED, "LONGFI~1.TXT"),
-      (MODIFIED, r"sub\deep\LONGFI~1.TXT"),
-      (ADDED, r"sub\PROGRA~1\deep\a.js"),
-      (MODIFIED, r"sub\not~short.txt"),
-    ]);
+    let bytes = encode(&[(MODIFIED, "LONGFI~1.TXT"), (ADDED, r"sub\PROGRA~1\deep\a.js")]);
     assert_eq!(
       hints(&mut handles, read(id, "/p", Ok(bytes))),
-      [
-        changed(0, ""),
-        changed(0, r"sub\deep"),
-        changed(0, "sub"),
-        written(0, r"sub\not~short.txt"),
-      ]
+      [written(0, "LONGFI~1.TXT"), changed(0, r"sub\PROGRA~1\deep\a.js")]
     );
-  }
-
-  #[test]
-  fn a_short_name_that_no_key_holds_is_a_loss_for_the_keys_below_it() {
-    let mut handles = Handles::default();
-    // As above: what a shared handle on `/p` reads, with no key on `/p`.
-    let id = open(&mut handles, 0, "/p/long name/a");
-    open(&mut handles, 1, "/p/other");
-    open(&mut handles, 2, "/q");
-    // `LONGNA~1` can be the directory on the way to either key.
+    let id = open(&mut handles, 1, "/q/long name/a");
+    open(&mut handles, 2, "/q/other");
     let bytes = encode(&[(MODIFIED, r"LONGNA~1\a\x.js")]);
-    let lost = hints(&mut handles, read(id, "/p", Ok(bytes)));
-    assert_eq!(sorted(lost), [changed(0, ""), changed(1, "")]);
+    assert_eq!(hints(&mut handles, read(id, "/q", Ok(bytes))), []);
   }
 
   #[test]

@@ -167,19 +167,17 @@ the real disk, with this backend and with polling.
   and an unpacked archive make them. For a path with one, every call of the engine and the
   backend takes the `\\?\` form (`fs::literal`), so the entry is read under this very name.
   Before that, such a file below a watched directory got no event at all (measured).
-- **Short (8.3) names.** Windows may report a change under the short name of a file. A name that
-  looks like one (`LONGFI~1.TXT`) becomes a `Changed` hint for the directory that holds it. A
-  name with a lower-case letter (`v1~1.txt`) is never taken for one: Windows makes short names
-  in upper case only. Not checked: which parts of a reported path can be short names, and how
-  often real long names look like one. The other way round: a watched path that holds the short
-  name of an entry (`d\LONGFI~1.JSO`, or `d\LONGDI~1\file.js`) gets records that carry the
-  long name, which match no registered name. The tree keeps the registered names that look like
-  short names on a list for each directory, and a hint with a long name marks all of them, as a
-  guess that the look decides (`design.md` 5.2). Measured: a watched file with a short name, and
-  a watched file below a directory with one, get `Update`, `Delete` and `Create` through the
-  long names (`disk::promises::a_watched_path_with_a_short_name`). Still open: a key whose own
-  directory holds a short name and shares a handle above it is found by the text of its path,
-  which the long name in the record does not match (README, "more than 64 directories").
+- **Short (8.3) names.** Windows may report a change under the short name of a file, when the
+  program that made it used that name. Such a name reaches the engine like any other: below
+  a watched directory it is a new name, the disk is asked how it spells it
+  (`FindFirstFileW` gives the long name), and the entry is found under its long name in the
+  same flush. Not checked: how often that happens. Two things are not done (README,
+  "Holes"): a watched path that holds a short name gets records that carry the long name,
+  which match no registered name; and a short name of a directory on the way to a key of a
+  shared handle, with no key at the directory of the handle, matches no key and is dropped.
+  (A rule that took a name of that shape for a short name and scanned the directory that
+  holds it was built and taken out again: a guess that could misfire on a real long name, for
+  a case nobody measured.)
 - **Names that no path can hold.** A disk that another system filled (an NTFS volume written
   from Linux, a share without name mangling) can list a name with `\` or `/` in it, or one that
   reads as a drive (`C:`, `Q:x`). `PathBuf::push` would start the path anew for the second kind,
@@ -310,12 +308,8 @@ its limits are, is in `docs/design.md` 7.3.
    in the table of design 6 allows a late hint, and the engine drops a hint whose key names no
    node.
 
-3. **A short name in the directory of a key itself** becomes `Changed` with an empty `rel`.
-   For the engine that means "check this directory and watch it again", so everything below is
-   scanned, and a handle on that directory is opened again. It is correct, but more work than
-   needed. A hint that says "scan this one directory" does not exist. With a shared handle it
-   can be worse: when no key is at or above the directory that holds the short name, the short
-   name can be a directory on the way to any key below, so each of these keys gets that hint.
+3. **A short name in a record** is a name like any other now: see "Short (8.3) names" above
+   for what is found and what is not.
 
 4. **The return of `ReadDirectoryChangesW`.** Every non-zero return is taken for "a request
    is queued": kernelbase can return non-zero for a warning status, where nothing was queued

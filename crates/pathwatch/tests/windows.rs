@@ -764,12 +764,10 @@ fn open_point_a_change_made_through_a_short_name() {
   let key = harness.handle(temp.path());
 
   fs::write(temp.path().join(&short), "12").unwrap();
-  // Windows may report the long name, or the backend names the directory that holds the short
-  // one. The short name itself must never reach the engine.
-  let seen = harness
-    .hints_until(|hint| hint.names(key, "a long file name.txt") || hint.names_the_directory(key));
+  // Windows may report the long name or the short one: the engine asks the disk how a name
+  // it does not know is spelled, and finds the entry under its long name.
   let short = short.to_string_lossy();
-  assert!(seen.iter().all(|hint| !hint.names(key, &short)), "{seen:?}");
+  harness.hints_until(|hint| hint.names(key, "a long file name.txt") || hint.names(key, &short));
 }
 
 /// A disk that another system filled can list a name that reads as a drive (`C:`, `Q:evil`):

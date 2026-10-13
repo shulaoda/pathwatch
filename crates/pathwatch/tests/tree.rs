@@ -576,51 +576,6 @@ fn a_write_under_another_spelling_is_a_write_to_the_registered_name() {
   f.tree.check_links().unwrap();
 }
 
-/// Windows names an entry by its long name in a record, also when the registered name is its
-/// short (8.3) name: a hint with a long name marks each registered name of the directory that
-/// looks like a short name, as a guess that the look decides. A short name with a lower-case
-/// letter is a long name, and a strict directory has no short names.
-#[test]
-fn a_long_name_marks_the_registered_short_names() {
-  let mut f = fixture();
-  f.tree.loose_spelling = true;
-  f.tree.twins_share_writes = true;
-  let short = child(&mut f.tree, f.p, "LONGFI~1.JSO");
-  let lower = child(&mut f.tree, f.p, "v1~1.txt");
-  let dir = child(&mut f.tree, f.p, "LONGDI~1");
-  on_disk(&mut f.tree, dir, false);
-  let below = child(&mut f.tree, dir, "file.js");
-  for key in [short, lower, below] {
-    assert!(f.tree.make_path(key));
-  }
-  assert!(f.tree.hint(changed(f.p, "longfilename.config.json", true)));
-  assert_eq!(marks(&f.tree), ["/p|LONGDI~1|d", "/p|LONGFI~1.JSO|d"]);
-  // No node is made for the long name: the directory is partial.
-  assert_eq!(f.tree.child(f.p, OsStr::new("longfilename.config.json")), None);
-  clear_marks(&mut f.tree);
-  // On the way: the directory with the short name leads on to the name below.
-  assert!(f.tree.hint(changed(f.p, "longdirectoryname/file.js", false)));
-  assert_eq!(marks(&f.tree), ["/p/LONGDI~1|file.js|d", "/p|LONGFI~1.JSO|d"]);
-  clear_marks(&mut f.tree);
-  // The short name itself, in any case of its letters, is found as always, and it is no long
-  // name: nothing else is marked.
-  assert!(f.tree.hint(changed(f.p, "longfi~1.jso", true)));
-  assert_eq!(marks(&f.tree), ["/p|LONGFI~1.JSO|w"]);
-  clear_marks(&mut f.tree);
-  // A strict disk has no short names.
-  f.tree.loose_spelling = false;
-  assert!(!f.tree.hint(changed(f.p, "longfilename.config.json", false)));
-  assert!(!f.tree.has_work());
-  f.tree.loose_spelling = true;
-  // A name that is taken back is no short name any more.
-  assert!(f.tree.drop_path(short));
-  f.tree.prune(short);
-  assert!(f.tree.hint(changed(f.p, "longfilename.config.json", false)));
-  assert_eq!(marks(&f.tree), ["/p|LONGDI~1|d"]);
-  clear_marks(&mut f.tree);
-  f.tree.check_links().unwrap();
-}
-
 /// The name of a hint means each registered name that the OS can take for it, and nothing else.
 #[test]
 fn a_name_that_can_be_another_spelling() {

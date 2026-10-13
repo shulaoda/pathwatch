@@ -258,8 +258,11 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   directory; it looks once more at the next flush, within the poll interval, and reports the
   link then. Until then a watched path at or through the link gets no events.
 - **Windows: more than 64 directories** share handles. A watched path whose directory is then
-  spelled in another way than the disk (more than the case of letters, or a short 8.3 name)
-  gets no events.
+  spelled in another way than the disk (more than the case of letters) gets no events, and
+  neither does a change that a program makes through the short (8.3) name of a directory on
+  the way to it.
+- **Windows: a path watched by a short (8.3) name** (`LONGFI~1.TXT`) gets no events: Windows
+  names an entry by its long name. Watch the long name.
 - **Windows: a name with `\` or `/` in it**, which only a disk that another system filled can
   hold, is not reported: no path names such an entry.
 - **Where the OS watches are put depends on what was watched and unwatched before.** A stream of
