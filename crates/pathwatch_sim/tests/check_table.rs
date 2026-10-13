@@ -307,10 +307,7 @@ fn same_directory_with_a_written_mark() {
   assert_eq!(taken(&mut d), ["C /p/r/sub/new"]);
   let after = d.fs.calls();
   assert_eq!(after.read_dir, before.read_dir);
-  // The two marks, and `/p`: its parent `/` is only polled, so it is checked with them. And
-  // two looks for the first new name of a directory: the name in the other case of its
-  // letters is not there, and the name itself still is. That proves that the directory tells
-  // the two apart.
-  assert_eq!(after.lstat, before.lstat + 5);
+  // The two marks, and `/p`: its parent `/` is only polled, so it is checked with them.
+  assert_eq!(after.lstat, before.lstat + 3);
   caught_up(&mut d);
 }

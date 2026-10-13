@@ -54,7 +54,6 @@ impl SimFs {
       listing_kinds: true,
       listing_meta: false,
       ignore_case: false,
-      spelling_ids: false,
       mount: None,
       other_rule: FxHashSet::default(),
       offline: None,
@@ -318,13 +317,6 @@ impl SimFs {
   /// before the first entry is made.
   pub fn set_ignore_case(&self, ignore_case: bool) {
     self.lock().ignore_case = ignore_case;
-  }
-
-  /// Whether a look through another spelling of a name gives another file id than a look
-  /// through the spelling of the disk, as on a folder shared into a virtual machine (vboxsf)
-  /// or over ssh (sshfs). Off by default.
-  pub fn set_spelling_ids(&self, spelling_ids: bool) {
-    self.lock().spelling_ids = spelling_ids;
   }
 
   /// Takes away or gives back the permission to list a directory, while it can still be
@@ -605,8 +597,6 @@ pub(crate) struct State {
   listing_meta: bool,
   /// Names that differ only in the case of ASCII letters are one name.
   ignore_case: bool,
-  /// A look through another spelling of a name gives another file id (vboxsf, sshfs).
-  spelling_ids: bool,
   /// `SimFs::set_mount`.
   mount: Option<OsString>,
   /// The directories that take names the other way than `ignore_case` says.
@@ -679,35 +669,15 @@ impl State {
     }
   }
 
-  /// `lstat` or `stat`: what is at the path, with a file id of its own for a look through
-  /// another spelling of the last name when the disk gives one (`spelling_ids`).
+  /// `lstat` or `stat`: what is at the path.
   fn look(&self, path: &Path, follow: bool) -> io::Result<Meta> {
     if let Some(kind) = self.offline {
       return Err(error(kind));
     }
-    let mut respelled = false;
-    let id = self.walk_spelled(ROOT, path, follow, 0, &mut respelled)?;
-    let mut meta = self.meta(id);
-    if respelled && self.spelling_ids {
-      meta.file_id ^= 1 << 40;
-      meta.dir_id.inode ^= 1 << 40;
-    }
-    Ok(meta)
+    Ok(self.meta(self.resolve(path, follow)?))
   }
 
   fn walk(&self, from: u64, path: &Path, follow: bool, links: u32) -> io::Result<u64> {
-    self.walk_spelled(from, path, follow, links, &mut false)
-  }
-
-  /// `respelled`: the last name of `path` was found under another spelling.
-  fn walk_spelled(
-    &self,
-    from: u64,
-    path: &Path,
-    follow: bool,
-    links: u32,
-    respelled: &mut bool,
-  ) -> io::Result<u64> {
     let mut at = from;
     let mut parts = path.components().peekable();
     while let Some(part) = parts.next() {
@@ -721,9 +691,7 @@ impl State {
           if self.inodes[&at].denied {
             return Err(error(io::ErrorKind::PermissionDenied));
           }
-          let (spelled, child) =
-            self.entry(at, name).ok_or_else(|| error(io::ErrorKind::NotFound))?;
-          *respelled = spelled != name;
+          let (_, child) = self.entry(at, name).ok_or_else(|| error(io::ErrorKind::NotFound))?;
           at = match &self.inodes[&child].content {
             Content::Link(target) if follow || parts.peek().is_some() => {
               if links >= 32 {

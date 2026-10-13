@@ -534,7 +534,7 @@ fn a_directory_is_away_and_back_before_the_first_poll() {
 /// hear is still found: the end of a stream is told to every key that it had.
 #[test]
 fn a_directory_gets_a_new_stream_before_the_end_of_its_old_one_is_told() {
-  let mut d = driver(Mode::Prefix);
+  let mut d = Driver::sim(Mode::Prefix, Options { loose_spelling: true, ..Options::default() });
   d.fs.set_ignore_case(true);
   d.fs.mkdir_all("/a/sub").unwrap();
   d.fs.write("/a/sub/f.js", "1").unwrap();

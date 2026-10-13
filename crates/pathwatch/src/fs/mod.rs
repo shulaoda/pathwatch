@@ -44,7 +44,7 @@ pub trait Fs {
   fn real_path(&self, path: &Path) -> io::Result<PathBuf>;
 
   /// The last name of `path` as the disk spells it; a link at the end is not followed. Asked
-  /// only on a disk that takes two spellings of a name for one.
+  /// only where every disk takes two spellings of a name for one (macOS, Windows).
   fn name_on_disk(&self, path: &Path) -> io::Result<OsString>;
 
   /// The clock that the modification times come from.
@@ -306,39 +306,8 @@ pub(crate) use self::apple::name_and_kind;
 #[cfg(target_vendor = "apple")]
 use self::apple::name_on_disk;
 
-/// Linux has no call for the name of one entry, so the listing is read (1.8 ms for 2,000
-/// entries). The entry is the one with the name, else one in another ASCII case, else one with
-/// the same inode; none of these means no such entry, whatever `lstat` said: on a folder that
-/// a Mac shares, Linux still finds a name that was renamed away through another spelling.
-#[cfg(all(unix, not(target_vendor = "apple")))]
-fn name_on_disk(path: &Path) -> io::Result<OsString> {
-  use std::os::unix::fs::{DirEntryExt, MetadataExt};
-
-  let inode = fs::symlink_metadata(path)?.ino();
-  let (Some(given), Some(dir)) = (path.file_name(), path.parent()) else {
-    return Err(io::ErrorKind::InvalidInput.into());
-  };
-  // A listing that cannot be read, or that fails on the way, says nothing against the name.
-  let Ok(entries) = fs::read_dir(dir) else { return Ok(given.to_owned()) };
-  let (mut other_case, mut same_inode) = (None, None);
-  for entry in entries {
-    let Ok(entry) = entry else { return Ok(given.to_owned()) };
-    let name = entry.file_name();
-    if name == given {
-      return Ok(name);
-    }
-    if name.eq_ignore_ascii_case(given) {
-      other_case = Some(name);
-    } else if entry.ino() == inode {
-      same_inode = Some(name);
-    }
-  }
-  other_case.or(same_inode).ok_or_else(|| io::ErrorKind::NotFound.into())
-}
-
-/// Everywhere else a name has one spelling. (WASI: the inode of an entry is not in stable
-/// std, so the listing cannot be read as on Linux.)
-#[cfg(not(any(unix, windows)))]
+/// Everywhere else every disk tells two spellings of a name apart, and the engine never asks.
+#[cfg(not(any(target_vendor = "apple", windows)))]
 fn name_on_disk(path: &Path) -> io::Result<OsString> {
   fs::symlink_metadata(path)?;
   path.file_name().map(OsStr::to_owned).ok_or_else(|| io::ErrorKind::InvalidInput.into())

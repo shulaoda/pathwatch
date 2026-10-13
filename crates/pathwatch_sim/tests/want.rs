@@ -24,11 +24,19 @@ type Make = Box<dyn Fn() -> Box<dyn Sim>>;
 
 /// One way to make a driver for each backend, so that a story can be told many times.
 fn makes() -> [(&'static str, Make); 4] {
+  makes_with(&Options::default())
+}
+
+fn makes_with(options: &Options) -> [(&'static str, Make); 4] {
+  let with = |make: fn(Options) -> Box<dyn Sim>| -> Make {
+    let options = options.clone();
+    Box::new(move || make(options.clone()))
+  };
   [
-    ("Inode", Box::new(|| Box::new(Driver::sim(Mode::Inode, Options::default())))),
-    ("Prefix", Box::new(|| Box::new(Driver::sim(Mode::Prefix, Options::default())))),
-    ("Handle", Box::new(|| Box::new(Driver::sim(Mode::Handle, Options::default())))),
-    ("Poll", Box::new(|| Box::new(Driver::<PollBackend>::poll(Options::default())))),
+    ("Inode", with(|options| Box::new(Driver::sim(Mode::Inode, options)))),
+    ("Prefix", with(|options| Box::new(Driver::sim(Mode::Prefix, options)))),
+    ("Handle", with(|options| Box::new(Driver::sim(Mode::Handle, options)))),
+    ("Poll", with(|options| Box::new(Driver::<PollBackend>::poll(options)))),
   ]
 }
 
@@ -610,10 +618,10 @@ fn a_polled_directory_is_asked_again_when_a_stream_above_it_starts() {
   caught_up(&mut d);
 }
 
-/// A listing that tells all of a file (APFS) is its look: a scan asks no `lstat` for a file,
-/// the first one and the one after a loss. What the listing told can be old when the scan
-/// comes to the file: the file is written or removed, or a directory takes its place, at any
-/// moment of the `watch` call.
+/// A listing that tells all of a file (APFS, NTFS: disks that take two spellings of a name for
+/// one) is its look: a scan asks no `lstat` for a file, the first one and the one after a
+/// loss. What the listing told can be old when the scan comes to the file: the file is written
+/// or removed, or a directory takes its place, at any moment of the `watch` call.
 #[test]
 fn a_listing_that_tells_all_of_a_file_is_its_look() {
   fn prepare(d: &mut dyn Sim, meta: bool) {
@@ -630,7 +638,8 @@ fn a_listing_that_tells_all_of_a_file_is_its_look() {
       fs.mkdir_all("/p/src/a.js/in").unwrap();
     },
   ];
-  for (on, make) in makes() {
+  let loose = Options { loose_spelling: true, ..Options::default() };
+  for (on, make) in makes_with(&loose) {
     let calls = |meta: bool| {
       let mut d = make();
       prepare(&mut *d, meta);
@@ -638,12 +647,15 @@ fn a_listing_that_tells_all_of_a_file_is_its_look() {
       let first = d.fs().calls();
       d.overflow();
       d.settled();
-      let again = d.fs().calls().lstat - first.lstat;
+      let after = d.fs().calls();
       d.caught_up();
-      (first, again)
+      (first, after.lstat - first.lstat, after.read_dir - first.read_dir)
     };
-    let ((with_lstat, again_with_lstat), (first, again)) = (calls(false), calls(true));
-    assert_eq!((with_lstat.lstat - first.lstat, again_with_lstat - again), (2, 2), "{on}");
+    let ((with_lstat, again_with_lstat, _), (first, again, listings)) = (calls(false), calls(true));
+    // The two files at `watch`, and in each round after the loss (the deep scan, and under
+    // polling each poll): a round lists `/p` and `/p/src` once and spares the two files.
+    assert_eq!(with_lstat.lstat - first.lstat, 2, "{on}");
+    assert_eq!(again_with_lstat - again, listings, "{on}");
 
     for moment in 0..first.total() {
       for change in changes {

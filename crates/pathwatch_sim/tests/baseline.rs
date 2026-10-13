@@ -902,7 +902,7 @@ fn a_scan_that_waited_runs_inside_a_watch_of_a_file_below() {
 /// directory spelled `C` can be there, which that directory covers, and whose files are new.
 #[test]
 fn a_name_in_another_spelling_is_looked_at_again_before_a_new_path_below_it() {
-  on_all(&Options::default(), |d, on| {
+  on_all(&Options { loose_spelling: true, ..Options::default() }, |d, on| {
     d.fs().set_ignore_case(true);
     d.fs().mkdir_all("/b/c").unwrap();
     d.fs().write("/b/c/f", "1").unwrap();
@@ -925,7 +925,7 @@ fn a_name_in_another_spelling_is_looked_at_again_before_a_new_path_below_it() {
 /// The entry under the name the disk has is looked at in the same flush.
 #[test]
 fn a_known_entry_that_becomes_a_registered_name_is_asked_for_its_spelling() {
-  on_all(&Options::default(), |d, on| {
+  on_all(&Options { loose_spelling: true, ..Options::default() }, |d, on| {
     d.fs().set_ignore_case(true);
     d.fs().mkdir_all("/d").unwrap();
     d.fs().mkdir_all("/q/dir").unwrap();

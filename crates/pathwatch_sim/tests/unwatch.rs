@@ -838,7 +838,7 @@ fn a_watch_that_is_given_back_is_followed_by_a_commit() {
 /// the handler knows, and the directory reports the files under its own spelling.
 #[test]
 fn unwatch_below_a_name_whose_spelling_the_directory_above_has_not_told_yet() {
-  on_all(&Options::default(), |d, on| {
+  on_all(&Options { loose_spelling: true, ..Options::default() }, |d, on| {
     d.fs().set_ignore_case(true);
     d.fs().mkdir_all("/p/t/x/s").unwrap();
     d.fs().write("/p/t/x/s/f", "1").unwrap();

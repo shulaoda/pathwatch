@@ -11,7 +11,7 @@ use std::{
 use pathwatch::{
   backend::{DirKey, Hint, Want},
   fs::DirId,
-  tree::{Content, Depth, Dir, Fingerprint, Kind, Mark, Spelling, Tree, Watch},
+  tree::{Content, Depth, Dir, Fingerprint, Kind, Mark, Tree, Watch},
 };
 
 fn child(tree: &mut Tree, parent: DirKey, name: &str) -> DirKey {
@@ -607,12 +607,11 @@ fn a_long_name_marks_the_registered_short_names() {
   assert!(f.tree.hint(changed(f.p, "longfi~1.jso", true)));
   assert_eq!(marks(&f.tree), ["/p|LONGFI~1.JSO|w"]);
   clear_marks(&mut f.tree);
-  // A directory proved strict has no short names.
+  // A strict disk has no short names.
   f.tree.loose_spelling = false;
-  f.tree[f.p].dir_mut().unwrap().spelling = Spelling::Strict;
   assert!(!f.tree.hint(changed(f.p, "longfilename.config.json", false)));
   assert!(!f.tree.has_work());
-  f.tree[f.p].dir_mut().unwrap().spelling = Spelling::Unknown;
+  f.tree.loose_spelling = true;
   // A name that is taken back is no short name any more.
   assert!(f.tree.drop_path(short));
   f.tree.prune(short);
@@ -642,9 +641,7 @@ fn a_name_that_can_be_another_spelling() {
   assert!(f.tree.hint(changed(f.p, "R/sub/a.js", true)));
   assert_eq!(marks(&f.tree), ["/p/r/sub|a.js|d"]);
   clear_marks(&mut f.tree);
-  // In a directory proved strict, an accent is no other spelling of anything.
-  f.tree[f.p].dir_mut().unwrap().spelling = Spelling::Strict;
-  assert!(!f.tree.is_loose(f.p) && f.tree.is_loose(f.r));
+  // On a strict disk, an accent is no other spelling of anything.
   let accent = child(&mut f.tree, f.p, "\u{e9}.js");
   assert!(f.tree.make_path(accent));
   assert!(!f.tree.hint(changed(f.p, "\u{c9}.js", true)));

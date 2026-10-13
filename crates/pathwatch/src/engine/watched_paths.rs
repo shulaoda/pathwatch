@@ -9,7 +9,7 @@ use crate::{
   config::EntryKind,
   fs::Fs,
   path::split_top,
-  tree::{Added, Depth, Kind, Mark, Spelling, Tree, emptied},
+  tree::{Added, Depth, Kind, Mark, Tree, emptied},
 };
 
 /// The baseline: what a `watch` call finds is known without an event, unless an older watched
@@ -253,8 +253,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           self.forget_file(key);
           continue;
         }
-        // Nothing is asked in a partial directory, so nothing would take a wrong proof back.
-        Kind::Dir(dir) => (dir.complete, dir.spelling) = (false, Spelling::Unknown),
+        Kind::Dir(dir) => dir.complete = false,
       }
       if stays {
         // Before the directories below, so that they know of the deep scan that comes from here.

@@ -5,12 +5,12 @@ use std::path::PathBuf;
 
 use super::{
   Engine,
-  check::{Found, Listed, is_missing, swap_case},
+  check::{Found, Listed, is_missing},
 };
 use crate::{
   backend::{Backend, DirKey},
   fs::{DirId, Entry, FileType, Fs},
-  tree::{Depth, Dir, Kind, Mark, Spelling, Watch, push_name, with_name},
+  tree::{Depth, Dir, Kind, Mark, Watch},
 };
 
 /// One node to check in a scan, with what the listing said about it.
@@ -33,10 +33,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.tree.frozen(key) {
       return;
     }
-    // A look proved meanwhile that the directory is strict: there are no names to compare.
-    if depth == Depth::Names && !self.tree.is_loose(key) {
-      return;
-    }
     self.tree.path_into(key, path);
     self.scan_had_error = false;
     names.clear();
@@ -48,15 +44,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if listing == Listing::Stop {
       return;
     }
-    let kept_names = self.tree.is_loose(key);
-    if listing == Listing::Whole && known > 0 && !self.options.loose_spelling {
-      self.ask_for_the_rule(key, path, names);
-    }
     // The listing of a loose directory says how the disk spells each known node, or that it is
     // gone.
-    let names_are_known = listing == Listing::Whole && kept_names;
+    let names_are_known = listing == Listing::Whole && self.tree.loose_spelling;
     let names_only = depth == Depth::Names && names_are_known;
-    let strict_now = !self.tree.is_loose(key);
 
     let why = if depth == Depth::Deep { Mark::DEEP } else { Mark::default() };
     for (index, &(child, listed)) in names.iter().enumerate() {
@@ -76,7 +67,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         && index < known
         && listed.is_named()
         && self.tree[child].is_entry()
-        && (strict_now || self.tree.is_plain(child))
+        && self.tree.is_plain(child)
       {
         continue;
       }
@@ -102,7 +93,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       matches!(self.tree[key].watch(), Watch::Watched | Watch::WatchedTree | Watch::FromAbove);
     let lags = self.fs.listing_lags() && !heard;
     let tree = &mut self.tree;
-    let mut listed = tree.is_loose(key).then_some(&mut self.listed);
+    let mut listed = tree.loose_spelling.then_some(&mut self.listed);
     let result = self.fs.read_dir(path, &mut |name, entry| {
       let entry = match entry {
         Entry::File { .. } if lags => Entry::Kind(FileType::File),
@@ -166,57 +157,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     // Permission denied: nothing in here can be read, so every node is checked as missing.
     Listing::None
-  }
-
-  /// Tries a name the listing gave in the other case: whether the directory tells two spellings
-  /// apart. A proof of strict is taken back when the other spelling finds the very entry; a
-  /// proof of loose stands. A name that says nothing (the other spelling finds another entry)
-  /// is followed by the next one, up to a few.
-  fn ask_for_the_rule(&mut self, key: DirKey, path: &mut PathBuf, names: &[ScanEntry]) {
-    const TRIES: usize = 3;
-    let Some(spelling) = self.tree[key].dir().map(|dir| dir.spelling) else { return };
-    if spelling == Spelling::Loose {
-      return;
-    }
-    let was_strict = spelling == Spelling::Strict;
-    let swap = |name: &str| -> Option<String> {
-      let has_letter = name.bytes().any(|byte| byte.is_ascii_alphabetic());
-      has_letter.then(|| name.chars().map(swap_case).collect())
-    };
-    // A listing of a strict directory keeps no names: every child is tried there, and one that
-    // is gone says nothing.
-    let is_listed = |&&(child, listed): &&ScanEntry| {
-      let named = was_strict || listed.is_named() || self.listed.contains_key(&child);
-      named && !self.tree.has_twin(child)
-    };
-    let to_try = names.iter().filter(is_listed).filter_map(|&(child, _)| {
-      let name = self.tree.name(child);
-      Some((name.to_owned(), name.to_str().and_then(swap)?))
-    });
-    let tries = if was_strict { 1 } else { TRIES };
-    let (mut tried, mut found) = (0, None);
-    for (name, other) in to_try {
-      push_name(path, &name);
-      let entry = self.fs.lstat(path);
-      found = match &entry {
-        Ok(entry) if was_strict => {
-          let other = self.fs.lstat(&with_name(path, &other));
-          other.is_ok_and(|other| other.file_id == entry.file_id).then_some(false)
-        }
-        Ok(entry) => self.tells_spellings_apart(path, entry),
-        Err(_) => None,
-      };
-      path.pop();
-      tried += usize::from(entry.is_ok());
-      if found.is_some() || tried == tries {
-        break;
-      }
-    }
-    match found {
-      Some(true) => self.set_spelling(key, Spelling::Strict),
-      Some(false) => self.set_spelling(key, Spelling::Loose),
-      None => {}
-    }
   }
 
   /// The directory is gone: its parent finds out what is at its path now. True: the same

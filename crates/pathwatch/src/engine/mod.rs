@@ -71,8 +71,8 @@ pub struct Options {
   pub poll_interval: Duration,
   /// The same once the backend has stopped and everything is polled. `None`: no other time.
   pub poll_interval_alone: Option<Duration>,
-  /// Every disk takes two spellings of a name for one (macOS, Windows). Without it, a directory
-  /// counts as such a disk until a look proves otherwise.
+  /// Every disk takes two spellings of a name for one (macOS, Windows). Without it, every
+  /// directory tells them apart.
   pub loose_spelling: bool,
   /// A junction or a directory link is a plain directory first, and the second step gives no
   /// record (Windows): a directory that the tree did not know is looked at once more at the
@@ -135,11 +135,6 @@ pub struct Engine<B: Backend, F: Fs> {
   hold_queue: BinaryHeap<Reverse<(Instant, DirKey)>>,
   /// The held nodes whose second look is due in the running tick.
   due_holds: Vec<DirKey>,
-  /// The loose directory whose spelling of a new name the disk was asked for in this flush.
-  spelling_asked: Option<DirKey>,
-  /// The directory whose scan runs: a look inside it waits for no listing of it, which the
-  /// scan made or could not make.
-  scanning: Option<DirKey>,
   /// The scans that loss reports ask for wait until then.
   rest_until: Option<Instant>,
   /// A loss report waits for the end of that rest.
@@ -210,8 +205,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       hold_queue: BinaryHeap::new(),
       due_holds: Vec::new(),
       rest_until: None,
-      spelling_asked: None,
-      scanning: None,
       loss_waits: false,
       now: None,
       flush_time: SystemTime::UNIX_EPOCH,
@@ -378,7 +371,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.flush_time = self.fs.now();
     self.flush_ticks = self.fs.ticks();
     self.commit_took = Duration::ZERO;
-    self.spelling_asked = None;
     // The scans that loss reports ask for are paced: after one flush of them, the next wait
     // for a rest.
     let rest_is_over = self.rest_until.is_none_or(|until| until <= now);
@@ -493,10 +485,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         *queued = depth.max(*queued);
         continue;
       }
-      self.scanning = Some(key);
       self.scan(key, depth, path, names);
     }
-    self.scanning = None;
     self.scans = emptied(scans);
   }
 

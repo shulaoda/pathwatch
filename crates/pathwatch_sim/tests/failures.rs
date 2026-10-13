@@ -123,9 +123,8 @@ fn a_loss_report_for_one_watch_scans_below_that_watch() {
     let after = d.fs.calls();
     // `/p/A` itself, `sub` and the 21 files in it. And `/p`, which is checked with every
     // mark below it, because the directory above it is only polled. Nothing of `/q/B`. Each
-    // of the two listings costs one look when it is done, and three looks more, once: they
-    // prove that the directory tells two spellings of a name apart.
-    assert_eq!(after.lstat - before.lstat, 32, "{mode:?}");
+    // of the two listings costs one look when it is done.
+    assert_eq!(after.lstat - before.lstat, 26, "{mode:?}");
     assert_eq!(after.read_dir - before.read_dir, 2, "{mode:?}");
     caught_up(&mut d);
   }

@@ -167,8 +167,7 @@ that tells the forms apart (every disk but the usual one of macOS).
     what is behind it is the baseline of that `watch`; the `unwatch` of it reports the link as
     a new file and forgets what was behind it without a word.
 13. **Spelling.** On a disk that takes two spellings of a name for one (letter case, Unicode
-    form: the usual disks of macOS and Windows, and on Linux a folder of such a system, a FAT
-    or SMB disk, a directory with the casefold flag), a watched path is the text you gave:
+    form: the usual disks of macOS and Windows), a watched path is the text you gave:
     what is at it is what the OS finds there, and its events carry your spelling. A name below
     a watched directory is spelled as on the disk. Every watched path is a question of its own.
     Two watched paths that are two spellings of one file both get their events. So does a
@@ -226,10 +225,12 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   a ligature like `ﬁ` for `fi`, a CJK compatibility ideograph for its ideograph. The disks of
   macOS take these for one name. Such a path gets no events on macOS. With polling it works.
   NTFS takes the two for two names (measured), so nothing is missed there.
-- **Linux: a disk that takes two Unicode forms of a name for one, and tells the case of
-  letters apart** (a case-sensitive volume of a Mac, shared into a Linux machine): it is taken
-  for a disk that tells every spelling apart. A name below a watched directory that is renamed
-  to its other Unicode form can stay known under the old one.
+- **Linux: a disk that takes two spellings of a name for one** (a folder shared from a Mac or
+  from Windows, a FAT or SMB disk, a directory with the casefold flag) is taken for one that
+  tells them apart, as the disks of Linux do. A watched path that differs from the disk only
+  in the case of its ASCII letters still gets its events. Below a watched directory a change
+  made through another spelling of a name can be reported under a name the disk does not
+  have, or not at all, and a rename that changes only the case leaves the old name known.
 - **A young file above 16 MiB, or one that cannot be read, under polling:** it gets one
   `Update` when it is 2 s old, also when nothing changed, and also when it was written just
   before `watch`.

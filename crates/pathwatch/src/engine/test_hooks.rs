@@ -2,11 +2,11 @@
 
 use std::{collections::BTreeSet, iter, path::PathBuf, time::Instant};
 
-use super::{Engine, check::swap_case};
+use super::Engine;
 use crate::{
   backend::{Backend, DirKey, Want},
   fs::Fs,
-  tree::{Added, Fingerprint, Kind, Node, Spelling, Tree, Watch, with_name},
+  tree::{Added, Fingerprint, Kind, Node, Tree, Watch},
 };
 
 impl<B: Backend, F: Fs> Engine<B, F> {
@@ -59,33 +59,15 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// Checks the kept answers of the disk, `Node::is_unlisted` and `Spelling::Strict`, against the
-  /// disk once the tree has caught up.
+  /// Checks the kept answer of the disk, `Node::is_unlisted`, against the disk once the tree has
+  /// caught up.
   pub fn check_spellings(&self) -> Result<(), String> {
+    if !self.tree.loose_spelling {
+      return Ok(());
+    }
     for (key, node) in self.tree.nodes() {
-      if node.dir().is_some_and(|dir| dir.spelling == Spelling::Strict) {
-        for child in self.tree.children(key) {
-          let path = self.tree.path(child);
-          let other: Option<String> = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.chars().map(swap_case).collect());
-          let (Ok(meta), Some(other)) = (self.fs.lstat(&path), other) else { continue };
-          let folded = self.fs.lstat(&with_name(&path, &other)).is_ok_and(|found| {
-            found.file_id == meta.file_id
-              && path.file_name().is_some_and(|name| name != other.as_str())
-          });
-          if folded {
-            return Err(format!(
-              "{}: the tree says strict, the disk finds {other}",
-              path.display()
-            ));
-          }
-        }
-      }
       let Some(parent) = self.tree.parent(key) else { continue };
-      let in_complete = self.tree[parent].is_complete() && self.tree.is_loose(parent);
-      if !(node.is_registered() && in_complete) {
+      if !(node.is_registered() && self.tree[parent].is_complete()) {
         continue;
       }
       let path = self.tree.path(key);

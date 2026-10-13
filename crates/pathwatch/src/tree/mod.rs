@@ -186,33 +186,14 @@ pub struct Dir {
   /// An entry that the listing named was not there when it was looked at: the next check lists
   /// the directory again, since it can have been away and back.
   pub relist: bool,
-  /// What the looks found out about the disk under this directory ([`Tree::is_loose`]).
-  pub spelling: Spelling,
-}
-
-/// Whether two spellings of a name are one name in a directory, as far as the looks found out.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Spelling {
-  /// Nothing is known yet: the directory counts as loose, and a look that cannot tell asks for
-  /// one listing of the names, which tries one.
-  Unknown,
-  /// That listing was asked for. The directory counts as loose, and no look asks for another
-  /// one: a listing that comes anyway tries again.
-  Asked,
-  /// They are two names: a look proved it.
-  Strict,
-  /// They are one name: one entry was found under both. Nothing tries again, so that a disk
-  /// that answers in two ways cannot keep a flush busy.
-  Loose,
 }
 
 impl Dir {
   /// A directory that was just found. The backend was not asked yet.
   pub fn new(id: DirId, complete: bool) -> Self {
     let (asked, scan) = (None, None);
-    let spelling = Spelling::Unknown;
     let (has_error, relist) = (false, false);
-    Self { id, complete, asked, watch: Watch::None, has_error, scan, relist, spelling }
+    Self { id, complete, asked, watch: Watch::None, has_error, scan, relist }
   }
 
   /// Whether the timer has to look at the directory: no OS watch tells about it, or it had an
@@ -764,15 +745,6 @@ pub(crate) fn push_name(path: &mut PathBuf, name: &OsStr) {
   text.push(name);
 }
 
-/// The path of `name` next to `path`: `Path::with_file_name` with the name appended by its text
-/// (`push_name`).
-pub(crate) fn with_name(path: &Path, name: impl AsRef<OsStr>) -> PathBuf {
-  let mut other = path.to_path_buf();
-  other.pop();
-  push_name(&mut other, name.as_ref());
-  other
-}
-
 /// Empties a list for its next use and keeps its memory, unless it is long: a `watch` of 20,000
 /// paths must not leave its lists behind for ever.
 pub(crate) fn emptied<T>(mut list: Vec<T>) -> Vec<T> {
@@ -848,7 +820,7 @@ impl Tree {
       let is_seen = below.is_some_and(Node::is_registered) || is_complete;
       // The table finds the other spellings of a plain name only; the registered ones that are not
       // plain, and the short names, are on a list, and a listing shows the rest.
-      let loose = self.is_loose_dir(parent);
+      let loose = self.loose_spelling;
       let not_in_table = loose
         && (!self.not_plain.is_empty() || (is_complete && !below.is_some_and(Node::is_entry)));
       let has_short = loose && !could_be_short(name) && self.has_short_names(at);
@@ -895,7 +867,7 @@ impl Tree {
     let parent = linked(&self.slots, at);
     let is_entry = exact.is_some_and(|exact| linked(&self.slots, exact).is_entry());
     let one_entry = written && self.twins_share_writes;
-    if self.is_loose_dir(parent) && parent.is_complete() && !is_entry && !is_plain(name) {
+    if self.loose_spelling && parent.is_complete() && !is_entry && !is_plain(name) {
       // A name that is not plain can be another spelling of each child that is not plain.
       self.queue_scan(self.key(at), Depth::Names);
     }
@@ -1059,7 +1031,7 @@ impl Tree {
   /// case of ASCII letters. Why: design.md 5.2.
   fn others_meant(&self, at: u32, name: &OsStr, exact: Option<u32>) -> Vec<u32> {
     let parent = linked(&self.slots, at);
-    let loose = self.is_loose_dir(parent);
+    let loose = self.loose_spelling;
     let any_child = parent.is_complete();
     let is_meant = |&child: &u32| {
       let node = linked(&self.slots, child);
@@ -1091,17 +1063,6 @@ impl Tree {
     }
   }
 
-  /// Whether two spellings of a name count as one in the directory: always with `loose_spelling`,
-  /// else until a look proved the directory strict. A strict disk taken for loose costs looks; the
-  /// other way round gives wrong events (design.md 5.2).
-  pub fn is_loose(&self, key: DirKey) -> bool {
-    self.is_loose_dir(&self[key])
-  }
-
-  fn is_loose_dir(&self, node: &Node) -> bool {
-    self.loose_spelling || !node.dir().is_some_and(|dir| dir.spelling == Spelling::Strict)
-  }
-
   /// Whether the name of the node `key` is plain: the table finds every other spelling of it.
   pub fn is_plain(&self, key: DirKey) -> bool {
     is_plain(self.name(key))
@@ -1124,15 +1085,6 @@ impl Tree {
   /// the node `key`.
   pub fn has_twin(&self, key: DirKey) -> bool {
     self.twins(key).next().is_some()
-  }
-
-  /// The same for a name that differs only in the case of ASCII letters: what a strict proof is
-  /// about.
-  pub fn has_case_twin(&self, key: DirKey) -> bool {
-    let name = self.name(key);
-    self
-      .twins(key)
-      .any(|twin| name_of(&self.names, linked(&self.slots, twin)).eq_ignore_ascii_case(name))
   }
 
   /// The nodes that `has_twin` speaks of, if they have a mark.

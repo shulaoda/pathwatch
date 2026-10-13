@@ -192,7 +192,8 @@ struct Config {
   poll_interval: Duration,
   /// The engine takes every disk for one that knows a name under two spellings (macOS,
   /// Windows). On a disk that is not such a disk, the rule for it only costs looks: it must
-  /// do no harm. Without it, the engine finds out for each directory.
+  /// do no harm. Without it, every directory tells them apart: so it is on wherever a part of
+  /// the disk folds (`folds`).
   loose_spelling: bool,
   /// A new directory is looked at once more, as on Windows for a link made in two steps.
   two_step_links: bool,
@@ -250,6 +251,7 @@ impl Config {
     };
     config.mount = random.chance(15);
     config.two_step_links = random.chance(25);
+    config.loose_spelling |= config.folds();
     config
   }
 
