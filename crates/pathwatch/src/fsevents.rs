@@ -100,6 +100,10 @@ impl FsEventsBackend {
     &self.covers.dir_of
   }
 
+  pub fn not_watched(&self) -> &FxHashMap<DirKey, PathBuf> {
+    &self.not_watched
+  }
+
   pub fn streamed(&self) -> Vec<&Path> {
     self.streams.paths.paths()
   }
@@ -147,7 +151,7 @@ impl Backend for FsEventsBackend {
     };
     let has_stream = self.streams.paths.holds(&real) || self.streams.pending.holds(&real);
     if !has_stream {
-      if want == Want::Names {
+      if want == Want::Names || !may_hold_a_stream(&real) {
         self.unwatch(key);
         self.not_watched.insert(key, real);
         return Coverage::NotWatched;
@@ -580,17 +584,32 @@ fn is_gone(error: &io::Error) -> bool {
 /// Whether a stream path there would report far more than the covers: `/`, a directory in
 /// it, one more name down, and the temporary directory of the user with the names above it.
 pub fn is_too_high(dir: &Path) -> bool {
-  let dir = dir.strip_prefix(DATA_VOLUME).unwrap_or(dir);
-  let names = dir.components().filter_map(|part| match part {
-    Component::Normal(name) => Some(name.as_bytes()),
-    _ => None,
-  });
-  let names: Vec<&[u8]> = names.collect();
+  let names: Vec<&[u8]> = names_of(dir).collect();
   match names.as_slice() {
     [] | [_] | [_, _] => true,
     [b"private", b"var", b"folders", below @ ..] => below.len() <= 3,
     _ => false,
   }
+}
+
+/// Whether a stream may stand on the directory that a cover asks for: not on `/`, `/Users`
+/// or a home directory, where every program of the user writes. The same three that no
+/// handle of Windows is put on (`windows::place::may_hold_a_handle`).
+pub fn may_hold_a_stream(dir: &Path) -> bool {
+  let mut names = names_of(dir);
+  match (names.next(), names.next(), names.next()) {
+    (None, ..) => false,
+    (Some(first), _, None) => first != b"Users",
+    _ => true,
+  }
+}
+
+fn names_of(dir: &Path) -> impl Iterator<Item = &[u8]> {
+  let dir = dir.strip_prefix(DATA_VOLUME).unwrap_or(dir);
+  dir.components().filter_map(|part| match part {
+    Component::Normal(name) => Some(name.as_bytes()),
+    _ => None,
+  })
 }
 
 /// At most `max` stream paths for the covers: paths go up to directories that covers have in
@@ -980,7 +999,7 @@ mod ffi {
     }
 
     pub(super) fn holds(&self, path: &Path) -> bool {
-      path.parent().is_none() || self.dirs.contains_key(path)
+      self.dirs.contains_key(path)
     }
   }
 
@@ -1234,7 +1253,7 @@ mod ffi {
 mod tests {
   use std::path::{Path, PathBuf};
 
-  use super::{Dirs, is_too_high, place};
+  use super::{Dirs, is_too_high, may_hold_a_stream, place};
 
   fn paths(paths: &[&str]) -> Vec<PathBuf> {
     paths.iter().map(PathBuf::from).collect()
@@ -1295,6 +1314,17 @@ mod tests {
     ];
     for dir in fine {
       assert!(!is_too_high(Path::new(dir)), "{dir}");
+    }
+  }
+
+  #[test]
+  fn where_a_stream_may_stand_for_a_cover() {
+    for dir in ["/", "/Users", "/Users/me", "/System/Volumes/Data", "/System/Volumes/Data/Users/me"]
+    {
+      assert!(!may_hold_a_stream(Path::new(dir)), "{dir}");
+    }
+    for dir in ["/Users/me/project", "/Volumes/disk", "/opt/homebrew", "/private/tmp", "/home"] {
+      assert!(may_hold_a_stream(Path::new(dir)), "{dir}");
     }
   }
 

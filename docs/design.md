@@ -1297,7 +1297,12 @@ As built:
   real path with every key, in a table by path (`Dirs`). `watch(key, dir, Contents)`: if no
   stream reports the real path of `dir` yet, it goes into the stream of the next `commit`; the
   answer is `WatchedTree`. `watch(key, dir, Names)`: `WatchedTree` if a stream reports the
-  directory, else `NotWatched`.
+  directory, else `NotWatched`. A stream never stands on `/`, `/Users` or a home directory
+  (`may_hold_a_stream`), where every program of the user writes: a cover there is answered
+  `NotWatched` and polled, as a handle of Windows is never put on `C:\`, `C:\Users` or
+  `C:\Users\<name>` (7.3). (Before, a watched path whose lowest existing directory was the
+  home directory put a stream on the home directory: 2,000 files written elsewhere in it gave
+  3,680 records, each dropped after one lookup.)
 - **Stream paths.** A stream path is a directory that a stream was started for. Usually it is a
   cover with no cover above it. With more than 64 stream paths (`MAX_STREAM_PATHS`; the probe
   above: up to 100 paths cost nothing), a commit places all covers again by the rule of
@@ -1402,8 +1407,8 @@ As built:
   error: its stream path is reported lost right after the start, and the engine finds out
   what is there. The guard holds the directory that is at the path when it is opened, and
   nothing else: an open file that is another directory than the one at the path by then (a
-  swap in the moment between) counts as gone. `/` has nothing above it and needs no guard.
-  (It is a cover when a watched path right below it has a file or nothing at it.)
+  swap in the moment between) counts as gone. No stream path is `/`, so every stream path
+  has a directory above it to guard.
 - **The check after the start.** The real path of a cover is asked at `watch`, and its stream
   and its guard start at `commit`. A directory above that was renamed in between leaves the
   stream at a path where nothing is. So after the start, the real path of each stream path

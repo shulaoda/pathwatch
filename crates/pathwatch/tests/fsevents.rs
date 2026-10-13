@@ -852,9 +852,12 @@ fn the_short_way_out_of_the_data_volume() {
   File::create(h.path("dir/file")).unwrap();
   h.hints_until(&[changed(key, "file")]);
 
-  // `/Users` has a parent with no short way.
-  let users = h.watch(2, &data.join("Users"), Want::Contents);
-  assert_eq!(h.backend.cover_of_key()[&users], Path::new("/Users"));
+  // `/Users` has a parent with no short way. No stream stands on it, and the real path is
+  // kept with the keys that got no watch.
+  let users = DirKey::new(2, 0);
+  let coverage = h.backend.watch(users, &data.join("Users"), Want::Contents);
+  assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
+  assert_eq!(h.backend.not_watched()[&users], Path::new("/Users"));
   h.backend.unwatch(users);
   // `/home` is a link into the data volume: the same directory, but no real path.
   if let Ok(real) = fs::canonicalize("/home")
@@ -918,16 +921,22 @@ fn a_guard_that_cannot_be_opened_fails_its_path_only() {
   h.hints_until(&[changed(y, "file")]);
 }
 
-/// Nothing is above `/`, so it needs no guard.
+/// A stream never stands on `/`, `/Users` or a home directory: such a cover gets no watch and
+/// is polled, as on Windows, and the covers below are reported as before.
 #[test]
-fn a_cover_at_the_top_of_the_disk_is_trusted() {
+fn no_stream_stands_on_the_root_or_a_home() {
   let mut h = Harness::new();
   fs::create_dir(h.path("dir")).unwrap();
   let key = h.cover(1, "dir");
-  let top = h.watch(2, Path::new("/"), Want::Contents);
-  h.commit();
-  assert_eq!(h.backend.streamed(), [Path::new("/")]);
-  h.backend.unwatch(top);
+  let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+  for (index, dir) in [(2, Path::new("/")), (3, Path::new("/Users")), (4, home.as_path())] {
+    let key = DirKey::new(index, 0);
+    let coverage = h.backend.watch(key, dir, Want::Contents);
+    assert!(matches!(coverage, Coverage::NotWatched), "{}: {coverage:?}", dir.display());
+    assert!(h.backend.not_watched().contains_key(&key), "{}", dir.display());
+  }
+  assert_eq!(h.commit(), []);
+  assert_eq!(h.backend.streamed(), [h.real("dir")]);
 
   File::create(h.path("dir/file")).unwrap();
   h.hints_until(&[changed(key, "file")]);
