@@ -20,7 +20,7 @@ use std::{
 
 use pathwatch::{
   EventKind,
-  backend::{Backend, Coverage, DirKey, Hint, Signal, Want},
+  backend::{Backend, Committed, Coverage, DirKey, Hint, Signal, Want},
   engine::{Engine, Ignored, Options, Output},
   fs::{Entry, Fs, Meta},
   poll::PollBackend,
@@ -201,7 +201,7 @@ impl<B: Backend> Backend for Timed<B> {
     timed(&self.outside, || self.inner.unwatch(key));
   }
 
-  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
+  fn commit(&mut self) -> Committed {
     timed(&self.outside, || self.inner.commit())
   }
 

@@ -8,7 +8,7 @@ use std::{
 
 use super::{Engine, check::is_missing};
 use crate::{
-  backend::{Backend, Coverage, DirKey, Want, is_watch_limit, same},
+  backend::{Backend, Committed, Coverage, DirKey, Want, is_watch_limit, same},
   config::EntryKind,
   error::{ErrorKind, context},
   fs::{FileType, Fs},
@@ -132,37 +132,30 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Makes the watches asked for since the last commit live. Gives the directories that an OS
-  /// watch reports now (see `ask_again`).
+  /// watch reports now (see `ask_again`). A key that got no watch is polled and asked again.
   pub(super) fn commit(&mut self) -> Vec<DirKey> {
     let Some(backend) = &mut self.backend else {
       self.covered.clear();
       return Vec::new();
     };
     let started = self.fs.ticks();
-    let committed = backend.commit();
+    let Committed { now_watched, failed } = backend.commit();
     // A commit can take long (an FSEvents stream: a quarter of a second); the pacing leaves it
     // out.
     self.commit_took += self.fs.ticks().saturating_sub(started);
-    let error = match committed {
-      Ok(now_watched) => return now_watched,
-      Err(error) => error,
-    };
+    if failed.is_empty() {
+      return now_watched;
+    }
     // A watch above a covered directory may not be live: it keeps its own and is asked again.
     self.covered.clear();
-    // Every node asked since the last commit is in the scan queue: all of them count as failed.
-    let asked = |node: &Node| {
-      node.dir().is_some_and(|dir| {
-        dir.asked.is_some() && matches!(dir.watch, Watch::Watched | Watch::WatchedTree)
-      })
-    };
-    let queued = self.tree.to_scan.clone();
-    for key in queued {
-      if self.tree.get(key).is_some_and(asked) {
+    for (key, error) in failed {
+      let asked = self.tree.get(key).and_then(Node::dir).is_some_and(|dir| dir.asked.is_some());
+      if asked {
         let path = self.tree.path(key);
-        self.set_watch(key, Coverage::Failed(same(&error)), &path);
+        self.set_watch(key, Coverage::Failed(error), &path);
       }
     }
-    Vec::new()
+    now_watched
   }
 
   /// Asks again for the directories that got `NotWatched` and that an OS watch reports now.

@@ -17,7 +17,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::ffi::{Guard, Queue, Stream};
 use crate::{
-  backend::{Backend, Coverage, DirKey, Hint, Sink, Want},
+  backend::{Backend, Committed, Coverage, DirKey, Hint, Sink, Want, same},
   fs::{FileType, name_and_kind},
 };
 
@@ -181,29 +181,45 @@ impl Backend for FsEventsBackend {
     }
   }
 
-  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
+  fn commit(&mut self) -> Committed {
     self.streams.stop_retired();
     self.streams.stop_idle(&self.covers);
     self.last_parent = None;
-    if self.streams.pending.is_empty() {
-      return Ok(Vec::new());
+    if self.covers.dir_of.is_empty() {
+      self.streams.stop_retired_now();
     }
-    let started = self.streams.start_pending(&self.covers);
-    let streamed = &self.streams.paths;
-    let started = match started {
+    let mut committed = Committed::default();
+    if self.streams.pending.is_empty() {
+      return committed;
+    }
+    let started = match self.streams.start_pending(&self.covers) {
       Ok(started) => started,
+      // No stream started: every cover that no running stream holds got no watch.
       Err(error) => {
+        let streamed = &self.streams.paths;
+        let failed = self.covers.dir_of.iter().filter(|(_, dir)| !streamed.holds(dir));
+        committed.failed = failed.map(|(&key, _)| (key, same(&error))).collect();
         self.covers.retain(|dir| streamed.holds(dir));
-        return Err(error);
+        return committed;
       }
     };
-    let moved = self.streams.moved_since_asked(&started, &self.covers);
+    // A path whose guard could not be opened got no stream: its covers got no watch.
+    for (path, error) in &started.failed {
+      let below = self.covers.dir_of.iter().filter(|(_, dir)| dir.starts_with(path));
+      let keys: Vec<DirKey> = below.map(|(&key, _)| key).collect();
+      for key in keys {
+        self.covers.remove(key);
+        committed.failed.push((key, same(error)));
+      }
+    }
+    let moved = self.streams.moved_since_asked(&started.fresh, &self.covers);
     if !moved.records.is_empty() || !moved.lost.is_empty() {
       self.streams.sink.raw(moved);
     }
     let streamed = &self.streams.paths;
     let now_streamed = self.not_watched.iter().filter(|(_, dir)| streamed.holds(dir));
-    Ok(now_streamed.map(|(&key, _)| key).collect())
+    committed.now_watched = now_streamed.map(|(&key, _)| key).collect();
+    committed
   }
 
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
@@ -361,37 +377,60 @@ struct Retiring {
   deadline: Instant,
 }
 
+/// What `start_pending` did.
+#[derive(Default)]
+struct Started {
+  /// The paths that got a stream and had none before.
+  fresh: Vec<PathBuf>,
+  /// The paths whose guard could not be opened, each with the reason: no stream was started
+  /// for them.
+  failed: Vec<(PathBuf, io::Error)>,
+}
+
 impl Streams {
-  fn start_pending(&mut self, covers: &Covers) -> io::Result<Vec<PathBuf>> {
+  /// Starts the streams for the pending paths. `Err`: no stream could start, and the old ones
+  /// stay as they are.
+  fn start_pending(&mut self, covers: &Covers) -> io::Result<Started> {
     let new = top_most(self.pending.drain().collect());
     let replace = self.running.len() >= MAX_STREAMS
       || self.paths.len() + new.len() > self.path_limit
       || !self.paths.below(&new).is_empty();
-    let paths = if replace {
-      place(covers.dir_of.values().cloned().collect(), MAX_STREAM_PATHS)
+    let placed = if replace {
+      // With room for the paths of the next few commits: a few new directories must not
+      // replace every stream again.
+      place(covers.dir_of.values().cloned().collect(), MAX_STREAM_PATHS - MAX_NEW_STREAMS)
     } else {
       new
     };
+    // The guard first. A path whose directories cannot be held is left out, and the others
+    // get their streams. A directory that is gone is no error: the check after the start
+    // reports the path lost.
+    let (mut paths, mut failed) = (Vec::new(), Vec::new());
+    for path in placed {
+      match self.guard.hold(&path) {
+        Err(error) if !is_gone(&error) => failed.push((path, error)),
+        _ => paths.push(path),
+      }
+    }
+    if paths.is_empty() {
+      return match failed.pop() {
+        Some((_, error)) => Err(error),
+        None => Ok(Started::default()),
+      };
+    }
     let stream_count =
       MAX_NEW_STREAMS.min(paths.len()).max(paths.len().div_ceil(MAX_PATHS_PER_STREAM));
     let fresh: Vec<PathBuf> =
       paths.iter().filter(|path| !self.paths.contains(path)).cloned().collect();
-    let mut asked = 0;
-    let no_guard = paths.iter().find_map(|path| {
-      asked += 1;
-      self.guard.hold(path).err().filter(|error| !is_gone(error))
-    });
     let start = |first: usize| -> io::Result<Running> {
       let every_nth = || paths.iter().skip(first).step_by(stream_count);
       let stream = Stream::start(&self.queue, &self.sink, every_nth())?;
       Ok(Running { stream, paths: every_nth().cloned().collect() })
     };
-    let streams = no_guard
-      .map_or_else(|| (0..stream_count).map(start).collect::<io::Result<Vec<Running>>>(), Err);
-    let streams = match streams {
+    let streams = match (0..stream_count).map(start).collect::<io::Result<Vec<Running>>>() {
       Ok(streams) => streams,
       Err(error) => {
-        for path in &paths[..asked] {
+        for path in &paths {
           self.guard.release(path);
         }
         return Err(error);
@@ -417,7 +456,7 @@ impl Streams {
     for path in paths {
       self.paths.insert(path, ());
     }
-    Ok(fresh)
+    Ok(Started { fresh, failed })
   }
 
   fn distrust(&mut self, dirs: &[PathBuf]) {
@@ -483,6 +522,15 @@ impl Streams {
     }
     let streams: Vec<Stream> = idle.into_iter().map(|running| running.stream).collect();
     self.queue.sync(move || drop(streams));
+  }
+
+  /// No key is left: the streams that were replaced need no overlap, since their records
+  /// would reach no key.
+  fn stop_retired_now(&mut self) {
+    let stopped: Vec<Stream> = self.retiring.drain(..).flat_map(|old| old.streams).collect();
+    if !stopped.is_empty() {
+      self.queue.sync(move || drop(stopped));
+    }
   }
 
   fn stop_retired(&mut self) {
@@ -696,11 +744,14 @@ impl<T> Dirs<T> {
 mod ffi {
   use std::{
     ffi::{CStr, c_char, c_void},
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io,
     os::{
       fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-      unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+      unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+      },
     },
     path::{Path, PathBuf},
     ptr::{self, NonNull},
@@ -869,7 +920,19 @@ mod ffi {
       let room = usize::try_from(unsafe { getdtablesize() }).unwrap_or(0) / 2;
       let first_id = self.last_id + 1;
       let open = |(index, dir): (usize, &&Path)| {
-        let file = OpenOptions::new().read(true).custom_flags(O_EVTONLY | O_SEARCH).open(dir)?;
+        let opened = OpenOptions::new().read(true).custom_flags(O_EVTONLY | O_SEARCH).open(dir);
+        // No open file left in the process: a limit, as the room check above says it.
+        let file = opened.map_err(|error| match error.raw_os_error() {
+          Some(EMFILE | ENFILE) => watch_limit(ERROR_NO_GUARD),
+          _ => error,
+        })?;
+        // The directory at the path, not one that was there a moment ago: a swap between the
+        // look and the open would leave the new one unguarded. Then the path counts as gone,
+        // and the check after the start reports it lost.
+        let (held, at_path) = (file.metadata()?, fs::symlink_metadata(dir)?);
+        if (held.dev(), held.ino()) != (at_path.dev(), at_path.ino()) {
+          return Err(io::ErrorKind::NotFound.into());
+        }
         let (fd, id) = (file.as_raw_fd(), first_id + index);
         let moves = NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE;
         change(&self.queue, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, moves, id)?;
@@ -1057,6 +1120,8 @@ mod ffi {
   const SINCE_NOW: u64 = u64::MAX;
   const ENCODING_UTF8: u32 = 0x0800_0100;
 
+  const ENFILE: i32 = 23;
+  const EMFILE: i32 = 24;
   const EVFILT_VNODE: i16 = -4;
   const EVFILT_USER: i16 = -10;
   const EV_ADD: u16 = 0x1;

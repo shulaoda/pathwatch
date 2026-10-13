@@ -841,7 +841,8 @@ next commit. The watch state of the node:
 | `None` | the directory was just found and the backend was not asked yet; also: no directory is on disk |
 
 - A node that loses `WatchedTree` gets a deep scan: it asks for the watch of every node below.
-- When `commit` fails, every node in the scan queue with a watch becomes `Failed`.
+- A node whose key `commit` names as failed becomes `Failed`, with the reason the backend
+  gave; no other node does.
 - If the backend says that it cannot go on, the error is reported once, every node becomes
   `Polled`, and everything is scanned.
 
@@ -1063,7 +1064,7 @@ type has its own `new(sink: Sink<Self::Raw>)`.
 | `Raw` | A raw OS notification. Cheap to make: the backend thread only copies it into the sink. |
 | `watch(key, dir, want)` | Report changes in `dir` as hints that carry `key`. The answer is a `Coverage`. |
 | `unwatch(key)` | Forget `key`. No hint should carry it after this; a late one costs the engine one check. |
-| `commit()` | Make every watch asked for since the last call live. On an error none of them is. It returns the keys that got `NotWatched` and whose directories an OS watch reports now: the engine calls `watch` again for each of them, with the `Want` of before, and does not poll one that is reported (5.10, "Asked again"). Only a backend that starts one OS watch for many directories (FSEvents) has work here, and only such a backend returns a key: its answer for a directory depends on the OS watches of other directories. Every other backend leaves the method out: then it does nothing and returns no key. |
+| `commit()` | Make every watch asked for since the last call live. It returns two lists of keys (`Committed`). The keys whose watch could not be made live, each with the reason: the engine reports it, polls the directory, and asks again later; a key that is not named is live. And the keys that got `NotWatched` and whose directories an OS watch reports now: the engine calls `watch` again for each of them, with the `Want` of before, and does not poll one that is reported (5.10, "Asked again"). Only a backend that starts one OS watch for many directories (FSEvents) has work here, and only such a backend returns a key: its answer for a directory depends on the OS watches of other directories. Every other backend leaves the method out: then it does nothing and returns no key. |
 | `translate(raw, hint)` | Turn one raw notification into hints. |
 | `raw_bytes(raw)` | How many bytes `raw` keeps on the heap (5.13). A backend that leaves it out says 0. |
 
@@ -1106,7 +1107,8 @@ type has its own `new(sink: Sink<Self::Raw>)`.
 1. **Threads.** Every method runs on the watcher thread. A backend thread only copies raw
    notifications into the `Sink`.
 2. **Watch, commit, scan.** The engine reads a directory only after `watch` and then `commit`.
-   So a watch is live when `commit` returns, and `commit` opens no gap in a watch that is live.
+   So a watch is live when `commit` returns, unless `commit` named its key, and `commit` opens
+   no gap in a watch that is live.
 3. **`watch` again** for a key means: the watch must stand on the directory that is at `dir`
    now. If that needs a new OS watch, the new one is live before the old one goes.
 4. **The answer is the truth.** `Coverage` says which changes make hints from now on. After
@@ -1302,8 +1304,10 @@ As built:
   running, so nothing is ever in a gap. With 64 streams running (`MAX_STREAMS`), with too many
   stream paths, or when a new path lies above a running one, `commit` starts new streams for
   all covers in their place: so no stream path lies below another, and no record comes twice
-  for long. If the streams cannot start, `commit` returns the watch limit error and the old
-  streams keep running.
+  for long. The covers are then placed on 56 paths, not 64: room for the paths of the next
+  few commits, so that a few new directories do not replace every stream again. If the
+  streams cannot start, `commit` names every key of the new paths as failed, with the watch
+  limit error, and the old streams keep running.
 - **Up to 8 streams for a commit** (`MAX_NEW_STREAMS`; more only where a stream would get more
   than 4,096 paths). The paths of a commit go to its streams in turn: so neighbours in the
   tree have different streams, and a flood over many watched directories is shared by all of
@@ -1349,7 +1353,8 @@ As built:
 - `unwatch(key)` forgets the key. The path stays in its stream until the streams are replaced,
   or until no path of that stream has a cover at or below it any more: then the stream is
   stopped at the next commit and its guards are given back, with no loss report, since none of
-  its records would reach a key.
+  its records would reach a key. With no key left at all, the streams that a replacement left
+  running are stopped at the next commit too, before their time: nothing stays open.
 - **A cover is a text.** A stream stands at the text of its path, and a record finds its
   cover by the text of the cover. Both hold only while every name in them is the one that the
   disk has. Each way for a name to change has one place that finds it, and all of them answer
@@ -1372,12 +1377,18 @@ As built:
   are paced (5.13), so a directory that is renamed again and again costs one scan in a
   while, not one for each rename.
 - **The room for the guard.** All watchers of a process together keep at most half of the
-  files that the process may open (`getdtablesize`). When a commit would need more, it fails
-  with the watch limit error like a stream that cannot start: the new covers are polled, and
-  the old streams stay. The same for every other error of the guard, with that error. Only a
-  directory that is gone is no error: its stream path is reported lost right after the
-  start, and the engine finds out what is there. `/` has nothing above it and needs no
-  guard. (It is a cover when a watched path right below it has a file or nothing at it.)
+  files that the process may open (`getdtablesize`). When a commit would need more, or the
+  process has no open file left (`EMFILE`, `ENFILE`), the path gets the watch limit error
+  like a stream that cannot start. The same for every other error of the guard, with that
+  error. A path whose guard fails is left out of the commit, and the other paths get their
+  streams: `commit` names the keys of the covers at and below it as failed, so that they are
+  polled and asked again, and forgets them. A stream that cannot start fails every path of the
+  commit in the same way, and the old streams stay. Only a directory that is gone is no
+  error: its stream path is reported lost right after the start, and the engine finds out
+  what is there. The guard holds the directory that is at the path when it is opened, and
+  nothing else: an open file that is another directory than the one at the path by then (a
+  swap in the moment between) counts as gone. `/` has nothing above it and needs no guard.
+  (It is a cover when a watched path right below it has a file or nothing at it.)
 - **The check after the start.** The real path of a cover is asked at `watch`, and its stream
   and its guard start at `commit`. A directory above that was renamed in between leaves the
   stream at a path where nothing is. So after the start, the real path of each stream path

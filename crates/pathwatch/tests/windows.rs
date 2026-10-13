@@ -112,12 +112,12 @@ impl Harness {
 
   fn watch_again(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
     let coverage = self.backend.watch(key, dir, want);
-    self.backend.commit().unwrap();
+    self.backend.commit();
     // A key that got no handle at the commit is asked again, as the engine does: that answer
     // says why.
     if matches!(coverage, Coverage::WatchedTree) && !self.backend.serves(key) {
       let coverage = self.backend.watch(key, dir, want);
-      self.backend.commit().unwrap();
+      self.backend.commit();
       return coverage;
     }
     coverage
@@ -718,7 +718,7 @@ fn a_directory_behind_a_junction_is_told_when_the_handle_above_comes_with_it() {
     let coverage = harness.backend.watch(key, dir, Want::Contents);
     assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
   }
-  harness.backend.commit().unwrap();
+  harness.backend.commit();
   harness.hints_until(|hint| hint.names_the_directory(key));
   let coverage = harness.watch_again(key, &behind, Want::Contents);
   assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
@@ -823,6 +823,6 @@ fn directories_above_the_limit_and_a_junction_come_to_rest() {
   fs::write(project.join("d5").join("next.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(keys[5], "next.txt"));
   harness.backend.unwatch(link_key);
-  harness.backend.commit().unwrap();
+  harness.backend.commit();
   fs::remove_dir(&link).unwrap();
 }

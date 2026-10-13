@@ -223,7 +223,9 @@ impl Harness {
 
   /// Says which keys that got `NotWatched` a stream reports now.
   fn commit(&mut self) -> Vec<DirKey> {
-    self.backend.commit().unwrap()
+    let committed = self.backend.commit();
+    assert!(committed.failed.is_empty(), "{:?}", committed.failed);
+    committed.now_watched
   }
 
   /// `watch`, `commit` and a sync: a new stream also delivers what happened shortly before
@@ -864,6 +866,58 @@ fn the_short_way_out_of_the_data_volume() {
   }
 }
 
+/// With the last key gone, the streams that a replacement left running need no overlap: the
+/// next commit stops them, and nothing stays open.
+#[test]
+fn the_last_unwatch_stops_the_replaced_streams_too() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("up/low")).unwrap();
+  let low = h.cover(1, "up/low");
+  let up = h.watch(2, &h.path("up"), Want::Contents);
+  h.commit();
+  assert_eq!(h.backend.retiring_count(), 1);
+
+  h.backend.unwatch(low);
+  h.backend.unwatch(up);
+  h.commit();
+  assert_eq!((h.backend.stream_count(), h.backend.retiring_count()), (0, 0));
+  assert_eq!(h.backend.guarded(), NO_PATHS);
+}
+
+/// A guard that cannot be opened (here: the process has no open file left) fails its own path
+/// and no other: the other paths get their streams, and the keys of that path are named.
+#[test]
+fn a_guard_that_cannot_be_opened_fails_its_path_only() {
+  let mut h = Harness::alone();
+  fs::create_dir_all(h.path("a/x")).unwrap();
+  fs::create_dir_all(h.path("a/z")).unwrap();
+  fs::create_dir_all(h.path("b/y")).unwrap();
+  h.cover(1, "a/x");
+  let z = h.watch(2, &h.path("a/z"), Want::Contents);
+  let y = h.watch(3, &h.path("b/y"), Want::Contents);
+  // Every open file of the process but two: the guard of `a/z` takes one and `b` the other,
+  // so `b/y` gets none.
+  let mut hogs = Vec::new();
+  while let Ok(file) = File::open("/dev/null") {
+    hogs.push(file);
+  }
+  hogs.truncate(hogs.len() - 2);
+  let committed = h.backend.commit();
+  drop(hogs);
+  assert_eq!(committed.failed.len(), 1, "{committed:?}");
+  let (failed, error) = &committed.failed[0];
+  assert!(*failed == y && is_watch_limit(error), "{committed:?}");
+  assert_eq!(h.backend.streamed(), [h.real("a/x"), h.real("a/z")]);
+  File::create(h.path("a/z/file")).unwrap();
+  h.hints_until(&[changed(z, "file")]);
+
+  // With room again, the key asks again and gets its stream.
+  h.watch(3, &h.path("b/y"), Want::Contents);
+  h.commit();
+  File::create(h.path("b/y/file")).unwrap();
+  h.hints_until(&[changed(y, "file")]);
+}
+
 /// Nothing is above `/`, so it needs no guard.
 #[test]
 fn a_cover_at_the_top_of_the_disk_is_trusted() {
@@ -1394,12 +1448,12 @@ fn drop_while_a_writer_is_active() {
       let coverage = backend.watch(DirKey::new(index, 0), &dir, Want::Contents);
       assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
     }
-    backend.commit().unwrap();
+    assert!(backend.commit().failed.is_empty());
     // Every second round also drops the streams that a rebuild has just replaced.
     if rebuild {
       let coverage = backend.watch(DirKey::new(covers, 0), dir.path(), Want::Contents);
       assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
-      backend.commit().unwrap();
+      assert!(backend.commit().failed.is_empty());
     }
     assert_eq!(backend.retiring_count(), if rebuild { MAX_NEW_STREAMS } else { 0 });
     assert!(matches!(signals.recv_timeout(TIMEOUT), Ok(Signal::Raw(_))), "no callback yet");
@@ -1480,7 +1534,7 @@ fn failed_start_is_reported_and_the_old_streams_stay() {
     let mut hog = FsEventsBackend::new(Sink::new(|_signal| {})).unwrap();
     let coverage = hog.watch(DirKey::new(0, 0), unwatched.path(), Want::Contents);
     assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
-    if hog.commit().is_err() {
+    if !hog.commit().failed.is_empty() {
       break;
     }
     hogs.push(hog);
@@ -1488,15 +1542,17 @@ fn failed_start_is_reported_and_the_old_streams_stay() {
   }
   assert_eq!(hogs.len() + MAX_STREAMS, 512);
 
-  // The commit fails, and the backend forgets the two keys it was for.
+  // The commit fails for the two keys it was for, and names them: the backend forgets them.
   let last = h.path(&format!("dir-{MAX_STREAMS}"));
   fs::create_dir(last.join("below")).unwrap();
   let (new, below) = (DirKey::new(100, 0), DirKey::new(101, 0));
   assert!(matches!(h.backend.watch(new, &last, Want::Contents), Coverage::WatchedTree));
   let coverage = h.backend.watch(below, &last.join("below"), Want::Names);
   assert!(matches!(coverage, Coverage::WatchedTree));
-  let error = h.backend.commit().unwrap_err();
-  assert!(is_watch_limit(&error), "{error}");
+  let committed = h.backend.commit();
+  let failed: HashSet<DirKey> = committed.failed.iter().map(|(key, _)| *key).collect();
+  assert_eq!(failed, HashSet::from([new, below]));
+  assert!(committed.failed.iter().all(|(_, error)| is_watch_limit(error)), "{committed:?}");
   let known: HashSet<DirKey> = h.backend.cover_of_key().keys().copied().collect();
   assert_eq!(known, keys.iter().copied().collect());
   assert_eq!(h.backend.stream_count(), MAX_STREAMS);
@@ -1513,7 +1569,7 @@ fn failed_start_is_reported_and_the_old_streams_stay() {
   let deadline = Instant::now() + TIMEOUT;
   let new = loop {
     let new = h.watch(100, &last, Want::Contents);
-    if h.backend.commit().is_ok() {
+    if h.backend.commit().failed.is_empty() {
       break new;
     }
     assert!(Instant::now() < deadline, "no stream can start");

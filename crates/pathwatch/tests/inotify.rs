@@ -100,7 +100,7 @@ impl Harness {
     let key = DirKey::new(index, 0);
     let coverage = self.backend.watch(key, &self.path(rel), want);
     assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
-    self.backend.commit().unwrap();
+    self.backend.commit();
     key
   }
 

@@ -3,11 +3,11 @@
 use std::{
   collections::VecDeque,
   ffi::OsStr,
-  io, mem,
+  mem,
   path::{Path, PathBuf},
 };
 
-use pathwatch::backend::{Backend, Coverage, DirKey, Hint, Want, watch_limit};
+use pathwatch::backend::{Backend, Committed, Coverage, DirKey, Hint, Want, watch_limit};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::fs::SimFs;
@@ -137,7 +137,7 @@ impl Backend for SimBackend {
     self.unbind(key);
   }
 
-  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
+  fn commit(&mut self) -> Committed {
     self.fs.enter(|calls| calls.commit += 1);
     let pending = mem::take(&mut self.pending);
     let mut state = self.fs.lock();
@@ -150,10 +150,12 @@ impl Backend for SimBackend {
       .collect();
     if kernel.limit.is_some_and(|limit| kernel.streams.len() + new.len() > limit) {
       drop(state);
+      let mut failed = Vec::new();
       for (key, _) in pending {
         self.unbind(key);
+        failed.push((key, watch_limit("no room for one more stream")));
       }
-      return Err(watch_limit("no room for one more stream"));
+      return Committed { now_watched: Vec::new(), failed };
     }
     let is_new = |dir: &Path| new.iter().any(|stream| dir.starts_with(stream));
     let now_streamed: Vec<DirKey> =
@@ -196,7 +198,7 @@ impl Backend for SimBackend {
     for (key, old) in left {
       self.move_on(key, old);
     }
-    Ok(now_streamed)
+    Committed { now_watched: now_streamed, failed: Vec::new() }
   }
 
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {

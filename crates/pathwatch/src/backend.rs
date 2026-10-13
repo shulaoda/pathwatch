@@ -23,10 +23,10 @@ pub trait Backend: Send + 'static {
     true
   }
 
-  /// Makes the watches asked for since the last commit live. Gives the keys that were answered
-  /// `NotWatched` before and that an OS watch reports now.
-  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
-    Ok(Vec::new())
+  /// Makes the watches asked for since the last commit live. Says which keys got no watch,
+  /// and which keys that were answered `NotWatched` before an OS watch reports now.
+  fn commit(&mut self) -> Committed {
+    Committed::default()
   }
 
   /// Turns a raw notification into hints: one call of `hint` for each.
@@ -58,6 +58,16 @@ impl DirKey {
   pub fn generation(self) -> u32 {
     self.generation
   }
+}
+
+/// What a [`commit`](Backend::commit) made live, and what it could not.
+#[derive(Debug, Default)]
+pub struct Committed {
+  /// The keys that were answered `NotWatched` before and that an OS watch reports now.
+  pub now_watched: Vec<DirKey>,
+  /// The keys whose watch could not be made live, each with the reason: the engine reports
+  /// it, polls the directory, and asks again later.
+  pub failed: Vec<(DirKey, io::Error)>,
 }
 
 /// What a directory asks to hear about.

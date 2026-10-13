@@ -265,12 +265,12 @@ fn a_stream_that_one_key_leaves_and_another_joins_in_one_commit() {
   fs.mkdir("/y").unwrap();
   let (one, other) = (DirKey::new(1, 0), DirKey::new(2, 0));
   assert!(matches!(backend.watch(one, Path::new("/x"), Want::Contents), Coverage::WatchedTree));
-  backend.commit().unwrap();
+  backend.commit();
   assert_eq!(os_watches(&fs), [at("/x", Want::Contents)]);
 
   backend.watch(one, Path::new("/y"), Want::Contents);
   backend.watch(other, Path::new("/x"), Want::Contents);
-  backend.commit().unwrap();
+  backend.commit();
   assert_eq!(os_watches(&fs), [at("/x", Want::Contents), at("/y", Want::Contents)]);
 
   fs.write("/x/f", "1").unwrap();

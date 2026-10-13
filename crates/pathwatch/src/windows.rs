@@ -14,7 +14,7 @@ pub use self::{
   records::{Malformed, Record, Records},
 };
 use self::{port::Port, records::FILE_ACTION_MODIFIED};
-use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want};
+use crate::backend::{Backend, Committed, Coverage, DirKey, Hint, Sink, Want};
 
 #[derive(Debug)]
 pub struct WindowsBackend {
@@ -58,11 +58,11 @@ impl Backend for WindowsBackend {
     self.port.wait_for_closes();
   }
 
-  fn commit(&mut self) -> io::Result<Vec<DirKey>> {
+  fn commit(&mut self) -> Committed {
     let told = self.handles.commit(&mut self.port);
     self.tell(told);
     self.port.wait_for_closes();
-    Ok(mem::take(&mut self.covered))
+    Committed { now_watched: mem::take(&mut self.covered), failed: Vec::new() }
   }
 
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
