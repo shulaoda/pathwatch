@@ -1,14 +1,18 @@
 //! The questions to the ignore filter (`Options::ignored`): what is asked, when, and what a node
 //! keeps of the answer (design.md 5.11).
 
-use std::{iter, path::Path};
+use std::{
+  iter,
+  path::{Path, PathBuf},
+};
 
 use super::Engine;
 use crate::{
   backend::{Backend, DirKey},
   config::EntryKind,
   fs::Fs,
-  tree::Kind,
+  path::split_top,
+  tree::{Kind, Tree, push_name},
 };
 
 impl<B: Backend, F: Fs> Engine<B, F> {
@@ -20,6 +24,31 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let answer = self.ignored(path, kind);
     self.tree[key].set_ignored(kind, answer);
     answer
+  }
+
+  /// Whether the filter ignores a directory above the path, as a directory. Asked from the top
+  /// down, whether the directory exists or not, so nothing is asked below an ignored one. A
+  /// node on the way keeps the answer.
+  pub(super) fn is_ignored_above(&mut self, path: &Path) -> bool {
+    if self.options.ignored.is_none() {
+      return false;
+    }
+    let Some((top, rest)) = split_top(path) else { return false };
+    let above = iter::once(top).chain(rest.iter()).take(rest.iter().count());
+    let mut dir = PathBuf::with_capacity(path.as_os_str().len());
+    let mut at = Some(Tree::ROOT);
+    for name in above {
+      push_name(&mut dir, name);
+      at = at.and_then(|at| self.tree.child(at, name));
+      let ignored = match at {
+        Some(at) => self.ignores(at, &dir, EntryKind::Dir),
+        None => self.ignored(&dir, EntryKind::Dir),
+      };
+      if ignored {
+        return true;
+      }
+    }
+    false
   }
 
   /// Whether the directory above covers the node: it tracks every entry, and the node is one.
@@ -49,8 +78,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Whether the filter ignores the directory or one of the `levels - 1` above it, below the
-  /// watched path `levels` above, which is never asked about. Asked from the top down, so
-  /// nothing is asked below an ignored one.
+  /// watched path `levels` above. That one is not asked: a watched directory that the filter
+  /// ignores counts as missing, and has nothing below it. Asked from the top down, so nothing
+  /// is asked below an ignored one.
   pub(super) fn is_ignored_on_the_way(&self, key: DirKey, levels: usize) -> bool {
     let parent = |&at: &DirKey| self.tree.parent(at);
     let way: Vec<DirKey> = iter::successors(Some(key), parent).take(levels).collect();

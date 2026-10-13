@@ -16,9 +16,17 @@ use crate::{
 /// path covered it already (design.md 5.7).
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Puts the path into the tree, a registered node for each name, and marks where the disk has
-  /// to be checked.
+  /// to be checked. A path below a directory that the filter ignores, and one that it ignores
+  /// as a file and as a directory, is left out (design.md 5.11).
   pub(super) fn register(&mut self, path: &Path) {
     let Some((top, rest)) = split_top(path) else { return };
+    if self.is_ignored_above(path) {
+      return;
+    }
+    let ignored_file = self.ignored(path, EntryKind::File);
+    if ignored_file && self.ignored(path, EntryKind::Dir) {
+      return;
+    }
 
     // The anchor: the deepest node with only directories on disk above it, each listed by the
     // directory above it. The way ends at a held node, since nothing is on disk below it, and
@@ -28,8 +36,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut below_directories = true;
     let mut at = Tree::ROOT;
     for name in iter::once(top).chain(rest.iter()) {
-      let node = &self.tree[at];
+      let node = &mut self.tree[at];
       below_directories &= node.is_dir() && !node.is_unlisted();
+      // A directory on the way was asked about, or there is no filter: the node keeps that.
+      if at != Tree::ROOT {
+        node.set_ignored(EntryKind::Dir, false);
+      }
       at = match self.tree.child(at, name) {
         Some(child) => child,
         None => self.tree.insert_child(at, name),
@@ -48,6 +60,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
     }
 
+    // The first look does not ask the filter again.
+    let node = &mut self.tree[at];
+    node.set_ignored(EntryKind::File, ignored_file);
+    if ignored_file {
+      node.set_ignored(EntryKind::Dir, false);
+    }
     if !self.tree.make_path(at) {
       return;
     }
@@ -60,7 +78,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // A directory asked for names only must tell more when no directory is at the new path.
     if below_directories
       && self.tells_names_only(parent)
-      && !self.is_dir_on_disk(path)
+      && !self.is_dir_on_disk(at, path)
       && let Some(parent_path) = path.parent()
     {
       self.ask(parent, parent_path, Want::Contents);
@@ -76,23 +94,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Whether a new file at the node is part of the baseline of the running `watch`.
-  pub(super) fn is_baseline_file(&mut self, key: DirKey, path: &Path) -> bool {
-    !self.reported_before(key) || self.is_ignored_entry(key, path, EntryKind::File)
+  pub(super) fn is_baseline_file(&self, key: DirKey) -> bool {
+    !self.reported_before(key)
   }
 
   /// Whether what is in a directory that appears, or becomes complete, is the baseline.
   /// `relinked`: the node is a link that was none at the last check.
-  pub(super) fn is_baseline_dir(&mut self, key: DirKey, path: &Path, relinked: bool) -> bool {
+  pub(super) fn is_baseline_dir(&self, key: DirKey, relinked: bool) -> bool {
     // A link that the running call follows for the first time: nobody read its target before.
     let new_link = relinked && self.tree[key].added() == Added::Registered;
-    new_link || !self.reported_before(key) || self.is_ignored_entry(key, path, EntryKind::Dir)
-  }
-
-  /// Whether the directory above reported nothing at a name that the running call made a
-  /// watched path, although it is complete: the filter ignores the entry. The question is
-  /// about the entry of the directory, not about the watched path (design.md 5.11).
-  fn is_ignored_entry(&mut self, key: DirKey, path: &Path, kind: EntryKind) -> bool {
-    self.tree[key].added() != Added::No && self.ignores(key, path, kind)
+    new_link || !self.reported_before(key)
   }
 
   /// Whether what is at the node had to be reported before the running `watch`.

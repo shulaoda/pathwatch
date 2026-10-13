@@ -521,47 +521,6 @@ fn unwatch_a_link_to_a_file_inside_a_watched_directory() {
   });
 }
 
-/// A watched file below a directory that the filter ignores, inside a watched directory. While
-/// it is watched, the ignored directory has a node for it. Taken back, nothing is left of
-/// that: no event, and the hints from inside end at the watched directory again.
-#[test]
-fn unwatch_a_file_below_an_ignored_directory() {
-  on_all(&pathwatch_sim::ignore_node_modules(), |d, on| {
-    d.fs().mkdir_all("/p/node_modules/pkg").unwrap();
-    d.fs().write("/p/node_modules/pkg/x.js", "1").unwrap();
-    d.fs().write("/p/a.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p", "/p/node_modules/pkg/x.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/a.js", "/p/node_modules/pkg/x.js"], "{on}");
-
-    assert_eq!(d.unwatch(&["/p/node_modules/pkg/x.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/a.js"], "{on}");
-    d.fs().write("/p/node_modules/pkg/x.js", "22").unwrap();
-    d.fs().write("/p/a.js", "22").unwrap();
-    assert_eq!(d.settled(), ["U /p/a.js"], "{on}");
-    d.caught_up();
-  });
-}
-
-/// A watched directory that the filter would ignore is watched all the same, and it covers the
-/// watched file below it: when that path is taken back, the file stays known through the
-/// directory.
-#[test]
-fn unwatch_below_a_watched_directory_that_the_filter_would_ignore() {
-  on_all(&pathwatch_sim::ignore_node_modules(), |d, on| {
-    d.fs().mkdir_all("/p/node_modules/pkg").unwrap();
-    d.fs().write("/p/node_modules/pkg/x.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/node_modules", "/p/node_modules/pkg/x.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/node_modules/pkg/x.js"], "{on}");
-
-    assert_eq!(d.unwatch(&["/p/node_modules/pkg/x.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/node_modules/pkg/x.js"], "{on}");
-    d.fs().write("/p/node_modules/pkg/x.js", "22").unwrap();
-    d.fs().write("/p/node_modules/new.js", "1").unwrap();
-    assert_eq!(d.settled(), ["C /p/node_modules/new.js", "U /p/node_modules/pkg/x.js"], "{on}");
-    d.caught_up();
-  });
-}
-
 /// A directory becomes a watched path while the disk does not answer, so its node is not
 /// complete yet. A watched file in it is taken back. The directory covers the file all the
 /// same: it stays known, and no `Delete` comes for it while the look at the directory waits.

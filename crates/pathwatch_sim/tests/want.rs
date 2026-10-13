@@ -252,29 +252,22 @@ fn a_directory_comes_at_a_watched_path() {
   }
 }
 
-/// A watched directory that the filter would ignore is watched like any other: it asks for its
-/// contents and reports its entries, with a watched file below it. The directory above tells
-/// names only.
+/// A watched path that the filter ignores counts as missing, also when a directory is there:
+/// the directory above tells its contents, as for every watched path with nothing at it.
 #[test]
-fn a_watched_directory_that_the_filter_would_ignore() {
-  for mode in Mode::ALL {
-    let mut d = Driver::sim(mode, pathwatch_sim::ignore_node_modules());
-    d.fs.mkdir_all("/p/node_modules/pkg").unwrap();
-    d.fs.write("/p/node_modules/pkg/x.js", "1").unwrap();
-    d.fs.write("/p/node_modules/other.js", "1").unwrap();
-    d.watch(&["/p/node_modules", "/p/node_modules/pkg/x.js"]);
-    let files = ["/p/node_modules/other.js", "/p/node_modules/pkg/x.js"];
-    assert_eq!(known(&d), files, "{mode:?}");
-    let asked = asked(&d.fs);
-    assert!(asked.contains(&at("/p/node_modules", Some(Contents))), "{mode:?}: {asked:?}");
-    assert!(!asked.contains(&at("/p", Some(Contents))), "{mode:?}: {asked:?}");
-
-    d.fs.write("/p/node_modules/other.js", "22").unwrap();
-    d.fs.write("/p/node_modules/a.js", "1").unwrap();
-    let events = ["C /p/node_modules/a.js", "U /p/node_modules/other.js"];
-    assert_eq!(settled(&mut d), events, "{mode:?}");
-    caught_up(&mut d);
-  }
+fn a_watched_directory_that_the_filter_ignores() {
+  let mut d = Driver::sim(Mode::Inode, pathwatch_sim::ignore_node_modules());
+  d.fs.mkdir_all("/p/node_modules").unwrap();
+  d.watch(&["/p/node_modules"]);
+  // The look for the kind asks the filter too: `/p` is asked once, for its contents.
+  assert_eq!(asked(&d.fs), [at("/", Some(Names)), at("/p", Some(Contents))]);
+  assert_eq!(os_watches(&d.fs), [at("/", Names), at("/p", Contents)]);
+  // Every later look at `/p` finds its want as it is, and asks nothing.
+  let calls = d.fs.calls();
+  d.fs.write("/p/node_modules/a.js", "1").unwrap();
+  assert_eq!(settled(&mut d), NONE);
+  assert_eq!(d.fs.calls().watch, calls.watch);
+  caught_up(&mut d);
 }
 
 /// Many watched directories in one directory: each costs one look for its kind, one check and

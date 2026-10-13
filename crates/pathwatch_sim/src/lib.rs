@@ -70,7 +70,7 @@ mod fs;
 
 pub use crate::{
   backend::{Mode, RECURSIVE, SimBackend, SimRaw, WatchCall},
-  caught_up::{check_fingerprints, followed, reportable},
+  caught_up::{can_be_watched, check_fingerprints, followed, reportable},
   driver::{
     Deliver, Driver, NONE, Sim, asked, at, caught_up, flush, ignore_node_modules, known,
     not_caught_up, on_a_small_stack, on_all, on_modes, os_watches, settled, show, sorted, taken,

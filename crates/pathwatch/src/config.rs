@@ -74,12 +74,14 @@ impl Config {
     self
   }
 
-  /// An entry of a watched directory for which `ignored` returns `true` is never reported, and
-  /// an ignored directory is never read or watched. Default: nothing is ignored.
+  /// A path for which `ignored` returns `true` is never reported, and an ignored directory is
+  /// never read or watched. Default: nothing is ignored.
   ///
   /// The path is absolute. The filter must give the same answer for the same path and kind,
-  /// and when it ignores a directory, it should ignore everything below it. It is not asked
-  /// about the paths given to `watch`, nor about the directories on the way to them.
+  /// and when it ignores a directory, it should ignore everything below it. It decides about
+  /// the paths given to `watch` too: one below a directory that it ignores, or ignored as a
+  /// file and as a directory, is not watched at all, and one ignored for the kind that is
+  /// there counts as missing (README, promise 10).
   #[must_use]
   pub fn with_ignored(
     mut self,

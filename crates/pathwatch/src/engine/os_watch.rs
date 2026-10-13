@@ -9,6 +9,7 @@ use std::{
 use super::{Engine, check::is_missing};
 use crate::{
   backend::{Backend, Committed, Coverage, DirKey, Want, is_watch_limit, same},
+  config::EntryKind,
   error::{ErrorKind, context},
   fs::{FileType, Fs},
   tree::{Depth, Kind, Mark, Node, Tree, Watch, push_name},
@@ -118,14 +119,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Whether a directory is at the watched path now. Only the kind is read, nothing is stored.
-  pub(super) fn is_dir_on_disk(&self, path: &Path) -> bool {
+  pub(super) fn is_dir_on_disk(&mut self, key: DirKey, path: &Path) -> bool {
     let kind = self.fs.lstat(path).map(|meta| meta.kind);
     let kind = if matches!(kind, Ok(FileType::Symlink)) {
       self.fs.stat(path).map(|meta| meta.kind)
     } else {
       kind
     };
+    // As in `read_entry`: an ignored watched path counts as missing, a name on the way never.
     matches!(kind, Ok(FileType::Dir))
+      && (self.tree[key].is_ancestor() || !self.ignores(key, path, EntryKind::Dir))
   }
 
   /// Makes the watches asked for since the last commit live. Gives the directories that an OS
@@ -171,7 +174,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// What the directory asks from the backend (design.md 5.10).
-  fn want(&self, key: DirKey, path: &mut PathBuf) -> Want {
+  fn want(&mut self, key: DirKey, path: &mut PathBuf) -> Want {
     if self.tree[key].is_complete() {
       return Want::Contents;
     }
@@ -184,7 +187,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Whether a watched path in the directory, where the tree has nothing, has no directory on
   /// disk. A name on the way is not asked: a directory is expected there.
-  fn has_no_dir_at_a_watched_child(&self, key: DirKey, path: &mut PathBuf) -> bool {
+  fn has_no_dir_at_a_watched_child(&mut self, key: DirKey, path: &mut PathBuf) -> bool {
     let mut next = self.tree.children(key).next();
     while let Some(child) = next {
       next = self.tree.next_sibling(child);
@@ -193,7 +196,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         continue;
       }
       push_name(path, self.tree.name(child));
-      let is_dir = self.is_dir_on_disk(path);
+      let is_dir = self.is_dir_on_disk(child, path);
       path.pop();
       if !is_dir {
         return true;

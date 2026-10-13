@@ -248,8 +248,7 @@ fn node_modules_is_ignored() {
   each_backend_with(&config, |w| {
     w.write("proj/src/a.js", "1");
     w.write("proj/node_modules/dep/index.js", "1");
-    // A file inside the ignored directory can still be a watched path of its own.
-    w.watch(&["proj", "proj/node_modules/dep/index.js"]);
+    w.watch(&["proj"]);
 
     for (package, file) in (0..50).flat_map(|p| (0..10).map(move |f| (p, f))) {
       w.write(&format!("proj/node_modules/pkg{package}/lib/{file}.js"), "1");
@@ -257,13 +256,11 @@ fn node_modules_is_ignored() {
     w.write("proj/node_modules/dep/other.js", "1");
     w.write("proj/node_modules/dep/index.js", "22");
     w.write("proj/src/a.js", "22");
-    w.expect(&[(Update, "proj/node_modules/dep/index.js"), (Update, "proj/src/a.js")]);
+    w.expect(&[(Update, "proj/src/a.js")]);
 
-    // The filter looks at the last name only, so a removal name by name can show the watcher a
-    // moment when `dep` is gone and `node_modules` is still there. The `Delete` comes all the same.
     w.remove("proj/node_modules");
     w.write("proj/src/b.js", "1");
-    w.expect(&[(Delete, "proj/node_modules/dep/index.js"), (Create, "proj/src/b.js")]);
+    w.expect(&[(Create, "proj/src/b.js")]);
   });
 }
 

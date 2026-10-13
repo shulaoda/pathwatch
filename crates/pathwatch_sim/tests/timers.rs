@@ -435,19 +435,19 @@ fn nothing_is_due_when_nothing_is_watched() {
     d.watch(&[""]);
     assert_eq!(d.engine.deadline(), None, "{on}");
 
-    d.fs.mkdir_all("/p/node_modules/pkg").unwrap();
+    d.fs.mkdir_all("/p/lib/pkg").unwrap();
     d.fs.write("/p/a.js", "1").unwrap();
-    d.fs.write("/p/node_modules/pkg/x.js", "1").unwrap();
-    d.watch(&["/p/a.js", "/p/node_modules/pkg/x.js"]);
+    d.fs.write("/p/lib/pkg/x.js", "1").unwrap();
+    d.watch(&["/p/a.js", "/p/lib/pkg/x.js"]);
     assert_eq!(d.engine.deadline(), Some(d.now + second), "{on}");
     let poll = d.engine.deadline();
     // One watched path is left: the poll stays, also when nothing is at the path any more.
     d.unwatch(&["/p/a.js"]);
     assert_eq!(d.engine.deadline(), poll, "{on}");
-    d.fs.remove_all("/p/node_modules/pkg").unwrap();
-    assert_eq!(settled(&mut d), ["D /p/node_modules/pkg/x.js"], "{on}");
+    d.fs.remove_all("/p/lib/pkg").unwrap();
+    assert_eq!(settled(&mut d), ["D /p/lib/pkg/x.js"], "{on}");
     assert!(d.engine.deadline().is_some(), "{on}");
-    d.unwatch(&["/p/node_modules/pkg/x.js"]);
+    d.unwatch(&["/p/lib/pkg/x.js"]);
     assert_eq!(d.engine.deadline(), None, "{on}");
 
     d.watch(&["/p/a.js"]);

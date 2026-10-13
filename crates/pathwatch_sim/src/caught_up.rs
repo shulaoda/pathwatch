@@ -44,24 +44,35 @@ pub fn check_fingerprints(
 }
 
 /// The files a handler must know when the engine has caught up, found by a walk of the disk
-/// from each watched path.
+/// from each watched path that `watch` takes ([`can_be_watched`]).
 ///
 /// A watched path stands for itself if a file is there, and for every file below it if a
-/// directory is there. The filter is asked about every file and every directory of the walk
-/// below a watched directory, and not about a watched path or a name on the way to one.
+/// directory is there. The filter is asked about every file and every directory of the walk,
+/// the watched path too: one that it ignores for the kind that is there counts as missing.
 pub fn reportable(
   fs: &SimFs,
   ignored: &dyn Fn(&Path, EntryKind) -> bool,
   watched: &BTreeSet<PathBuf>,
 ) -> BTreeSet<PathBuf> {
-  let followed = followed(watched);
-  let mut walk = Walk { fs, ignored, watched, followed, files: BTreeSet::new() };
+  let taken: BTreeSet<PathBuf> =
+    watched.iter().filter(|path| can_be_watched(ignored, path)).cloned().collect();
+  let followed = followed(&taken);
+  let mut walk = Walk { fs, ignored, watched: &taken, followed, files: BTreeSet::new() };
   fs.quiet(|| {
-    for path in watched {
+    for path in &taken {
       walk.visit(path, false);
     }
   });
   walk.files
+}
+
+/// Whether `watch` takes `path`: no directory above it is ignored as a directory, and the path
+/// itself is not ignored both as a file and as a directory. Such a path can never be reported,
+/// so it does not become a watched path at all.
+pub fn can_be_watched(ignored: &dyn Fn(&Path, EntryKind) -> bool, path: &Path) -> bool {
+  let above_is_ignored = path.ancestors().skip(1).any(|dir| ignored(dir, EntryKind::Dir));
+  let both_kinds = ignored(path, EntryKind::File) && ignored(path, EntryKind::Dir);
+  !above_is_ignored && !both_kinds
 }
 
 struct Walk<'a> {
@@ -78,7 +89,7 @@ impl Walk<'_> {
   fn visit(&mut self, path: &Path, in_watched_dir: bool) {
     let Ok(meta) = look(self.fs, &self.followed, path) else { return };
     let kind = if meta.kind == FileType::Dir { EntryKind::Dir } else { EntryKind::File };
-    let counts = self.watched.contains(path) || (in_watched_dir && !(self.ignored)(path, kind));
+    let counts = (self.watched.contains(path) || in_watched_dir) && !(self.ignored)(path, kind);
     if !counts {
       return;
     }

@@ -10,7 +10,7 @@ use std::{io, path::Path, time::Duration};
 use pathwatch::{ErrorKind, engine::Options, poll::PollBackend};
 use pathwatch_sim::{
   Deliver, Driver, Mode, NONE, Sim, SimBackend, SimFs, caught_up, flush, ignore_node_modules,
-  known, on_all, on_modes, settled, sorted, taken,
+  known, on_all, on_modes, settled, taken,
 };
 
 fn inode() -> Driver<SimBackend> {
@@ -273,31 +273,6 @@ fn a_directory_and_a_file_two_levels_below_it_in_one_batch() {
       assert_eq!(d.settled(), ["C /p/R/lib/b.js", "U /p/R/lib/other.js"]);
       d.caught_up();
     }
-  });
-}
-
-/// A directory inside an ignored directory becomes a watched path. The watched directory above
-/// never looked into the ignored one, so what is found there is the baseline.
-#[test]
-fn a_watched_directory_inside_an_ignored_directory() {
-  on_all(&ignore_node_modules(), |d, on| {
-    d.fs().mkdir_all("/p/node_modules/pkg/lib").unwrap();
-    d.fs().write("/p/a.js", "1").unwrap();
-    d.fs().write("/p/node_modules/pkg/index.js", "1").unwrap();
-    d.fs().write("/p/node_modules/pkg/lib/a.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/a.js"], "{on}");
-
-    assert_eq!(d.watch(&["/p/node_modules/pkg"]), NONE, "{on}");
-    assert_eq!(
-      d.known(),
-      ["/p/a.js", "/p/node_modules/pkg/index.js", "/p/node_modules/pkg/lib/a.js"],
-      "{on}"
-    );
-    d.fs().write("/p/node_modules/pkg/lib/new.js", "1").unwrap();
-    d.fs().write("/p/node_modules/other.js", "1").unwrap();
-    assert_eq!(d.settled(), ["C /p/node_modules/pkg/lib/new.js"], "{on}");
-    d.caught_up();
   });
 }
 
@@ -832,26 +807,23 @@ fn a_later_add_opens_no_gap() {
   }
 }
 
-/// A directory that the filter ignores leads to a watched path, inside a watched directory. A
-/// file takes its place, and before the flush the path becomes a watched path itself. The
-/// watched directory above already had to report that file: its `Create` is due.
+/// A directory that the filter ignores, inside a watched directory, is replaced by a file, and
+/// before the flush the path becomes a watched path itself. The watched directory above
+/// already had to report that file: its `Create` is due.
 #[test]
-fn a_directory_on_the_way_turns_into_a_file_and_becomes_a_watched_path() {
+fn an_ignored_directory_turns_into_a_file_and_becomes_a_watched_path() {
   on_all(&ignore_node_modules(), |d, on| {
-    // The watched file is one level below the ignored directory: the directory that holds a
-    // watched file is its watch target, and an ignored target would hide the file.
     d.fs().mkdir_all("/p/R/node_modules/pkg").unwrap();
     d.fs().write("/p/R/node_modules/pkg/x.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/R", "/p/R/node_modules/pkg/x.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/R/node_modules/pkg/x.js"], "{on}");
-    assert_eq!(d.settled(), NONE, "{on}");
+    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
+    assert_eq!(d.known(), NONE, "{on}");
 
     d.fs().remove_all("/p/R/node_modules").unwrap();
     d.fs().write("/p/R/node_modules", "a file now").unwrap();
     let mut events = d.watch(&["/p/R/node_modules"]);
     events.append(&mut d.settled());
     events.retain(|event| event != "U /p/R/node_modules");
-    assert_eq!(sorted(events), ["C /p/R/node_modules", "D /p/R/node_modules/pkg/x.js"], "{on}");
+    assert_eq!(events, ["C /p/R/node_modules"], "{on}");
     d.caught_up();
   });
 }

@@ -413,35 +413,72 @@ fn an_ignored_directory_comes_and_goes() {
   assert!(asked.iter().any(|path| path.ends_with("r/node_modules")));
 }
 
-/// The filter is asked about the entries of a watched directory, and not about the paths that
-/// are watched: a watched file in an ignored directory, and a watched file that the filter
-/// would ignore, are reported; the same names as entries of a watched directory are not.
+/// A watched path that the filter ignores for the kind that is there counts as missing: no
+/// event while it is so, a `Create` when a kind that the filter takes comes, a `Delete` when
+/// it goes. One ignored for both kinds is never anything.
 #[test]
-fn a_watched_path_is_never_filtered() {
+fn a_watched_path_that_the_filter_ignores_counts_as_missing() {
   let config = Config::default().with_ignored(|path, kind| {
-    path.components().any(|part| part.as_os_str() == "node_modules")
+    path.ends_with("secret.txt")
+      || (kind == EntryKind::Dir && path.ends_with("dist"))
       || (kind == EntryKind::File && path.extension().is_some_and(|extension| extension == "log"))
   });
   each_backend_with(&config, |w| {
-    w.write("p/node_modules/pkg/index.js", "1");
+    w.write("p/dist/a.js", "1");
     w.write("r/old.log", "1");
-    w.watch(&["p/node_modules/pkg/index.js", "p/node_modules", "r", "r/new.log"]);
+    w.watch(&["secret.txt", "p/dist", "r", "r/new.log"]);
 
-    w.write("p/node_modules/pkg/index.js", "22");
-    w.write("p/node_modules/other.js", "1");
+    w.write("secret.txt", "1");
+    w.write("p/dist/a.js", "22");
+    w.write("p/dist/b.js", "1");
     w.write("r/old.log", "22");
     w.write("r/new.log", "1");
     w.write("r/seen.txt", "1");
-    w.expect(&[
-      (Update, "p/node_modules/pkg/index.js"),
-      (Create, "r/new.log"),
-      (Create, "r/seen.txt"),
-    ]);
+    w.expect(&[(Create, "r/seen.txt")]);
 
-    w.remove("p/node_modules/pkg/index.js");
-    w.remove("r/new.log");
+    // A file where the ignored directory was, and a directory again.
+    w.remove("p/dist");
+    w.write("p/dist", "a file now");
+    w.expect(&[(Create, "p/dist")]);
+    w.write("p/dist", "written");
+    w.expect(&[(Update, "p/dist")]);
+    w.remove("p/dist");
+    w.write("p/dist/a.js", "1");
+    w.expect(&[(Delete, "p/dist")]);
+
+    w.remove("secret.txt");
     w.remove("r/old.log");
-    w.expect(&[(Delete, "p/node_modules/pkg/index.js"), (Delete, "r/new.log")]);
+    w.remove("r/new.log");
+    w.remove("r/seen.txt");
+    w.expect(&[(Delete, "r/seen.txt")]);
+  });
+}
+
+/// A watched path below a directory that the filter ignores is never watched, however deep,
+/// and whether it exists or not: nothing is reported for it, and `unwatch` of it does
+/// nothing. The filter looks at the last name only.
+#[test]
+fn a_watched_path_below_an_ignored_directory_gets_nothing() {
+  let config = Config::default()
+    .with_ignored(|path, kind| kind == EntryKind::Dir && path.ends_with("node_modules"));
+  each_backend_with(&config, |w| {
+    w.write("p/node_modules/top.js", "1");
+    w.write("p/node_modules/pkg/index.js", "1");
+    w.write("p/seen.js", "1");
+    let below = ["p/node_modules/top.js", "p/node_modules/pkg/index.js", "p/node_modules/later.js"];
+    w.watch(&["p/node_modules", "p/seen.js"]);
+    w.watch(&below);
+
+    w.write("p/node_modules/top.js", "22");
+    w.write("p/node_modules/later.js", "1");
+    w.write("p/node_modules/pkg/index.js", "22");
+    w.write("p/seen.js", "22");
+    w.expect(&[(Update, "p/seen.js")]);
+
+    w.unwatch(&below);
+    w.remove("p/node_modules");
+    w.remove("p/seen.js");
+    w.expect(&[(Delete, "p/seen.js")]);
   });
 }
 

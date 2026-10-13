@@ -136,17 +136,13 @@ fn the_new_name_is_not_deaf() {
     assert_eq!(d.window(), ["U /R/a/f.js"], "{on}");
     d.caught_up();
   });
-  // Case 2: an ignored directory with a watched file in it; "nm" sorts before "node_modules".
+  // Case 2: an ignored directory gets a visible name; "nm" sorts before "node_modules".
   on_all(&ignore_node_modules(), |d, on| {
     d.fs().mkdir_all("/p/node_modules/foo").unwrap();
     d.fs().write("/p/node_modules/foo/index.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p", "/p/node_modules/foo/index.js"]), NONE, "{on}");
+    assert_eq!(d.watch(&["/p"]), NONE, "{on}");
     d.fs().rename("/p/node_modules", "/p/nm").unwrap();
-    assert_eq!(
-      sorted(d.settled()),
-      ["C /p/nm/foo/index.js", "D /p/node_modules/foo/index.js"],
-      "{on}"
-    );
+    assert_eq!(d.settled(), ["C /p/nm/foo/index.js"], "{on}");
     d.fs().write("/p/nm/foo/index.js", "22").unwrap();
     d.fs().write("/p/nm/foo/new.js", "1").unwrap();
     d.fs().write("/p/nm/top.js", "1").unwrap();
