@@ -62,8 +62,8 @@ input or output error: the OS watcher stopped, so every path is polled: Bad file
 ```
 
 The source of a limit is written by the backend that met it, so it names that very limit and
-what to raise. (Before, the kind named one limit for each OS, also when another one was met:
-on macOS the limit of streams, when the limit of open files had stopped the guard.) An error
+what to raise. (Before, the kind named one limit for each OS, also when another one was met.)
+An error
 without a path is about the watcher: its backend did not start or has stopped, and the source
 says which, and that every path is polled now.
 
@@ -1162,7 +1162,8 @@ Facts from probes on macOS (APFS):
   769 open files. And a stream with it takes 0.09 to 0.16 ms to make for each path (paths
   of 9 and of 11 names), without it 0.002 ms. (Other watchers that set it stop watching on
   that record, or report the watched directory as removed: Watchman, .NET, notify, watchdog.)
-- The kernel tells about a rename or a removal of a directory through a queue for vnode
+- Not used any more (see "The check of the stream paths" below): the kernel tells about a
+  rename or a removal of a directory through a queue for vnode
   events (`kqueue`, `EVFILT_VNODE` with `NOTE_RENAME`, `NOTE_DELETE`, `NOTE_REVOKE`), on a
   descriptor of that very directory that was opened for events only (`O_EVTONLY`; it does
   not keep a disk from being unmounted). Measured: the event is there when `rename` returns;
@@ -1288,51 +1289,39 @@ As built:
   path once more.)
 - `unwatch(key)` forgets the key. The path stays in its stream until the streams are replaced,
   or until no path of that stream has a cover at or below it any more: then the stream is
-  stopped at the next commit and its guards are given back, with no loss report, since none of
+  stopped at the next commit, with no loss report, since none of
   its records would reach a key. With no key left at all, the streams that a replacement left
   running are stopped at the next commit too, before their time: nothing stays open.
 - **A cover is a text.** A stream stands at the text of its path, and a record finds its
   cover by the text of the cover. Both hold only while every name in them is the one that the
   disk has. Each way for a name to change has one place that finds it, and all of them answer
   in the same way: the cover is reported lost, and the engine asks for it again (which reads
-  its real path anew) and scans it deep. A directory above a stream path: the guard. A
-  directory inside a stream: the record of its rename. A change between `watch` and the
-  start of the stream: the check after the start. A link that leads somewhere else: the
-  poll (5.14). The notes that follow are these four.
-- **The guard.** Each directory at and above a stream path, from the top of the disk down,
-  is kept open for events, once for all stream paths below it (`Guard`). It is opened for
-  search only (`O_SEARCH`), so a directory that the user may pass through but not read is
-  guarded too, and a disk can still be unmounted (measured on APFS and HFS+). A project with 64
-  stream paths has some 70 of them. One thread waits for the queue of the kernel. When a
-  guarded directory is renamed or removed, every stream path at or below it is trusted no
-  more (it leaves the list of stream paths, and its directories are closed), and every cover
-  at or below the directory is reported lost: the engine watches each one again, which
-  resolves its real path anew and starts a stream at it, and scans it deep. A notice counts
-  only for the registration that made it: one that comes late, for a descriptor number that
-  has been given to another directory since, is dropped. The scans that loss reports ask for
-  are paced (5.13), so a directory that is renamed again and again costs one scan in a
-  while, not one for each rename.
-- **The room for the guard.** All watchers of a process together keep at most half of the
-  files that the process may open (`getdtablesize`). When a commit would need more, or the
-  process has no open file left (`EMFILE`, `ENFILE`), the path gets the watch limit error
-  like a stream that cannot start. The same for every other error of the guard, with that
-  error. A path whose guard fails is left out of the commit, and the other paths get their
-  streams: `commit` names the keys of the covers at and below it as failed, so that they are
-  polled and asked again, and forgets them. A stream that cannot start fails every path of the
-  commit in the same way, and the old streams stay. Only a directory that is gone is no
-  error: its stream path is reported lost right after the start, and the engine finds out
-  what is there. The guard holds the directory that is at the path when it is opened, and
-  nothing else: an open file that is another directory than the one at the path by then (a
-  swap in the moment between) counts as gone. No stream path is `/`, so every stream path
-  has a directory above it to guard.
+  its real path anew) and scans it deep. A directory above a stream path: the check of the
+  next commit. A directory inside a stream: the record of its rename. A change between
+  `watch` and the start of the stream: the check after the start. A link that leads
+  somewhere else: the poll (5.14). The notes that follow are these four.
+- **The check of the stream paths.** At each commit, the real path of each stream path is
+  asked again (`realpath`, 8 µs; 64 paths at most, and the poll of the directories above
+  the covers brings a commit once a second). A path that is another one now, also only in
+  the case of its letters, or none, is trusted no more (it leaves the list of stream paths),
+  and every cover at or below it is reported lost: the engine watches each one again, which
+  resolves its real path anew and starts a stream at it, and scans it deep. The stream that
+  stood there is idle then, and the same commit stops it. So a rename or a removal of a
+  directory above a stream path is found within a second, as on Windows, and not at once.
+  (Before, each directory at and above a stream path was kept open for the vnode events of
+  the kernel, `kqueue` with `NOTE_RENAME` and `NOTE_DELETE`, which told at once and caught a
+  rename that was taken back within the second: 300 lines, a thread, and an open file for
+  each such directory with a limit of its own, for that second. Taken out; the README names
+  the hole.)
+- **A stream that cannot start** fails every path of the commit, with the watch limit error:
+  `commit` names the keys of their covers as failed, so that they are polled and asked
+  again, and the old streams stay. A directory that is gone is no error: its stream path is
+  reported lost right after the start, and the engine finds out what is there.
 - **The check after the start.** The real path of a cover is asked at `watch`, and its stream
-  and its guard start at `commit`. A directory above that was renamed in between leaves the
-  stream at a path where nothing is. So after the start, the real path of each stream path
-  that is new is asked again, in the way it was asked before (`realpath`, 8 µs; the guard is
-  registered by then). One that is another path now, or that has no guard, is reported lost.
-  The same question is asked both times on purpose: `F_GETPATH` on the descriptor of the
-  guard is cheaper, but it can spell a path in another way than `realpath` does, and a
-  difference that is no rename would make the engine watch and scan again without end.
+  starts at `commit`. A directory above that was renamed in between leaves the stream at a
+  path where nothing is. So after the start, the real path of each stream path that is new
+  is asked again, in the way it was asked before (`realpath`, 8 µs). One that is another
+  path now is reported lost.
 
   A directory between a new stream path and a cover below it can get another spelling of
   its name in that time too (`src` to `Src`: the watched path stays valid, so no scan finds
@@ -1352,8 +1341,8 @@ As built:
   its parent: `/System/Volumes/Data/Users` has a parent with no short way, and is `/Users`.
 - **A cover at another real path.** A key that is watched again and whose directory has
   another real path than before is reported lost, if its old path still has a stream that
-  is trusted: then a directory on the old path was renamed and the notice
-  of the guard is still on its way, or a link leads somewhere else. Without this, a key that
+  is trusted: then a directory on the old path was renamed and the check of the next commit
+  has not come yet, or a link leads somewhere else. Without this, a key that
   asks for more in that moment would take the new path with a scan of its own directory
   only. (A key below a stream path that is trusted no more was reported with it.)
 - **Covers below a renamed directory.** A record for a renamed directory inside a stream is
@@ -1363,6 +1352,9 @@ As built:
 
 What stays open:
 
+- A directory above a stream path that is renamed away and back between two commits, with
+  changes below it meanwhile: the stream heard nothing while its path was another one, and
+  the check finds the path in place (README, "Holes").
 - A link on the way to a watched path that points somewhere else now is found by the poll
   (5.14), within a second.
 - A stream path that is trusted no more keeps its stream until the streams are replaced,
@@ -1459,7 +1451,7 @@ Unix hosts). `SimFs` is a file system in memory with inodes, a clock, a change t
 entry, and a mode that ignores the case of letters. `SimBackend` plays an OS watch API on it in
 three modes: by inode (inotify), by path prefix with real paths (FSEvents), by handle for a tree
 (Windows). A stream of the second mode ends when a directory at or above its path is renamed or
-removed, and says so, as the guard of the real backend does (7.2). The test decides when each
+removed, and says so at once, where the real backend finds it out at its next commit (7.2). The test decides when each
 notification is delivered: now, late, twice, or never, with or without the word that it was
 lost. The disk can change in the middle of an engine call.
 The backend keeps a log of every `watch` and `unwatch` call, and the disk tells where an OS
@@ -1597,8 +1589,6 @@ the order in which a change meets them.
   backend, the real directory that a key stands for.
 - **Place.** Where the OS watches are put when there are more directories than the OS lets a
   process watch at once: the deepest directories that the paths have in common.
-- **Guard.** FSEvents: one open file for each directory above a stream path, so that a rename or
-  a removal above the path is heard at once.
 - **Hint.** What a backend says about a raw notification: where to look (`Changed`, `Written`),
   or that notifications were lost. A hint never says what happened.
 - **Mark.** "Check this name at the next flush." A hint leaves one, and so does the engine when it

@@ -2,7 +2,7 @@
 
 use std::{
   collections::{BTreeMap, BTreeSet},
-  fs,
+  fs, thread,
   time::{Duration, Instant},
 };
 
@@ -17,6 +17,11 @@ use crate::{Watch, each, each_backend, each_backend_with, files_at, symlink};
 fn slow_delete() -> Config {
   Config::default().with_delete_delay(Duration::from_secs(2))
 }
+
+/// Longer than the poll of the directories above a watched path (a second), and shorter than
+/// the delete delay of `slow_delete`: a directory that is away this long is found gone and
+/// held, and is back before its second look.
+const AWAY: Duration = Duration::from_millis(1200);
 
 /// A fixed sequence of numbers, so that a test picks the same things in every run.
 struct Random(u64);
@@ -143,7 +148,10 @@ fn a_directory_is_moved_away_changed_and_moved_back() {
   });
 }
 
-/// A watch of macOS stands below the renamed directory and hears nothing about the renames.
+/// A watch of macOS stands below the renamed directory and hears nothing about the renames:
+/// the poll of the directories above finds the directory gone within a second, and the
+/// delete delay holds it until it is back. Moved back before that second, the changes would
+/// not be noticed (README, "Holes").
 #[test]
 fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
   each_backend_with(&slow_delete(), |w| {
@@ -156,6 +164,7 @@ fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
     w.watch(&["r/x/a"]);
 
     w.rename("r/x", "r/away");
+    thread::sleep(AWAY);
     w.write("r/away/a/changes.js", "22");
     w.remove("r/away/a/goes.js");
     w.write("r/away/a/comes.js", "1");
@@ -186,6 +195,7 @@ fn a_directory_above_the_target_of_a_link_is_moved_away_changed_and_moved_back()
     w.watch(&["r/link"]);
 
     w.rename("store/x", "store/away");
+    thread::sleep(AWAY);
     w.write("store/away/real/changes.js", "22");
     w.remove("store/away/real/goes.js");
     w.write("store/away/real/comes.js", "1");

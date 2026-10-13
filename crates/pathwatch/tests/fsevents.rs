@@ -13,7 +13,7 @@ use std::{
   },
   path::{Path, PathBuf},
   sync::{
-    Arc, Condvar, Mutex, MutexGuard, Once, OnceLock, PoisonError,
+    Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, Receiver, TryRecvError},
   },
@@ -49,7 +49,6 @@ static TURN_IS_OVER: Condvar = Condvar::new();
 impl Turn {
   fn take(alone: bool) -> Self {
     assert_few_files_next_to_the_test_program();
-    allow_more_open_files();
     let mut turns = Self::turns();
     while turns.1 || (alone && turns.0 > 0) {
       turns = TURN_IS_OVER.wait(turns).unwrap_or_else(PoisonError::into_inner);
@@ -92,33 +91,6 @@ fn assert_few_files_next_to_the_test_program() {
      stream takes 0.1 s and more to start for every 100,000 of them. `cargo clean` removes \
      the old object files of the build directory."
   );
-}
-
-/// A shell gives a program 256 open files: too few for the guards of thousands of stream paths.
-fn allow_more_open_files() {
-  #[repr(C)]
-  struct Limit {
-    now: u64,
-    most: u64,
-  }
-  unsafe extern "C" {
-    fn getrlimit(resource: i32, limit: *mut Limit) -> i32;
-    fn setrlimit(resource: i32, limit: *const Limit) -> i32;
-  }
-  const OPEN_FILES: i32 = 8;
-  /// `OPEN_MAX`: macOS gives every program this many when it asks.
-  const ENOUGH: u64 = 10_240;
-  static ASKED: Once = Once::new();
-  ASKED.call_once(|| {
-    let mut limit = Limit { now: 0, most: 0 };
-    // SAFETY: both calls get a pointer to a `struct rlimit` that lives until they return.
-    unsafe {
-      if getrlimit(OPEN_FILES, &raw mut limit) == 0 && limit.now < ENOUGH {
-        limit.now = ENOUGH.min(limit.most);
-        setrlimit(OPEN_FILES, &raw const limit);
-      }
-    }
-  });
 }
 
 const NO_PATHS: [&Path; 0] = [];
@@ -602,7 +574,7 @@ fn a_cover_unwatched_before_the_commit_gets_no_stream() {
   h.hints_until(&[changed(below, "file")]);
 }
 
-/// Its guards go with it. A cover below one of its paths keeps it.
+/// A cover below one of its paths keeps it.
 #[test]
 fn a_stream_with_no_cover_left_is_stopped() {
   let mut h = Harness::new();
@@ -613,7 +585,6 @@ fn a_stream_with_no_cover_left_is_stopped() {
   let below = h.watch(3, &h.path("one/below"), Want::Contents);
   h.commit();
   assert_eq!(h.backend.stream_count(), 2);
-  let guarded = h.backend.guarded().len();
 
   h.backend.unwatch(one);
   h.commit();
@@ -625,7 +596,6 @@ fn a_stream_with_no_cover_left_is_stopped() {
   h.commit();
   assert_eq!(h.backend.stream_count(), 1);
   assert_eq!(h.backend.streamed(), [h.real("two")]);
-  assert_eq!(h.backend.guarded().len(), guarded - 1);
   File::create(h.path("two/file")).unwrap();
   h.hints_until(&[changed(two, "file")]);
 }
@@ -884,41 +854,6 @@ fn the_last_unwatch_stops_the_replaced_streams_too() {
   h.backend.unwatch(up);
   h.commit();
   assert_eq!((h.backend.stream_count(), h.backend.retiring_count()), (0, 0));
-  assert_eq!(h.backend.guarded(), NO_PATHS);
-}
-
-/// A guard that cannot be opened (here: the process has no open file left) fails its own path
-/// and no other: the other paths get their streams, and the keys of that path are named.
-#[test]
-fn a_guard_that_cannot_be_opened_fails_its_path_only() {
-  let mut h = Harness::alone();
-  fs::create_dir_all(h.path("a/x")).unwrap();
-  fs::create_dir_all(h.path("a/z")).unwrap();
-  fs::create_dir_all(h.path("b/y")).unwrap();
-  h.cover(1, "a/x");
-  let z = h.watch(2, &h.path("a/z"), Want::Contents);
-  let y = h.watch(3, &h.path("b/y"), Want::Contents);
-  // Every open file of the process but two: the guard of `a/z` takes one and `b` the other,
-  // so `b/y` gets none.
-  let mut hogs = Vec::new();
-  while let Ok(file) = File::open("/dev/null") {
-    hogs.push(file);
-  }
-  hogs.truncate(hogs.len() - 2);
-  let committed = h.backend.commit();
-  drop(hogs);
-  assert_eq!(committed.failed.len(), 1, "{committed:?}");
-  let (failed, error) = &committed.failed[0];
-  assert!(*failed == y && is_watch_limit(error), "{committed:?}");
-  assert_eq!(h.backend.streamed(), [h.real("a/x"), h.real("a/z")]);
-  File::create(h.path("a/z/file")).unwrap();
-  h.hints_until(&[changed(z, "file")]);
-
-  // With room again, the key asks again and gets its stream.
-  h.watch(3, &h.path("b/y"), Want::Contents);
-  h.commit();
-  File::create(h.path("b/y/file")).unwrap();
-  h.hints_until(&[changed(y, "file")]);
 }
 
 /// A stream never stands on `/`, `/Users` or a home directory: such a cover gets no watch and
@@ -964,7 +899,9 @@ fn cover_renamed_in_letter_case_is_heard_after_the_next_watch() {
   h.hints_until(&[changed(key, "file")]);
 }
 
-/// The guard tells: a loss report for each cover below, and the path is trusted no more.
+/// The check of the next commit tells: a loss report for each cover below, and the path is
+/// trusted no more. Also for a rename that only changes the case of the letters, which the
+/// stream would never hear of.
 #[test]
 fn a_directory_above_a_cover_is_renamed() {
   let mut h = Harness::new();
@@ -972,14 +909,11 @@ fn a_directory_above_a_cover_is_renamed() {
   fs::create_dir_all(h.path("above/other")).unwrap();
   let key = h.cover(1, "above/dir");
   let other = h.cover(2, "above/other");
-  // One open file for each directory on the way, and the two covers share the way.
-  let playground = h.real("").components().count() - 1;
-  assert_eq!(h.backend.guarded().len(), playground + 3);
 
   fs::rename(h.path("above"), h.path("away")).unwrap();
+  h.commit();
   h.hints_until(&[changed(key, ""), changed(other, "")]);
   assert_eq!(h.backend.streamed(), NO_PATHS);
-  assert_eq!(h.backend.guarded(), NO_PATHS);
 
   fs::rename(h.path("away"), h.path("above")).unwrap();
   h.watch(1, &h.path("above/dir"), Want::Contents);
@@ -987,35 +921,31 @@ fn a_directory_above_a_cover_is_renamed() {
   h.commit();
   File::create(h.path("above/dir/file")).unwrap();
   h.hints_until(&[changed(key, "file")]);
-  assert_eq!(h.backend.guarded().len(), playground + 2);
-}
 
-/// The kernel tells about each rename, however short the directory was away.
-#[test]
-fn a_directory_above_a_cover_is_away_and_back_at_once() {
-  let mut h = Harness::new();
-  fs::create_dir_all(h.path("above/dir")).unwrap();
-  let key = h.cover(1, "above/dir");
-  for round in 0..20 {
-    fs::rename(h.path("above"), h.path("away")).unwrap();
-    File::create(h.path("away/dir").join(format!("file-{round}"))).unwrap();
-    fs::rename(h.path("away"), h.path("above")).unwrap();
-    h.hints_until(&[changed(key, "")]);
-    h.watch(1, &h.path("above/dir"), Want::Contents);
-    h.commit();
-    h.sync(key);
+  fs::rename(h.path("above"), h.path("Above")).unwrap();
+  if !h.path("above").exists() {
+    // The volume tells letter case apart: the rename is one away, as above.
+    return;
   }
+  h.commit();
+  h.hints_until(&[changed(key, "")]);
+  assert_eq!(h.backend.streamed(), NO_PATHS);
+  h.watch(1, &h.path("above/dir"), Want::Contents);
+  assert_eq!(h.backend.pending(), [h.real("Above/dir")]);
+  h.commit();
+  File::create(h.path("above/dir/other-file")).unwrap();
+  h.hints_until(&[changed(key, "other-file")]);
 }
 
-/// Guarded all the same, like a cover spelled through the data volume: neither is taken for
-/// a directory that moved.
+/// A directory on the way that cannot be read, and a cover spelled through the data volume:
+/// neither is taken for a directory that moved by the check of a commit.
 #[test]
 fn a_cover_below_a_directory_that_cannot_be_read() {
   let mut h = Harness::new();
   fs::create_dir_all(h.path("locked/dir")).unwrap();
   fs::set_permissions(h.path("locked"), Permissions::from_mode(0o311)).unwrap();
   let key = h.cover(1, "locked/dir");
-  assert!(h.backend.guarded().contains(&h.real("locked").as_path()));
+  h.commit();
   File::create(h.path("locked/dir/file")).unwrap();
   let hints = h.hints_until(&[changed(key, "file")]);
   assert!(h.os_dropped() || !hints.contains(&changed(key, "")), "{hints:?}");
