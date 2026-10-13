@@ -55,6 +55,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // gone.
     let names_are_known = listing == Listing::Whole && kept_names;
     let names_only = depth == Depth::Names && names_are_known;
+    let strict_now = !self.tree.is_loose(key);
 
     let why = if depth == Depth::Deep { Mark::DEEP } else { Mark::default() };
     for (index, &(child, listed)) in names.iter().enumerate() {
@@ -64,8 +65,15 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         }
         said => said,
       };
-      // The tree knew the node, and the listing names it: it is as it was.
-      if names_only && index < known && listed.is_named() {
+      // The tree knew the node as an entry, and the listing names it: it is as it was. Not a
+      // name that is not plain in a loose directory: the hint that asked for this scan can have
+      // meant it, under another spelling that the table does not find.
+      if names_only
+        && index < known
+        && listed.is_named()
+        && self.tree[child].is_entry()
+        && (strict_now || self.tree.is_plain(child))
+      {
         continue;
       }
       // A check frees no node but its own.
@@ -105,7 +113,33 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         None => names.push((tree.insert_child(key, name), entry.into())),
       }
     });
-    let Err(error) = result else { return Listing::Whole };
+    // A listing follows a link at the path: one that took the place of the directory since the
+    // look would be read as the directory. So it counts only while the same directory is at the
+    // path when it is done (one look, 1 µs); else it is read again at the next flush. A
+    // registered link is followed as the look followed it.
+    let error = match result {
+      Ok(()) => {
+        let is_link = self.tree.link(key).is_some();
+        let still = if is_link { self.fs.stat(path) } else { self.fs.lstat(path) };
+        match still {
+          Ok(meta)
+            if meta.kind == FileType::Dir
+              && self.tree[key].dir().is_some_and(|dir| dir.id == meta.dir_id) =>
+          {
+            return Listing::Whole;
+          }
+          Ok(_) => {
+            for (new, _) in names.drain(known..) {
+              self.tree.prune(new);
+            }
+            self.tree.mark(key, Mark::DEEP);
+            return Listing::Stop;
+          }
+          Err(error) => error,
+        }
+      }
+      Err(error) => error,
+    };
 
     // What the listing gave before it failed is forgotten.
     for (new, _) in names.drain(known..) {
@@ -130,10 +164,17 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     Listing::None
   }
 
-  /// Tries one name the listing gave in the other case: whether the directory tells two spellings
-  /// apart. A proof of strict is taken back when the other spelling finds the very entry.
+  /// Tries a name the listing gave in the other case: whether the directory tells two spellings
+  /// apart. A proof of strict is taken back when the other spelling finds the very entry; a
+  /// proof of loose stands. A name that says nothing (the other spelling finds another entry)
+  /// is followed by the next one, up to a few.
   fn ask_for_the_rule(&mut self, key: DirKey, path: &mut PathBuf, names: &[ScanEntry]) {
-    let was_strict = !self.tree.is_loose(key);
+    const TRIES: usize = 3;
+    let Some(spelling) = self.tree[key].dir().map(|dir| dir.spelling) else { return };
+    if spelling == Spelling::Loose {
+      return;
+    }
+    let was_strict = spelling == Spelling::Strict;
     let swap = |name: &str| -> Option<String> {
       let has_letter = name.bytes().any(|byte| byte.is_ascii_alphabetic());
       has_letter.then(|| name.chars().map(swap_case).collect())
@@ -148,10 +189,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let name = self.tree.name(child);
       Some((name.to_owned(), name.to_str().and_then(swap)?))
     });
-    let tries = if was_strict { usize::MAX } else { 1 };
-    let (mut tried, mut found) = (false, None);
-    for (name, other) in to_try.take(tries) {
-      tried = true;
+    let tries = if was_strict { 1 } else { TRIES };
+    let (mut tried, mut found) = (0, None);
+    for (name, other) in to_try {
       push_name(path, &name);
       let entry = self.fs.lstat(path);
       found = match &entry {
@@ -163,15 +203,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         Err(_) => None,
       };
       path.pop();
-      if entry.is_ok() {
+      tried += usize::from(entry.is_ok());
+      if found.is_some() || tried == tries {
         break;
       }
     }
     match found {
       Some(true) => self.set_spelling(key, Spelling::Strict),
       Some(false) => self.set_spelling(key, Spelling::Loose),
-      // No name to try: the looks must not ask for a listing again and again.
-      None if !tried && !was_strict => self.set_spelling(key, Spelling::Loose),
       None => {}
     }
   }

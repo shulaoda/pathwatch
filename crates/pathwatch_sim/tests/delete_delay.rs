@@ -394,13 +394,13 @@ fn a_poll_does_not_go_below_a_held_directory() {
   assert_eq!(taken(&mut d), NONE);
   assert_eq!(d.engine.pending_deletes().len(), 2);
   // Three more polls inside the delay. Each one looks at `/`, `/p`, `/p/r` and `d`, and
-  // lists `/p/r`.
+  // lists `/p/r`, with a look at it when the listing is done.
   for _ in 0..3 {
     let before = d.fs.calls();
     assert!(d.step());
     assert_eq!(taken(&mut d), NONE);
     let after = d.fs.calls();
-    assert_eq!((after.lstat - before.lstat, after.read_dir - before.read_dir), (4, 1));
+    assert_eq!((after.lstat - before.lstat, after.read_dir - before.read_dir), (5, 1));
   }
   assert_eq!(settled(&mut d), ["D /p/r/d/g", "D /p/r/d/sub/f"]);
   caught_up(&mut d);

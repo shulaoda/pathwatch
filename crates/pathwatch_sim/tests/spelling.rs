@@ -9,6 +9,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use pathwatch::{
+  ErrorKind,
   engine::{Ignored, Options},
   fs::Fs,
 };
@@ -396,13 +397,13 @@ fn names_with_no_ascii_letter_on_a_strict_disk() {
   };
   let (looks, listings, _) = calls(&d);
 
-  // The look at the name, and three for the proof with `app.js`.
+  // The look at the name, one when the listing is done, and three for the proof with `app.js`.
   d.fs.write("/p/R/\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}", "22").unwrap();
   assert_eq!(window(&mut d), ["U /p/R/\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}"]);
-  assert_eq!(calls(&d), (looks + 4, listings + 1, 1));
+  assert_eq!(calls(&d), (looks + 5, listings + 1, 1));
   d.fs.write("/p/R/\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}", "333").unwrap();
   assert_eq!(window(&mut d), ["U /p/R/\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}"]);
-  assert_eq!(calls(&d), (looks + 5, listings + 1, 1));
+  assert_eq!(calls(&d), (looks + 6, listings + 1, 1));
   caught_up(&mut d);
 }
 
@@ -969,6 +970,49 @@ fn a_rewrite_in_place_under_another_spelling() {
     assert_eq!(d.window(), ["U /p/src/App.js"], "{on}");
     d.fs().write("/p/src/components/ui/App.js", "1").unwrap();
     assert_eq!(d.window(), ["U /p/src/Components/UI/App.js"], "{on}");
+    d.caught_up();
+  });
+}
+
+/// A loose disk that gives each spelling of an entry a file id of its own (a folder shared into
+/// a virtual machine, or over ssh). The other case of a name finds another id there, as a twin
+/// on a strict disk would: that proves nothing either way. The disk says how it spells a name,
+/// and that answer stands: a listing does not try again, so the two never take turns.
+#[test]
+fn a_loose_disk_that_numbers_each_spelling() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().set_spelling_ids(true);
+    d.fs().mkdir_all("/p/R").unwrap();
+    d.fs().write("/p/R/app.js", "1").unwrap();
+    d.fs().write("/p/R/other.js", "1").unwrap();
+    assert_eq!(d.watch(&["/p/R", "/p/R/APP.js"]), NONE, "{on}");
+    assert_eq!(d.known(), ["/p/R/APP.js", "/p/R/app.js", "/p/R/other.js"], "{on}");
+
+    d.fs().write("/p/R/app.js", "22").unwrap();
+    assert_eq!(d.window(), ["U /p/R/APP.js", "U /p/R/app.js"], "{on}");
+    d.fs().rename("/p/R/app.js", "/p/R/App.js").unwrap();
+    assert_eq!(d.settled(), ["C /p/R/App.js", "D /p/R/app.js"], "{on}");
+    d.caught_up();
+  });
+}
+
+/// A directory that can be entered but not listed, with a watched path in it whose name has no
+/// ASCII letter: the look cannot tell the rule and asks for one listing of the names, which
+/// fails. It does not ask again, so the flush ends.
+#[test]
+fn a_directory_that_cannot_be_listed_is_asked_for_one_listing() {
+  on_all(&Options::default(), |d, on| {
+    let name = "/p/R/\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}";
+    d.fs().mkdir_all("/p/R").unwrap();
+    d.fs().write(name, "1").unwrap();
+    d.fs().set_unlistable("/p/R", true).unwrap();
+    assert_eq!(d.watch(&["/p/R", name]), NONE, "{on}");
+    assert_eq!(d.errors(), [ErrorKind::PermissionDenied], "{on}");
+    assert_eq!(d.known(), [name], "{on}");
+
+    d.fs().write(name, "22").unwrap();
+    assert_eq!(d.settled(), [format!("U {name}")], "{on}");
     d.caught_up();
   });
 }

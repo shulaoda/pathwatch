@@ -262,8 +262,9 @@ fn a_watched_directory_that_the_filter_ignores() {
   caught_up(&mut d);
 }
 
-/// Many watched directories in one directory: each costs one look for its kind and one check,
-/// whether they come in one batch or one by one. The directory above tells names only.
+/// Many watched directories in one directory: each costs one look for its kind, one check and
+/// one look when its listing is done, whether they come in one batch or one by one. The
+/// directory above tells names only.
 #[test]
 fn many_watched_directories_in_one_directory() {
   let mut d = Driver::sim(Mode::Inode, Options::default());
@@ -272,14 +273,14 @@ fn many_watched_directories_in_one_directory() {
     d.fs.mkdir_all(dir).unwrap();
   }
   d.watch(&dirs[..25]);
-  // `/` and `/p`, and two looks for each watched directory.
-  assert_eq!(d.fs.calls().lstat, 2 + 25 * 2);
+  // `/` and `/p`, and three looks for each watched directory.
+  assert_eq!(d.fs.calls().lstat, 2 + 25 * 3);
 
   let before = d.fs.calls().lstat;
   for dir in &dirs[25..] {
     d.watch(&[dir]);
   }
-  assert_eq!(d.fs.calls().lstat - before, 25 * 2);
+  assert_eq!(d.fs.calls().lstat - before, 25 * 3);
   assert_eq!(os_watches(&d.fs)[1], at("/p", Names));
   assert_eq!(os_watches(&d.fs).len(), 2 + 50);
   caught_up(&mut d);

@@ -113,9 +113,9 @@ fn a_loss_report_for_one_watch_scans_below_that_watch() {
     let after = d.fs.calls();
     // `/p/A` itself, `sub` and the 21 files in it. And `/p`, which is checked with every
     // mark below it, because the directory above it is only polled. Nothing of `/q/B`. Each
-    // of the two listings costs three looks more, once: they prove that the directory tells
-    // two spellings of a name apart.
-    assert_eq!(after.lstat - before.lstat, 30, "{mode:?}");
+    // of the two listings costs one look when it is done, and three looks more, once: they
+    // prove that the directory tells two spellings of a name apart.
+    assert_eq!(after.lstat - before.lstat, 32, "{mode:?}");
     assert_eq!(after.read_dir - before.read_dir, 2, "{mode:?}");
     caught_up(&mut d);
   }
@@ -577,4 +577,22 @@ fn a_name_on_the_way_is_registered_and_the_disk_stops_answering() {
       d.caught_up();
     });
   }
+}
+
+/// A path that the OS does not take (longer than it allows): the look fails with an invalid
+/// name. That is not "not found": nothing can ever be there. The handler is told once, as `Io`,
+/// and the path counts as missing.
+#[test]
+fn a_path_that_the_os_does_not_take() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().mkdir_all("/p").unwrap();
+    d.fs().set_offline(Some(io::ErrorKind::InvalidFilename));
+    assert_eq!(d.watch(&["/p/f"]), NONE, "{on}");
+    assert_eq!(d.errors(), [ErrorKind::Io], "{on}");
+
+    d.fs().set_offline(None);
+    d.fs().write("/p/f", "1").unwrap();
+    assert_eq!(d.settled(), ["C /p/f"], "{on}");
+    d.caught_up();
+  });
 }

@@ -895,3 +895,50 @@ fn a_scan_that_waited_runs_inside_a_watch_of_a_file_below() {
     d.caught_up();
   });
 }
+
+/// The tree can be behind the disk when `watch` is called: a notification is still on its way.
+/// A name on the way that the directory above listed under another spelling at its last look
+/// (`/b/C` for an entry `c`) is looked at again before the new path below it: by now a
+/// directory spelled `C` can be there, which that directory covers, and whose files are new.
+#[test]
+fn a_name_in_another_spelling_is_looked_at_again_before_a_new_path_below_it() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().mkdir_all("/b/c").unwrap();
+    d.fs().write("/b/c/f", "1").unwrap();
+    assert_eq!(d.watch(&["/b", "/b/C/x"]), NONE, "{on}");
+    assert_eq!(d.known(), ["/b/c/f"], "{on}");
+
+    d.fs().remove_all("/b/c").unwrap();
+    d.fs().mkdir("/b/C").unwrap();
+    d.fs().write("/b/C/a", "1").unwrap();
+    assert_eq!(d.watch(&["/b/C/a"]), ["C /b/C/a"], "{on}");
+    assert_eq!(d.settled(), ["D /b/c/f"], "{on}");
+    d.caught_up();
+  });
+}
+
+/// A name that the running `watch` registers is spelled by its caller, whatever the tree knew
+/// at it: here a file entry of the watched directory, which was renamed to another case and
+/// replaced by a link to a directory meanwhile, unheard. The disk is asked how it spells the
+/// name: the directory does not list it so, and what is behind the link is not an entry of it.
+/// The entry under the name the disk has is looked at in the same flush.
+#[test]
+fn a_known_entry_that_becomes_a_registered_name_is_asked_for_its_spelling() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().mkdir_all("/d").unwrap();
+    d.fs().mkdir_all("/q/dir").unwrap();
+    d.fs().write("/q/dir/g", "1").unwrap();
+    d.fs().write("/d/c", "1").unwrap();
+    assert_eq!(d.watch(&["/d"]), NONE, "{on}");
+
+    d.fs().remove("/d/c").unwrap();
+    d.fs().symlink("/q/dir", "/d/C").unwrap();
+    assert_eq!(d.watch(&["/d/c/x"]), ["C /d/C", "D /d/c"], "{on}");
+    assert_eq!(d.known(), ["/d/C"], "{on}");
+    // The hint for the new link comes late: the `Update` it can bring is one too many, not wrong.
+    assert!(d.settled().iter().all(|event| event == "U /d/C"), "{on}");
+    d.caught_up();
+  });
+}

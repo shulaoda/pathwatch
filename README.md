@@ -163,8 +163,9 @@ that tells the forms apart (every disk but the usual one of macOS).
 12. **Symbolic links.** A watched path that is a link, or that goes through one, is followed,
     and its events carry the spelling you gave. A link inside a watched directory is a file: it
     is not followed. While a watched path is at or goes through such a link, the link is
-    followed for the directory too: the `watch` of that path reports the link as gone and the
-    files behind it as new, and the `unwatch` of it the other way round.
+    followed for the directory too: the `watch` of that path reports the link as gone, and
+    what is behind it is the baseline of that `watch`; the `unwatch` of it reports the link as
+    a new file and forgets what was behind it without a word.
 13. **Spelling.** On a disk that takes two spellings of a name for one (letter case, Unicode
     form: the usual disks of macOS and Windows, and on Linux a folder of such a system, a FAT
     or SMB disk, a directory with the casefold flag), a watched path is the text you gave:
@@ -211,6 +212,8 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   macOS and with polling. Linux reports it.
 - **A mount over a watched directory** is not noticed until something else makes the watcher
   look there.
+- **A path longer than the OS allows** gets no events: `watch` takes it, the handler is told
+  once (`Io`), and the path counts as missing.
 - **A directory on a network drive, or shared with another machine** (NFS, a folder of the
   host in a virtual machine or a container): changes that the other machine makes are not
   reported, and nothing tells the watcher so. `with_polling(true)` finds them.

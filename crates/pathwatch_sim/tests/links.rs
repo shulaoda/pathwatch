@@ -519,3 +519,27 @@ fn a_directory_became_a_link_before_its_name_is_registered() {
     d.caught_up();
   });
 }
+
+/// Between the look at a directory and its listing, the directory is moved away and a link to
+/// another directory is put in its place. The listing went through the link, so it is not
+/// taken: the same directory has to be at the path when the listing is done. The next look
+/// finds the link, a file inside the watched directory, and not the files behind it.
+#[test]
+fn a_directory_becomes_a_link_while_it_is_listed() {
+  let mut d = Driver::poll(Options::default());
+  d.fs.mkdir_all("/p/r/d").unwrap();
+  d.fs.mkdir_all("/q/other").unwrap();
+  d.fs.write("/p/r/d/f", "1").unwrap();
+  d.fs.write("/q/other/g", "1").unwrap();
+  d.watch(&["/p/r"]);
+  // The tenth call of the poll is the listing of `d`.
+  d.fs.at_call(9, |fs| {
+    fs.rename("/p/r/d", "/q/away").unwrap();
+    fs.symlink("/q/other", "/p/r/d").unwrap();
+  });
+  assert!(d.step());
+  assert_eq!(d.fs.traps_run(), 1);
+  assert_eq!(taken(&mut d), NONE);
+  assert_eq!(settled(&mut d), ["C /p/r/d", "D /p/r/d/f"]);
+  caught_up(&mut d);
+}

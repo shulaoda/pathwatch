@@ -334,11 +334,15 @@ rename that changed only the case left the old name behind, with polling too. So
   (measured), so what `pathconf` says about the case proves nothing.
 - Without it, each directory has an answer of its own (`Dir::spelling`): nothing is known
   at first, and the directory counts as loose; then the looks find out that it is strict, or
-  that it is loose.
+  that it is loose. A proof of loose stands until the directory is another one: a disk that
+  answers in two ways (vboxsf, sshfs, a ZFS that folds Unicode forms but not letter case)
+  must not make strict and loose take turns, each with a listing, for ever.
 - The proof (`Engine::tells_spellings_apart`): an entry is tried in the other case of its
-  ASCII letters. The same entry is there: loose. Nothing is there, or another inode, and a
-  third look finds the entry itself as it was: strict. The third look is there so that a
-  change of the disk between the first two does not pass for a proof.
+  ASCII letters. The same entry is there: loose. Nothing is there, and a third look finds
+  the entry itself as it was: strict. The third look is there so that a change of the disk
+  between the first two does not pass for a proof. Another entry under the other case is no
+  proof either way: a twin on a strict disk looks the same as one entry on a disk that gives
+  each spelling of it a number of its own (vboxsf, sshfs), and the next name is tried.
 - The entry that is tried must be there, and `lstat` alone does not say that. Measured on
   the shared folder: after a rename away through another spelling, Linux still finds the
   old name with `lstat` (its kernel keeps what it knew about each spelling), and nothing in
@@ -346,9 +350,11 @@ rename that changed only the case left the old name behind, with polling too. So
   name with no second spelling in the tree (`Engine::other_spelling`): such a name is there
   because something made it. That is the first new file of a watched directory, and it
   costs two looks and no listing. And a listing: each listing of a directory whose nodes
-  the tree knows tries one of the names that it gave (`Engine::ask_for_the_rule`). A look
-  that is not sure, cannot tell, and finds nothing known asks for such a listing, once.
-  The first listing of a directory tries nothing: watching a tree costs no call more than
+  the tree knows tries one of the names that it gave (`Engine::ask_for_the_rule`), or the
+  next few when a name says nothing. A look that is not sure, cannot tell, and finds
+  nothing known asks for such a listing, once (`Spelling::Asked`): a directory that can be
+  entered but not listed would be asked at every look otherwise, and never answer. The
+  first listing of a directory tries nothing: watching a tree costs no call more than
   before.
 - A proof is taken back. By such a listing, when the other spelling finds the very entry:
   the directory can be another one by now, which the tree cannot tell from the old one (the
@@ -429,7 +435,9 @@ asks the disk for the name of that entry when
 
 - the node was no entry of the directory at the last look (`Node::is_entry`): the tree had
   nothing there, the node is held, or the directory had the entry under another name. Such a
-  name comes from a hint or from a caller, and both can spell it as no entry is spelled;
+  name comes from a hint or from a caller, and both can spell it as no entry is spelled. So
+  is a name that the running `watch` registered (`Added::Registered`), also when the tree knew
+  an entry at it: the caller spelled it, and the entry can have another spelling by now;
 - another node of the directory can be the same name (`Tree::has_other_spelling`): the disk
   has only one of the two. A name that is not plain counts as such a name at every look;
 - the look is part of a scan that listed the whole directory, and the listing did not name it.
@@ -446,10 +454,15 @@ When the disk spells the name in another way, the directory has no entry of this
   it: the node says so (`Node::is_unlisted`, read by `Engine::is_inside`). A watched path
   reports what is at it as before. A name that only leads to a watched path has nothing of
   its own: a file that the directory reported there is gone at once, and a directory there
-  becomes partial and keeps only what the watched paths below it cover (`uncover`).
+  becomes partial and keeps only what the watched paths below it cover (`uncover`). The same
+  when a partial directory is found under another name for the first time: its entries were
+  covered through this name, and are not any more.
 
-In both cases the disk gave the name that the entry has. If the tree has no node for it, one
-is made and looked at in the same flush.
+In both cases the disk gave the name that the entry has. That name is looked at in the same
+flush, with what the hint said of the entry (`written`), whether the tree has a node for it
+or not: the hint was for the entry, under whatever spelling. Once only: a disk whose answers
+do not agree with each other must not keep the flush busy, so a second step is marked for the
+next flush.
 
 The flag is an answer of the disk that the tree keeps, so it can be old. It is asked again
 at every look of a node that is no sure entry, and the tests hold it to the disk when the
@@ -584,7 +597,11 @@ that the tree has, so only what differs is reported.
 
 `scan(node, depth)`: `check` every child of the node. A **complete** node also lists the
 directory: each entry that the tree has no node for yet gets one, and is checked with the type
-from the listing. A **partial** node lists nothing: its children are its registered names. In
+from the listing. A listing follows a link at the path, so it counts only when the same
+directory is still at the path when it is done (one look): a link that took the place of the
+directory since the look would be read as the directory, and the files behind it reported.
+Else the node is marked deep, and the next flush looks again. A **partial** node lists
+nothing: its children are its registered names. In
 a deep scan each check gets a `deep` mark, so every directory below is watched again and
 scanned deep too. Nothing is scanned below a held node. If the listing fails because the
 directory is gone, its parent checks its name; when that look finds the same directory again,
@@ -610,10 +627,13 @@ That scan checks the child directories in the same way, so this goes all the way
 **`watch`** (`engine/watched_paths.rs`). A path that the filter ignores as a file and as a directory
 is left out (5.11). For each other new path: walk down from the root; make the missing
 nodes; make the last one a watched path, which makes every node above it registered; put a
-deep mark on the deepest node on the way that has only directories on disk above it (unless a
-scan that checks every name of its directory is queued already: a scan of the names alone
-skips what the listing names). Then run one flush right away, without the quiet time, and
-return when it is done.
+deep mark on the deepest node on the way that has only directories on disk above it, each
+listed by the directory above it (unless a scan that checks every name of its directory is
+queued already: a scan of the names alone skips what the listing names). The way ends at a
+name that the disk spelled in another way at its last look: the tree can be behind the disk
+when `watch` is called, a notification still on its way, and the baseline of what is below
+is decided by that answer. Then run one flush right away, without the quiet time, and return
+when it is done.
 
 The whole batch is registered before the flush, and each node is checked once in a flush. So
 a batch costs one `watch` call for a directory and one `lstat` for a name (the test
@@ -948,7 +968,8 @@ is not, or if `pkg` goes away later, the path is dropped. That is allowed. The s
 
 | Error | Meaning |
 |---|---|
-| not found, not a directory, invalid name | missing |
+| not found, not a directory | missing |
+| an invalid name (a path longer than the OS allows) | missing; reported once as `Io`; the node is polled: nothing can ever be at the path |
 | an entry that is being deleted (Windows: the name goes when the last handle on it is closed) | missing; the node is looked at again at each flush until the name is gone or the file is there, since the holder can take the deletion back and the OS says nothing then |
 | permission denied, link loop | missing for events; reported once; the node is polled until a scan of it has no error |
 | a server that cannot be reached (Windows `ERROR_BAD_NETPATH`, which std calls not found) | no answer |

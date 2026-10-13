@@ -24,13 +24,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       return;
     }
 
-    // The anchor: the deepest node with only directories on disk above it. The way ends at a
-    // held node: nothing is on disk below it.
+    // The anchor: the deepest node with only directories on disk above it, each listed by the
+    // directory above it. The way ends at a held node, since nothing is on disk below it, and
+    // at a name that the disk spelled in another way at its last look: that answer can be old,
+    // and the baseline of what is below is decided by it.
     let mut anchor = None;
     let mut below_directories = true;
     let mut at = Tree::ROOT;
     for name in iter::once(top).chain(rest.iter()) {
-      below_directories &= self.tree[at].is_dir();
+      let node = &self.tree[at];
+      below_directories &= node.is_dir() && !node.is_unlisted();
       at = match self.tree.child(at, name) {
         Some(child) => child,
         None => self.tree.insert_child(at, name),

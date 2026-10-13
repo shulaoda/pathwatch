@@ -82,7 +82,7 @@ impl From<Entry> for Listed {
 enum Had {
   Nothing,
   File,
-  Dir { id: DirId, complete: bool },
+  Dir { id: DirId, complete: bool, unlisted: bool },
 }
 
 impl<B: Backend, F: Fs> Engine<B, F> {
@@ -90,18 +90,19 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// `listed` is what a listing of it said.
   pub(super) fn check(&mut self, key: DirKey, path: &mut PathBuf, listed: Listed, why: Mark) {
     let mut twins = Vec::new();
-    self.check_one(key, path, listed, why, &mut twins);
+    self.check_one(key, path, listed, why, &mut twins, false);
     // The twins of a node that goes are looked at now: their looks were unsure of the spelling
     // because of this node (`Tree::has_twin`). A twin that goes has twins of its own: a list,
     // not a recursion, since a flush can see thousands.
     while let Some(twin) = twins.pop() {
       if let Some(mark) = self.tree.take_mark(twin) {
-        self.check_one(twin, path, Listed::NotNamed, mark, &mut twins);
+        self.check_one(twin, path, Listed::NotNamed, mark, &mut twins, false);
       }
     }
   }
 
-  /// One check, which puts the twins that are to be looked at next on `twins`.
+  /// One check, which puts the twins that are to be looked at next on `twins`. `followed`: the
+  /// check came from one that found its entry under this name.
   fn check_one(
     &mut self,
     key: DirKey,
@@ -109,6 +110,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     listed: Listed,
     why: Mark,
     twins: &mut Vec<DirKey>,
+    followed: bool,
   ) {
     let Some(parent) = self.tree.parent(key) else { return };
     let Some(asked) = self.tree[parent].dir().map(|dir| dir.asked) else {
@@ -120,7 +122,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let had = match node.kind {
       Kind::Missing => Had::Nothing,
       Kind::File(_) => Had::File,
-      Kind::Dir(dir) => Had::Dir { id: dir.id, complete: dir.complete },
+      Kind::Dir(dir) => {
+        Had::Dir { id: dir.id, complete: dir.complete, unlisted: node.is_unlisted() }
+      }
     };
 
     push_name(path, self.tree.name(key));
@@ -158,12 +162,22 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       // The ask queues a scan: the name is looked at again when the wider watch is live.
       self.ask(parent, path, Want::Contents);
     }
-    // The entry is on the disk under another name that the tree has no node for yet.
-    if let Some(name) = on_disk
-      && self.tree.child(parent, &name).is_none()
-    {
-      let node = self.tree.insert_child(parent, &name);
-      self.check_one(node, path, Listed::NotAsked, Mark::DEEP, twins);
+    // The entry is on the disk under another name: that name is looked at now, with what the
+    // hint said of the entry. Once only, so that a disk whose answers do not agree with each
+    // other cannot keep the flush busy; a second step waits for the next flush.
+    if let Some(name) = on_disk {
+      let node = match self.tree.child(parent, &name) {
+        Some(node) => node,
+        None => self.tree.insert_child(parent, &name),
+      };
+      let pending = self.tree.take_mark(node).unwrap_or_default();
+      let written = why.written || pending.written;
+      let mark = Mark { deep: true, written, lost: false, since: why.since };
+      if followed {
+        self.tree.mark(node, mark);
+      } else {
+        self.check_one(node, path, Listed::NotAsked, mark, twins, true);
+      }
     }
   }
 
@@ -199,7 +213,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         self.appear(key, path, id, complete, baseline);
         self.look_again_at_a_new_dir(key);
       }
-      (Found::Dir { id, complete, relinked }, Had::Dir { id: old, complete: was_complete }) => {
+      (
+        Found::Dir { id, complete, relinked },
+        Had::Dir { id: old, complete: was_complete, unlisted: was_unlisted },
+      ) => {
         let was_held = self.tree[key].is_held();
         if was_held {
           self.tree.unhold(key);
@@ -210,11 +227,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           // Another directory, and maybe on another disk.
           (dir.id, dir.spelling) = (id, Spelling::Unknown);
         }
+        let unlisted = self.tree[key].is_unlisted();
         if complete && !was_complete {
           self.make_complete(key, relinked);
-        } else if was_complete && !complete && self.tree[key].is_unlisted() {
+        } else if !complete && unlisted && (was_complete || !was_unlisted) {
           // The directory above lists it under another name now: only what a watched path covers
-          // stays.
+          // stays. Also in a partial node, whose entries were covered through this name.
           self.uncover(key, true, false);
         } else if complete && relinked && self.tree[key].added() == Added::Registered {
           // The running `watch` follows this link for the first time: what is behind it is its
@@ -303,35 +321,24 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     let mut meta = match self.fs.lstat(path) {
       Ok(meta) => meta,
-      Err(error) => {
-        if is_delete_pending(&error) {
-          // The deletion can be taken back, and the OS says nothing then: the node is looked at
-          // again at the next flush, until the name is gone or the file is there.
-          self.tree.mark(key, Mark::default());
-        } else if listed.is_named()
-          && is_missing(&error)
-          && let Some(dir) = self.tree[parent].dir_mut()
-        {
-          // The listing named the entry a moment ago: the directory itself can be away, renamed
-          // away and back while it is read, which nothing else would report. It is listed again.
-          dir.relist = true;
-          self.tree.mark(parent, Mark::default());
-        }
-        return self.disk_error(parent, path, error);
-      }
+      Err(error) => return self.look_failed(parent, key, path, listed, error),
     };
     // A registered name is an entry of the directory above only under this very name: asked
     // before a link is followed.
     let mut other = None;
     let mut relinked = false;
     if registered {
+      // The flag is an answer of the disk: it is written when the disk was asked, or when the
+      // listing of the running scan named this very spelling.
       if unsure {
         other = match self.other_spelling(parent, key, path, &meta, is_new) {
           Ok(other) => other,
           Err(error) => return self.disk_error(parent, path, error),
         };
+        self.tree[key].set_unlisted(other.is_some());
+      } else if listed.is_named() {
+        self.tree[key].set_unlisted(false);
       }
-      self.tree[key].set_unlisted(other.is_some());
       // Only a registered node is followed.
       let link = (meta.kind == FileType::Symlink).then(|| self.real_place(path));
       let old = self.tree.link(key);
@@ -378,6 +385,31 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     found
   }
 
+  /// What an error of the `lstat` at the node means.
+  fn look_failed(
+    &mut self,
+    parent: DirKey,
+    key: DirKey,
+    path: &Path,
+    listed: Listed,
+    error: io::Error,
+  ) -> Found {
+    if is_delete_pending(&error) {
+      // The deletion can be taken back, and the OS says nothing then: the node is looked at
+      // again at the next flush, until the name is gone or the file is there.
+      self.tree.mark(key, Mark::default());
+    } else if listed.is_named()
+      && is_missing(&error)
+      && let Some(dir) = self.tree[parent].dir_mut()
+    {
+      // The listing named the entry a moment ago: the directory itself can be away, renamed
+      // away and back while it is read, which nothing else would report. It is listed again.
+      dir.relist = true;
+      self.tree.mark(parent, Mark::default());
+    }
+    self.disk_error(parent, path, error)
+  }
+
   /// The name the disk has for the entry, when it is another one than the node has. On a disk that
   /// can be strict, a new name with no twin proves the rule first (design.md 5.2).
   fn other_spelling(
@@ -388,8 +420,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     meta: &Meta,
     is_new: bool,
   ) -> io::Result<Option<OsString>> {
+    let spelling = self.tree[parent].dir().map(|dir| dir.spelling);
     let can_be_strict = !self.options.loose_spelling;
-    if can_be_strict {
+    if can_be_strict && spelling != Some(Spelling::Loose) {
       let can_tell = is_new && !self.tree.has_twin(key);
       match can_tell.then(|| self.tells_spellings_apart(path, meta)).flatten() {
         Some(true) => {
@@ -397,8 +430,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           return Ok(None);
         }
         Some(false) => self.set_spelling(parent, Spelling::Loose),
-        None if self.tree[parent].dir().is_some_and(|dir| dir.spelling == Spelling::Unknown) => {
+        None if spelling == Some(Spelling::Unknown) => {
           self.tree.queue_scan(parent, Depth::Names);
+          self.set_spelling(parent, Spelling::Asked);
         }
         None => {}
       }
@@ -412,9 +446,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Keeps what a look found out. A proof of strict that is taken back costs one listing: the
-  /// looks before took the disk for a strict one.
+  /// looks before took the disk for a strict one. A proof of loose is kept.
   pub(super) fn set_spelling(&mut self, dir: DirKey, spelling: Spelling) {
     let Some(kept) = self.tree[dir].dir_mut() else { return };
+    if kept.spelling == Spelling::Loose {
+      return;
+    }
     let was = mem::replace(&mut kept.spelling, spelling);
     if was == Spelling::Strict && spelling == Spelling::Loose {
       self.tree.queue_scan(dir, Depth::Names);
@@ -423,7 +460,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Whether the directory of `path` tells two spellings of a name apart, tried with the other
   /// case of the ASCII letters of the entry. `Some(true)` needs a third look that finds the entry
-  /// as it was: a change between the looks is no proof. `None`: nothing could be tried.
+  /// as it was: a change between the looks is no proof. `None`: nothing could be tried, or the
+  /// other spelling found another entry: a twin on a strict disk, or a disk that gives each
+  /// spelling of one entry a number of its own (vboxsf, sshfs), which is no proof either way.
   pub(super) fn tells_spellings_apart(&self, path: &Path, meta: &Meta) -> Option<bool> {
     let name = path.file_name().and_then(OsStr::to_str)?;
     if !name.bytes().any(|byte| byte.is_ascii_alphabetic()) {
@@ -431,8 +470,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     let other: String = name.chars().map(swap_case).collect();
     match self.fs.lstat(&with_name(path, other)) {
-      Ok(found) if found.file_id == meta.file_id => return Some(false),
-      Ok(_) => {}
+      Ok(found) => return (found.file_id == meta.file_id).then_some(false),
       Err(error) if error.kind() == io::ErrorKind::NotFound => {}
       Err(_) => return None,
     }
@@ -450,7 +488,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let was_entry = match listed {
       Listed::Named(_) | Listed::File(_) | Listed::Dir(_) => return false,
       Listed::NotNamed => false,
-      Listed::NotAsked => node.is_entry(),
+      // A name that the running call registered is spelled by its caller, whatever the tree
+      // knew at the name.
+      Listed::NotAsked => node.is_entry() && node.added() != Added::Registered,
     };
     self.tree.has_spellings(key) && (!was_entry || self.tree.has_other_spelling(key))
   }
@@ -467,6 +507,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     let (kind, found) = match error.kind() {
       io::ErrorKind::PermissionDenied => (Some(ErrorKind::PermissionDenied), Found::Missing),
+      // A path that the OS does not take (longer than it allows): nothing can ever be at it.
+      io::ErrorKind::InvalidFilename | io::ErrorKind::InvalidInput => {
+        (Some(ErrorKind::Io), Found::Missing)
+      }
       _ if is_link_loop(&error) => (Some(ErrorKind::Io), Found::Missing),
       // Another program holds the entry for a moment (Windows: a sharing violation): nothing is
       // wrong with the disk, so nothing is reported, and the next look decides.
@@ -633,13 +677,7 @@ pub(super) fn swap_case(letter: char) -> char {
 
 /// Whether an error of the disk says "nothing is at this path".
 pub(super) fn is_missing(error: &io::Error) -> bool {
-  matches!(
-    error.kind(),
-    io::ErrorKind::NotFound
-      | io::ErrorKind::NotADirectory
-      | io::ErrorKind::InvalidFilename
-      | io::ErrorKind::InvalidInput
-  )
+  matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }
 
 /// Whether the error is a link loop. Its kind (`FilesystemLoop`) has no stable name, so the

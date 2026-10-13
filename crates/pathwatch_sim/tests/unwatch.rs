@@ -14,7 +14,7 @@ use pathwatch::{
 };
 use pathwatch_sim::{
   Deliver, Driver, Mode, NONE, RECURSIVE, Sim, SimFs, asked, at, caught_up, ignore_node_modules,
-  known, on_a_small_stack, on_all, on_modes, os_watches, settled, taken, window,
+  known, on_a_small_stack, on_all, on_modes, os_watches, settled, sorted, taken, window,
 };
 
 /// `unwatch` of a directory above a chain deeper than the stack of a thread takes: the names
@@ -827,6 +827,30 @@ fn a_watch_that_is_given_back_is_followed_by_a_commit() {
     let after = d.fs().calls();
     assert!(after.unwatch > before.unwatch, "{on}: no watch was given back");
     assert!(after.commit > before.commit, "{on}: no commit followed");
+    d.caught_up();
+  });
+}
+
+/// The directory above lists a name on the way to a watched path under another spelling, and
+/// the look that finds that out is still to come when the path is taken back: the disk did not
+/// answer. The directory below the name stayed, as an entry through that name. When the look
+/// comes, the name is no entry: what was kept through it goes, with a `Delete` for each file
+/// the handler knows, and the directory reports the files under its own spelling.
+#[test]
+fn unwatch_below_a_name_whose_spelling_the_directory_above_has_not_told_yet() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().set_ignore_case(true);
+    d.fs().mkdir_all("/p/t/x/s").unwrap();
+    d.fs().write("/p/t/x/s/f", "1").unwrap();
+    assert_eq!(d.watch(&["/p/t/X/S", "/p/t/X/other"]), NONE, "{on}");
+    assert_eq!(d.known(), ["/p/t/X/S/f"], "{on}");
+
+    d.fs().set_offline(Some(std::io::ErrorKind::TimedOut));
+    assert_eq!(d.watch(&["/p/t"]), NONE, "{on}");
+    d.fs().set_offline(None);
+    let mut events = d.unwatch(&["/p/t/X/S"]);
+    events.append(&mut d.settled());
+    assert_eq!(sorted(events), ["C /p/t/x/s/f", "D /p/t/X/S/f"], "{on}");
     d.caught_up();
   });
 }

@@ -40,6 +40,7 @@ impl SimFs {
       changed: 0,
       born: 0,
       denied: false,
+      unlistable: false,
     };
     let state = State {
       inodes: FxHashMap::from_iter([(ROOT, root)]),
@@ -53,6 +54,7 @@ impl SimFs {
       listing_kinds: true,
       listing_meta: false,
       ignore_case: false,
+      spelling_ids: false,
       mount: None,
       other_rule: FxHashSet::default(),
       offline: None,
@@ -318,6 +320,24 @@ impl SimFs {
     self.lock().ignore_case = ignore_case;
   }
 
+  /// Whether a look through another spelling of a name gives another file id than a look
+  /// through the spelling of the disk, as on a folder shared into a virtual machine (vboxsf)
+  /// or over ssh (sshfs). Off by default.
+  pub fn set_spelling_ids(&self, spelling_ids: bool) {
+    self.lock().spelling_ids = spelling_ids;
+  }
+
+  /// Takes away or gives back the permission to list a directory, while it can still be
+  /// entered (`x` without `r`).
+  pub fn set_unlistable(&self, path: impl AsRef<Path>, unlistable: bool) -> io::Result<()> {
+    let mut state = self.lock();
+    let id = state.resolve(path.as_ref(), true)?;
+    if let Some(inode) = state.inodes.get_mut(&id) {
+      inode.unlistable = unlistable;
+    }
+    Ok(())
+  }
+
   /// Another disk is mounted at `/name`: a directory that is made there takes names the other
   /// way than `set_ignore_case` says, and so does every directory that is made in it. Set it
   /// before the directory is made.
@@ -454,14 +474,12 @@ impl SimFs {
 impl Fs for SimFs {
   fn lstat(&self, path: &Path) -> io::Result<Meta> {
     self.enter(|calls| calls.lstat += 1);
-    let state = self.lock();
-    state.look_up(path, false).map(|id| state.meta(id))
+    self.lock().look(path, false)
   }
 
   fn stat(&self, path: &Path) -> io::Result<Meta> {
     self.enter(|calls| calls.stat += 1);
-    let state = self.lock();
-    state.look_up(path, true).map(|id| state.meta(id))
+    self.lock().look(path, true)
   }
 
   fn read_dir(&self, dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()> {
@@ -469,7 +487,7 @@ impl Fs for SimFs {
     let state = self.lock();
     let id = state.look_up(dir, true)?;
     let entries = state.entries(id)?;
-    if state.inodes[&id].denied {
+    if state.inodes[&id].denied || state.inodes[&id].unlistable {
       return Err(error(io::ErrorKind::PermissionDenied));
     }
     for (name, child) in entries {
@@ -587,6 +605,8 @@ pub(crate) struct State {
   listing_meta: bool,
   /// Names that differ only in the case of ASCII letters are one name.
   ignore_case: bool,
+  /// A look through another spelling of a name gives another file id (vboxsf, sshfs).
+  spelling_ids: bool,
   /// `SimFs::set_mount`.
   mount: Option<OsString>,
   /// The directories that take names the other way than `ignore_case` says.
@@ -659,7 +679,35 @@ impl State {
     }
   }
 
+  /// `lstat` or `stat`: what is at the path, with a file id of its own for a look through
+  /// another spelling of the last name when the disk gives one (`spelling_ids`).
+  fn look(&self, path: &Path, follow: bool) -> io::Result<Meta> {
+    if let Some(kind) = self.offline {
+      return Err(error(kind));
+    }
+    let mut respelled = false;
+    let id = self.walk_spelled(ROOT, path, follow, 0, &mut respelled)?;
+    let mut meta = self.meta(id);
+    if respelled && self.spelling_ids {
+      meta.file_id ^= 1 << 40;
+      meta.dir_id.inode ^= 1 << 40;
+    }
+    Ok(meta)
+  }
+
   fn walk(&self, from: u64, path: &Path, follow: bool, links: u32) -> io::Result<u64> {
+    self.walk_spelled(from, path, follow, links, &mut false)
+  }
+
+  /// `respelled`: the last name of `path` was found under another spelling.
+  fn walk_spelled(
+    &self,
+    from: u64,
+    path: &Path,
+    follow: bool,
+    links: u32,
+    respelled: &mut bool,
+  ) -> io::Result<u64> {
     let mut at = from;
     let mut parts = path.components().peekable();
     while let Some(part) = parts.next() {
@@ -673,7 +721,9 @@ impl State {
           if self.inodes[&at].denied {
             return Err(error(io::ErrorKind::PermissionDenied));
           }
-          let (_, child) = self.entry(at, name).ok_or_else(|| error(io::ErrorKind::NotFound))?;
+          let (spelled, child) =
+            self.entry(at, name).ok_or_else(|| error(io::ErrorKind::NotFound))?;
+          *respelled = spelled != name;
           at = match &self.inodes[&child].content {
             Content::Link(target) if follow || parts.peek().is_some() => {
               if links >= 32 {
@@ -764,6 +814,7 @@ impl State {
         changed: now,
         born: now,
         denied: false,
+        unlistable: false,
       },
     );
     self.entries_mut(dir).insert(name.to_owned(), id);
@@ -877,6 +928,8 @@ struct Inode {
   changed: u64,
   born: u64,
   denied: bool,
+  /// The directory can be entered but not listed.
+  unlistable: bool,
 }
 
 enum Content {

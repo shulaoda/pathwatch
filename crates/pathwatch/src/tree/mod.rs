@@ -193,11 +193,16 @@ pub struct Dir {
 /// Whether two spellings of a name are one name in a directory, as far as the looks found out.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Spelling {
-  /// Nothing is known yet: the directory counts as loose, and a listing decides when a look cannot.
+  /// Nothing is known yet: the directory counts as loose, and a look that cannot tell asks for
+  /// one listing of the names, which tries one.
   Unknown,
+  /// That listing was asked for. The directory counts as loose, and no look asks for another
+  /// one: a listing that comes anyway tries again.
+  Asked,
   /// They are two names: a look proved it.
   Strict,
-  /// They are one name: one entry was found under both. Or nothing in the directory can be tried.
+  /// They are one name: one entry was found under both. Nothing tries again, so that a disk
+  /// that answers in two ways cannot keep a flush busy.
   Loose,
 }
 
@@ -1093,6 +1098,11 @@ impl Tree {
 
   fn is_loose_dir(&self, node: &Node) -> bool {
     self.loose_spelling || !node.dir().is_some_and(|dir| dir.spelling == Spelling::Strict)
+  }
+
+  /// Whether the name of the node `key` is plain: the table finds every other spelling of it.
+  pub fn is_plain(&self, key: DirKey) -> bool {
+    is_plain(self.name(key))
   }
 
   /// Whether the name of the node `key` has more than one spelling at all: it has an ASCII
