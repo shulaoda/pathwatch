@@ -6,6 +6,6 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-pathwatch = { path = "../../crates/pathwatch" }
+pathwatch = { path = "../.." }
 # The fork of notify that rolldown uses today.
 notify_fork = { package = "rolldown-notify", git = "https://github.com/rolldown/notify", rev = "3a1cde091855ee031e1a6ebc662c63c37fa4f091" }

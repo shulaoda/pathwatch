@@ -1,27 +1,36 @@
-[workspace]
-members = ["crates/*"]
-resolver = "3"
-
-[workspace.package]
+[package]
+name = "pathwatch"
+description = "A path-based file event watcher"
 version = "0.0.0"
 edition = "2024"
-license = "MIT"
 # The toolchain of `rust-toolchain.toml`: the only one that the tests run on.
 rust-version = "1.99"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/shulaoda/pathwatch"
+keywords = ["watch", "watcher", "filesystem", "events"]
+categories = ["filesystem"]
+# What a published package holds, next to this file and the README. The tests stay in the
+# repository.
+include = ["src/**/*.rs", "examples/**/*.rs", "LICENSE"]
 
-[workspace.dependencies]
-pathwatch = { version = "0.0.0", path = "crates/pathwatch" }
-
+[dependencies]
 bitflags = { version = "2.13.2", default-features = false }
 hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
-libc = "0.2.180"
 rustc-hash = "2.1.2"
-tempfile = "3.26.0"
-windows-sys = "0.61.2"
 
-[workspace.lints.clippy]
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2.180"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3.26.0"
+
+[lints.clippy]
 # Same guidelines as rolldown: restriction rules are opt-in, pedantic is on, and a rule is only
-# turned off for the whole workspace when it is a false positive or pure noise.
+# turned off when it is a false positive or pure noise.
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"

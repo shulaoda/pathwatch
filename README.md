@@ -99,7 +99,7 @@ The settings cannot be changed after the watcher is made.
 
 ## Promises
 
-Each of these has a story (`crates/pathwatch/tests/stories`; the first lines of
+Each of these has a story (`tests/stories`; the first lines of
 `promises.rs` say which). A story runs on the simulated disk with each simulated backend
 and on the real disk with the backend of this OS and with polling, and the events are the
 same everywhere. A story that needs a disk that takes two spellings of a name for one (13)
@@ -335,29 +335,27 @@ The Rust toolchain is the one in `rust-toolchain.toml`.
 ## The repository
 
 ```
-crates/
-  pathwatch/                 the crate, and the only one that is published
-    src/
-      lib.rs                 the crate docs; re-exports the API
-      config.rs  error.rs  event.rs
-      watcher.rs             the thread and the queue; picks the backend
-      backend.rs             the `Backend` trait: what the engine asks of an OS watch API
-      inotify.rs  fsevents.rs  windows.rs  poll.rs     one backend each
-      engine/                the engine: watched_paths, check, filter, scan, os_watch, events
-      tree/  fs/  path.rs
-    tests/
-      stories/               the promises above: each story on the real disk, and on the
-                             simulated disk of `sim/` where its words allow
-      sim/                   the engine on a disk in memory (Unix hosts): what the real disk
-                             cannot play on demand, with a fuzzer and a cost program; the
-                             disk and the backends are in `fixtures/`
-      watcher.rs             the thread
-      tree.rs                the tree of the engine, alone
-      poll.rs                the poll backend on a real directory, with a clock the test moves,
-                             and the hash of a file
-      inotify.rs  fsevents.rs  windows/     each backend alone, on its OS; `windows/parts.rs`
-                             holds the parts of that backend that call no Windows
-    examples/                watch.rs, dev_server.rs
+src/
+  lib.rs                 the crate docs; re-exports the API
+  config.rs  error.rs  event.rs
+  watcher.rs             the thread and the queue; picks the backend
+  backend.rs             the `Backend` trait: what the engine asks of an OS watch API
+  inotify.rs  fsevents.rs  windows.rs  poll.rs     one backend each
+  engine/                the engine: watched_paths, check, filter, scan, os_watch, events
+  tree/  fs/  path.rs
+tests/
+  stories/               the promises above: each story on the real disk, and on the
+                         simulated disk of `sim/` where its words allow
+  sim/                   the engine on a disk in memory (Unix hosts): what the real disk
+                         cannot play on demand, with a fuzzer and a cost program; the
+                         disk and the backends are in `fixtures/`
+  watcher.rs             the thread
+  tree.rs                the tree of the engine, alone
+  poll.rs                the poll backend on a real directory, with a clock the test moves,
+                         and the hash of a file
+  inotify.rs  fsevents.rs  windows/     each backend alone, on its OS; `windows/parts.rs`
+                         holds the parts of that backend that call no Windows
+examples/                watch.rs, dev_server.rs
 docs/
   design.md                  how it works
 bench/                       the comparison with other watchers: a workspace of its own,
@@ -376,8 +374,8 @@ cargo test --workspace
 
 This runs, on the machine it is called on:
 
-- the engine on a simulated disk, with a fuzzer (`crates/pathwatch/tests/sim`, on Unix hosts),
-- the backend of this OS against the real watch API (`crates/pathwatch/tests/inotify.rs`,
+- the engine on a simulated disk, with a fuzzer (`tests/sim`, on Unix hosts),
+- the backend of this OS against the real watch API (`tests/inotify.rs`,
   `fsevents.rs` or `windows/os.rs`),
 - the watcher thread (`tests/watcher.rs`),
 - the tree alone (`tests/tree.rs`), and on a real directory the poll backend with a clock that
@@ -396,7 +394,7 @@ This runs, on the machine it is called on:
 | Windows | `cargo test --workspace` on a Windows machine. Done on Windows 11 with NTFS. From another OS only a type check is possible: `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` |
 | Android, WASI, FreeBSD, musl, 32-bit Linux | Only a lint of the crate and its tests, as on CI: `cargo clippy -p pathwatch --all-targets --target aarch64-linux-android`, and the same with `wasm32-wasip1-threads`, `x86_64-unknown-freebsd`, `x86_64-unknown-linux-musl` or `i686-unknown-linux-gnu`. The engine with the poll backend was run once under wasmtime on a preopened directory (a probe, not a test). |
 
-The fuzzer (`crates/pathwatch/tests/sim/fuzz.rs`):
+The fuzzer (`tests/sim/fuzz.rs`):
 
 ```sh
 # The quick run: 250 seeds for each backend. It is a part of `cargo test --workspace`.

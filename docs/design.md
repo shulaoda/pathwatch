@@ -119,7 +119,7 @@ The table is these rules in examples. `R` is a watched path.
      └─ watch(key, dir) ──┘
 ```
 
-| Module (`crates/pathwatch/src`) | Holds |
+| Module (`src/`) | Holds |
 |---|---|
 | `config`, `error`, `event`, `watcher` | The API. `watcher.rs` has the one thread and its queue, and picks the backend. |
 | `engine/`, `tree`, `fs`, `path` | The engine, the tree, the disk as the engine sees it (`Fs`), path cleaning. No thread, no clock, no OS watch API. |
@@ -989,7 +989,7 @@ takes more than a minute rests nine minutes, not nine times its length.
 
 ## 6. Backend interface
 
-`crates/pathwatch/src/backend.rs`. The engine asks a backend to watch directories, and the
+`src/backend.rs`. The engine asks a backend to watch directories, and the
 backend tells the engine where to check. A backend never says what happened: the engine reads
 the disk itself. The items of the file have short docs; this section is the one place for the
 rules.
@@ -1452,7 +1452,7 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
 
 ## 8. Tests
 
-**The simulator** (`crates/pathwatch/tests/sim`: the fixtures in `fixtures/`, the tests
+**The simulator** (`tests/sim`: the fixtures in `fixtures/`, the tests
 beside them; on Unix hosts). `SimFs` is a file system in memory with inodes, a clock, a change time for each
 entry, and a mode that ignores the case of letters. `SimBackend` plays an OS watch API on it in
 three modes: by inode (inotify), by path prefix with real paths (FSEvents), by handle for a tree
@@ -1496,7 +1496,7 @@ The test files of the simulator:
   files, a directory of 50,000 files, 100,000 hints, a polling round, `unwatch`), in time,
   allocations and bytes. Run it before and after a change of the engine and compare.
 
-**The other tests** (`crates/pathwatch`):
+**The other tests** (`tests/`, and the `mod tests` of `src/`):
 
 - Private functions (a `mod tests` at the end of the file): `tree/mod.rs`, `tree/names.rs`,
   `path.rs`, `fs/mod.rs`, `fs/windows.rs`, `engine/events.rs`, and helpers of the backends.
