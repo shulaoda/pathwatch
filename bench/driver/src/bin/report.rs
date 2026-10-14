@@ -324,7 +324,7 @@ fn behind(out: &mut String, report: &Report) {
     "Every number in which pathwatch is more than 10% behind the best other library, and by \
      more than 1 ms or 0.5 MiB. Only a library that did the job counts: it missed no change of \
      the phase, and for the setup it stopped early in no phase of the run. `pathwatch` has the default settings, and `pathwatch-0` is the same without the \
-     50 ms that pathwatch waits on purpose. `times` is `pathwatch-0` next to the best other, \
+     20 ms that pathwatch waits on purpose. `times` is `pathwatch-0` next to the best other, \
      and `pathwatch` where there is no `pathwatch-0`. With more runs than one, a number is \
      `middle (lowest to highest)`.\n"
   );
@@ -391,7 +391,7 @@ fn behind(out: &mut String, report: &Report) {
     ["scenario", "where", "number", "pathwatch", "pathwatch-0", "best other", "which", "times"];
   let titles = [
     "Behind with and without the wait",
-    "Behind only with the wait: the price of the 50 ms",
+    "Behind only with the wait: the price of the 20 ms",
     "Behind only without the wait",
   ];
   for (title, rows) in titles.iter().zip(rows) {

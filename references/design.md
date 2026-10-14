@@ -33,7 +33,7 @@ watcher.close();
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
 | `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
-| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 50 ms (5.13); `with_delete_delay(d)`: the delete delay, 100 ms, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
+| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 20 ms (5.13); `with_delete_delay(d)`: the delete delay, 100 ms, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
 
@@ -938,7 +938,11 @@ asked for is in place before anything that came in meanwhile.
 leaves work moves the flush to one quiet time after it. So a save in several steps is one
 batch. Hints that keep coming do not hold a batch back for ever: counted from the first hint
 after the last flush, the flush comes after 500 ms at the latest, or after four quiet times if
-that is longer. The marks of hints wait for that time, and nothing else takes them: the quiet
+that is longer. The default quiet time is 20 ms: long enough for the steps of one save (a
+temporary file, a rename) to be one batch, also on a busy machine, and short enough not to be
+felt; watchman and webpack wait the same. A quiet time of zero would report the temporary
+file of a save in a watched directory: a `Create` and a `Delete` for a file that no one wants
+to know. The marks of hints wait for that time, and nothing else takes them: the quiet
 time can be longer than the poll interval, and a poll or a second look that runs before it
 checks its own work and leaves them. Two exceptions, each because a look is made anyway: a
 `watch` or `unwatch` call ends the quiet time, since its baseline is decided by a tree that

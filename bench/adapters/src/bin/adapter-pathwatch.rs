@@ -1,7 +1,7 @@
 //! pathwatch, used as its crate docs show: a handler that sends each batch to a channel, and
 //! `watch` for the paths.
 //!
-//! `--debounce-ms <n>` sets `Config::with_debounce`; without it the default (50 ms) is used.
+//! `--debounce-ms <n>` sets `Config::with_debounce`; without it the default (20 ms) is used.
 
 use std::{env, sync::mpsc, time::Duration};
 

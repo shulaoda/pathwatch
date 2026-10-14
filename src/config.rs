@@ -31,7 +31,7 @@ impl Default for Config {
   fn default() -> Self {
     Self {
       ignored: None,
-      debounce: Duration::from_millis(50),
+      debounce: Duration::from_millis(20),
       delete_delay: Duration::from_millis(100),
       polling: false,
       poll_interval: Duration::from_millis(100),
@@ -52,7 +52,9 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
-  /// The quiet time: a batch goes out when no change was noticed for this long. Default: 50 ms.
+  /// The quiet time: a batch goes out when no change was noticed for this long. Default: 20 ms:
+  /// long enough for the steps of one save (a temporary file, a rename) to be one batch, also
+  /// on a busy machine, and short enough not to be felt.
   ///
   /// While changes keep coming, a batch still goes out every 500 ms, or every four quiet times
   /// if that is longer. The most is a year.
