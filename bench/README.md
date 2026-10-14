@@ -52,7 +52,7 @@ How the numbers are read:
 
 | Name | Library | How it is used |
 | --- | --- | --- |
-| `pathwatch` | this repository | `Watcher::with_config` with a handler that sends each batch to a channel, and `watch`. Default settings (20 ms debounce). |
+| `pathwatch` | this repository | `Watcher::with_config` with a handler that sends each batch to a channel, and `watch`. Default settings (debounce 10 ms on macOS, 20 ms elsewhere). |
 | `pathwatch-0` | this repository | The same with `with_debounce(Duration::ZERO)`. |
 | `notify-fork` | `rolldown-notify` from `github.com/rolldown/notify` | The way rolldown uses it today: `RecommendedWatcher::new` with a `Config`, `paths_mut()`, every path with `Recursive` and `TrackPath`. Ignore: `Config::with_ignored`. Polling: `PollWatcher`, and `ready` waits for its first scan: the watcher answers a call only after it. |
 | `chokidar` | chokidar 5 | `chokidar.watch(paths, { ignoreInitial: true })` and the `all` event. Ignore: a function for `ignored`. Polling: `usePolling` with `interval` and `binaryInterval`. |
@@ -234,7 +234,7 @@ Where pathwatch is behind:
 | which numbers | The time and the CPU time of the setup, the memory above the base (the footprint, or the resident size where there is no footprint), and for each phase the p50, the max and the CPU time. Lower is better in each. |
 | who is compared | `pathwatch` and `pathwatch-0` with the best of the other libraries in that number. A library counts in a phase only when it missed no change there and did not stop early, and in the numbers of the setup only when it stopped early in no phase of the run. |
 | behind | More than 10% above the best other, and by more than 1 ms or 0.5 MiB. |
-| the three tables | Behind with both settings; behind only with the default settings (what the 20 ms wait costs); behind only without the wait. |
+| the three tables | Behind with both settings; behind only with the default settings (what the quiet time costs); behind only without the wait. |
 | `middle (lowest to highest)` | With more runs than one: the middle run, and how far the runs are apart. Two numbers whose ranges overlap are not apart. |
 | times | `pathwatch-0` divided by the best other (`pathwatch` where `pathwatch-0` has no number). |
 | below the tables | In how many numbers each setting is the best or near it, and every phase in which pathwatch missed a change, gave an event too many, or printed an error. |
@@ -303,9 +303,9 @@ The rules of the driver:
   atomic save and the noise in `project/dist`. A real program would filter by hand.
 - **The cost of the adapter is in the numbers**: one line of text for each event, and for Node
   the event loop. The floor of a latency is about 0.1 ms (pipe and thread of the driver).
-- **pathwatch waits on purpose.** By default it collects changes for 20 ms, and it holds a
-  `Delete` for 100 ms. So its latency is at least that. `pathwatch-0` shows it without the
-  20 ms.
+- **pathwatch waits on purpose.** By default it collects changes for 10 ms on macOS and 20 ms
+  elsewhere, and it holds a `Delete` for 10 ms on macOS and 50 ms elsewhere. So its latency is
+  at least that. `pathwatch-0` shows it without the first wait.
 - **The word of an event is not checked.** `first word` shows it, and that is all. On macOS
   `notify-fork` says `create` for many edits, because FSEvents repeats old flags of a path.
 - **Three runs are few.** `--repeat 3` shows whether two numbers are apart, not how a number

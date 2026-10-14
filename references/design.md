@@ -33,7 +33,7 @@ watcher.close();
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
 | `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
-| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 20 ms (5.13); `with_delete_delay(d)`: the delete delay, 100 ms, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
+| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 10 ms on macOS and 20 ms elsewhere (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and 50 ms elsewhere, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
 
@@ -167,7 +167,7 @@ The words, each for one idea:
 | coverage | what the backend answers | `Coverage::{Watched, WatchedTree, NotWatched, Failed}` |
 | polled | no OS watch covers the directory, so the timer scans it | `Watch::Polled` |
 | held | a look found nothing at the node; what the tree has there, and below, stays until the second look | `Node::is_held`, `Tree::hold` |
-| delete delay | the time from the hint to the second look: 100 ms | `Options::delete_delay` |
+| delete delay | the time from the hint to the second look: 10 ms on macOS, 50 ms elsewhere | `Options::delete_delay` |
 | young | a file whose modification time is too close to the check to trust | `Content` |
 | quiet time | the debounce: how long no hint must come before the disk is checked | `Options::debounce` |
 | rest | the pause after work that no hint asked for by name: a poll, the scans after loss reports | `REST`, `rest_until` |
@@ -724,13 +724,15 @@ no rule: a file that came and went gives nothing, a file that went and came give
 is not told at once.
 
 - The first look that finds nothing where the tree has a file or a directory only **holds** the
-  node, with the time of its second look: 100 ms after the hint that asked for the first look,
-  so the quiet time before the look does not add to the delay; 100 ms after the look where no
-  hint asked for it (a poll, a scan), the time of the look itself and not of the start of the
-  flush, which can be long before it. A first look that comes later than that, as under a
-  flood, gets its second look at once, in the next flush. Nothing else changes: the
-  fingerprint stays, and under a directory every node stays as it is. A directory that vanishes
-  with 50,000 files is one held node. The backend forgets the watch of a held directory at once.
+  node, with the time of its second look: one delete delay after the hint that asked for the
+  first look, so the quiet time before the look does not add to the delay; one delete delay
+  after the look where no hint asked for it (a poll, a scan), the time of the look itself and
+  not of the start of the flush, which can be long before it. A first look that comes later
+  than that, after a quiet time longer than the delay or under a flood, gets its second look
+  at once, in the next flush. So a path that is back within the longer of the two is one
+  `Update`. Nothing else changes: the fingerprint stays, and under a directory every node
+  stays as it is. A directory that vanishes with 50,000 files is one held node. The backend
+  forgets the watch of a held directory at once.
 - **The second look** comes at its time, also when no hint came and also with polling. Still
   nothing: a file is forgotten (`Delete`), a directory is `vanish`ed (`Delete` for each told
   file below it, in one batch). If the disk does not answer, the hold stays until it does: an
@@ -742,6 +744,13 @@ is not told at once.
 - A file that is not told yet is not held: when it is gone, it is forgotten.
 - If a node above a held node is found missing too, the upper one decides for both.
 - With a delay of zero (`with_delete_delay`) nothing is held: a `Delete` comes at the first look.
+- **The default** is 50 ms where the OS tells at once (inotify, Windows): vim on Linux renames
+  the file away and writes a new one, and on a busy machine the path was missing for long
+  enough that no delay made 4 of 20 saves a `Delete` and a `Create`, and 30 ms 2 of 60; with
+  50 ms, none of 60 was. On macOS FSEvents tells about 10 ms after the change, and no save that
+  was tried needed more than the quiet time: the delay is 10 ms, the quiet time, and so adds
+  nothing to it (VS Code, vim, `sed -i`, `git checkout` and a JetBrains-like save, idle and
+  busy, measured on 2026-10-15).
 
 ### 5.10 Want, watch, poll
 
@@ -938,13 +947,18 @@ asked for is in place before anything that came in meanwhile.
 leaves work moves the flush to one quiet time after it. So a save in several steps is one
 batch. Hints that keep coming do not hold a batch back for ever: counted from the first hint
 after the last flush, the flush comes after 500 ms at the latest, or after four quiet times if
-that is longer. The default quiet time is 20 ms: long enough for the steps of one save (a
-temporary file, a rename) to be one batch, also on a busy machine, and short enough not to be
-felt; watchman and webpack wait the same. A quiet time of zero would report the temporary
-file of a save in a watched directory: a `Create` and a `Delete` for a file that no one wants
-to know. The marks of hints wait for that time, and nothing else takes them: the quiet
-time can be longer than the poll interval, and a poll or a second look that runs before it
-checks its own work and leaves them. Two exceptions, each because a look is made anyway: a
+that is longer. The default quiet time is 20 ms where the OS tells at once (inotify,
+Windows): long enough for the steps of one save (a temporary file, a rename) to be one batch,
+also on a busy machine, and short enough not to be felt; watchman and webpack wait the same.
+Measured on Linux with the saves of 5.9 on a busy machine: with 5 ms, 4 of 60 saves and 2
+files of 1,000 that `git checkout` wrote were reported twice, the first time half written;
+with 10 ms, none. On macOS FSEvents tells about 10 ms after the change, by when a save is
+done: no value was wrong there, and from 10 ms on no temporary file was reported either, so
+the default is 10 ms. A quiet time of zero would report the temporary file of a save in a
+watched directory: a `Create` and a `Delete` for a file that no one wants to know. The marks
+of hints wait for that time, and nothing else takes them: the quiet time can be longer than
+the poll interval, and a poll or a second look that runs before it checks its own work and
+leaves them. Two exceptions, each because a look is made anyway: a
 `watch` or `unwatch` call ends the quiet time, since its baseline is decided by a tree that
 is in line with the hints; a hint for a directory above a held node is checked with the
 second look of that node, since the directory decides for it. And a check that a scan makes

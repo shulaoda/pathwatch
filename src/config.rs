@@ -29,10 +29,13 @@ pub enum EntryKind {
 
 impl Default for Config {
   fn default() -> Self {
+    // FSEvents tells of a change about 10 ms after it, when the steps of a save are mostly done:
+    // less wait is needed than where the OS tells at once (`references/design.md` 5.13).
+    let (debounce, delete_delay) = if cfg!(target_os = "macos") { (10, 10) } else { (20, 50) };
     Self {
       ignored: None,
-      debounce: Duration::from_millis(20),
-      delete_delay: Duration::from_millis(100),
+      debounce: Duration::from_millis(debounce),
+      delete_delay: Duration::from_millis(delete_delay),
       polling: false,
       poll_interval: Duration::from_millis(100),
     }
@@ -52,9 +55,10 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
-  /// The quiet time: a batch goes out when no change was noticed for this long. Default: 20 ms:
-  /// long enough for the steps of one save (a temporary file, a rename) to be one batch, also
-  /// on a busy machine, and short enough not to be felt.
+  /// The quiet time: a batch goes out when no change was noticed for this long. Default: 10 ms
+  /// on macOS, 20 ms elsewhere: long enough for the steps of one save (a temporary file, a
+  /// rename) to be one batch, also on a busy machine, and short enough not to be felt. FSEvents
+  /// tells of a change about 10 ms after it, so macOS needs less.
   ///
   /// While changes keep coming, a batch still goes out every 500 ms, or every four quiet times
   /// if that is longer. The most is a year.
@@ -64,12 +68,14 @@ impl Config {
     self
   }
 
-  /// How long a `Delete` waits for the path to come back. Default: 100 ms.
+  /// How long a `Delete` waits for the path to come back. Default: 10 ms on macOS, 50 ms
+  /// elsewhere.
   ///
   /// A file that is removed and written again within this time is one `Update`, as the tools
-  /// that replace a file that way expect. A real delete is reported this long after the OS
-  /// said that the path is gone. Zero: a `Delete` comes at the first look that finds the path
-  /// gone, and such a file is a `Delete` and a `Create`. The most is a year.
+  /// that replace a file that way expect (vim on Linux renames the file away and writes a new
+  /// one). A real delete is reported this long after the OS said that the path is gone, or
+  /// after the quiet time if that is longer. Zero: a `Delete` comes at the first look that finds
+  /// the path gone, and such a file is a `Delete` and a `Create`. The most is a year.
   #[must_use]
   pub fn with_delete_delay(mut self, delay: Duration) -> Self {
     self.delete_delay = delay;
