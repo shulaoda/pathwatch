@@ -83,13 +83,31 @@ Why this is fair:
   library that runs after a big tree pays for the one before it. So before each run and each
   phase the driver waits until fseventsd used less than 5% of a core for half a second, two
   minutes at most; the lines that come meanwhile count for the phase before. The tables say how
-  long the waits took in all. S3 waits before its noise starts, not before the phases that
-  the noise keeps busy. The tree of S7, one directory of 20,000 files, is not removed after
-  its run: fseventsd took more than two minutes to digest the removal of a few of them, and
-  the next run would start in that backlog. It is removed at the end of the driver, with the
-  temporary directory. Linux and Windows have no such daemon, and nothing is waited for.
+  long the waits took in all, and how much CPU fseventsd had used before and after the
+  driver: one that has run for days is slower for every library alike. S3 waits before its
+  noise starts, not before the phases that the noise keeps busy. Linux and Windows have no
+  such daemon, and nothing is waited for.
+- Each scenario makes its tree once, and all adapters run on it in turn; after each run the
+  driver puts it back as it was made (what the run added goes, what it removed comes back).
+  A tree of 55,000 entries made and removed for every run kept fseventsd busy for half of the
+  time of a round, and made it slower round by round. The tree of S7, one directory of 20,000
+  files, is removed at the end of the driver: fseventsd took more than two minutes to digest
+  the removal of a few of them.
 - The adapters take turns: each round of a scenario starts with another adapter, so what the
   first run after another scenario meets is not always met by the same library.
+- A burst waits until every changed path had its event, and gives up only when no changed
+  path got one for 10 s (S4, one edit after 30,000 new files in `node_modules`: 30 s). Other
+  lines do not count: an adapter that prints what it should not would be waited for longer
+  than one that keeps quiet.
+- S3: the noise runs alone for 5 s before the edits (the phase `noise alone`, which shows what
+  the noise costs each adapter). The start of a flood keeps the OS busy for a while, for every
+  library alike; the edits come when the noise is written at its usual pace. The noise files
+  are there from the start, as the output of the build before, and the writer writes them
+  again.
+- The summary compares a burst by the time until the events for all its paths had come: a
+  library that hands a burst over in one batch is not behind for the first events it holds
+  back. A phase of one single change (the first edit right after `ready`) is one sample, and is
+  shown but not compared.
 - S5: each single change waits a random time of 0 to 300 ms first, the same times for every
   adapter. A library that polls in rounds finds a change at its next round, and a change made
   right after the event of the one before lands at the start of a round, the worst place,
@@ -111,7 +129,7 @@ Full sizes. `--scale` multiplies them, `--quick` is `--scale 0.05` with a quiet 
 | --- | --- | --- | --- |
 | S1 module files | 20,000 files in 2,000 directories | every file by its own path | first edit right after `ready`; quiet; 200 single edits; 50 single atomic saves (write a temporary file, rename it over the file) and one edit of each saved file after; a burst of 2,000 edits; 200 files removed; the same files written again |
 | S2 project directory | 50,000 files in 5,000 directories | the one directory | first edit; quiet; 200 single edits; 5,000 new files in 500 new directories; a tree of 5,500 files removed (one group, with its 500 new files); a tree of 5,000 files moved in by one rename, and moved out by one rename |
-| S3 noise | as S1 | as S1 | 100 single edits while another process writes 50,000 files in `project/dist` again and again (`--noise-outside`: in a directory next to the project) |
+| S3 noise | as S1, and 50,000 files in `project/dist` | as S1 | 5 s of noise alone, then 100 single edits while another process writes the 50,000 files in `project/dist` again and again (`--noise-outside`: in a directory next to the project) |
 | S4 ignored directory | 5,000 files in `src`, and `node_modules` | the project directory, with a rule that ignores `node_modules` | first edit; 30,000 files are written into `node_modules`, then one edit in `src` right after; 20 single edits |
 | S5 polling | as S1 | as S1, with the polling mode of each library at 100 ms | first edit; quiet; 50 single edits |
 | S6 missing paths | an empty directory | 1,000 paths that do not exist, in directories that do not exist | quiet (3 s at most); all paths are made; 20 single edits of them |

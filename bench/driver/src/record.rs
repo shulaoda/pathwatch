@@ -16,6 +16,10 @@ pub struct Report {
   /// Each adapter when it watches nothing: what the runtime and the library cost by themselves.
   pub bases: BTreeMap<String, Base>,
   pub runs: Vec<Run>,
+  /// macOS: the CPU time that fseventsd had used, in seconds, when the driver started and when
+  /// it ended (`os`).
+  #[serde(default)]
+  pub daemon_cpu_s: Option<[f64; 2]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -150,6 +154,10 @@ pub struct Phase {
   /// In a burst every path counts from the start of the burst, so `max_ms` is the time until
   /// the events for ALL paths came (when nothing was missed).
   pub latency: Option<Latency>,
+  /// The changes were made at once: every path counts from the start, and `max_ms` is when the
+  /// events for all of them had come.
+  #[serde(default)]
+  pub burst: bool,
   /// How long the driver took to make the changes of a burst.
   pub write_ms: f64,
   /// How long the phase took, with the wait for late events.

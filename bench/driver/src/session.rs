@@ -25,8 +25,10 @@ const GAP_SILENCE: Duration = Duration::from_millis(10);
 const SILENCE: Duration = Duration::from_millis(250);
 /// ... or when this much time has passed since the phase had all its events.
 const LONGEST_DRAIN: Duration = Duration::from_secs(3);
-/// A burst gives up when not one line came for this long, and in any case after `LONGEST_BURST`.
-const STALL: Duration = Duration::from_secs(3);
+/// A burst gives up when no changed path got its first event for this long, and in any case
+/// after `LONGEST_BURST`. Other lines do not count: an adapter that reports what it should not
+/// would be waited for longer than one that keeps quiet.
+pub const STALL: Duration = Duration::from_secs(10);
 const LONGEST_BURST: Duration = Duration::from_secs(60);
 /// Single changes stop after this many changes in a row with no event.
 const MISSES_IN_A_ROW: usize = 5;
@@ -287,17 +289,19 @@ impl Session {
     changed: &[PathBuf],
     change: impl FnOnce() -> io::Result<()>,
   ) {
-    self.burst_from(name, changed, || {
+    self.burst_from(name, changed, STALL, || {
       let start = Instant::now();
       change().map(|()| start)
     });
   }
 
-  /// As `burst`, but `change` says from which moment the times of the changed paths count.
+  /// As `burst`, but `change` says from which moment the times of the changed paths count, and
+  /// the wait gives up after `stall` without progress.
   pub fn burst_from(
     &mut self,
     name: &str,
     changed: &[PathBuf],
+    stall: Duration,
     change: impl FnOnce() -> io::Result<Instant>,
   ) {
     if self.dead {
@@ -306,7 +310,7 @@ impl Session {
     if self.settle_before_phases {
       self.settle(name);
     }
-    let mut phase = Phase { name: name.to_owned(), ..Phase::default() };
+    let mut phase = Phase { name: name.to_owned(), burst: true, ..Phase::default() };
     let mut times = Vec::new();
     let mut tally = Tally::new(changed, &self.root);
     let before = self.sample();
@@ -316,7 +320,7 @@ impl Session {
     phase.write_ms = ms(written - start);
     let count_from = match changed {
       Ok(count_from) => {
-        self.pump(&mut tally, written + LONGEST_BURST, Some(STALL));
+        self.pump(&mut tally, written + LONGEST_BURST, Some(stall));
         count_from
       }
       Err(error) => {
@@ -341,6 +345,16 @@ impl Session {
     // What is still on its way from the phase before is not part of the quiet time.
     let mut earlier = Tally::new(&[], &self.root);
     self.drain(&mut earlier);
+    self.listen(name, time);
+  }
+
+  /// The driver changes nothing for `time`, from now on: every event in it is one too many. S3
+  /// runs it while its noise is written, which the drain of `quiet` would wait for as long as
+  /// an adapter reports the noise: every adapter gets the same time of noise alone.
+  pub fn listen(&mut self, name: &str, time: Duration) {
+    if self.dead {
+      return;
+    }
     let mut phase = Phase { name: name.to_owned(), ..Phase::default() };
     let mut tally = Tally::new(&[], &self.root);
     let before = self.sample();
@@ -406,10 +420,14 @@ impl Session {
   }
 
   /// Reads lines into the tally until it is complete or `until` has come. With `stall`, the
-  /// wait also ends when no line came for that long.
+  /// wait also ends when no changed path got its first event for that long.
   fn pump(&mut self, tally: &mut Tally, until: Instant, stall: Option<Duration>) {
+    let (mut seen, mut progress) = (tally.seen, Instant::now());
     while !tally.complete() && !self.dead {
-      let wait = stall.map_or(until, |stall| until.min(Instant::now() + stall));
+      if tally.seen > seen {
+        (seen, progress) = (tally.seen, Instant::now());
+      }
+      let wait = stall.map_or(until, |stall| until.min(progress + stall));
       if !self.take_line(tally, wait) {
         return;
       }

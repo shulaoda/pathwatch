@@ -42,9 +42,11 @@ impl Daemon {
     Some(Self { pid })
   }
 
-  /// The CPU time of the daemon. `ps` reads it: the daemon belongs to root, and the calls of
-  /// `measure` may not read such a process.
-  fn cpu(self) -> Option<Duration> {
+  /// The CPU time of the daemon since it started. `ps` reads it: the daemon belongs to root,
+  /// and the calls of `measure` may not read such a process. A daemon that has used hours is
+  /// slow to digest a big tree, for every library alike.
+  #[must_use]
+  pub fn cpu(self) -> Option<Duration> {
     let pid = self.pid.to_string();
     let out = Command::new("ps").args(["-o", "time=", "-p", &pid]).output().ok()?;
     // `minutes:seconds.hundredths`, with hours in front for a long life.

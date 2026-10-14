@@ -19,7 +19,7 @@ use driver::{
   machine,
   os::Daemon,
   record::{self, Report},
-  scenarios::{self, SCENARIOS, Settings},
+  scenarios::{self, SCENARIOS, Settings, Tree},
 };
 
 const USAGE: &str = "\
@@ -164,8 +164,11 @@ fn main() {
     }
   }
 
+  let daemon_cpu = || settings.daemon.and_then(Daemon::cpu).map(|cpu| cpu.as_secs_f64());
+  let cpu_at_start = daemon_cpu();
   let mut runs = Vec::new();
   for (index, scenario) in scenarios.iter().enumerate() {
+    let tree = Tree::make(&settings, scenario);
     // One round is every adapter once: what disturbs the machine for a while hits a round of
     // all adapters, not every run of one. Each round starts with another adapter, so that what
     // the first run after another scenario meets is not always met by the same library.
@@ -176,12 +179,14 @@ fn main() {
       for adapter in &order {
         eprint!("{} {:<12} {round}/{} ", scenario.name, adapter.name, flags.repeat.max(1));
         let start = Instant::now();
-        let run = scenarios::run(&settings, scenario, adapter, round);
+        let run = tree.run(&settings, scenario, adapter);
         eprintln!("{} ({:.1} s)", run.status, start.elapsed().as_secs_f64());
         runs.push(run);
       }
     }
+    tree.remove(&settings, scenario);
   }
+  let daemon_cpu_s = cpu_at_start.zip(daemon_cpu()).map(|(start, end)| [start, end]);
   let _ = fs::remove_dir_all(&tmp);
 
   let report = Report {
@@ -198,6 +203,7 @@ fn main() {
     },
     bases,
     runs,
+    daemon_cpu_s,
   };
   let out = flags.out.unwrap_or_else(|| {
     let name = format!("{}-{}.json", env::consts::OS, started.replace(':', ""));

@@ -110,6 +110,15 @@ fn markdown(report: &Report) -> String {
       waited / 1000.0
     );
   }
+  if let Some([start, end]) = report.daemon_cpu_s {
+    let _ = writeln!(
+      out,
+      "- fseventsd had used {:.0} min of CPU since it started, and {:.0} min at the end: a \
+       daemon that has used hours digests big trees slowly, for every FSEvents library alike.",
+      start / 60.0,
+      end / 60.0
+    );
+  }
   let _ = writeln!(out, "- Times are in milliseconds, memory is in MiB.\n");
 
   let _ = writeln!(out, "## Versions\n");
@@ -276,9 +285,10 @@ struct Number {
 
 /// Every number in which two adapters can be compared: lower is better in each. A run in
 /// which an adapter gave up gives no number of the setup for that adapter: what it set up did
-/// not work. A phase in
-/// which an adapter missed a change, or gave up, gives no time for that adapter: it did not
-/// do the job.
+/// not work. A phase in which an adapter missed a change, or gave up, gives no time for that
+/// adapter: it did not do the job. A burst is compared by the time until the events for all
+/// its paths had come: a watcher that hands a burst over in one batch is not behind for the
+/// first events it holds back. A phase of one single change is one sample, and not compared.
 fn numbers(report: &Report) -> Vec<Number> {
   let mut numbers: Vec<Number> = Vec::new();
   let mut add = |run: &Run, place: &str, name: &'static str, value: f64| {
@@ -317,8 +327,14 @@ fn numbers(report: &Report) -> Vec<Number> {
         add(run, &phase.name, "CPU", phase.cpu_ms);
       } else if let Some(latency) = phase.latency.filter(|_| phase.missed == 0 && !phase.abandoned)
       {
-        add(run, &phase.name, "p50", latency.p50_ms);
-        add(run, &phase.name, "max", latency.max_ms);
+        if phase.burst {
+          add(run, &phase.name, "max", latency.max_ms);
+        } else if phase.changes > 1 {
+          add(run, &phase.name, "p50", latency.p50_ms);
+          add(run, &phase.name, "max", latency.max_ms);
+        } else {
+          continue;
+        }
         add(run, &phase.name, "CPU", phase.cpu_ms);
       }
     }
@@ -338,8 +354,10 @@ fn behind(out: &mut String, report: &Report) {
     out,
     "Every number in which pathwatch is more than 10% behind the best other library, and by \
      more than 1 ms or 0.5 MiB. Only a library that did the job counts: it missed no change of \
-     the phase, and for the setup it stopped early in no phase of the run. `pathwatch` has the default settings, and `pathwatch-0` is the same without the \
-     quiet time that pathwatch waits on purpose. `times` is `pathwatch-0` next to the best other, \
+     the phase, and for the setup it stopped early in no phase of the run. A burst counts by \
+     its `max`, the time until the events for all its paths had come, and a phase of one \
+     single change is not compared. `pathwatch` has the default settings, and `pathwatch-0` is \
+     the same without the quiet time that pathwatch waits on purpose. `times` is `pathwatch-0` next to the best other, \
      and `pathwatch` where there is no `pathwatch-0`. With more runs than one, a number is \
      `middle (lowest to highest)`.\n"
   );
