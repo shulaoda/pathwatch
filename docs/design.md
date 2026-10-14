@@ -1372,7 +1372,6 @@ What stays open:
 
 The tests of this backend (`tests/windows.rs`, and `tests/windows_parts.rs` for the parts that
 make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Windows 11 with NTFS.
-What was not checked, and what is known to be missing, is in `docs/windows-open-points.md`.
 
 - One thread owns one I/O completion port and every directory handle (`port`). A handle
   reports its directory and everything below it. A request that needs a new handle is

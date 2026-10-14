@@ -270,7 +270,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   macOS stays where it is until the streams are replaced, or until nothing watched is left below
   it. Nothing is missed.
 - **The Windows backend is young.** Its tests pass on Windows 11 with NTFS, and nothing else
-  was tried: no network share, no ReFS, no older Windows. See `docs/windows-open-points.md`.
+  was tried: no network share, no ReFS, no older Windows.
 - **Android was never run.** It is set to use the same code as Linux, and only type-checked.
 
 ## Timing
@@ -320,7 +320,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 |---|---|---|
 | Linux, Android | inotify | One kernel watch for each directory, so a big tree needs a high `fs.inotify.max_user_watches`. At the limit the handler gets `WatchLimit` and the directory is polled once a second. Otherwise only a watched path that is a link is polled; with none, the watcher sleeps between notifications. When inotify cannot start at all, the handler is told once and the watcher polls everything. Changes made on another machine (NFS, a folder shared with a VM) are not reported: use polling there. |
 | macOS | FSEvents | See "Holes". A process can run 512 streams; one watcher most often keeps 8 or fewer, and at most about 70: a `watch` call that needs new ones adds up to 8, and from 64 on all of them are replaced. No stream is put on `/`, `/Users` or the home directory: what could only be watched from there is polled once a second, as on Windows. |
-| Windows | `ReadDirectoryChangesW` | Tested on Windows 11 with NTFS only (`docs/windows-open-points.md`). At most 64 handles; more directories share a handle on a directory above them, and a directory behind a junction keeps one of its own. No handle is put on `C:\`, `C:\Users` or `C:\Users\<name>`: what could only be watched from there is polled. |
+| Windows | `ReadDirectoryChangesW` | Tested on Windows 11 with NTFS only. At most 64 handles; more directories share a handle on a directory above them, and a directory behind a junction keeps one of its own. No handle is put on `C:\`, `C:\Users` or `C:\Users\<name>`: what could only be watched from there is polled. |
 | every other target | none: always polling | The cost grows with the number of watched files. On WASI (`wasm32-wasip1-threads`) the directories that the program may use lie below `/`, which is none of them: `/` counts as a directory all the same, so a path below a preopened directory is watched. |
 
 The Rust toolchain is the one in `rust-toolchain.toml`.
@@ -352,7 +352,6 @@ crates/
     tests/                   the engine tests on them, with a fuzzer and a cost program
 docs/
   design.md                  how it works
-  windows-open-points.md     what to check on a Windows machine
 bench/                       the comparison with other watchers: a workspace of its own,
                              with the tables of the last full runs in BENCHMARK.md
 ```
@@ -384,7 +383,7 @@ This runs, on the machine it is called on:
 |---|---|
 | macOS | `cargo test --workspace` |
 | Linux | `cargo test --workspace`. From macOS with OrbStack: `orb bash -c 'source $HOME/.cargo/env; cd <this directory> && CARGO_TARGET_DIR=$HOME/pathwatch-target-inotify cargo test --workspace'`. The tests use the temporary directory of the VM, because inotify does not see changes that macOS makes on the shared folder. |
-| Windows | `cargo test --workspace` on a Windows machine. Done on Windows 11 with NTFS; `docs/windows-open-points.md` says what was not tried. From another OS only a type check is possible: `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` |
+| Windows | `cargo test --workspace` on a Windows machine. Done on Windows 11 with NTFS. From another OS only a type check is possible: `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` |
 | Android, WASI, FreeBSD, musl, 32-bit Linux | Only a lint of the crate and its tests, as on CI: `cargo clippy -p pathwatch --all-targets --target aarch64-linux-android`, and the same with `wasm32-wasip1-threads`, `x86_64-unknown-freebsd`, `x86_64-unknown-linux-musl` or `i686-unknown-linux-gnu`. The engine with the poll backend was run once under wasmtime on a preopened directory (a probe, not a test). |
 
 The fuzzer (`crates/pathwatch_sim/tests/fuzz.rs`):

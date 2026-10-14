@@ -1,5 +1,5 @@
-//! The Windows backend alone, on a real Windows file system. A test named `open_point_` checks
-//! a point of `docs/windows-open-points.md`.
+//! The Windows backend alone, on a real Windows file system. A test named `open_point_` settles
+//! a point that was only known from the Windows documents before it ran.
 #![cfg(windows)]
 
 use std::{
