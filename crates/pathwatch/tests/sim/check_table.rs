@@ -194,7 +194,6 @@ fn directory_and_file() {
 #[test]
 fn directory_and_nothing() {
   let mut d = driver(Mode::Inode);
-  d.fs.write("/p/r/a", "1").unwrap();
   d.watch(&["/p/r"]);
 
   // A new directory: one create for each file in it.
@@ -202,18 +201,6 @@ fn directory_and_nothing() {
   d.fs.write("/p/r/new/x", "1").unwrap();
   flush(&mut d);
   assert_eq!(taken(&mut d), ["C /p/r/new/x"]);
-
-  // A directory at a path whose delete is pending: the delete goes out now, before the
-  // creates below it.
-  d.fs.remove("/p/r/a").unwrap();
-  flush(&mut d);
-  assert_eq!(pending(&d), ["/p/r/a"]);
-  d.fs.mkdir("/p/r/a").unwrap();
-  d.fs.write("/p/r/a/x", "1").unwrap();
-  flush(&mut d);
-  assert_eq!(taken(&mut d), ["D /p/r/a", "C /p/r/a/x"]);
-  assert_eq!(pending(&d), NONE);
-  assert_eq!(settled(&mut d), NONE);
   caught_up(&mut d);
 }
 
@@ -240,34 +227,6 @@ fn directory_and_another_directory() {
   d.fs.write("/p/r/sub/more", "1").unwrap();
   assert_eq!(settled(&mut d), ["C /p/r/sub/more"]);
   caught_up(&mut d);
-}
-
-/// A hint names a directory that is still the same one: it is watched again and scanned.
-/// It can have been away, changed there, and come back, all between two flushes.
-#[test]
-fn same_directory_named_by_a_hint() {
-  for mode in Mode::ALL {
-    let mut d = driver(mode);
-    d.fs.mkdir("/q").unwrap();
-    d.fs.mkdir_all("/p/r/sub/deep").unwrap();
-    d.fs.write("/p/r/sub/a", "1").unwrap();
-    d.fs.write("/p/r/sub/deep/b", "1").unwrap();
-    d.watch(&["/p/r"]);
-
-    d.fs.rename("/p/r/sub", "/q/sub").unwrap();
-    d.fs.remove("/q/sub/a").unwrap();
-    d.fs.write("/q/sub/new", "1").unwrap();
-    d.fs.write("/q/sub/deep/b", "12").unwrap();
-    d.fs.rename("/q/sub", "/p/r/sub").unwrap();
-    flush(&mut d);
-    assert_eq!(taken(&mut d), ["U /p/r/sub/deep/b", "C /p/r/sub/new"], "{mode:?}");
-    assert_eq!(settled(&mut d), ["D /p/r/sub/a"], "{mode:?}");
-
-    // It still reports.
-    d.fs.write("/p/r/sub/deep/c", "1").unwrap();
-    assert_eq!(settled(&mut d), ["C /p/r/sub/deep/c"], "{mode:?}");
-    caught_up(&mut d);
-  }
 }
 
 /// A listing shows a directory that is still the same one: it is not scanned.

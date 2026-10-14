@@ -18,46 +18,17 @@ fn poll_with_coarse_time(step: Duration, options: Options) -> Driver<PollBackend
   d
 }
 
-/// Two writes of the same size inside one step of the file system clock (two seconds, as on
-/// FAT): the fingerprint is the same, the stored hash is not.
-#[test]
-fn a_second_write_inside_one_time_step() {
-  let mut d = poll_with_coarse_time(Duration::from_secs(2), Options::default());
-  d.fs.write("/p/a", "x=1;").unwrap();
-  d.watch(&["/p/a"]);
-  d.fs.write("/p/a", "x=2;").unwrap();
-  assert!(d.step());
-  assert_eq!(taken(&mut d), ["U /p/a"]);
-  d.fs.write("/p/a", "x=3;").unwrap();
-  assert!(d.step());
-  assert_eq!(taken(&mut d), ["U /p/a"]);
-  assert_eq!(settled(&mut d), NONE);
-  caught_up(&mut d);
-}
-
-#[test]
-fn the_hash_is_dropped_when_the_file_is_old() {
-  let mut d = poll_with_coarse_time(Duration::from_millis(1), Options::default());
-  d.fs.write("/p/a", "1").unwrap();
-  d.watch(&["/p/a"]);
-  assert_eq!(d.fs.calls().hash, 1);
-  // Checks at 1 s (still young: the hash decides, and is kept) and at 2 s (old: one last
-  // compare, then no hash is stored).
-  assert_eq!(settled(&mut d), NONE);
-  assert_eq!(d.fs.calls().hash, 3);
-  assert_eq!(settled(&mut d), NONE);
-  assert_eq!(d.fs.calls().hash, 3);
-  caught_up(&mut d);
-}
-
 /// A file that is too big to hash and too young to trust owes one `Update`: a write can have
 /// left its time stamp as it is. The poll looks at it in every round, so the `Update` waits
-/// for the round that finds the file old. It does not come in each round until then.
+/// for the round that finds the file old. It does not come in each round until then. Such a
+/// write happens here, and no look can see it: the one `Update` that the file owes tells it.
 #[test]
 fn a_big_young_file() {
   let mut d = poll_with_coarse_time(Duration::from_millis(1), Options::default());
   d.fs.write("/p/big", vec![0; 16 * 1024 * 1024 + 1]).unwrap();
   d.watch(&["/p/big"]);
+  // Written again inside the same step of the clock: the time stamp and the size stay.
+  d.fs.write("/p/big", vec![1; 16 * 1024 * 1024 + 1]).unwrap();
   // The poll at 1 s: young, the same time stamp. The poll at 2 s: old.
   assert!(d.step());
   assert_eq!(taken(&mut d), NONE);
@@ -65,26 +36,6 @@ fn a_big_young_file() {
   assert_eq!(taken(&mut d), ["U /p/big"]);
   assert_eq!(settled(&mut d), NONE);
   assert_eq!(d.fs.calls().hash, 0);
-  caught_up(&mut d);
-}
-
-/// The big young file is written again, and the time stamp and the size stay (a clock in steps
-/// of two seconds). No look can see that write. The one `Update` that the file owes tells it.
-#[test]
-fn a_big_young_file_is_written_inside_one_time_step() {
-  let mut d = poll_with_coarse_time(Duration::from_secs(2), Options::default());
-  d.fs.write("/p/big", vec![0; 16 * 1024 * 1024 + 1]).unwrap();
-  d.watch(&["/p/big"]);
-  d.fs.write("/p/big", vec![1; 16 * 1024 * 1024 + 1]).unwrap();
-  let mut rounds = Vec::new();
-  for _ in 0..4 {
-    assert!(d.step());
-    rounds.push(taken(&mut d).len());
-  }
-  // One `Update`, in the first round that finds the file two seconds old.
-  assert_eq!(rounds.iter().sum::<usize>(), 1, "{rounds:?}");
-  assert_eq!(rounds[0], 0);
-  assert_eq!(settled(&mut d), NONE);
   caught_up(&mut d);
 }
 
@@ -104,44 +55,6 @@ fn a_big_young_file_with_a_new_time_stamp_is_reported_at_once() {
   // The poll at 3 s finds it two seconds old.
   assert!(d.step());
   assert_eq!(taken(&mut d), ["U /p/big"]);
-  assert_eq!(settled(&mut d), NONE);
-  caught_up(&mut d);
-}
-
-/// The content of a link is its target, and that is compared for a young link. So a link that
-/// was made right before `watch`, or right before its `Create`, gets no `Update` while it stays
-/// as it is.
-#[test]
-fn a_young_link_that_does_not_change() {
-  let mut d = poll_with_coarse_time(Duration::from_millis(1), Options::default());
-  d.fs.mkdir("/p/r").unwrap();
-  d.fs.write("/p/r/one", "1").unwrap();
-  d.fs.symlink("/p/r/one", "/p/r/old").unwrap();
-  d.watch(&["/p/r"]);
-  d.fs.symlink("/p/r/one", "/p/r/new").unwrap();
-  assert!(d.step());
-  assert_eq!(taken(&mut d), ["C /p/r/new"]);
-  assert_eq!(settled(&mut d), NONE);
-  caught_up(&mut d);
-}
-
-/// A young link is pointed somewhere else inside one step of the clock: the same time stamp,
-/// the same length of the target, the same inode number. The target tells.
-#[test]
-fn a_young_link_points_elsewhere_inside_one_time_step() {
-  let mut d = poll_with_coarse_time(Duration::from_secs(2), Options::default());
-  d.fs.mkdir("/p/r").unwrap();
-  d.fs.write("/p/r/one", "1").unwrap();
-  d.fs.write("/p/r/two", "1").unwrap();
-  d.fs.symlink("/p/r/one", "/p/r/link").unwrap();
-  d.watch(&["/p/r"]);
-  let before = d.engine.fingerprints();
-
-  d.fs.remove("/p/r/link").unwrap();
-  d.fs.symlink("/p/r/two", "/p/r/link").unwrap();
-  assert_eq!(d.engine.fingerprints(), before, "the fingerprint must not tell");
-  assert!(d.step());
-  assert_eq!(taken(&mut d), ["U /p/r/link"]);
   assert_eq!(settled(&mut d), NONE);
   caught_up(&mut d);
 }
@@ -240,7 +153,7 @@ fn a_file_with_a_whole_second_is_young_for_2_s() {
 /// No OS watch covers the file, so no "written" hint can make up for a wrong guess: it is young
 /// for 2 s, whatever its time stamp looks like. Three ways to be there: the poll backend, a
 /// watch that the OS had no room for, and a watched path that is a link (nothing watches what
-/// is behind it).
+/// is behind it, and the link itself cannot be read for a hash).
 #[test]
 fn a_file_that_only_the_poll_looks_at_is_young_for_2_s() {
   fn run<B: Deliver>(mut d: Driver<B>, path: &str, on: &str) {
@@ -252,7 +165,16 @@ fn a_file_that_only_the_poll_looks_at_is_young_for_2_s() {
     assert_eq!(d.fs.calls().hash, 1, "{on}");
     assert_eq!(scans_that_hash(&mut d, 20), 20, "{on}");
     d.advance(Duration::from_secs(2));
-    assert_eq!(scans_that_hash(&mut d, 10), 1, "{on}");
+    if path == "/p/link" {
+      // A link cannot be opened (`O_NOFOLLOW`): nothing was compared while it was young, so the
+      // first look that finds it old reports one `Update` for all (5.8), and reads nothing.
+      d.engine.overflow(d.now);
+      assert!(d.step());
+      assert_eq!(taken(&mut d), ["U /p/link"], "{on}");
+      assert_eq!(scans_that_hash(&mut d, 10), 0, "{on}");
+    } else {
+      assert_eq!(scans_that_hash(&mut d, 10), 1, "{on}");
+    }
     caught_up(&mut d);
   }
   run(Driver::poll(Options::default()), "/p/real/a", "the poll backend");
@@ -352,25 +274,6 @@ fn a_repeated_written_hint() {
     assert_eq!(Sim::settled(&mut d), NONE, "{mode:?}");
     caught_up(&mut d);
   }
-}
-
-/// The poll backend never hears "written". The stored hash of a young file tells a second
-/// write inside one modification time step.
-#[test]
-fn poll_and_the_same_time_step() {
-  let options = Options { poll_interval: Duration::from_millis(100), ..Options::default() };
-  let mut d = Driver::poll(options);
-  d.fs.set_time_step(Duration::from_secs(1));
-  d.fs.mkdir("/p").unwrap();
-  d.fs.write("/p/R", "0".repeat(500)).unwrap();
-  d.watch(&["/p/R"]);
-  d.fs.write("/p/R", "1".repeat(500)).unwrap();
-  assert_eq!(Sim::window(&mut d), ["U /p/R"]);
-  d.advance(Duration::from_millis(300));
-  d.fs.write("/p/R", "2".repeat(500)).unwrap();
-  assert_eq!(Sim::window(&mut d), ["U /p/R"]);
-  assert_eq!(Sim::settled(&mut d), NONE);
-  caught_up(&mut d);
 }
 
 /// A young file goes away at any moment of a scan, also between the `lstat` and the read of its

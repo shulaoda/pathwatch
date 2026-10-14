@@ -489,9 +489,11 @@ impl Fs for SimFs {
   fn hash(&self, path: &Path, limit: u64) -> io::Result<Option<u64>> {
     self.enter(|calls| calls.hash += 1);
     let state = self.lock();
-    let id = state.look_up(path, true)?;
+    // The real disk opens with `O_NOFOLLOW`: a link at the end of the path is refused.
+    let id = state.look_up(path, false)?;
     let inode = &state.inodes[&id];
     match &inode.content {
+      Content::Link(_) => Err(error(io::ErrorKind::InvalidInput)),
       Content::File(_) if inode.denied => Err(error(io::ErrorKind::PermissionDenied)),
       Content::File(bytes) if u64::try_from(bytes.len()).is_ok_and(|len| len > limit) => Ok(None),
       Content::File(bytes) => {
@@ -499,7 +501,7 @@ impl Fs for SimFs {
         hasher.write(bytes);
         Ok(Some(hasher.finish()))
       }
-      _ => Err(error(io::ErrorKind::IsADirectory)),
+      Content::Dir(_) => Err(error(io::ErrorKind::IsADirectory)),
     }
   }
 

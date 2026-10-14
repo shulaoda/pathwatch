@@ -13,9 +13,11 @@
 //! - `contract`: the rows S1 to S14 of `docs/design.md`.
 //! - `promises`: the promises of the README.
 //! - `projects`: what editors, package managers and big projects do.
+//! - `engine`: what the engine has to get right below the promises.
 
 mod contract;
 mod disk;
+mod engine;
 /// The fixtures of `tests/sim`: the simulated disk and its backends. The stories use a part.
 #[cfg(unix)]
 #[path = "../sim/fixtures/mod.rs"]

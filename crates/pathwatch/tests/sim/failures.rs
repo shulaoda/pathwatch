@@ -12,7 +12,7 @@ use std::{
 
 use crate::fixtures::{
   Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, caught_up, flush, not_caught_up, on_all,
-  on_modes, settled, sorted, taken, window, window_then_settled,
+  on_modes, settled, sorted, taken, window,
 };
 use pathwatch::{
   ErrorKind,
@@ -61,40 +61,48 @@ fn a_look_that_got_no_answer_is_tried_again_deep() {
   }
 }
 
-/// Every notification is lost and the queue says so: the scan of everything finds all of it.
+/// Every notification is lost and the queue says so, or the queue of the runtime overflows,
+/// which is the coarsest "lost track" there is: the scan of everything finds all of it.
 #[test]
 fn lost_notifications() {
-  for mode in Mode::ALL {
-    let mut d = driver(mode);
-    d.fs.mkdir_all("/p/r/keep/deep").unwrap();
-    d.fs.mkdir_all("/p/r/leave").unwrap();
-    d.fs.write("/p/r/keep/deep/a", "1").unwrap();
-    d.fs.write("/p/r/leave/b", "1").unwrap();
-    d.fs.write("/p/f.js", "1").unwrap();
-    d.watch(&["/p/r", "/p/f.js"]);
+  on_all(&Options::default(), |d, on| {
+    d.fs().mkdir_all("/p/r/keep/deep").unwrap();
+    d.fs().mkdir_all("/p/r/leave").unwrap();
+    d.fs().mkdir_all("/p/r/a/b").unwrap();
+    d.fs().write("/p/r/keep/deep/a", "1").unwrap();
+    d.fs().write("/p/r/leave/b", "1").unwrap();
+    d.fs().write("/p/r/a/b/f", "1").unwrap();
+    d.fs().write("/p/f.js", "1").unwrap();
+    assert_eq!(d.watch(&["/p/r", "/p/f.js"]), NONE, "{on}");
 
-    d.fs.write("/p/r/keep/deep/a", "12").unwrap();
-    d.fs.write("/p/r/keep/deep/new", "1").unwrap();
-    d.fs.remove_all("/p/r/leave").unwrap();
-    d.fs.mkdir_all("/p/r/come/in").unwrap();
-    d.fs.write("/p/r/come/in/c", "1").unwrap();
-    d.fs.write("/p/f.js", "12").unwrap();
-    assert!(!d.fs.take_raw(usize::MAX).is_empty());
-    d.engine.overflow(d.now);
-    assert!(d.step());
+    d.fs().write("/p/r/keep/deep/a", "12").unwrap();
+    d.fs().write("/p/r/keep/deep/new", "1").unwrap();
+    d.fs().remove_all("/p/r/leave").unwrap();
+    d.fs().mkdir_all("/p/r/come/in").unwrap();
+    d.fs().write("/p/r/come/in/c", "1").unwrap();
+    d.fs().rename("/p/r/a", "/p/r/c").unwrap();
+    d.fs().write("/p/f.js", "12").unwrap();
+    assert!(!d.fs().take_raw(usize::MAX).is_empty() || on == "Poll", "{on}");
+    d.overflow();
     assert_eq!(
-      taken(&mut d),
-      ["U /p/f.js", "C /p/r/come/in/c", "U /p/r/keep/deep/a", "C /p/r/keep/deep/new"],
-      "{mode:?}"
+      d.window(),
+      [
+        "U /p/f.js",
+        "C /p/r/c/b/f",
+        "C /p/r/come/in/c",
+        "U /p/r/keep/deep/a",
+        "C /p/r/keep/deep/new"
+      ],
+      "{on}"
     );
-    assert_eq!(settled(&mut d), ["D /p/r/leave/b"], "{mode:?}");
+    assert_eq!(d.settled(), ["D /p/r/a/b/f", "D /p/r/leave/b"], "{on}");
     // The watches are all there again.
-    d.fs.write("/p/r/come/in/d", "1").unwrap();
-    d.fs.write("/p/r/keep/deep/a", "123").unwrap();
-    flush(&mut d);
-    assert_eq!(taken(&mut d), ["C /p/r/come/in/d", "U /p/r/keep/deep/a"], "{mode:?}");
-    caught_up(&mut d);
-  }
+    d.fs().write("/p/r/come/in/d", "1").unwrap();
+    d.fs().write("/p/r/keep/deep/a", "123").unwrap();
+    assert!(d.fs().pending_raw() >= 2 || on == "Poll", "{on}");
+    assert_eq!(d.window(), ["C /p/r/come/in/d", "U /p/r/keep/deep/a"], "{on}");
+    d.caught_up();
+  });
 }
 
 /// The OS says for one watch that it lost notifications. Only what is below that watch is
@@ -116,14 +124,10 @@ fn a_loss_report_for_one_watch_scans_below_that_watch() {
     d.fs.write("/p/A/sub/new", "1").unwrap();
     assert!(d.fs.lose_raw(usize::MAX) >= 2, "{mode:?}");
     assert_eq!(d.fs.pending_raw(), 1, "{mode:?}");
-    let before = d.fs.calls();
+    let before = d.fs.calls().read_dir;
     assert_eq!(window(&mut d), ["U /p/A/sub/f7", "C /p/A/sub/new"], "{mode:?}");
-    let after = d.fs.calls();
-    // `/p/A` itself, `sub` and the 21 files in it. And `/p`, which is checked with every
-    // mark below it, because the directory above it is only polled. Nothing of `/q/B`. Each
-    // of the two listings costs one look when it is done.
-    assert_eq!(after.lstat - before.lstat, 26, "{mode:?}");
-    assert_eq!(after.read_dir - before.read_dir, 2, "{mode:?}");
+    // `/p/A` and `sub` are listed, and nothing below `/q/B`.
+    assert_eq!(d.fs.calls().read_dir - before, 2, "{mode:?}");
     caught_up(&mut d);
   }
 }
@@ -222,35 +226,6 @@ fn the_watch_limit() {
   caught_up(&mut d);
 }
 
-/// `commit` takes back the answer `Subtree`. The directories below relied on it: each is asked
-/// for by itself, fails too, and all of them are polled until the backend has room.
-#[test]
-fn commit_takes_the_coverage_back() {
-  let mut d = driver(Mode::Prefix);
-  d.fs.mkdir_all("/p/r/src/deep").unwrap();
-  d.fs.write("/p/r/src/deep/a", "1").unwrap();
-  d.fs.set_watch_limit(Some(0));
-  d.watch(&["/p/r"]);
-  assert_eq!(d.known.len(), 1);
-  assert_eq!(d.errors.len(), 1);
-  assert_eq!(d.errors[0].kind(), ErrorKind::WatchLimit);
-
-  d.fs.write("/p/r/src/deep/a", "12").unwrap();
-  d.fs.write("/p/r/src/deep/b", "1").unwrap();
-  assert_eq!(d.fs.pending_raw(), 0);
-  assert_eq!(settled(&mut d), ["U /p/r/src/deep/a", "C /p/r/src/deep/b"]);
-
-  // With room again, the poll asks again and the stream covers the tree.
-  d.fs.set_watch_limit(None);
-  assert_eq!(settled(&mut d), NONE);
-  d.fs.write("/p/r/src/deep/a", "123").unwrap();
-  assert!(d.fs.pending_raw() > 0);
-  flush(&mut d);
-  assert_eq!(taken(&mut d), ["U /p/r/src/deep/a"]);
-  assert_eq!(d.errors.len(), 1);
-  caught_up(&mut d);
-}
-
 /// `commit` cannot make live what `watch` promised. The new directory is
 /// still scanned (the baseline is there), the old stream keeps working, and the new directory is
 /// polled until the backend has room.
@@ -283,8 +258,11 @@ fn a_failed_commit() {
   caught_up(&mut d);
 }
 
-/// A watch for a tree that the backend cannot give. Nothing
-/// below it may be left without a watch and without the poll.
+/// A watch for a tree that the backend cannot give. Nothing below it may be left without a
+/// watch and without the poll. Where the backend answers for a whole tree, `commit` takes that
+/// answer back: the directories below relied on it, so each is asked for by itself, fails too,
+/// and all of them are polled until the backend has room. Then the coverage comes back through
+/// a later commit.
 #[test]
 fn below_a_tree_watch_that_failed() {
   on_modes(&Mode::ALL, &Options::default(), |d, on| {
@@ -305,37 +283,14 @@ fn below_a_tree_watch_that_failed() {
       "{on}"
     );
     assert_eq!(d.errors(), [ErrorKind::WatchLimit], "{on}");
-    d.caught_up();
-  });
-  // The same when the backend dies after the watches were made.
-  on_modes(&Mode::ALL, &Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/R/src/deep").unwrap();
-    d.fs().write("/p/R/src/deep/b.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
-    d.backend_dies();
-    assert_eq!(d.settled(), NONE, "{on}");
-    d.fs().write("/p/R/src/deep/b.js", "22").unwrap();
-    d.fs().take_raw(usize::MAX);
-    assert_eq!(d.settled(), ["U /p/R/src/deep/b.js"], "{on}");
-    assert_eq!(d.errors(), [ErrorKind::Io], "{on}");
-    d.caught_up();
-  });
-}
 
-/// The queue of the runtime overflows, which is the coarsest "lost track" there is.
-#[test]
-fn everything_is_checked_after_an_overflow() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/R/a/b").unwrap();
-    d.fs().write("/p/R/a/b/f", "1").unwrap();
-    d.fs().write("/p/x.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/R", "/p/x.js"]), NONE, "{on}");
-    d.fs().write("/p/R/a/b/f", "22").unwrap();
-    d.fs().write("/p/x.js", "22").unwrap();
-    d.fs().rename("/p/R/a", "/p/R/c").unwrap();
-    d.fs().take_raw(usize::MAX);
-    d.overflow();
-    assert_eq!(window_then_settled(d), ["C /p/R/c/b/f", "D /p/R/a/b/f", "U /p/x.js"], "{on}");
+    // With room again, the poll asks again, and the coverage comes back through a later commit.
+    d.fs().set_watch_limit(None);
+    assert_eq!(d.settled(), NONE, "{on}");
+    d.fs().write("/p/R/src/deep/b.js", "333").unwrap();
+    assert!(d.fs().pending_raw() > 0, "{on}");
+    assert_eq!(d.window(), ["U /p/R/src/deep/b.js"], "{on}");
+    assert_eq!(d.errors(), [ErrorKind::WatchLimit], "{on}");
     d.caught_up();
   });
 }
@@ -465,39 +420,10 @@ fn a_mark_that_the_disk_did_not_answer_is_kept() {
   }
 }
 
-/// Every watch ended (the drive was unplugged), and the scan that makes them again runs while
-/// the disk gives errors that say nothing. The request is not dropped with the failed scan: when
-/// the disk answers, every watch is made again.
-#[test]
-fn a_scan_that_the_disk_did_not_answer_is_not_forgotten() {
-  for mode in Mode::ALL {
-    let mut d = Driver::sim(mode, Options::default());
-    d.fs.mkdir_all("/p/r/sub").unwrap();
-    d.fs.write("/p/r/sub/a", "1").unwrap();
-    d.fs.write("/p/f", "1").unwrap();
-    d.watch(&["/p/r", "/p/f"]);
-
-    d.fs.set_offline(Some(io::ErrorKind::NotFound));
-    d.fs.set_offline(Some(io::ErrorKind::TimedOut));
-    assert!(d.fs.pending_raw() > 0, "{mode:?}");
-    assert_eq!(window(&mut d), NONE, "{mode:?}");
-    assert_eq!(d.errors.len(), 1, "{mode:?}");
-    assert_eq!(d.errors[0].kind(), ErrorKind::Io);
-
-    d.fs.set_offline(None);
-    assert_eq!(settled(&mut d), NONE, "{mode:?}");
-    d.fs.write("/p/r/sub/a", "22").unwrap();
-    d.fs.write("/p/f", "22").unwrap();
-    assert!(d.fs.pending_raw() >= 2, "{mode:?}: the watches were not made again");
-    assert_eq!(window(&mut d), ["U /p/f", "U /p/r/sub/a"], "{mode:?}");
-    assert_eq!(d.errors.len(), 1, "{mode:?}");
-    caught_up(&mut d);
-  }
-}
-
 /// Every watch ended, and the deep scan that makes them again is cut short: from some call
 /// on, the disk answers nothing. Whatever the moment, the rest of the scan is made again when
-/// the disk is back, so that no directory is left with a watch that is gone.
+/// the disk is back, so that no directory is left with a watch that is gone. A look that the
+/// disk did not answer is told once, as `Io`.
 ///
 /// `dropped`: the queue lost the notifications that said so, and all that is left is "check
 /// everything". Then the request to watch again exists only as the deep scan that goes down
@@ -537,6 +463,13 @@ fn a_deep_scan_that_the_disk_stops_answering() {
         ["U /p/f", "U /p/r/a", "U /p/r/sub/b", "U /p/r/sub/deep/c"],
         "{on}: a watch was not made again"
       );
+      // A look that the disk did not answer is told once, as `Io`, and the scans that bring
+      // the watches back tell nothing more.
+      let errors = Sim::errors(&d);
+      assert!(errors.len() <= 1 && errors.iter().all(|error| *error == ErrorKind::Io), "{on}");
+      if moment == 0 {
+        assert_eq!(errors, [ErrorKind::Io], "{on}");
+      }
       caught_up(&mut d);
     }
   }

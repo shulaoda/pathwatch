@@ -7,32 +7,12 @@ use std::{collections::BTreeMap, io, time::Duration};
 
 use crate::fixtures::{
   Deliver, Driver, Mode, NONE, Sim, SimBackend, SimFs, caught_up, flush, on_all, settled, show,
-  taken, window, window_then_settled,
+  taken, window,
 };
 use pathwatch::{ErrorKind, engine::Options};
 
 fn inode() -> Driver<SimBackend> {
   Driver::sim(Mode::Inode, Options::default())
-}
-
-#[test]
-fn a_lonely_delete_goes_out_one_delay_later() {
-  let mut d = inode();
-  d.fs.mkdir("/p").unwrap();
-  d.fs.write("/p/a", "1").unwrap();
-  d.watch(&["/p/a"]);
-  let start = d.now;
-
-  d.fs.remove("/p/a").unwrap();
-  d.deliver(usize::MAX);
-  assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(10)));
-  assert!(d.step());
-  assert_eq!(taken(&mut d), NONE);
-  // The delete has a timer of its own: one delay after the hint, not after the look.
-  assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(100)));
-  assert!(d.step());
-  assert_eq!(taken(&mut d), ["D /p/a"]);
-  caught_up(&mut d);
 }
 
 /// The delay counts from the hint of each file, not from the look that found it gone: a file
@@ -85,24 +65,6 @@ fn a_late_first_look_gets_its_second_look_at_once() {
 }
 
 #[test]
-fn a_lonely_delete_with_the_poll_backend() {
-  let mut d = Driver::poll(Options::default());
-  d.fs.mkdir("/p").unwrap();
-  d.fs.write("/p/a", "1").unwrap();
-  d.watch(&["/p/a"]);
-  let start = d.now;
-
-  d.fs.remove("/p/a").unwrap();
-  assert!(d.step());
-  assert_eq!(d.now, start + Duration::from_secs(1));
-  assert_eq!(taken(&mut d), NONE);
-  assert!(d.step());
-  assert_eq!(d.now, start + Duration::from_millis(1100));
-  assert_eq!(taken(&mut d), ["D /p/a"]);
-  caught_up(&mut d);
-}
-
-#[test]
 fn zero_turns_the_delay_off() {
   let mut d =
     Driver::sim(Mode::Inode, Options { delete_delay: Duration::ZERO, ..Options::default() });
@@ -116,23 +78,6 @@ fn zero_turns_the_delay_off() {
   flush(&mut d);
   assert_eq!(taken(&mut d), ["D /p/r/a", "D /p/r/sub/b"]);
   assert!(d.engine.pending_deletes().is_empty());
-  caught_up(&mut d);
-}
-
-#[test]
-fn pending_then_back_then_gone() {
-  let mut d = inode();
-  d.fs.mkdir("/p").unwrap();
-  d.fs.write("/p/a", "1").unwrap();
-  d.watch(&["/p/a"]);
-
-  d.fs.remove("/p/a").unwrap();
-  flush(&mut d);
-  d.fs.write("/p/a", "1").unwrap();
-  flush(&mut d);
-  assert_eq!(taken(&mut d), ["U /p/a"]);
-  d.fs.remove("/p/a").unwrap();
-  assert_eq!(settled(&mut d), ["D /p/a"]);
   caught_up(&mut d);
 }
 
@@ -151,30 +96,6 @@ fn the_check_at_the_deadline_finds_the_file() {
   assert_eq!(d.fs.take_raw(usize::MAX).len(), 1);
   assert!(d.step());
   assert_eq!(taken(&mut d), ["U /p/a"]);
-  caught_up(&mut d);
-}
-
-/// A file appears where a directory was: the deletes below it cannot become updates any more
-/// and go out in the same batch.
-#[test]
-fn a_file_sends_the_pending_deletes_below_it() {
-  let mut d = inode();
-  d.fs.mkdir_all("/p/r/d/e").unwrap();
-  d.fs.write("/p/r/d/f", "1").unwrap();
-  d.fs.write("/p/r/d/e/g", "1").unwrap();
-  d.fs.write("/p/r/dx", "1").unwrap();
-  d.watch(&["/p/r"]);
-
-  d.fs.remove_all("/p/r/d").unwrap();
-  d.fs.remove("/p/r/dx").unwrap();
-  flush(&mut d);
-  assert_eq!(d.engine.pending_deletes().len(), 3);
-
-  d.fs.write("/p/r/d", "a file now").unwrap();
-  flush(&mut d);
-  assert_eq!(taken(&mut d), ["C /p/r/d", "D /p/r/d/e/g", "D /p/r/d/f"]);
-  // A name that only starts with the same letters is not below it.
-  assert_eq!(settled(&mut d), ["D /p/r/dx"]);
   caught_up(&mut d);
 }
 
@@ -800,6 +721,7 @@ fn a_pending_delete_and_a_change_of_kind() {
     d.fs().mkdir_all("/p/W/d").unwrap();
     d.fs().write("/p/R", "file").unwrap();
     d.fs().write("/p/W/d/f", "1").unwrap();
+    d.fs().write("/p/W/dx", "1").unwrap();
     d.fs().write("/p/W/keep", "1").unwrap();
     assert_eq!(d.watch(&["/p/R", "/p/W"]), NONE, "{on}");
 
@@ -814,10 +736,19 @@ fn a_pending_delete_and_a_change_of_kind() {
     // The mirror: the deletes that `vanish` made are pending too, and a file at the path
     // of the directory sends them out with its `Create`.
     d.fs().remove_all("/p/W/d").unwrap();
+    d.fs().remove("/p/W/dx").unwrap();
     assert_eq!(d.window(), NONE, "{on}");
-    assert_eq!(d.pending_deletes(), 1, "{on}");
+    assert_eq!(d.pending_deletes(), 2, "{on}");
     d.fs().write("/p/W/d", "a file now").unwrap();
-    assert_eq!(d.window(), ["C /p/W/d", "D /p/W/d/f"], "{on}");
+    // A name that only starts with the same letters is not below it: its `Delete` waits for
+    // its own time. With the poll backend that time is over at the poll.
+    let (now, later): (&[&str], &[&str]) = if on == "Poll" {
+      (&["C /p/W/d", "D /p/W/d/f", "D /p/W/dx"], &[])
+    } else {
+      (&["C /p/W/d", "D /p/W/d/f"], &["D /p/W/dx"])
+    };
+    assert_eq!(d.window(), now, "{on}");
+    assert_eq!(d.settled(), later, "{on}");
 
     // A file that came and went inside one flush is nothing: no delete becomes pending.
     d.fs().write("/p/W/short", "1").unwrap();
@@ -950,41 +881,27 @@ fn case_c_git_checkout() {
   }
 }
 
-/// (e): `rm -r` and a copy with the same names: one `Update` for a name that is still there,
-/// `Delete` for the rest, `Create` for the new ones.
-#[test]
-fn case_e_remove_and_copy_again() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/D/sub").unwrap();
-    for file in ["x", "y", "z", "sub/s"] {
-      d.fs().write(format!("/p/D/{file}"), "1").unwrap();
-    }
-    assert_eq!(d.watch(&["/p/D"]), NONE, "{on}");
-
-    d.fs().remove_all("/p/D").unwrap();
-    d.fs().mkdir_all("/p/D/sub").unwrap();
-    for file in ["x", "y", "w", "sub/s"] {
-      d.fs().write(format!("/p/D/{file}"), "copied").unwrap();
-    }
-    assert_eq!(
-      window_then_settled(d),
-      ["C /p/D/w", "D /p/D/z", "U /p/D/sub/s", "U /p/D/x", "U /p/D/y"],
-      "{on}"
-    );
-    d.caught_up();
-  });
-}
-
-/// The delay of a `Delete` that no hint asked for counts from the look that found nothing, not
-/// from the start of the flush: a flush can take long before it reaches the file.
+/// With the poll backend no hint asks for a `Delete`: its delay counts from the look that found
+/// nothing. That look is the poll, and the delay does not count from the start of its flush: a
+/// flush can take long before it reaches the file.
 #[test]
 fn the_delay_counts_from_the_look() {
   let mut d = Driver::poll(Options::default());
   d.fs.mkdir_all("/p/r").unwrap();
   d.fs.write("/p/r/a", "1").unwrap();
+  d.fs.write("/p/r/b", "1").unwrap();
   d.watch(&["/p/r"]);
+  let start = d.now;
 
   d.fs.remove("/p/r/a").unwrap();
+  assert!(d.step());
+  assert_eq!(d.now, start + Duration::from_secs(1));
+  assert_eq!(taken(&mut d), NONE);
+  assert!(d.step());
+  assert_eq!(d.now, start + Duration::from_millis(1100));
+  assert_eq!(taken(&mut d), ["D /p/r/a"]);
+
+  d.fs.remove("/p/r/b").unwrap();
   // The disk takes 300 ms before the first look of the poll.
   d.fs.at_call(0, |fs| fs.advance(Duration::from_millis(300)));
   assert!(d.step());
@@ -992,6 +909,6 @@ fn the_delay_counts_from_the_look() {
   assert_eq!(d.engine.pending_deletes().len(), 1);
   // The second look comes 100 ms after the first, which was 300 ms into the flush.
   assert_eq!(d.engine.deadline(), Some(d.now + Duration::from_millis(400)));
-  assert_eq!(settled(&mut d), ["D /p/r/a"]);
+  assert_eq!(settled(&mut d), ["D /p/r/b"]);
   caught_up(&mut d);
 }

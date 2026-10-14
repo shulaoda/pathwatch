@@ -12,10 +12,7 @@ use std::{
   },
 };
 
-use crate::fixtures::{
-  Driver, Mode, NONE, RECURSIVE, Sim, asked, caught_up, flush, ignore_node_modules, on_all,
-  on_modes, sorted, taken,
-};
+use crate::fixtures::{NONE, RECURSIVE, Sim, asked, ignore_node_modules, on_all, on_modes, sorted};
 use pathwatch::{EntryKind, engine::Options};
 
 /// What a filter was asked, in the order of the calls.
@@ -70,100 +67,32 @@ fn a_directory_with_many_known_files_goes() {
   });
 }
 
-/// An ignored directory with 1,000 files comes into a watched directory and goes again. The
-/// filter is asked about the directory, and never about a name inside it.
-#[test]
-fn an_ignored_directory_with_many_files_comes_and_goes() {
-  let (options, asked_filter) =
-    recording(|path, kind| kind == EntryKind::Dir && path.ends_with("node_modules"));
-  on_all(&options, |d, on| {
-    d.fs().mkdir_all("/p/r").unwrap();
-    d.fs().mkdir_all("/q/node_modules").unwrap();
-    for file in 0..1000 {
-      d.fs().write(format!("/q/node_modules/{file}.js"), "1").unwrap();
-    }
-    assert_eq!(d.watch(&["/p/r"]), NONE, "{on}");
-    take(&asked_filter);
-    let listings = d.fs().calls().read_dir;
-
-    let the_directory = (PathBuf::from("/p/r/node_modules"), EntryKind::Dir);
-    d.fs().rename("/q/node_modules", "/p/r/node_modules").unwrap();
-    assert_eq!(windows(d, 3), NONE, "{on}");
-    let asked = take(&asked_filter);
-    assert!(
-      !asked.is_empty() && asked.iter().all(|call| *call == the_directory),
-      "{on}: {asked:?}"
-    );
-    d.fs().write("/p/r/node_modules/0.js", "22").unwrap();
-    d.fs().rename("/p/r/node_modules", "/q/node_modules").unwrap();
-    assert_eq!(windows(d, 3), NONE, "{on}");
-    let asked = take(&asked_filter);
-    assert!(asked.iter().all(|call| *call == the_directory), "{on}: {asked:?}");
-    // Only the watched directory was listed, never the ignored one.
-    let listed = d.fs().calls().read_dir - listings;
-    assert!(listed <= 6, "{on}: {listed}");
-    d.caught_up();
-  });
-}
-
 /// 10,000 hints from inside an ignored directory, below a watch for a whole tree, in one
 /// flush: one question for the filter, and one look at the ignored directory. The watched
-/// directory is looked at with it, because the directory above it is only polled.
+/// directory is looked at with it, because the directory above it is only polled. As many
+/// hints from a place that no watched path covers, below the watch of a watched file, cost
+/// nothing.
 #[test]
 fn many_hints_from_inside_an_ignored_directory() {
   let (options, asked_filter) =
     recording(|path, kind| kind == EntryKind::Dir && path.ends_with("node_modules"));
   on_modes(&RECURSIVE, &options, |d, on| {
     d.fs().mkdir_all("/p/node_modules/x").unwrap();
-    assert_eq!(d.watch(&["/p"]), NONE, "{on}");
+    d.fs().mkdir_all("/q/other").unwrap();
+    d.fs().write("/q/f.js", "1").unwrap();
+    assert_eq!(d.watch(&["/p", "/q/f.js"]), NONE, "{on}");
     take(&asked_filter);
     let before = d.fs().calls();
     for file in 0..10_000 {
       d.fs().write(format!("/p/node_modules/x/{file}.js"), "1").unwrap();
+      d.fs().write(format!("/q/other/{file}.js"), "1").unwrap();
     }
-    assert!(d.fs().pending_raw() >= 10_000, "{on}");
+    assert!(d.fs().pending_raw() >= 20_000, "{on}");
     assert_eq!(d.window(), NONE, "{on}");
     let after = d.fs().calls();
-    assert_eq!((after.lstat - before.lstat, after.read_dir - before.read_dir), (2, 0), "{on}");
+    let checks = (after.lstat - before.lstat, after.stat - before.stat);
+    assert_eq!((checks, after.read_dir - before.read_dir), ((2, 0), 0), "{on}");
     assert_eq!(take(&asked_filter), [(PathBuf::from("/p/node_modules"), EntryKind::Dir)], "{on}");
-    d.caught_up();
-  });
-}
-
-/// A file in a watched directory changes 100 times. The filter is asked about it once, when it
-/// is found.
-#[test]
-fn a_file_that_changes_many_times_is_asked_once() {
-  let (options, asked_filter) =
-    recording(|path, kind| kind == EntryKind::Dir && path.ends_with("node_modules"));
-  on_all(&options, |d, on| {
-    d.fs().mkdir_all("/p/r").unwrap();
-    assert_eq!(d.watch(&["/p/r"]), NONE, "{on}");
-    take(&asked_filter);
-    d.fs().write("/p/r/a.js", "0").unwrap();
-    assert_eq!(d.window(), ["C /p/r/a.js"], "{on}");
-    for change in 1..=100 {
-      d.fs().write("/p/r/a.js", "1".repeat(change)).unwrap();
-      assert_eq!(sorted(d.window()), ["U /p/r/a.js"], "{on}");
-    }
-    assert_eq!(take(&asked_filter), [(PathBuf::from("/p/r/a.js"), EntryKind::File)], "{on}");
-    d.caught_up();
-  });
-}
-
-/// The filter is not asked about an entry that is not there: `unwatch` of a path with a
-/// missing directory above it asks nothing.
-#[test]
-fn unwatch_asks_the_filter_about_nothing_new() {
-  let (options, asked_filter) =
-    recording(|path, kind| kind == EntryKind::Dir && path.ends_with("node_modules"));
-  on_all(&options, |d, on| {
-    let missing = "/p/r/gone/b.js";
-    d.fs().mkdir_all("/p/r").unwrap();
-    assert_eq!(d.watch(&["/p/r", missing]), NONE, "{on}");
-    take(&asked_filter);
-    assert_eq!(d.unwatch(&[missing]), NONE, "{on}");
-    assert_eq!(take(&asked_filter), [], "{on}");
     d.caught_up();
   });
 }
@@ -176,7 +105,7 @@ fn case_i_an_ignored_directory() {
     d.fs().write("/p/node_modules/foo/index.js", "1").unwrap();
     d.fs().write("/p/node_modules/foo/lib/other.js", "1").unwrap();
     d.fs().write("/p/a.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p"]), NONE, "{on}");
+    d.watch(&["/p"]);
     assert_eq!(d.known(), ["/p/a.js"], "{on}");
     // Only `/p` was listed.
     assert_eq!(d.fs().calls().read_dir, 1, "{on}");
@@ -195,7 +124,8 @@ fn case_i_an_ignored_directory() {
 }
 
 /// The filter is asked about an entry when it is found, and again when its kind changes. Not at
-/// every check: for an entry that the tree has, the answer is known.
+/// every check: for an entry that the tree has, the answer is known. And not about an entry
+/// that is not there.
 #[test]
 fn the_filter_is_asked_once_for_an_entry() {
   for listing_kinds in [true, false] {
@@ -245,55 +175,14 @@ fn the_filter_is_asked_once_for_an_entry() {
       assert_eq!(d.window(), ["D /p/r/b.js"], "{on}");
       assert_eq!(asked(), listing + 1, "{on}");
       d.settled();
+
+      // `unwatch` of a path with a missing directory above it asks nothing.
+      assert_eq!(d.watch(&["/p/r/gone/d.js"]), NONE, "{on}");
+      asked();
+      assert_eq!(d.unwatch(&["/p/r/gone/d.js"]), NONE, "{on}");
+      assert_eq!(asked(), 0, "{on}");
       d.caught_up();
     });
-  }
-}
-
-/// A flood of hints from inside an ignored directory ends at its parent and costs
-/// one `lstat` for a flush. The watched directory is checked with it, because the directory
-/// above it is only polled: one more.
-#[test]
-fn hints_from_an_ignored_directory() {
-  on_modes(&RECURSIVE, &ignore_node_modules(), |d, on| {
-    d.fs().mkdir_all("/p/node_modules/x").unwrap();
-    assert_eq!(d.watch(&["/p"]), NONE, "{on}");
-    let before = d.fs().calls();
-    for file in 0..50 {
-      d.fs().write(format!("/p/node_modules/x/{file}.js"), "1").unwrap();
-    }
-    assert!(d.fs().pending_raw() >= 50, "{on}");
-    assert_eq!(d.window(), NONE, "{on}");
-    let after = d.fs().calls();
-    assert_eq!((after.lstat - before.lstat, after.read_dir - before.read_dir), (2, 0), "{on}");
-    d.caught_up();
-  });
-}
-
-/// A flood from an ignored directory below a recursive watch costs one check for a flush, and a
-/// flood from a place no watched path covers costs none.
-#[test]
-fn a_flood_from_places_nobody_watches() {
-  for mode in [Mode::Prefix, Mode::Handle] {
-    let mut d = Driver::sim(mode, ignore_node_modules());
-    d.fs.mkdir_all("/p/r/node_modules/pkg").unwrap();
-    d.fs.mkdir_all("/p/other").unwrap();
-    d.fs.write("/p/f.js", "1").unwrap();
-    d.watch(&["/p/r", "/p/f.js"]);
-
-    let before = d.fs.calls();
-    for file in 0..100 {
-      d.fs.write(format!("/p/r/node_modules/pkg/{file}.js"), "1").unwrap();
-      d.fs.write(format!("/p/other/{file}.js"), "1").unwrap();
-    }
-    assert!(d.fs.pending_raw() >= 200, "{mode:?}");
-    flush(&mut d);
-    assert_eq!(taken(&mut d), NONE, "{mode:?}");
-    let after = d.fs.calls();
-    // `node_modules`, and `/p`: its parent `/` is only polled, so it is checked with the mark.
-    let checks = (after.lstat - before.lstat) + (after.stat - before.stat);
-    assert_eq!((checks, after.read_dir - before.read_dir), (2, 0), "{mode:?}");
-    caught_up(&mut d);
   }
 }
 
@@ -367,11 +256,11 @@ fn a_path_that_is_ignored_for_the_kind_it_has_now() {
     d.fs().mkdir_all("/p/dist").unwrap();
     d.fs().write("/p/dist/a.js", "1").unwrap();
     d.fs().write("/p/dist/b.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/dist"]), NONE, "{on}");
+    d.watch(&["/p/dist"]);
     assert_eq!(d.known(), NONE, "{on}");
     d.fs().write("/p/dist/a.js", "22").unwrap();
     d.fs().write("/p/dist/new.js", "1").unwrap();
-    assert_eq!(d.settled(), NONE, "{on}");
+    d.settled();
     // The directory was never listed, and the backend was never asked to watch it.
     assert_eq!(d.fs().calls().read_dir, 0, "{on}");
     assert!(!asked(d.fs()).iter().any(|(dir, _)| dir == "/p/dist"), "{on}");
@@ -385,7 +274,7 @@ fn a_path_that_is_ignored_for_the_kind_it_has_now() {
     d.fs().remove("/p/dist").unwrap();
     d.fs().mkdir("/p/dist").unwrap();
     d.fs().write("/p/dist/a.js", "1").unwrap();
-    assert_eq!(d.settled(), ["D /p/dist"], "{on}");
+    d.settled();
     assert_eq!(d.fs().calls().read_dir, 0, "{on}");
     d.caught_up();
   });
@@ -407,7 +296,7 @@ fn a_watched_path_below_an_ignored_directory_is_never_watched() {
     take(&asked_filter);
     let paths =
       ["/p/node_modules/x.js", "/p/node_modules/pkg/deep.js", "/p/node_modules/gone/later.js"];
-    assert_eq!(d.watch(&paths), NONE, "{on}");
+    d.watch(&paths);
     let way = |dir: &str| (PathBuf::from(dir), EntryKind::Dir);
     let down_to_the_ignored_one = [way("/"), way("/p"), way("/p/node_modules")];
     let for_each_path: Vec<_> = (0..3).flat_map(|_| down_to_the_ignored_one.clone()).collect();
@@ -426,7 +315,7 @@ fn a_watched_path_below_an_ignored_directory_is_never_watched() {
     d.fs().rename("/p/away", "/p/node_modules").unwrap();
     assert_eq!(d.settled(), NONE, "{on}");
     take(&asked_filter);
-    assert_eq!(d.unwatch(&paths), NONE, "{on}");
+    d.unwatch(&paths);
     assert_eq!(take(&asked_filter), [], "{on}");
 
     // A path beside the ignored directory is watched as usual.

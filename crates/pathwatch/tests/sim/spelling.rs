@@ -70,8 +70,12 @@ fn a_watched_file_in_another_spelling() {
 }
 
 /// The other spelling is in a directory name on the way: `Components` is registered, the disk
-/// says `components`, and a watch above reports `components/App.js`. The check of a registered
-/// directory name goes deep, so the file below it is found.
+/// says `components`, and a watch above reports `components/ui/App.js`. The check of a
+/// registered directory name goes deep, so the file below it is found. The same file is
+/// watched through `components/UI` too: there the other spelling is two names below the
+/// directory of the OS watch. The hint goes down through the names that match, and the
+/// directory in which a name does not match any more checks its registered names. Each
+/// watched path gets its events.
 #[test]
 fn a_directory_on_the_way_in_another_spelling() {
   on_all(&loose(), |d, on| {
@@ -80,37 +84,24 @@ fn a_directory_on_the_way_in_another_spelling() {
     d.fs().write("/p/src/main.js", "1").unwrap();
     d.fs().write("/p/src/components/ui/App.js", "1").unwrap();
     // `main.js` makes `/p/src` tell its contents: where a watch covers a tree, it is this one.
-    let paths = ["/p/src/main.js", "/p/src/Components/UI/App.js"];
+    let paths = ["/p/src/main.js", "/p/src/Components/UI/App.js", "/p/src/components/UI/App.js"];
     assert_eq!(d.watch(&paths), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/src/Components/UI/App.js", "/p/src/main.js"], "{on}");
+    let known = ["/p/src/Components/UI/App.js", "/p/src/components/UI/App.js", "/p/src/main.js"];
+    assert_eq!(d.known(), known, "{on}");
 
+    let both = |event: &str| {
+      [
+        format!("{event} /p/src/Components/UI/App.js"),
+        format!("{event} /p/src/components/UI/App.js"),
+      ]
+    };
     d.fs().write("/p/src/components/ui/App.js", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/src/Components/UI/App.js"], "{on}");
+    assert_eq!(d.window(), both("U"), "{on}");
     d.fs().remove_all("/p/src/components").unwrap();
-    assert_eq!(d.settled(), ["D /p/src/Components/UI/App.js"], "{on}");
+    assert_eq!(d.settled(), both("D"), "{on}");
     d.fs().mkdir_all("/p/src/COMPONENTS/ui").unwrap();
     d.fs().write("/p/src/COMPONENTS/ui/app.js", "1").unwrap();
-    assert_eq!(d.settled(), ["C /p/src/Components/UI/App.js"], "{on}");
-    d.caught_up();
-  });
-}
-
-/// The other spelling is two names below the directory of the OS watch: `components` is
-/// spelled as on disk, `UI` is not. The hint goes down through the names that match, and the
-/// directory in which a name does not match any more checks its registered names.
-#[test]
-fn the_other_spelling_is_below_a_registered_directory() {
-  on_all(&loose(), |d, on| {
-    d.fs().set_ignore_case(true);
-    d.fs().mkdir_all("/p/src/components/ui").unwrap();
-    d.fs().write("/p/src/main.js", "1").unwrap();
-    d.fs().write("/p/src/components/ui/App.js", "1").unwrap();
-    // `main.js` makes `/p/src` tell its contents: where a watch covers a tree, it is this one.
-    let paths = ["/p/src/main.js", "/p/src/components/UI/App.js"];
-    assert_eq!(d.watch(&paths), NONE, "{on}");
-
-    d.fs().write("/p/src/components/ui/App.js", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/src/components/UI/App.js"], "{on}");
+    assert_eq!(d.settled(), both("C"), "{on}");
     d.caught_up();
   });
 }
@@ -137,23 +128,32 @@ fn a_watched_directory_in_another_spelling() {
 
 /// A hint for a name that is no registered name in any spelling is dropped: a build that writes
 /// next to a watched file costs no look at the disk. Many hints for another spelling of one
-/// registered name cost one check of that name.
+/// registered name cost one check of that name. The same for a directory name on the way:
+/// `Components` is registered, the disk says `components`, a name next to it that is no
+/// spelling of it costs nothing, and a write below it costs one look at the file.
 #[test]
 fn only_a_name_that_can_be_the_hinted_one_is_checked() {
   let mut d = Driver::sim(Mode::Inode, loose());
   d.fs.set_ignore_case(true);
-  d.fs.mkdir_all("/p/src").unwrap();
+  d.fs.mkdir_all("/p/src/components").unwrap();
   d.fs.write("/p/src/app.js", "1").unwrap();
-  d.watch(&["/p/src/App.js", "/p/src/Not-there.js", "/p/src/\u{c9}t\u{e9}.js"]);
+  d.fs.write("/p/src/components/App.js", "1").unwrap();
+  d.watch(&[
+    "/p/src/App.js",
+    "/p/src/Not-there.js",
+    "/p/src/\u{c9}t\u{e9}.js",
+    "/p/src/Components/App.js",
+  ]);
 
   let before = d.fs.calls();
   for file in 0..50 {
     d.fs.write(format!("/p/src/other{file}.js"), "1").unwrap();
   }
   d.fs.write("/p/src/app.jsx", "1").unwrap();
+  d.fs.write("/p/src/component", "1").unwrap();
   // A name of ideographs is only itself, like a name of ASCII letters.
   d.fs.write("/p/src/\u{4e2d}\u{6587}.js", "1").unwrap();
-  assert_eq!(d.deliver(usize::MAX), 52);
+  assert_eq!(d.deliver(usize::MAX), 53);
   // No hint left work: nothing is due, and the disk was not asked.
   assert_eq!(d.engine.deadline(), None);
   assert_eq!(d.fs.calls(), before);
@@ -167,6 +167,12 @@ fn only_a_name_that_can_be_the_hinted_one_is_checked() {
   // The one registered name. The directory is not listed.
   assert_eq!((after.lstat - before.lstat, after.read_dir - before.read_dir), (1, 0));
 
+  let before = d.fs.calls();
+  d.fs.write("/p/src/components/App.js", "22").unwrap();
+  assert_eq!(window(&mut d), ["U /p/src/Components/App.js"]);
+  let after = d.fs.calls();
+  assert_eq!((after.lstat - before.lstat, after.read_dir - before.read_dir), (1, 0));
+
   // A name with an accent: the rules of the disk for such letters are not known, so every
   // registered name with such a letter is checked, and no other.
   let before = d.fs.calls();
@@ -177,52 +183,14 @@ fn only_a_name_that_can_be_the_hinted_one_is_checked() {
   caught_up(&mut d);
 }
 
-/// The other spelling is in a directory name, next to names that have nothing to do with it:
-/// `Components` is registered, the disk says `components`. A write below `components` is found
-/// by a deep check of `Components` alone, and a write below any other name costs nothing.
-#[test]
-fn the_other_spelling_of_a_directory_next_to_unrelated_names() {
-  for mode in Mode::ALL {
-    let mut d = Driver::sim(mode, loose());
-    d.fs.set_ignore_case(true);
-    d.fs.mkdir_all("/p/src/components").unwrap();
-    d.fs.mkdir_all("/p/src/lib").unwrap();
-    d.fs.write("/p/src/main.js", "1").unwrap();
-    d.fs.write("/p/src/components/App.js", "1").unwrap();
-    // `main.js` makes `/p/src` tell its contents: where a watch covers a tree, it is this one.
-    d.watch(&["/p/src/main.js", "/p/src/Components/App.js"]);
-    assert_eq!(
-      crate::fixtures::known(&d),
-      ["/p/src/Components/App.js", "/p/src/main.js"],
-      "{mode:?}"
-    );
-
-    let before = d.fs.calls();
-    d.fs.write("/p/src/lib/x.js", "1").unwrap();
-    d.fs.write("/p/src/out.js", "1").unwrap();
-    d.fs.write("/p/src/component", "1").unwrap();
-    assert!(d.deliver(usize::MAX) >= 2, "{mode:?}");
-    // No hint left work: nothing is due but the poll of the directories above, where the OS
-    // does not watch them, and the disk was not asked.
-    let poll = (mode != Mode::Inode).then(|| d.now + std::time::Duration::from_secs(1));
-    assert_eq!(d.engine.deadline(), poll, "{mode:?}");
-    assert_eq!(d.fs.calls(), before, "{mode:?}");
-
-    d.fs.write("/p/src/components/App.js", "22").unwrap();
-    assert_eq!(window(&mut d), ["U /p/src/Components/App.js"], "{mode:?}");
-    d.fs.remove_all("/p/src/components").unwrap();
-    assert_eq!(settled(&mut d), ["D /p/src/Components/App.js"], "{mode:?}");
-    d.fs.mkdir("/p/src/COMPONENTS").unwrap();
-    d.fs.write("/p/src/COMPONENTS/app.js", "1").unwrap();
-    assert_eq!(settled(&mut d), ["C /p/src/Components/App.js"], "{mode:?}");
-    caught_up(&mut d);
-  }
-}
-
 /// A watched path is the path that its caller gave, and the OS says what is at it. So on every
 /// disk it is looked at when a name next to it changes that differs only in the case of its
 /// letters. On a disk that tells the two names apart, that is one look that finds nothing new.
-/// A name that is no spelling of a watched path costs nothing.
+/// A name that is no spelling of a watched path costs nothing. Inside a watched directory, an
+/// engine that takes every disk for a strict one (Linux) asks nothing about spelling: a new
+/// name, also one with a letter outside ASCII or with none, costs one look, no question and no
+/// listing. A name next to one that differs only in the case of its letters is looked at too
+/// (the OS names a gone entry so on a loose disk): one look that finds nothing new.
 #[test]
 fn a_strict_disk_costs_one_look() {
   let mut d = Driver::sim(Mode::Inode, Options::default());
@@ -246,6 +214,35 @@ fn a_strict_disk_costs_one_look() {
   assert_eq!(window(&mut d), ["C /p/src/App.js"]);
   d.fs.write("/p/src/app.js", "333").unwrap();
   assert_eq!(window(&mut d), NONE);
+
+  // Inside a watched directory.
+  d.fs.mkdir_all("/p/R").unwrap();
+  for file in 0..50 {
+    d.fs.write(format!("/p/R/f{file}.js"), "1").unwrap();
+  }
+  d.fs.write("/p/R/app.js", "1").unwrap();
+  d.watch(&["/p/R"]);
+  // The watch of `/p` heard `R` come: that look is over before the counts start.
+  assert_eq!(settled(&mut d), NONE);
+  let calls = |d: &Driver<_>| {
+    let calls = d.fs.calls();
+    (calls.lstat, calls.read_dir, calls.name_on_disk)
+  };
+  let (looks, listings, _) = calls(&d);
+
+  d.fs.write("/p/R/new.js", "1").unwrap();
+  assert_eq!(window(&mut d), ["C /p/R/new.js"]);
+  assert_eq!(calls(&d), (looks + 1, listings, 0));
+  let cyrillic = "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}";
+  d.fs.write("/p/R/caf\u{e9}.js", "1").unwrap();
+  d.fs.write(format!("/p/R/{cyrillic}"), "1").unwrap();
+  let expected = ["C /p/R/caf\u{e9}.js".to_owned(), format!("C /p/R/{cyrillic}")];
+  assert_eq!(window(&mut d), expected);
+  assert_eq!(calls(&d), (looks + 3, listings, 0));
+  // `APP.js` next to `app.js`: both are looked at, and `app.js` did not change.
+  d.fs.write("/p/R/APP.js", "1").unwrap();
+  assert_eq!(window(&mut d), ["C /p/R/APP.js"]);
+  assert_eq!(calls(&d), (looks + 5, listings, 0));
   caught_up(&mut d);
 }
 
@@ -759,39 +756,4 @@ fn a_rewrite_in_place_under_another_spelling() {
     assert_eq!(d.window(), ["U /p/src/Components/UI/App.js"], "{on}");
     d.caught_up();
   });
-}
-
-/// An engine that takes every disk for a strict one (Linux) asks nothing about spelling: a new
-/// name, also one with a letter outside ASCII or with none, costs one look, no question and no
-/// listing. A name next to one that differs only in the case of its letters is looked at too
-/// (the OS names a gone entry so on a loose disk): one look that finds nothing new.
-#[test]
-fn an_engine_that_takes_the_disk_for_strict_asks_nothing() {
-  let mut d = Driver::sim(Mode::Inode, Options::default());
-  d.fs.mkdir_all("/p/R").unwrap();
-  for file in 0..50 {
-    d.fs.write(format!("/p/R/f{file}.js"), "1").unwrap();
-  }
-  d.fs.write("/p/R/app.js", "1").unwrap();
-  d.watch(&["/p/R"]);
-  let calls = |d: &Driver<_>| {
-    let calls = d.fs.calls();
-    (calls.lstat, calls.read_dir, calls.name_on_disk)
-  };
-  let (looks, listings, _) = calls(&d);
-
-  d.fs.write("/p/R/new.js", "1").unwrap();
-  assert_eq!(window(&mut d), ["C /p/R/new.js"]);
-  assert_eq!(calls(&d), (looks + 1, listings, 0));
-  let cyrillic = "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}";
-  d.fs.write("/p/R/caf\u{e9}.js", "1").unwrap();
-  d.fs.write(format!("/p/R/{cyrillic}"), "1").unwrap();
-  let expected = ["C /p/R/caf\u{e9}.js".to_owned(), format!("C /p/R/{cyrillic}")];
-  assert_eq!(window(&mut d), expected);
-  assert_eq!(calls(&d), (looks + 3, listings, 0));
-  // `APP.js` next to `app.js`: both are looked at, and `app.js` did not change.
-  d.fs.write("/p/R/APP.js", "1").unwrap();
-  assert_eq!(window(&mut d), ["C /p/R/APP.js"]);
-  assert_eq!(calls(&d), (looks + 5, listings, 0));
-  caught_up(&mut d);
 }

@@ -6,8 +6,8 @@
 use std::{path::PathBuf, time::Duration};
 
 use crate::fixtures::{
-  Deliver, Driver, Mode, NONE, RECURSIVE, Sim, SimFs, asked, at, caught_up, ignore_node_modules,
-  known, on_a_small_stack, on_all, on_modes, os_watches, settled, sorted, taken, window,
+  Deliver, Driver, Mode, NONE, RECURSIVE, SimFs, asked, at, caught_up, ignore_node_modules, known,
+  on_a_small_stack, on_all, on_modes, os_watches, settled, sorted, taken, window,
 };
 use pathwatch::{
   backend::Want::{self, Contents, Names},
@@ -30,65 +30,6 @@ fn unwatch_above_a_chain_deeper_than_the_stack() {
     d.fs.write(&leaf, "22").unwrap();
     assert_eq!(settled(&mut d), [format!("U {leaf}")]);
     caught_up(&mut d);
-  });
-}
-
-/// A watched file is taken back: no event, and nothing is reported for it any more.
-#[test]
-fn unwatch_a_file() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir("/p").unwrap();
-    d.fs().write("/p/a.js", "1").unwrap();
-    d.fs().write("/p/b.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/a.js", "/p/b.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/a.js", "/p/b.js"], "{on}");
-
-    assert_eq!(d.unwatch(&["/p/a.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/b.js"], "{on}");
-    d.fs().write("/p/a.js", "22").unwrap();
-    d.fs().write("/p/b.js", "22").unwrap();
-    assert_eq!(d.settled(), ["U /p/b.js"], "{on}");
-    d.fs().remove("/p/a.js").unwrap();
-    assert_eq!(d.settled(), NONE, "{on}");
-    d.caught_up();
-  });
-}
-
-/// A watched directory is taken back: every file below it is forgotten, with no event.
-#[test]
-fn unwatch_a_directory() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/R/sub/deep").unwrap();
-    d.fs().write("/p/R/a.js", "1").unwrap();
-    d.fs().write("/p/R/sub/deep/b.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
-    assert_eq!(d.known().len(), 2, "{on}");
-
-    assert_eq!(d.unwatch(&["/p/R"]), NONE, "{on}");
-    assert_eq!(d.known(), NONE, "{on}");
-    d.fs().write("/p/R/a.js", "22").unwrap();
-    d.fs().write("/p/R/sub/new.js", "1").unwrap();
-    d.fs().remove_all("/p/R/sub/deep").unwrap();
-    assert_eq!(d.fs().pending_raw(), 0, "{on}");
-    assert_eq!(d.settled(), NONE, "{on}");
-    d.caught_up();
-  });
-}
-
-/// A watched path with nothing at it, below a chain that is not there either.
-#[test]
-fn unwatch_a_missing_path() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir("/p").unwrap();
-    assert_eq!(d.watch(&["/p/gone/deep/x.js", "/p/not-there.js"]), NONE, "{on}");
-    assert_eq!(d.unwatch(&["/p/gone/deep/x.js", "/p/not-there.js"]), NONE, "{on}");
-
-    d.fs().mkdir_all("/p/gone/deep").unwrap();
-    d.fs().write("/p/gone/deep/x.js", "1").unwrap();
-    d.fs().write("/p/not-there.js", "1").unwrap();
-    assert_eq!(d.fs().pending_raw(), 0, "{on}");
-    assert_eq!(d.settled(), NONE, "{on}");
-    d.caught_up();
   });
 }
 
@@ -115,61 +56,6 @@ fn unwatch_a_path_that_is_not_watched() {
     assert_eq!(d.unwatch(&["/p/R"]), NONE, "{on}");
     assert_eq!(d.unwatch(&["/p/R"]), NONE, "{on}");
     assert_eq!(d.known(), NONE, "{on}");
-    d.caught_up();
-  });
-}
-
-/// A watched file inside a watched directory is taken back: the directory still covers it, so
-/// it stays known and its changes are reported.
-#[test]
-fn unwatch_a_path_below_a_watched_directory() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/R/sub").unwrap();
-    d.fs().write("/p/R/sub/a.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/R", "/p/R/sub/a.js", "/p/R/sub", "/p/R/not-there.js"]), NONE, "{on}");
-
-    let below = ["/p/R/sub/a.js", "/p/R/sub", "/p/R/not-there.js"];
-    assert_eq!(d.unwatch(&below), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/R/sub/a.js"], "{on}");
-    d.fs().write("/p/R/sub/a.js", "22").unwrap();
-    d.fs().write("/p/R/not-there.js", "1").unwrap();
-    assert_eq!(d.settled(), ["C /p/R/not-there.js", "U /p/R/sub/a.js"], "{on}");
-    d.caught_up();
-  });
-}
-
-/// A watched directory with watched files below it is taken back. The watched files stay
-/// known, and everything else below the directory is forgotten.
-///
-/// Where one watch covers a whole tree, the watch of the directory covered the files too. It
-/// is given back, and the directory that holds a watched file gets a watch of its own.
-#[test]
-fn unwatch_a_directory_above_watched_files() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/R/lib/deep").unwrap();
-    d.fs().write("/p/R/top.js", "1").unwrap();
-    d.fs().write("/p/R/lib/a.js", "1").unwrap();
-    d.fs().write("/p/R/lib/other.js", "1").unwrap();
-    d.fs().write("/p/R/lib/deep/b.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
-    assert_eq!(d.watch(&["/p/R/lib/a.js", "/p/R/lib/deep"]), NONE, "{on}");
-    assert_eq!(d.known().len(), 4, "{on}");
-
-    assert_eq!(d.unwatch(&["/p/R"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/R/lib/a.js", "/p/R/lib/deep/b.js"], "{on}");
-    if on == "Prefix" || on == "Handle" {
-      assert_eq!(os_watches(d.fs()), [at("/p/R/lib", Contents)], "{on}");
-    }
-
-    d.fs().write("/p/R/lib/a.js", "22").unwrap();
-    d.fs().write("/p/R/lib/deep/new.js", "1").unwrap();
-    assert_eq!(d.fs().pending_raw() > 0, on != "Poll", "{on}");
-    assert_eq!(d.window(), ["U /p/R/lib/a.js", "C /p/R/lib/deep/new.js"], "{on}");
-    // What the directory covered alone.
-    d.fs().write("/p/R/top.js", "22").unwrap();
-    d.fs().write("/p/R/lib/other.js", "22").unwrap();
-    d.fs().write("/p/R/new.js", "1").unwrap();
-    assert_eq!(d.settled(), NONE, "{on}");
     d.caught_up();
   });
 }
@@ -305,33 +191,6 @@ fn unwatch_opens_no_gap_for_what_stays() {
   }
 }
 
-/// A path is taken back and watched again: what is there then is the baseline once more, and
-/// it is not reported.
-#[test]
-fn unwatch_then_watch_again() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/R/sub").unwrap();
-    d.fs().write("/p/R/sub/a.js", "1").unwrap();
-    d.fs().write("/p/f.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/R", "/p/f.js"]), NONE, "{on}");
-    assert_eq!(d.unwatch(&["/p/R", "/p/f.js"]), NONE, "{on}");
-    assert_eq!(d.known(), NONE, "{on}");
-
-    // The disk changes while nothing is watched.
-    d.fs().write("/p/R/sub/a.js", "22").unwrap();
-    d.fs().write("/p/R/new.js", "1").unwrap();
-    d.fs().write("/p/f.js", "22").unwrap();
-    assert_eq!(d.watch(&["/p/R", "/p/f.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/R/new.js", "/p/R/sub/a.js", "/p/f.js"], "{on}");
-    assert_eq!(d.settled(), NONE, "{on}");
-
-    d.fs().write("/p/R/sub/a.js", "333").unwrap();
-    d.fs().write("/p/f.js", "333").unwrap();
-    assert_eq!(d.window(), ["U /p/R/sub/a.js", "U /p/f.js"], "{on}");
-    d.caught_up();
-  });
-}
-
 /// A `Delete` waits for its second look, and the path that covers the file is taken back. The
 /// `Delete` is dropped with it.
 #[test]
@@ -446,31 +305,12 @@ fn unwatch_one_of_two_files_costs_nothing() {
   });
 }
 
-/// Nothing is watched any more, and the engine has nothing left to look at: a poll reads
-/// nothing.
-#[test]
-fn nothing_is_left_when_every_path_is_taken_back() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/R").unwrap();
-    d.fs().write("/p/R/a.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/R", "/p/gone/x.js"]), NONE, "{on}");
-    assert_eq!(d.unwatch(&["/p/R", "/p/gone/x.js"]), NONE, "{on}");
-    assert_eq!(os_watches(d.fs()), [], "{on}");
-    let reads = |d: &dyn Sim| {
-      let calls = d.fs().calls();
-      (calls.lstat, calls.stat, calls.read_dir, calls.hash, calls.watch)
-    };
-    let before = reads(d);
-    assert_eq!(d.settled(), NONE, "{on}");
-    assert_eq!(reads(d), before, "{on}");
-    d.caught_up();
-  });
-}
-
-/// A link inside a watched directory is followed only while a watched path goes through it.
-/// When that path is taken back, the link is a file entry of the watched directory again. For
-/// the handler that is the change of kind that it is: the files that were known behind the
-/// link go, and the link comes.
+/// A link inside a watched directory is followed only while a watched path goes through it, or
+/// is the link itself. When that path is taken back, the link is a file entry of the watched
+/// directory again. For a link to a directory that is the change of kind that it is: the files
+/// that were known behind the link go, and the link comes. A link to a file stays known: it is
+/// the link itself that the directory reports now, and the stored fingerprint is the one of the
+/// link.
 #[test]
 fn unwatch_a_path_behind_a_link_inside_a_watched_directory() {
   on_all(&Options::default(), |d, on| {
@@ -478,41 +318,25 @@ fn unwatch_a_path_behind_a_link_inside_a_watched_directory() {
     d.fs().mkdir("/store").unwrap();
     d.fs().write("/store/a.js", "1").unwrap();
     d.fs().write("/store/b.js", "1").unwrap();
-    d.fs().symlink("/store", "/p/R/link").unwrap();
-    // An old link: a young one counts as changed at every look.
-    d.advance(Duration::from_secs(3));
-    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/R/link"], "{on}");
-    // The link is followed from now on: what is behind it is the baseline.
-    assert_eq!(d.watch(&["/p/R/link/a.js"]), ["D /p/R/link"], "{on}");
-    assert_eq!(d.known(), ["/p/R/link/a.js", "/p/R/link/b.js"], "{on}");
-
-    let events = d.unwatch(&["/p/R/link/a.js"]);
-    assert_eq!(events, ["C /p/R/link", "D /p/R/link/a.js", "D /p/R/link/b.js"], "{on}");
-    d.fs().write("/store/a.js", "22").unwrap();
-    assert_eq!(d.settled(), NONE, "{on}");
-    d.caught_up();
-  });
-}
-
-/// A watched path that is a link to a file, inside a watched directory. Taken back, it is the
-/// link itself that the directory reports: the stored fingerprint is the one of the link.
-#[test]
-fn unwatch_a_link_to_a_file_inside_a_watched_directory() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/R").unwrap();
     d.fs().write("/target.js", "content").unwrap();
+    d.fs().symlink("/store", "/p/R/link").unwrap();
     d.fs().symlink("/target.js", "/p/R/link.js").unwrap();
-    // An old link: a young one counts as changed at every look.
+    // Old links: a young one counts as changed at every look.
     d.advance(Duration::from_secs(3));
     assert_eq!(d.watch(&["/p/R", "/p/R/link.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/R/link.js"], "{on}");
+    assert_eq!(d.known(), ["/p/R/link", "/p/R/link.js"], "{on}");
+    // The link to the directory is followed from now on: what is behind it is the baseline.
+    assert_eq!(d.watch(&["/p/R/link/a.js"]), ["D /p/R/link"], "{on}");
+    assert_eq!(d.known(), ["/p/R/link/a.js", "/p/R/link/b.js", "/p/R/link.js"], "{on}");
 
-    // One `Update` too many is allowed here; a stale fingerprint is not.
-    let events = d.unwatch(&["/p/R/link.js"]);
-    assert!(events.iter().all(|event| event == "U /p/R/link.js"), "{on}: {events:?}");
-    assert_eq!(d.known(), ["/p/R/link.js"], "{on}");
-    // The target is not read any more.
+    // One `Update` too many for the link to the file is allowed here; a stale fingerprint is
+    // not.
+    let mut events = d.unwatch(&["/p/R/link/a.js", "/p/R/link.js"]);
+    events.retain(|event| event != "U /p/R/link.js");
+    assert_eq!(events, ["C /p/R/link", "D /p/R/link/a.js", "D /p/R/link/b.js"], "{on}");
+    assert_eq!(d.known(), ["/p/R/link", "/p/R/link.js"], "{on}");
+    // The targets are not read any more.
+    d.fs().write("/store/a.js", "22").unwrap();
     d.fs().write("/target.js", "another content").unwrap();
     assert_eq!(d.settled(), NONE, "{on}");
     d.caught_up();

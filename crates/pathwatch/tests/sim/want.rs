@@ -268,30 +268,6 @@ fn a_watched_directory_that_the_filter_ignores() {
   caught_up(&mut d);
 }
 
-/// Many watched directories in one directory: each costs one look for its kind, one check and
-/// one look when its listing is done, whether they come in one batch or one by one. The
-/// directory above tells names only.
-#[test]
-fn many_watched_directories_in_one_directory() {
-  let mut d = Driver::sim(Mode::Inode, Options::default());
-  let dirs: Vec<String> = (0..50).map(|number| format!("/p/pkg{number}")).collect();
-  for dir in &dirs {
-    d.fs.mkdir_all(dir).unwrap();
-  }
-  d.watch(&dirs[..25]);
-  // `/` and `/p`, and three looks for each watched directory.
-  assert_eq!(d.fs.calls().lstat, 2 + 25 * 3);
-
-  let before = d.fs.calls().lstat;
-  for dir in &dirs[25..] {
-    d.watch(&[dir]);
-  }
-  assert_eq!(d.fs.calls().lstat - before, 25 * 3);
-  assert_eq!(os_watches(&d.fs)[1], at("/p", Names));
-  assert_eq!(os_watches(&d.fs).len(), 2 + 50);
-  caught_up(&mut d);
-}
-
 /// A watched path that is a link is followed, also by the look for its kind: behind a link to
 /// a directory there is a watched directory, and behind a link to a file a watched file.
 #[test]
@@ -477,66 +453,6 @@ fn a_chain_above_a_watched_path_goes_and_comes_back() {
 }
 
 // ---- cases of the design review ----
-
-/// The want of a node is raised before the scan, and nothing is asked below a watch that
-/// covers a tree.
-#[test]
-fn the_want_is_raised_before_the_scan() {
-  let mut d = Driver::sim(Mode::Inode, Options::default());
-  d.fs.mkdir_all("/p/src").unwrap();
-  d.fs.write("/p/src/a.js", "1").unwrap();
-  d.fs.write("/p/package.json", "1").unwrap();
-  d.watch(&["/p/src/a.js"]);
-  // `/p` only leads to a watched path: a write in it is not reported by the OS.
-  d.fs.write("/p/package.json", "22").unwrap();
-  assert_eq!(d.fs.pending_raw(), 0);
-  d.watch(&["/p/package.json"]);
-  d.fs.write("/p/package.json", "333").unwrap();
-  assert_eq!(d.fs.pending_raw(), 1);
-  assert_eq!(Sim::window(&mut d), ["U /p/package.json"]);
-  caught_up(&mut d);
-
-  for mode in RECURSIVE {
-    let mut d = Driver::sim(mode, Options::default());
-    d.fs.mkdir_all("/p/R/one/two/three").unwrap();
-    d.fs.write("/p/R/one/two/three/f", "1").unwrap();
-    d.watch(&["/p/R"]);
-    // `/` and `/p` only lead to the watched directory, `/p/R` is it. Nothing is asked for the
-    // four directories below `/p/R`.
-    assert_eq!(d.fs.calls().watch, 3, "{mode:?}");
-    d.fs.write("/p/R/one/two/three/f", "22").unwrap();
-    d.fs.mkdir("/p/R/one/new").unwrap();
-    d.fs.write("/p/R/one/new/g", "1").unwrap();
-    assert_eq!(Sim::window(&mut d), ["C /p/R/one/new/g", "U /p/R/one/two/three/f"], "{mode:?}");
-    assert_eq!(d.fs.calls().watch, 3, "{mode:?}");
-    caught_up(&mut d);
-  }
-}
-
-/// A directory that only leads to a watched path is watched for names: inotify does not report
-/// a write in it. When a directory above it becomes a watched path, it is a full part of that
-/// directory, and its watch must report writes from then on.
-#[test]
-fn a_directory_on_the_way_becomes_a_part_of_a_watched_directory() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/R/lib/sub").unwrap();
-    d.fs().write("/p/R/top.js", "1").unwrap();
-    d.fs().write("/p/R/lib/old.js", "1").unwrap();
-    d.fs().write("/p/R/lib/sub/x.js", "1").unwrap();
-    // `/p/R` and `/p/R/lib` only lead to the watched file.
-    assert_eq!(d.watch(&["/p/R/lib/sub/x.js"]), NONE, "{on}");
-    d.fs().write("/p/R/top.js", "22").unwrap();
-    d.fs().write("/p/R/lib/old.js", "22").unwrap();
-    assert_eq!(d.settled(), NONE, "{on}");
-
-    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/R/lib/old.js", "/p/R/lib/sub/x.js", "/p/R/top.js"], "{on}");
-    d.fs().write("/p/R/top.js", "333").unwrap();
-    d.fs().write("/p/R/lib/old.js", "333").unwrap();
-    assert_eq!(d.window(), ["U /p/R/lib/old.js", "U /p/R/top.js"], "{on}");
-    d.caught_up();
-  });
-}
 
 /// How many `lstat` calls the next poll makes.
 fn lstats_of_the_next_poll(d: &mut Driver<SimBackend>) -> u64 {

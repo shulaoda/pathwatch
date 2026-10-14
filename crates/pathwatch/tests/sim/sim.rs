@@ -1,11 +1,7 @@
 //! The fixtures themselves: what the simulated disk and backend do that the other tests rely on,
 //! and that the checks of the driver fail when they have to.
 
-use std::{
-  io,
-  path::{Path, PathBuf},
-  time::{Duration, SystemTime},
-};
+use std::path::{Path, PathBuf};
 
 use crate::fixtures::{
   Driver, Mode, NONE, SimBackend, SimFs, asked, at, caught_up, not_caught_up, on_modes, os_watches,
@@ -21,93 +17,11 @@ fn lstat(fs: &SimFs, path: &str) -> Meta {
   fs.lstat(Path::new(path)).unwrap()
 }
 
-/// The modification time and the change time of the entry at `path`.
-fn times(fs: &SimFs, path: &str) -> (SystemTime, SystemTime) {
-  let meta = lstat(fs, path);
-  (meta.modified, meta.changed)
-}
-
 fn names(fs: &SimFs, dir: &str) -> Vec<String> {
   let mut names = Vec::new();
   fs.read_dir(Path::new(dir), &mut |name, _| names.push(name.to_str().unwrap().to_owned()))
     .unwrap();
   names
-}
-
-// ---- the change time ----
-
-/// An entry that comes or goes moves both times of its directory. A rename of the entry
-/// itself, or other permissions for it, moves only its change time.
-#[test]
-fn the_change_time_of_a_directory() {
-  let fs = SimFs::new();
-  let tick = || fs.advance(Duration::from_secs(1));
-  fs.mkdir_all("/p/d").unwrap();
-  let (made, _) = times(&fs, "/p/d");
-  assert_eq!(times(&fs, "/p/d"), (made, made));
-
-  tick();
-  fs.write("/p/d/f", "1").unwrap();
-  let (filled, changed) = times(&fs, "/p/d");
-  assert!(filled > made && changed == filled);
-  let parent = times(&fs, "/p");
-
-  tick();
-  fs.rename("/p/d", "/p/e").unwrap();
-  let (modified, renamed) = times(&fs, "/p/e");
-  assert_eq!(modified, filled);
-  assert!(renamed > filled);
-  // The directory that holds the renamed entry lost one name and got another.
-  let (parent_modified, parent_changed) = times(&fs, "/p");
-  assert!(parent_modified > parent.0 && parent_changed == parent_modified);
-
-  tick();
-  fs.set_denied("/p/e", true).unwrap();
-  let (modified, denied) = times(&fs, "/p/e");
-  assert_eq!(modified, filled);
-  assert!(denied > renamed);
-  fs.set_denied("/p/e", false).unwrap();
-
-  tick();
-  fs.remove("/p/e/f").unwrap();
-  let (emptied, changed) = times(&fs, "/p/e");
-  assert!(emptied > filled && changed == emptied);
-}
-
-/// A write moves both times of the file and neither time of its directory. A rename of the
-/// file moves only its change time.
-#[test]
-fn the_change_time_of_a_file() {
-  let fs = SimFs::new();
-  let tick = || fs.advance(Duration::from_secs(1));
-  fs.mkdir("/p").unwrap();
-  fs.write("/p/f", "1").unwrap();
-  let (made, _) = times(&fs, "/p/f");
-  let dir = times(&fs, "/p");
-
-  tick();
-  fs.write("/p/f", "22").unwrap();
-  let (written, changed) = times(&fs, "/p/f");
-  assert!(written > made && changed == written);
-  assert_eq!(times(&fs, "/p"), dir);
-
-  tick();
-  fs.rename("/p/f", "/p/g").unwrap();
-  let (modified, renamed) = times(&fs, "/p/g");
-  assert_eq!(modified, written);
-  assert!(renamed > written);
-}
-
-/// The change time is as coarse as the modification time.
-#[test]
-fn the_change_time_has_the_time_step_of_the_disk() {
-  let fs = SimFs::new();
-  fs.set_time_step(Duration::from_secs(3600));
-  fs.mkdir("/p").unwrap();
-  let before = times(&fs, "/p");
-  fs.advance(Duration::from_secs(1));
-  fs.rename("/p", "/q").unwrap();
-  assert_eq!(times(&fs, "/q"), before);
 }
 
 // ---- a disk that ignores the case of letters ----
@@ -133,55 +47,6 @@ fn a_lookup_ignores_the_case_and_a_listing_does_not() {
   // Only the case of ASCII letters is ignored, and only that.
   assert_eq!(fs.read("/proj/src/app_js"), None);
   assert_eq!(fs.read("/proj/src/äpp.js"), None);
-}
-
-/// Another spelling is the same entry: it is written in place, it cannot be made again, and
-/// it is removed.
-#[test]
-fn another_spelling_is_the_same_entry() {
-  let fs = disk_without_case();
-  fs.write("/proj/src/APP.JS", "22").unwrap();
-  assert_eq!(names(&fs, "/Proj/Src"), ["App.js"]);
-  assert_eq!(fs.read("/Proj/Src/App.js"), Some(b"22".to_vec()));
-
-  let exists = |result: io::Result<()>| result.unwrap_err().kind() == io::ErrorKind::AlreadyExists;
-  assert!(exists(fs.mkdir("/proj/SRC")));
-  assert!(exists(fs.symlink("/x", "/proj/src/app.JS")));
-
-  fs.remove("/PROJ/src/app.js").unwrap();
-  assert_eq!(names(&fs, "/Proj/Src"), NONE);
-  fs.remove_all("/proj").unwrap();
-  assert_eq!(names(&fs, "/"), NONE);
-}
-
-/// A rename gives the entry the spelling of the new name, also when that is all that changes.
-/// A rename onto another spelling of another entry replaces that entry.
-#[test]
-fn a_rename_sets_the_spelling() {
-  let fs = disk_without_case();
-  fs.rename("/proj/src/app.js", "/proj/src/APP.js").unwrap();
-  assert_eq!(names(&fs, "/Proj/Src"), ["APP.js"]);
-  assert_eq!(fs.read("/Proj/Src/app.js"), Some(b"1".to_vec()));
-
-  fs.write("/Proj/Src/new.js", "new").unwrap();
-  fs.rename("/Proj/Src/new.js", "/Proj/Src/app.JS").unwrap();
-  assert_eq!(names(&fs, "/Proj/Src"), ["app.JS"]);
-  assert_eq!(fs.read("/Proj/Src/APP.js"), Some(b"new".to_vec()));
-
-  fs.rename("/proj", "/PROJ").unwrap();
-  assert_eq!(fs.dirs(), [Path::new("/PROJ"), Path::new("/PROJ/Src")]);
-}
-
-/// With the case not ignored, two spellings are two entries. This is the default.
-#[test]
-fn a_disk_that_tells_the_case_apart() {
-  let fs = SimFs::new();
-  fs.mkdir("/p").unwrap();
-  fs.write("/p/a.js", "1").unwrap();
-  fs.write("/p/A.js", "2").unwrap();
-  assert_eq!(names(&fs, "/p"), ["A.js", "a.js"]);
-  assert_eq!(fs.read("/p/a.js"), Some(b"1".to_vec()));
-  assert_eq!(fs.read("/P/a.js"), None);
 }
 
 /// A notification names an entry that is there as the disk spells it, whatever spelling the
@@ -324,19 +189,6 @@ fn a_settle_fails_on_a_file_that_the_handler_was_not_told_about() {
   d.fs.write("/p/r/new.js", "1").unwrap();
   assert_eq!(d.fs.take_raw(usize::MAX).len(), 1);
   d.settle();
-}
-
-/// With the poll backend the same two stories end well: the next poll finds the change.
-#[test]
-fn the_poll_catches_up_without_a_notification() {
-  let mut d = Driver::poll(Options::default());
-  d.fs.mkdir_all("/p/r").unwrap();
-  d.fs.write("/p/a.js", "1").unwrap();
-  d.watch(&["/p/r", "/p/a.js"]);
-  d.fs.write("/p/a.js", "22").unwrap();
-  d.fs.write("/p/r/new.js", "1").unwrap();
-  assert_eq!(settled(&mut d), ["U /p/a.js", "C /p/r/new.js"]);
-  caught_up(&mut d);
 }
 
 #[test]

@@ -2,34 +2,16 @@
 //! A story makes the disk, calls `watch`, changes the disk and compares the events that come
 //! out (`C`, `U`, `D` and the path). `on_all` tells one story on every backend.
 
-use std::{io, path::Path, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, io, path::PathBuf, time::Duration};
 
 use crate::fixtures::{
-  Deliver, Driver, Mode, NONE, SimBackend, caught_up, flush, on_all, settled, sorted, taken, window,
+  Deliver, Driver, Mode, NONE, SimBackend, caught_up, check_fingerprints, flush, on_all, settled,
+  sorted, taken, window,
 };
 use pathwatch::engine::Options;
 
 fn driver(mode: Mode) -> Driver<SimBackend> {
   Driver::sim(mode, Options::default())
-}
-
-/// The registered path goes through a link (as `/tmp` on macOS), and the OS reports real paths.
-#[test]
-fn a_linked_prefix() {
-  for mode in Mode::ALL {
-    let mut d = driver(mode);
-    d.fs.mkdir_all("/private/tmp/proj").unwrap();
-    d.fs.symlink("private/tmp", "/tmp").unwrap();
-    d.fs.write("/tmp/proj/a.js", "1").unwrap();
-    d.watch(&["/tmp/proj/a.js", "/tmp/proj/gen"]);
-
-    d.fs.write("/private/tmp/proj/a.js", "12").unwrap();
-    d.fs.mkdir("/tmp/proj/gen").unwrap();
-    d.fs.write("/tmp/proj/gen/out.js", "1").unwrap();
-    flush(&mut d);
-    assert_eq!(taken(&mut d), ["U /tmp/proj/a.js", "C /tmp/proj/gen/out.js"], "{mode:?}");
-    caught_up(&mut d);
-  }
 }
 
 /// The registered path goes through links (`/tmp` and `$TMPDIR` on macOS), and the OS
@@ -134,92 +116,6 @@ fn a_link_made_in_two_steps() {
   }
 }
 
-/// Nothing watches the target of a link. The poll finds a change behind it.
-#[test]
-fn a_change_behind_a_link() {
-  for mode in Mode::ALL {
-    let mut d = driver(mode);
-    d.fs.mkdir_all("/p").unwrap();
-    d.fs.mkdir_all("/shared/real").unwrap();
-    d.fs.write("/shared/config.json", "1").unwrap();
-    d.fs.write("/shared/real/c.js", "1").unwrap();
-    d.fs.symlink("/shared/config.json", "/p/config.json").unwrap();
-    d.fs.symlink("/shared/real", "/p/link").unwrap();
-    d.watch(&["/p/config.json", "/p/link/c.js"]);
-
-    // The watched file is a link, and its target is written.
-    d.fs.write("/shared/config.json", "12").unwrap();
-    assert_eq!(settled(&mut d), ["U /p/config.json"], "{mode:?}");
-
-    // A name on the way is a link, and its target goes away and comes back.
-    d.fs.rename("/shared/real", "/shared/gone").unwrap();
-    assert_eq!(settled(&mut d), ["D /p/link/c.js"], "{mode:?}");
-    d.fs.mkdir("/shared/real").unwrap();
-    d.fs.write("/shared/real/c.js", "1").unwrap();
-    assert_eq!(settled(&mut d), ["C /p/link/c.js"], "{mode:?}");
-
-    // The link itself is pointed at another file.
-    d.fs.write("/shared/other.json", "123").unwrap();
-    d.fs.remove("/p/config.json").unwrap();
-    d.fs.symlink("/shared/other.json", "/p/config.json").unwrap();
-    assert_eq!(settled(&mut d), ["U /p/config.json"], "{mode:?}");
-    caught_up(&mut d);
-  }
-}
-
-/// A link is followed for the check, and the poll finds what changes behind it.
-#[test]
-fn changes_behind_a_link() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir("/p").unwrap();
-    d.fs().mkdir_all("/shared").unwrap();
-    d.fs().mkdir_all("/z/real/b").unwrap();
-    d.fs().mkdir("/a").unwrap();
-    d.fs().write("/shared/config.json", "1").unwrap();
-    d.fs().write("/z/real/b/c.js", "1").unwrap();
-    d.fs().symlink("/shared/config.json", "/p/config.json").unwrap();
-    d.fs().symlink("/z/real", "/a/link").unwrap();
-    assert_eq!(d.watch(&["/p/config.json", "/a/link/b/c.js"]), NONE, "{on}");
-
-    // (a) The watched file is a link, and its target is written.
-    d.fs().write("/shared/config.json", "22").unwrap();
-    assert_eq!(d.settled(), ["U /p/config.json"], "{on}");
-
-    // (b) A name on the way is a link, and its target goes away and comes back as a new
-    // directory.
-    d.fs().rename("/z/real", "/z/gone").unwrap();
-    assert_eq!(d.settled(), ["D /a/link/b/c.js"], "{on}");
-    d.fs().mkdir_all("/z/real/b").unwrap();
-    d.fs().write("/z/real/b/c.js", "new").unwrap();
-    assert_eq!(d.settled(), ["C /a/link/b/c.js"], "{on}");
-    d.fs().write("/z/real/b/c.js", "newer").unwrap();
-    assert_eq!(d.settled(), ["U /a/link/b/c.js"], "{on}");
-    d.caught_up();
-  });
-}
-
-/// A watched path that is reached through two spellings of one directory gets its events under
-/// each spelling.
-#[test]
-fn two_spellings_of_one_directory() {
-  for mode in Mode::ALL {
-    let mut d = driver(mode);
-    d.fs.mkdir_all("/p/real").unwrap();
-    d.fs.symlink("/p/real", "/p/link").unwrap();
-    d.fs.write("/p/real/x.js", "1").unwrap();
-    d.fs.write("/p/real/y.js", "1").unwrap();
-    d.watch(&["/p/link/x.js", "/p/real/y.js", "/p/real/x.js"]);
-
-    d.fs.write("/p/real/x.js", "12").unwrap();
-    d.fs.write("/p/link/y.js", "12").unwrap();
-    d.deliver(usize::MAX);
-    assert!(d.step());
-    // No poll was needed: the hints came under every key.
-    assert_eq!(taken(&mut d), ["U /p/link/x.js", "U /p/real/x.js", "U /p/real/y.js"], "{mode:?}");
-    caught_up(&mut d);
-  }
-}
-
 /// One directory under two spellings. Each watched path gets its events under its own
 /// spelling, with no help from the poll.
 #[test]
@@ -233,75 +129,6 @@ fn each_watched_path_keeps_its_spelling() {
     d.fs().write("/p/real/x.js", "22").unwrap();
     d.fs().write("/p/link/y.js", "22").unwrap();
     assert_eq!(d.window(), ["U /p/link/x.js", "U /p/real/y.js"], "{on}");
-    d.caught_up();
-  });
-}
-
-/// A file inside a watched directory turns out to be on the way to a new watched path, and it
-/// is a link to a directory: it stops being a file.
-#[test]
-fn a_link_entry_becomes_an_ancestor() {
-  let mut d = driver(Mode::Inode);
-  d.fs.mkdir_all("/p/d").unwrap();
-  d.fs.mkdir_all("/q/dir").unwrap();
-  d.fs.write("/q/dir/x.js", "1").unwrap();
-  d.fs.symlink("/q/dir", "/p/d/l").unwrap();
-  d.watch(&["/p/d"]);
-  assert_eq!(d.known.iter().collect::<Vec<_>>(), [Path::new("/p/d/l")]);
-
-  d.watch(&["/p/d/l/x.js"]);
-  assert_eq!(taken(&mut d), ["D /p/d/l"]);
-  assert_eq!(d.known.iter().collect::<Vec<_>>(), [Path::new("/p/d/l/x.js")]);
-  caught_up(&mut d);
-}
-
-/// Links in a watched path (see also `changes_behind_a_link`): a link inside a watched
-/// directory is a file entry until a watched path goes through it; then it is followed and
-/// stops being one.
-#[test]
-fn a_link_entry_becomes_an_ancestor_and_is_followed() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/d").unwrap();
-    d.fs().mkdir_all("/q/dir").unwrap();
-    d.fs().write("/q/dir/x.js", "1").unwrap();
-    d.fs().symlink("/q/dir", "/p/d/l").unwrap();
-    assert_eq!(d.watch(&["/p/d"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/d/l"], "{on}");
-
-    assert_eq!(d.watch(&["/p/d/l/x.js"]), ["D /p/d/l"], "{on}");
-    assert_eq!(d.known(), ["/p/d/l/x.js"], "{on}");
-    d.fs().write("/q/dir/x.js", "22").unwrap();
-    d.fs().write("/q/dir/y.js", "1").unwrap();
-    assert_eq!(d.settled(), ["U /p/d/l/x.js", "C /p/d/l/y.js"], "{on}");
-    d.caught_up();
-  });
-}
-
-/// A link to a directory sits in a watched directory, and the filter ignores it as a file. Then
-/// the link becomes a watched path: it is followed from now on, and what is behind it is the
-/// baseline. The watched directory above never had to report that: for it the link was a file.
-#[test]
-fn an_ignored_link_becomes_a_watched_path() {
-  let options = Options {
-    ignored: Some(Arc::new(|path: &Path, kind| {
-      kind == pathwatch::EntryKind::File && path.ends_with("link")
-    })),
-    ..Options::default()
-  };
-  on_all(&options, |d, on| {
-    d.fs().mkdir_all("/p/d").unwrap();
-    d.fs().mkdir_all("/q/dir/deep").unwrap();
-    d.fs().write("/q/dir/x.js", "1").unwrap();
-    d.fs().write("/q/dir/deep/y.js", "1").unwrap();
-    d.fs().symlink("/q/dir", "/p/d/link").unwrap();
-    assert_eq!(d.watch(&["/p/d"]), NONE, "{on}");
-    assert_eq!(d.known(), NONE, "{on}");
-    assert_eq!(d.settled(), NONE, "{on}");
-
-    assert_eq!(d.watch(&["/p/d/link"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/d/link/deep/y.js", "/p/d/link/x.js"], "{on}");
-    d.fs().write("/q/dir/new.js", "1").unwrap();
-    assert_eq!(d.settled(), ["C /p/d/link/new.js"], "{on}");
     d.caught_up();
   });
 }
@@ -351,12 +178,16 @@ fn a_directory_above_the_one_behind_a_link_is_away_and_back() {
 
 /// A link inside a watched directory is a file entry. `rm` and `ln -s` in the same tick of
 /// the file system clock give the new link the inode number, the time and (with a target of
-/// the same length) the size of the old one. A link is never opened, so no hash can tell.
+/// the same length) the size of the old one: the stored fingerprint is still the one on disk.
+/// A link is never opened, so no hash can tell. The target tells.
 #[test]
 fn a_link_entry_pointed_elsewhere_in_the_same_time_step() {
-  fn repoint<B: Deliver>(d: &Driver<B>) {
+  fn repoint<B: Deliver>(d: &Driver<B>, on: &str) {
+    let stored = d.engine.fingerprints();
     d.fs.remove("/p/r/l").unwrap();
     d.fs.symlink("/x/b", "/p/r/l").unwrap();
+    let watched = BTreeSet::from([PathBuf::from("/p/r")]);
+    assert_eq!(check_fingerprints(&d.fs, &watched, &stored), Ok(()), "{on}: the fingerprint tells");
   }
   for mode in Mode::ALL {
     let mut d = Driver::sim(mode, Options::default());
@@ -364,7 +195,7 @@ fn a_link_entry_pointed_elsewhere_in_the_same_time_step() {
     d.fs.mkdir_all("/p/r").unwrap();
     d.fs.symlink("/x/a", "/p/r/l").unwrap();
     d.watch(&["/p/r"]);
-    repoint(&d);
+    repoint(&d, &format!("{mode:?}"));
     assert_eq!(window(&mut d), ["U /p/r/l"], "{mode:?}");
     caught_up(&mut d);
   }
@@ -373,7 +204,7 @@ fn a_link_entry_pointed_elsewhere_in_the_same_time_step() {
   d.fs.mkdir_all("/p/r").unwrap();
   d.fs.symlink("/x/a", "/p/r/l").unwrap();
   d.watch(&["/p/r"]);
-  repoint(&d);
+  repoint(&d, "Poll");
   assert_eq!(window(&mut d), ["U /p/r/l"]);
   caught_up(&mut d);
 }

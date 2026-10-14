@@ -3,7 +3,6 @@
 use std::{
   borrow::Cow,
   collections::BTreeSet,
-  io,
   path::{Path, PathBuf},
   sync::Arc,
   time::{Duration, Instant},
@@ -289,7 +288,6 @@ pub trait Sim {
   fn pending_deletes(&self) -> usize;
   fn errors(&self) -> Vec<ErrorKind>;
   fn overflow(&mut self);
-  fn backend_dies(&mut self);
 }
 
 impl<B: Deliver> Sim for Driver<B> {
@@ -342,10 +340,6 @@ impl<B: Deliver> Sim for Driver<B> {
 
   fn overflow(&mut self) {
     self.engine.overflow(self.now);
-  }
-
-  fn backend_dies(&mut self) {
-    self.engine.signal(Signal::Failed(io::Error::other("the backend died")), self.now);
   }
 }
 

@@ -5,32 +5,13 @@
 use std::{path::Path, time::Duration};
 
 use crate::fixtures::{
-  Driver, Mode, NONE, RECURSIVE, SimBackend, caught_up, flush, ignore_node_modules, known,
-  on_a_small_stack, on_all, on_modes, settled, sorted, taken, window, window_then_settled,
+  Driver, Mode, NONE, RECURSIVE, SimBackend, caught_up, flush, known, on_a_small_stack, on_all,
+  on_modes, settled, sorted, taken, window, window_then_settled,
 };
 use pathwatch::{ErrorKind, engine::Options};
 
 fn driver(mode: Mode) -> Driver<SimBackend> {
   Driver::sim(mode, Options::default())
-}
-
-/// inotify gives a renamed directory its old watch back. The node of the old name must not take
-/// that watch away when it goes.
-#[test]
-fn a_renamed_directory_keeps_its_watch() {
-  for (from, to) in [("a", "b"), ("b", "a")] {
-    let mut d = driver(Mode::Inode);
-    d.fs.mkdir_all(format!("/p/r/{from}/deep")).unwrap();
-    d.fs.write(format!("/p/r/{from}/x"), "1").unwrap();
-    d.watch(&["/p/r"]);
-
-    d.fs.rename(format!("/p/r/{from}"), format!("/p/r/{to}")).unwrap();
-    assert_eq!(settled(&mut d), [format!("C /p/r/{to}/x"), format!("D /p/r/{from}/x")]);
-    d.fs.write(format!("/p/r/{to}/new"), "1").unwrap();
-    d.fs.write(format!("/p/r/{to}/deep/new"), "1").unwrap();
-    assert_eq!(settled(&mut d), [format!("C /p/r/{to}/deep/new"), format!("C /p/r/{to}/new")]);
-    caught_up(&mut d);
-  }
 }
 
 /// The watched directory is renamed away and back while its tree is read, at every moment of
@@ -91,129 +72,6 @@ fn a_tree_deeper_than_the_stack_is_moved_away() {
   });
 }
 
-/// `unwatch` of the old name must not take away the watch that the new name got back.
-#[test]
-fn unwatch_keeps_the_watch_of_a_renamed_directory() {
-  on_all(&Options::default(), |d, on| {
-    // Both name orders: the marks of one directory have no order.
-    for (watched, from, to) in [("/p/r", "a", "b"), ("/p/q", "b", "a")] {
-      d.fs().mkdir_all(format!("{watched}/{from}/deep")).unwrap();
-      d.fs().write(format!("{watched}/{from}/x"), "1").unwrap();
-      assert_eq!(d.watch(&[watched]), NONE, "{on}");
-
-      d.fs().rename(format!("{watched}/{from}"), format!("{watched}/{to}")).unwrap();
-      assert_eq!(
-        sorted(d.settled()),
-        sorted(vec![format!("C {watched}/{to}/x"), format!("D {watched}/{from}/x")]),
-        "{on}"
-      );
-      d.fs().write(format!("{watched}/{to}/new.js"), "1").unwrap();
-      d.fs().write(format!("{watched}/{to}/deep/new.js"), "1").unwrap();
-      assert_eq!(
-        d.settled(),
-        [format!("C {watched}/{to}/deep/new.js"), format!("C {watched}/{to}/new.js")],
-        "{on}"
-      );
-    }
-    d.caught_up();
-  });
-}
-
-/// Three ways in which the node of an old name goes after the node of the new name took
-/// over the OS watch. The directory under the new name must not be deaf afterwards.
-#[test]
-fn the_new_name_is_not_deaf() {
-  // Case 1: a sub-directory of a watched directory.
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/R/b").unwrap();
-    d.fs().write("/R/b/f.js", "1").unwrap();
-    assert_eq!(d.watch(&["/R"]), NONE, "{on}");
-    d.fs().rename("/R/b", "/R/a").unwrap();
-    assert_eq!(sorted(d.settled()), ["C /R/a/f.js", "D /R/b/f.js"], "{on}");
-    d.fs().write("/R/a/f.js", "22").unwrap();
-    assert_eq!(d.window(), ["U /R/a/f.js"], "{on}");
-    d.caught_up();
-  });
-  // Case 2: an ignored directory gets a visible name; "nm" sorts before "node_modules".
-  on_all(&ignore_node_modules(), |d, on| {
-    d.fs().mkdir_all("/p/node_modules/foo").unwrap();
-    d.fs().write("/p/node_modules/foo/index.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p"]), NONE, "{on}");
-    d.fs().rename("/p/node_modules", "/p/nm").unwrap();
-    assert_eq!(d.settled(), ["C /p/nm/foo/index.js"], "{on}");
-    d.fs().write("/p/nm/foo/index.js", "22").unwrap();
-    d.fs().write("/p/nm/foo/new.js", "1").unwrap();
-    d.fs().write("/p/nm/top.js", "1").unwrap();
-    assert_eq!(
-      d.window(),
-      ["U /p/nm/foo/index.js", "C /p/nm/foo/new.js", "C /p/nm/top.js"],
-      "{on}"
-    );
-    d.caught_up();
-  });
-  // Case 3: two watched files, and the directory of one moves to the place of the other.
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/b").unwrap();
-    d.fs().write("/p/b/x.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/a/x.js", "/p/b/x.js"]), NONE, "{on}");
-    d.fs().rename("/p/b", "/p/a").unwrap();
-    assert_eq!(sorted(d.settled()), ["C /p/a/x.js", "D /p/b/x.js"], "{on}");
-    d.fs().write("/p/a/x.js", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/a/x.js"], "{on}");
-    d.caught_up();
-  });
-}
-
-/// `rm -r` and `mkdir` between two flushes: the new directory gets the inode number of the old
-/// one, so it looks like the same directory. Its watch is gone all the same.
-#[test]
-fn a_new_directory_with_the_old_inode_number() {
-  for mode in Mode::ALL {
-    let mut d = driver(mode);
-    d.fs.mkdir_all("/p/r/sub").unwrap();
-    d.fs.write("/p/r/sub/a", "1").unwrap();
-    d.watch(&["/p/r"]);
-
-    d.fs.remove_all("/p/r/sub").unwrap();
-    d.fs.mkdir("/p/r/sub").unwrap();
-    d.fs.write("/p/r/sub/b", "1").unwrap();
-    assert_eq!(settled(&mut d), ["C /p/r/sub/b", "D /p/r/sub/a"], "{mode:?}");
-    d.fs.write("/p/r/sub/c", "1").unwrap();
-    assert_eq!(settled(&mut d), ["C /p/r/sub/c"], "{mode:?}");
-    caught_up(&mut d);
-  }
-}
-
-/// A directory that left and came back with the same identity is scanned.
-#[test]
-fn a_directory_that_was_away_is_scanned() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/R/sub").unwrap();
-    d.fs().mkdir("/tmp").unwrap();
-    d.fs().write("/p/R/sub/a.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
-
-    // One window: out of the watched tree, changed there, back.
-    d.fs().rename("/p/R/sub", "/tmp/sub").unwrap();
-    d.fs().remove("/tmp/sub/a.js").unwrap();
-    d.fs().write("/tmp/sub/new.js", "1").unwrap();
-    d.fs().rename("/tmp/sub", "/p/R/sub").unwrap();
-    assert_eq!(window_then_settled(d), ["C /p/R/sub/new.js", "D /p/R/sub/a.js"], "{on}");
-
-    // The same for a watched file whose directory makes the trip.
-    d.fs().mkdir("/q").unwrap();
-    d.fs().mkdir("/q/lib").unwrap();
-    d.fs().write("/q/lib/a.js", "1").unwrap();
-    assert_eq!(d.watch(&["/q/lib/a.js"]), NONE, "{on}");
-    d.fs().rename("/q/lib", "/tmp/lib").unwrap();
-    d.fs().write("/tmp/lib/a.js", "edited").unwrap();
-    d.fs().rename("/tmp/lib", "/q/lib").unwrap();
-    assert_eq!(d.window(), ["U /q/lib/a.js"], "{on}");
-    assert_eq!(d.settled(), NONE, "{on}");
-    d.caught_up();
-  });
-}
-
 /// The sister case: no birth time, and the new directory gets the inode number of the
 /// removed one. It is a new directory all the same, and it is watched.
 #[test]
@@ -258,46 +116,6 @@ fn away_and_back_inside_one_window() {
     }
     d.caught_up();
   });
-}
-
-/// Spread over three windows: the same trip is a `Delete` and a `Create`.
-#[test]
-fn away_and_back_in_three_windows() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/proj/lib").unwrap();
-    d.fs().write("/proj/lib/a.js", "1").unwrap();
-    assert_eq!(d.watch(&["/proj/lib/a.js"]), NONE, "{on}");
-    d.fs().rename("/proj/lib", "/proj/lib2").unwrap();
-    assert_eq!(d.settled(), ["D /proj/lib/a.js"], "{on}");
-    d.fs().write("/proj/lib2/a.js", "edited").unwrap();
-    assert_eq!(d.settled(), NONE, "{on}");
-    d.fs().rename("/proj/lib2", "/proj/lib").unwrap();
-    assert_eq!(d.settled(), ["C /proj/lib/a.js"], "{on}");
-    d.caught_up();
-  });
-}
-
-/// The parent of a watched file is replaced by another directory that holds the same file.
-#[test]
-fn the_parent_of_a_watched_file_is_replaced() {
-  for mode in Mode::ALL {
-    let mut d = driver(mode);
-    d.fs.mkdir_all("/p/lib").unwrap();
-    d.fs.mkdir_all("/p/next").unwrap();
-    d.fs.write("/p/lib/a.js", "1").unwrap();
-    d.fs.write("/p/next/a.js", "22").unwrap();
-    d.watch(&["/p/lib/a.js"]);
-
-    d.fs.rename("/p/lib", "/p/old").unwrap();
-    d.fs.rename("/p/next", "/p/lib").unwrap();
-    assert_eq!(settled(&mut d), ["U /p/lib/a.js"], "{mode:?}");
-    d.fs.write("/p/lib/a.js", "333").unwrap();
-    assert_eq!(settled(&mut d), ["U /p/lib/a.js"], "{mode:?}");
-    // The directory that left is not the watched path any more.
-    d.fs.write("/p/old/a.js", "4444").unwrap();
-    assert_eq!(settled(&mut d), NONE, "{mode:?}");
-    caught_up(&mut d);
-  }
 }
 
 /// `watch` checks a file inside a directory that the tree still holds for another directory.

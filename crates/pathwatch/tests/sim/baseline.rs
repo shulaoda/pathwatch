@@ -7,7 +7,7 @@ use std::{io, path::Path, time::Duration};
 
 use crate::fixtures::{
   Deliver, Driver, Mode, NONE, Sim, SimBackend, SimFs, caught_up, flush, ignore_node_modules,
-  known, on_all, on_modes, settled, taken,
+  known, on_all, settled, taken,
 };
 use pathwatch::{ErrorKind, engine::Options, poll::PollBackend};
 
@@ -22,104 +22,6 @@ fn on_every_backend(test: impl Fn(&mut dyn FnMut() -> Box<dyn Sim>)) {
     test(&mut || Box::new(Driver::sim(mode, Options::default())));
   }
   test(&mut || Box::new(Driver::poll(Options::default())));
-}
-
-#[test]
-fn what_exists_at_watch_is_not_reported() {
-  on_every_backend(|make| {
-    let mut d = make();
-    d.fs().mkdir_all("/p/dir/deep").unwrap();
-    d.fs().write("/p/file.js", "1").unwrap();
-    d.fs().write("/p/dir/a", "1").unwrap();
-    d.fs().write("/p/dir/deep/b", "1").unwrap();
-    d.fs().write("/p/unwatched.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/file.js", "/p/dir", "/p/missing.js", "/p/no/such/dir"]), NONE);
-    assert_eq!(d.known(), ["/p/dir/a", "/p/dir/deep/b", "/p/file.js"]);
-    assert_eq!(d.settled(), NONE);
-    d.caught_up();
-  });
-}
-
-#[test]
-fn a_file_and_its_directory_in_one_batch() {
-  on_every_backend(|make| {
-    for paths in [["/p/d", "/p/d/f.js"], ["/p/d/f.js", "/p/d"]] {
-      let mut d = make();
-      d.fs().mkdir_all("/p/d").unwrap();
-      d.fs().write("/p/d/f.js", "1").unwrap();
-      d.fs().write("/p/d/g.js", "1").unwrap();
-      assert_eq!(d.watch(&paths), NONE);
-      assert_eq!(d.known(), ["/p/d/f.js", "/p/d/g.js"]);
-      // The file has one home: one event for a change.
-      d.fs().write("/p/d/f.js", "12").unwrap();
-      assert_eq!(d.settled(), ["U /p/d/f.js"]);
-      d.caught_up();
-    }
-  });
-}
-
-/// A file that a watched directory has to report is reported, also when it becomes a watched
-/// path before the flush that would have found it.
-#[test]
-fn add_does_not_swallow_a_create_that_was_due() {
-  let mut d = inode();
-  d.fs.mkdir_all("/p/d").unwrap();
-  d.watch(&["/p/d"]);
-
-  d.fs.write("/p/d/f.js", "1").unwrap();
-  d.watch(&["/p/d/f.js"]);
-  assert_eq!(taken(&mut d), ["C /p/d/f.js"]);
-  // The notification comes after it. It says "written", which costs one more update.
-  assert_eq!(settled(&mut d), ["U /p/d/f.js"]);
-  caught_up(&mut d);
-}
-
-#[test]
-fn add_does_not_swallow_an_update_that_was_due() {
-  let mut d = Driver::sim(Mode::Prefix, Options::default());
-  d.fs.mkdir_all("/p/src").unwrap();
-  d.fs.write("/p/src/a.vue", "1").unwrap();
-  d.watch(&["/p/src"]);
-
-  d.fs.write("/p/src/a.vue", "12").unwrap();
-  d.watch(&["/p/src/a.vue", "/p/src"]);
-  assert_eq!(taken(&mut d), ["U /p/src/a.vue"]);
-  assert_eq!(settled(&mut d), NONE);
-  caught_up(&mut d);
-}
-
-#[test]
-fn add_meets_a_pending_delete() {
-  let mut d = inode();
-  d.fs.mkdir_all("/p/r").unwrap();
-  d.fs.write("/p/r/a.js", "1").unwrap();
-  d.watch(&["/p/r"]);
-  d.fs.remove("/p/r/a.js").unwrap();
-  flush(&mut d);
-  assert!(d.engine.pending_deletes().contains(Path::new("/p/r/a.js")));
-
-  // A slow "remove, then write" save, and the path becomes a watched path in between.
-  d.fs.write("/p/r/a.js", "2").unwrap();
-  d.watch(&["/p/r/a.js"]);
-  assert_eq!(taken(&mut d), ["U /p/r/a.js"]);
-  assert!(d.engine.pending_deletes().is_empty());
-  caught_up(&mut d);
-}
-
-/// A watched file that appeared is reported when its directory becomes a watched path before
-/// the flush. The other files of the directory are new to the handler and are the baseline.
-#[test]
-fn the_listing_of_add_reports_an_older_watched_path() {
-  let mut d = inode();
-  d.fs.mkdir_all("/p/r").unwrap();
-  d.watch(&["/p/r/a.js"]);
-
-  d.fs.write("/p/r/a.js", "1").unwrap();
-  d.fs.write("/p/r/b.js", "1").unwrap();
-  d.watch(&["/p/r"]);
-  assert_eq!(taken(&mut d), ["C /p/r/a.js"]);
-  assert_eq!(known(&d), ["/p/r/a.js", "/p/r/b.js"]);
-  caught_up(&mut d);
 }
 
 /// A watched directory that was missing appears, and before the flush a file in it becomes a
@@ -139,97 +41,10 @@ fn an_older_watched_directory_appears_during_add() {
   caught_up(&mut d);
 }
 
-/// A directory becomes a watched path while nodes for watched files exist below it: they all
-/// become complete, down to the last level.
-#[test]
-fn a_directory_above_watched_files_becomes_a_watched_path() {
-  on_every_backend(|make| {
-    let mut d = make();
-    d.fs().mkdir_all("/p/r/lib/sub").unwrap();
-    d.fs().write("/p/r/lib/a.js", "1").unwrap();
-    d.fs().write("/p/r/lib/old.js", "1").unwrap();
-    d.fs().write("/p/r/lib/sub/deep.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/r/lib/a.js", "/p/r/lib/sub/missing.js"]), NONE);
-    assert_eq!(d.known(), ["/p/r/lib/a.js"]);
-
-    assert_eq!(d.watch(&["/p/r"]), NONE);
-    assert_eq!(d.known(), ["/p/r/lib/a.js", "/p/r/lib/old.js", "/p/r/lib/sub/deep.js"]);
-
-    d.fs().write("/p/r/lib/b.js", "1").unwrap();
-    d.fs().write("/p/r/lib/old.js", "12").unwrap();
-    d.fs().write("/p/r/lib/sub/c.js", "1").unwrap();
-    d.fs().mkdir("/p/r/lib/sub/new").unwrap();
-    d.fs().write("/p/r/lib/sub/new/d.js", "1").unwrap();
-    assert_eq!(
-      d.settled(),
-      ["C /p/r/lib/b.js", "U /p/r/lib/old.js", "C /p/r/lib/sub/c.js", "C /p/r/lib/sub/new/d.js"]
-    );
-    d.caught_up();
-  });
-}
-
-/// A directory on the way to a watched file lies inside a watched directory and is missing:
-/// when it appears it is a full part of the watched directory, with all of its files.
-#[test]
-fn a_missing_ancestor_inside_a_watched_directory() {
-  on_every_backend(|make| {
-    let mut d = make();
-    d.fs().mkdir_all("/p/r").unwrap();
-    assert_eq!(d.watch(&["/p/r", "/p/r/gen/x.js"]), NONE);
-
-    d.fs().mkdir("/p/r/gen").unwrap();
-    d.fs().write("/p/r/gen/x.js", "1").unwrap();
-    d.fs().write("/p/r/gen/y.js", "1").unwrap();
-    assert_eq!(d.settled(), ["C /p/r/gen/x.js", "C /p/r/gen/y.js"]);
-    d.caught_up();
-  });
-}
-
 // ---- what was due before `watch`, and what was not ----
 //
 // Each of these is a sequence in which a rule of this kind once swallowed an event, or told one
 // too many, in this design or in one of the five that were drawn up next to it.
-
-/// A watched file below a directory that is missing: nobody could look at it, and when `watch`
-/// returned it was known as missing. Then the directory and the file appear, and a path above
-/// them is added before the flush: the `Create` of the file is due. The other file of the new
-/// directory was no business of the watcher until that `watch`: it is the baseline.
-#[test]
-fn a_create_below_a_missing_directory_is_due() {
-  on_every_backend(|make| {
-    for above in ["/p", "/p/gen"] {
-      let mut d = make();
-      d.fs().mkdir("/p").unwrap();
-      assert_eq!(d.watch(&["/p/gen/x.js"]), NONE);
-
-      d.fs().mkdir("/p/gen").unwrap();
-      d.fs().write("/p/gen/x.js", "1").unwrap();
-      d.fs().write("/p/gen/y.js", "1").unwrap();
-      assert_eq!(d.watch(&[above]), ["C /p/gen/x.js"], "{above}");
-      assert_eq!(d.known(), ["/p/gen/x.js", "/p/gen/y.js"], "{above}");
-      // The notifications come after it. One that says "written" costs an update.
-      assert!(d.settled().iter().all(|event| event.starts_with("U /p/gen/")), "{above}");
-      d.caught_up();
-    }
-  });
-}
-
-/// A new directory with a file appears in a watched directory, and it becomes a watched path
-/// before the flush: the watched directory above already had to report the file.
-#[test]
-fn a_new_directory_in_a_watched_directory_becomes_a_watched_path() {
-  on_every_backend(|make| {
-    let mut d = make();
-    d.fs().mkdir_all("/p/src").unwrap();
-    assert_eq!(d.watch(&["/p/src"]), NONE);
-
-    d.fs().mkdir("/p/src/pages").unwrap();
-    d.fs().write("/p/src/pages/x.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/src/pages"]), ["C /p/src/pages/x.js"]);
-    assert!(d.settled().iter().all(|event| event == "U /p/src/pages/x.js"));
-    d.caught_up();
-  });
-}
 
 /// A file moves to another name in a watched directory, and the new name becomes a watched path
 /// while the `Delete` of the old name still waits. The `Create` is not swallowed, and nothing
@@ -250,86 +65,6 @@ fn add_while_a_delete_waits() {
     assert_eq!(d.known(), ["/p/d/b.js"]);
     d.caught_up();
   });
-}
-
-/// A directory and a file in a directory below it, in one batch and in both orders: the
-/// directory in between is a full part of the watched directory.
-#[test]
-fn a_directory_and_a_file_two_levels_below_it_in_one_batch() {
-  on_every_backend(|make| {
-    for paths in [["/p/R", "/p/R/lib/a.js"], ["/p/R/lib/a.js", "/p/R"]] {
-      let mut d = make();
-      d.fs().mkdir_all("/p/R/lib").unwrap();
-      d.fs().write("/p/R/top.js", "1").unwrap();
-      d.fs().write("/p/R/lib/a.js", "1").unwrap();
-      d.fs().write("/p/R/lib/other.js", "1").unwrap();
-      assert_eq!(d.watch(&paths), NONE);
-      assert_eq!(d.known(), ["/p/R/lib/a.js", "/p/R/lib/other.js", "/p/R/top.js"]);
-
-      d.fs().write("/p/R/lib/b.js", "1").unwrap();
-      d.fs().write("/p/R/lib/other.js", "22").unwrap();
-      assert_eq!(d.settled(), ["C /p/R/lib/b.js", "U /p/R/lib/other.js"]);
-      d.caught_up();
-    }
-  });
-}
-
-/// A file sits where a directory on the way to a watched path should be. It is nothing to
-/// report, and the tree has "nothing that counts" there. When that path becomes a watched path
-/// itself, the same file counts: it is the baseline, not a `Create`.
-#[test]
-fn a_file_on_the_way_becomes_a_watched_path() {
-  on_every_backend(|make| {
-    let mut d = make();
-    assert_eq!(d.watch(&["/a/a/b/c"]), NONE);
-    d.fs().write("/a", "1").unwrap();
-    assert_eq!(d.settled(), NONE);
-
-    assert_eq!(d.watch(&["/a"]), NONE);
-    assert_eq!(d.known(), ["/a"]);
-    d.fs().write("/a", "22").unwrap();
-    assert_eq!(d.settled(), ["U /a"]);
-    d.caught_up();
-  });
-}
-
-/// The same when the directory above becomes a watched path: the file that sat on the way to
-/// an older watched path is one of its files now, and part of its baseline.
-#[test]
-fn a_file_on_the_way_inside_a_new_watched_directory() {
-  on_every_backend(|make| {
-    let mut d = make();
-    d.fs().mkdir("/p").unwrap();
-    d.fs().write("/p/b", "a file").unwrap();
-    assert_eq!(d.watch(&["/p/b/c/d"]), NONE);
-    assert_eq!(d.settled(), NONE);
-
-    assert_eq!(d.watch(&["/p"]), NONE);
-    assert_eq!(d.known(), ["/p/b"]);
-    assert_eq!(d.settled(), NONE);
-    d.caught_up();
-  });
-}
-
-/// A directory becomes a watched path while the disk does not answer, so the look has to be
-/// tried again. Before that happens, a file in it becomes a watched path: the directory had to
-/// report it since the first `watch`, and it is reported, with everything else in the directory.
-#[test]
-fn a_look_that_waits_and_a_new_watched_path_below_it() {
-  let mut d = Driver::poll(Options::default());
-  d.fs.mkdir("/b").unwrap();
-  d.fs.write("/b/a", "1").unwrap();
-  d.fs.write("/b/z", "1").unwrap();
-  d.watch(&["/b/c/x"]);
-
-  d.fs.set_offline(Some(io::ErrorKind::TimedOut));
-  d.watch(&["/b"]);
-  assert!(d.known.is_empty());
-  d.fs.set_offline(None);
-  d.watch(&["/b/a"]);
-  assert_eq!(taken(&mut d), ["C /b/a", "C /b/z"]);
-  assert_eq!(settled(&mut d), NONE);
-  caught_up(&mut d);
 }
 
 /// A directory above a watched file is found missing, so it is held. It comes back, and before
@@ -420,7 +155,7 @@ struct Due {
 }
 
 /// Every story is one from above, with its change moved into the call.
-const DUE: [Due; 5] = [
+const DUE: [Due; 7] = [
   Due {
     name: "a new file in an older watched directory",
     before: |fs| fs.mkdir_all("/p/d").unwrap(),
@@ -457,6 +192,33 @@ const DUE: [Due; 5] = [
     },
     due: "C /p/gen/x.js",
     known: &["/p/gen/x.js", "/p/gen/y.js"],
+  },
+  Due {
+    name: "the missing directory above an older watched file becomes a watched path",
+    before: |fs| fs.mkdir("/p").unwrap(),
+    first: "/p/gen/x.js",
+    goes: None,
+    second: "/p/gen",
+    change: |fs| {
+      fs.mkdir("/p/gen").unwrap();
+      fs.write("/p/gen/x.js", "1").unwrap();
+      fs.write("/p/gen/y.js", "1").unwrap();
+    },
+    due: "C /p/gen/x.js",
+    known: &["/p/gen/x.js", "/p/gen/y.js"],
+  },
+  Due {
+    name: "a new directory in an older watched directory becomes a watched path",
+    before: |fs| fs.mkdir_all("/p/src").unwrap(),
+    first: "/p/src",
+    goes: None,
+    second: "/p/src/pages",
+    change: |fs| {
+      fs.mkdir("/p/src/pages").unwrap();
+      fs.write("/p/src/pages/x.js", "1").unwrap();
+    },
+    due: "C /p/src/pages/x.js",
+    known: &["/p/src/pages/x.js"],
   },
   Due {
     name: "a held file comes back",
@@ -564,62 +326,11 @@ fn bad_paths_are_told_once_and_the_rest_is_registered() {
   caught_up(&mut d);
 }
 
-/// One batch checks every directory once and every file once. Before a directory that holds
-/// watched paths is asked from the backend, one of them is looked at for its kind alone: a
-/// directory with a file among its watched paths has to tell more.
-#[test]
-fn a_batch_costs_one_check_for_a_name() {
-  for mode in Mode::ALL {
-    let mut d = Driver::sim(mode, Options::default());
-    let mut paths = Vec::new();
-    for dir in 0..20 {
-      d.fs.mkdir_all(format!("/p/src/d{dir}")).unwrap();
-      for file in 0..10 {
-        let path = format!("/p/src/d{dir}/f{file}.js");
-        d.fs.write(&path, "1").unwrap();
-        paths.push(path);
-      }
-    }
-    d.watch(&paths);
-    let calls = d.fs.calls();
-    // 200 files, 20 directories, `/p/src`, `/p` and `/`. And one look for the kind in each of
-    // the 20 directories that hold watched paths.
-    assert_eq!((calls.lstat, calls.stat, calls.read_dir, calls.hash), (243, 0, 0, 200), "{mode:?}");
-    assert_eq!(d.known.len(), 200);
-
-    // Half of them again, and some new ones in a known directory: only the new names are
-    // checked. Where the backend does not watch `/p/src`, that directory checks `d3` with them.
-    let mut again: Vec<String> = paths.iter().step_by(2).cloned().collect();
-    for file in 0..5 {
-      again.push(format!("/p/src/d3/new{file}.js"));
-    }
-    d.watch(&again);
-    let polled_parent = u64::from(mode != Mode::Inode);
-    let calls = d.fs.calls();
-    assert_eq!((calls.lstat, calls.stat), (248 + polled_parent, 0), "{mode:?}");
-    caught_up(&mut d);
-  }
-}
-
 // ---- cases of the design review ----
 
-/// A bad path is skipped and reported, the rest of the batch is
-/// registered, and the cleaned text is the registered path.
-#[test]
-fn a_bad_path_is_skipped_and_the_rest_is_registered() {
-  let mut d = Driver::sim(Mode::Inode, Options::default());
-  d.fs.mkdir_all("/p/src").unwrap();
-  d.fs.mkdir_all("/p/lib").unwrap();
-  d.watch(&["src/a.js", "/p/src/../lib/a.js", "/", "/p/../..", "/p/src/", "/p//src", "/p/./src"]);
-  assert_eq!(Sim::errors(&d), [ErrorKind::InvalidPath]);
-  d.fs.write("/p/src/a.js", "1").unwrap();
-  d.fs.write("/p/lib/a.js", "1").unwrap();
-  assert_eq!(Sim::settled(&mut d), ["C /p/lib/a.js", "C /p/src/a.js"]);
-  caught_up(&mut d);
-}
-
-/// What a batch costs. One check for a name, one watch for a directory, and
-/// one look for the kind of a watched path in each directory that holds some.
+/// What a batch costs. One check for a name, one watch for a directory, and one look for the
+/// kind of a watched path in each directory that holds some. A name that is watched already
+/// costs nothing.
 #[test]
 fn the_cost_of_a_batch() {
   for mode in Mode::ALL {
@@ -636,7 +347,8 @@ fn the_cost_of_a_batch() {
     d.watch(&paths);
     let calls = d.fs.calls();
     // 300 files and 33 directories: 30, `/p/src`, `/p` and `/`. And 30 looks for the kind.
-    assert_eq!((calls.lstat, calls.stat, calls.read_dir), (363, 0, 0), "{mode:?}");
+    // Every file is young, and read once for its hash.
+    assert_eq!((calls.lstat, calls.stat, calls.read_dir, calls.hash), (363, 0, 0, 300), "{mode:?}");
     // One watch call for a directory: 30, `/p/src`, `/p` and `/`.
     assert_eq!(calls.watch, 33, "{mode:?}");
     assert_eq!(d.known.len(), 300, "{mode:?}");
@@ -644,25 +356,19 @@ fn the_cost_of_a_batch() {
     // The same batch again costs nothing at all.
     d.watch(&paths);
     assert_eq!(d.fs.calls(), calls, "{mode:?}");
+
+    // Half of them again, and five new names in a known directory: only the new names are
+    // looked at. Where the backend does not watch `/p/src`, that directory checks `d3` with them.
+    let mut again: Vec<String> = paths.iter().step_by(2).cloned().collect();
+    for file in 0..5 {
+      again.push(format!("/p/src/d3/new{file}.js"));
+    }
+    d.watch(&again);
+    let polled_parent = u64::from(mode != Mode::Inode);
+    let calls = d.fs.calls();
+    assert_eq!((calls.lstat, calls.stat), (368 + polled_parent, 0), "{mode:?}");
     caught_up(&mut d);
   }
-}
-
-/// What exists when `watch` returns is the baseline, also when the
-/// caller read an older state. Only a change after `watch` is reported.
-#[test]
-fn a_change_before_add_is_the_baseline() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir("/src").unwrap();
-    d.fs().write("/src/a.js", "1").unwrap();
-    // The caller read "1"; the user saves before the path is watched.
-    d.fs().write("/src/a.js", "22").unwrap();
-    assert_eq!(d.watch(&["/src/a.js"]), NONE, "{on}");
-    assert_eq!(d.settled(), NONE, "{on}");
-    d.fs().write("/src/a.js", "333").unwrap();
-    assert_eq!(d.settled(), ["U /src/a.js"], "{on}");
-    d.caught_up();
-  });
 }
 
 /// The baseline of `watch` is only what no older watched path had to report.
@@ -696,43 +402,24 @@ fn the_baseline_keeps_what_was_due() {
     d.fs().write("/s/R/a.js", "1").unwrap();
     assert_eq!(d.watch(&["/s/R"]), ["C /s/R/a.js"], "{on}");
     assert_eq!(d.known(), ["/p/d/f.js", "/q/R/a.js", "/s/R/a.js", "/s/R/old.js"], "{on}");
-    d.caught_up();
-  });
-}
+    assert!(d.settled().iter().all(|event| event == "U /s/R/a.js"), "{on}");
 
-/// A watch that is only live after `commit`. The baseline holds over all rounds of the
-/// `watch`, and what is scanned after the commit is not reported.
-#[test]
-fn the_baseline_holds_over_the_rounds() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/content/deep/deeper").unwrap();
-    d.fs().mkdir_all("/q/other").unwrap();
-    d.fs().write("/p/content/a", "1").unwrap();
-    d.fs().write("/p/content/deep/deeper/b", "1").unwrap();
-    d.fs().write("/q/other/c", "1").unwrap();
-    assert_eq!(d.watch(&["/p/content", "/q/other/c", "/q/missing/chain/x"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/content/a", "/p/content/deep/deeper/b", "/q/other/c"], "{on}");
-    assert_eq!(d.settled(), NONE, "{on}");
-    d.fs().write("/p/content/deep/deeper/b", "22").unwrap();
-    d.fs().write("/q/other/c", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/content/deep/deeper/b", "U /q/other/c"], "{on}");
-    d.caught_up();
-  });
-}
+    // Case 4: as case 1, and the hint for the new file is a mark in the engine already.
+    d.fs().mkdir_all("/t/src").unwrap();
+    assert_eq!(d.watch(&["/t/src"]), NONE, "{on}");
+    d.fs().write("/t/src/x.js", "1").unwrap();
+    assert!(d.something_is_due(), "{on}");
+    assert_eq!(d.watch(&["/t/src/x.js", "/t/src/missing.js"]), ["C /t/src/x.js"], "{on}");
+    assert!(d.settled().iter().all(|event| event == "U /t/src/x.js"), "{on}");
 
-/// A hint and an `watch` for the same name in the same window. The `Create` that the
-/// watched directory owes is not swallowed by the baseline of the new watched path.
-#[test]
-fn a_hint_and_an_add_for_one_name() {
-  on_modes(&Mode::ALL, &Options::default(), |d, on| {
-    d.fs().mkdir_all("/p/src").unwrap();
-    assert_eq!(d.watch(&["/p/src"]), NONE, "{on}");
-    d.fs().write("/p/src/x.js", "1").unwrap();
-    // The hint waits as a mark when the `watch` comes.
-    let mut events = d.watch(&["/p/src/x.js", "/p/src/missing.js"]);
-    events.append(&mut d.settled());
-    assert_eq!(events.first().map(String::as_str), Some("C /p/src/x.js"), "{on}");
-    assert!(events[1..].iter().all(|event| event == "U /p/src/x.js"), "{on}: {events:?}");
+    // Case 5: an update that was due in a watched directory, and the file and the directory
+    // are watched again before the flush.
+    d.fs().mkdir_all("/u/src").unwrap();
+    d.fs().write("/u/src/a.vue", "1").unwrap();
+    assert_eq!(d.watch(&["/u/src"]), NONE, "{on}");
+    d.fs().write("/u/src/a.vue", "12").unwrap();
+    assert_eq!(d.watch(&["/u/src/a.vue", "/u/src"]), ["U /u/src/a.vue"], "{on}");
+    assert!(d.settled().iter().all(|event| event == "U /u/src/a.vue"), "{on}");
     d.caught_up();
   });
 }
@@ -848,7 +535,9 @@ fn a_scan_that_waited_runs_inside_a_later_add() {
 
 /// The same, and the later `watch` names a file below the directory that waits. The check of
 /// that file comes before the scan from above: its directory is still partial in the tree. But
-/// the older watched path covered the file, so it is no baseline of the later `watch`.
+/// the older watched path covered the file, so it is no baseline of the later `watch`. The same
+/// when the file is in the directory that waits itself: it is reported, with everything else in
+/// the directory.
 #[test]
 fn a_scan_that_waited_runs_inside_a_watch_of_a_file_below() {
   on_all(&Options::default(), |d, on| {
@@ -861,6 +550,17 @@ fn a_scan_that_waited_runs_inside_a_watch_of_a_file_below() {
     assert_eq!(d.watch(&["/b"]), NONE, "{on}");
     d.fs().set_offline(None);
     assert_eq!(d.watch(&["/b/c/a"]), ["C /b/c/a"], "{on}");
+    assert_eq!(d.settled(), NONE, "{on}");
+
+    d.fs().mkdir("/e").unwrap();
+    d.fs().write("/e/a", "1").unwrap();
+    d.fs().write("/e/z", "1").unwrap();
+    assert_eq!(d.watch(&["/e/c/x"]), NONE, "{on}");
+
+    d.fs().set_offline(Some(io::ErrorKind::TimedOut));
+    assert_eq!(d.watch(&["/e"]), NONE, "{on}");
+    d.fs().set_offline(None);
+    assert_eq!(d.watch(&["/e/a"]), ["C /e/a", "C /e/z"], "{on}");
     assert_eq!(d.settled(), NONE, "{on}");
     d.caught_up();
   });
