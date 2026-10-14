@@ -32,25 +32,19 @@ const NONE: u32 = u32::MAX;
 /// waits on it, or a `Delete` is still to be told; [`Tree::prune`] frees it otherwise.
 #[derive(Debug)]
 pub struct Node {
-  /// What the last look found at the path. While the node is held: the look before that.
   pub kind: Kind,
 
-  /// The second half of its key: the next node in the same slot gets another one.
   generation: u32,
-  /// `NONE` only for the root.
-  parent: u32,
-  /// The children are a list: the first one here, and each child knows its two neighbours.
-  first_child: u32,
-  next: u32,
-  prev: u32,
-  /// How many of its children are watched paths or lead to one.
-  registered_children: u32,
-  /// Where its name is in the names buffer. For a top directory the name is its whole path (`/`,
-  /// `C:\`).
+
   name_at: u32,
   name_len: u16,
 
-  /// The flags of `flags.rs`: held, told, changed, baseline, the mark, and more.
+  parent: u32,
+  next: u32,
+  prev: u32,
+  first_child: u32,
+  registered_children: u32,
+
   flags: Flags,
 }
 
@@ -63,13 +57,13 @@ impl Node {
     Self {
       kind: Kind::Missing,
       generation,
-      parent,
-      first_child: NONE,
-      next: NONE,
-      prev: NONE,
-      registered_children: 0,
       name_at,
       name_len,
+      parent,
+      next: NONE,
+      prev: NONE,
+      first_child: NONE,
+      registered_children: 0,
       flags: Flags::empty(),
     }
   }
