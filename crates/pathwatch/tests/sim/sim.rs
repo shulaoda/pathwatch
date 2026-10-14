@@ -1,22 +1,20 @@
 //! The fixtures themselves: what the simulated disk and backend do that the other tests rely on,
 //! and that the checks of the driver fail when they have to.
 
-#![cfg(unix)]
-
 use std::{
   io,
   path::{Path, PathBuf},
   time::{Duration, SystemTime},
 };
 
+use crate::fixtures::{
+  Driver, Mode, NONE, SimBackend, SimFs, asked, at, caught_up, not_caught_up, on_modes, os_watches,
+  settled, show,
+};
 use pathwatch::{
   backend::{Backend, Coverage, DirKey, Hint, Want},
   engine::Options,
   fs::{Fs, Meta},
-};
-use pathwatch_sim::{
-  Driver, Mode, NONE, SimBackend, SimFs, asked, at, caught_up, not_caught_up, on_modes, os_watches,
-  settled, show,
 };
 
 fn lstat(fs: &SimFs, path: &str) -> Meta {
@@ -290,7 +288,7 @@ fn a_stream_that_one_key_leaves_and_another_joins_in_one_commit() {
 
 /// A watched file is written, and the notification is dropped without a word. The engine
 /// cannot know, so what it stored is not what the disk has: the settle says so.
-fn a_write_that_nobody_reports() -> Driver<pathwatch_sim::SimBackend> {
+fn a_write_that_nobody_reports() -> Driver<crate::fixtures::SimBackend> {
   let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir("/p").unwrap();
   d.fs.write("/p/a.js", "1").unwrap();

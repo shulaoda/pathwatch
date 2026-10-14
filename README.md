@@ -340,7 +340,10 @@ crates/
       tree/  fs/  path.rs
     tests/
       stories/               the promises above: each story on the real disk, and on the
-                             simulated disk of `pathwatch_sim` where its words allow
+                             simulated disk of `sim/` where its words allow
+      sim/                   the engine on a disk in memory (Unix hosts): what the real disk
+                             cannot play on demand, with a fuzzer and a cost program; the
+                             disk and the backends are in `fixtures/`
       watcher.rs             the thread
       tree.rs                the tree of the engine, alone
       ahead.rs               the engine with polling: a file with a time ahead of the clock
@@ -348,9 +351,6 @@ crates/
       inotify.rs  fsevents.rs  windows.rs     each backend alone, on its OS
       windows_parts.rs       the parts of the Windows backend that call no Windows (on Windows only)
     examples/                watch.rs, dev_server.rs
-  pathwatch_sim/             fixtures for tests, not published
-    src/                     a disk and backends in memory
-    tests/                   the engine tests on them, with a fuzzer and a cost program
 docs/
   design.md                  how it works
 bench/                       the comparison with other watchers: a workspace of its own,
@@ -369,7 +369,7 @@ cargo test --workspace
 
 This runs, on the machine it is called on:
 
-- the engine on a simulated disk, with a fuzzer (`crates/pathwatch_sim/tests`, on Unix hosts),
+- the engine on a simulated disk, with a fuzzer (`crates/pathwatch/tests/sim`, on Unix hosts),
 - the backend of this OS against the real watch API (`crates/pathwatch/tests/inotify.rs`,
   `fsevents.rs` or `windows.rs`),
 - the watcher thread (`tests/watcher.rs`),
@@ -379,7 +379,7 @@ This runs, on the machine it is called on:
   the backend is compiled there only,
 - the stories (`tests/stories`): each once with the backend of this OS and once with polling
   on the real disk, and a story that needs no more than files, directories, links and renames
-  also on each simulated backend of `pathwatch_sim` (the note above the promises says which
+  also on each simulated backend of `tests/sim` (the note above the promises says which
   of them run where).
 
 | Platform | How |
@@ -389,26 +389,26 @@ This runs, on the machine it is called on:
 | Windows | `cargo test --workspace` on a Windows machine. Done on Windows 11 with NTFS. From another OS only a type check is possible: `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` |
 | Android, WASI, FreeBSD, musl, 32-bit Linux | Only a lint of the crate and its tests, as on CI: `cargo clippy -p pathwatch --all-targets --target aarch64-linux-android`, and the same with `wasm32-wasip1-threads`, `x86_64-unknown-freebsd`, `x86_64-unknown-linux-musl` or `i686-unknown-linux-gnu`. The engine with the poll backend was run once under wasmtime on a preopened directory (a probe, not a test). |
 
-The fuzzer (`crates/pathwatch_sim/tests/fuzz.rs`):
+The fuzzer (`crates/pathwatch/tests/sim/fuzz.rs`):
 
 ```sh
 # The quick run: 250 seeds for each backend. It is a part of `cargo test --workspace`.
-cargo test -p pathwatch_sim --test fuzz
+cargo test -p pathwatch --test sim fuzz::
 
 # The long run, with a range of seeds of your choice. CI runs it on the seeds of the day.
 PATHWATCH_FUZZ_FIRST=100000 PATHWATCH_FUZZ_SEEDS=20000 \
-  cargo test --release -p pathwatch_sim --test fuzz big -- --ignored
+  cargo test --release -p pathwatch --test sim fuzz::big -- --ignored
 
 # One seed again, on every backend, with the short story of each failure. A failure of the
 # `long` run needs `PATHWATCH_FUZZ_STEPS=5000` too.
-PATHWATCH_FUZZ_SEED=1234 cargo test -p pathwatch_sim --test fuzz replay -- --ignored --nocapture
+PATHWATCH_FUZZ_SEED=1234 cargo test -p pathwatch --test sim fuzz::replay -- --ignored --nocapture
 ```
 
 More:
 
 ```sh
 # What the engine costs for big cases. Run it before and after a change and compare.
-cargo test --release -p pathwatch_sim --test cost -- --ignored --nocapture
+cargo test --release -p pathwatch --test sim cost:: -- --ignored --nocapture
 
 # Also prints how long `watch` takes for 20,000 watched files.
 cargo test -p pathwatch --test disk -- --nocapture

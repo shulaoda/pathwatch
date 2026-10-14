@@ -3,13 +3,11 @@
 //! A story makes the disk, calls `watch`, changes the disk and compares the events that come
 //! out (`C`, `U`, `D` and the path).
 
-#![cfg(unix)]
-
-use pathwatch::engine::Options;
-use pathwatch_sim::{
+use crate::fixtures::{
   Driver, Mode, NONE, SimBackend, caught_up, flush, ignore_node_modules, on_all, settled, sorted,
   taken,
 };
+use pathwatch::engine::Options;
 
 fn driver(mode: Mode) -> Driver<SimBackend> {
   Driver::sim(mode, Options::default())

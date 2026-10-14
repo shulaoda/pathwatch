@@ -16,7 +16,7 @@ use pathwatch::{
   fs::{FileType, Fs, Meta},
 };
 
-use crate::SimFs;
+use super::SimFs;
 
 /// Compares each stored fingerprint (`Engine::fingerprints`) with a fresh look at the disk.
 /// The error names the first file whose fingerprint is not the one on disk. A file that was

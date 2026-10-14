@@ -10,7 +10,7 @@ repository = "https://github.com/shulaoda/pathwatch"
 keywords = ["watch", "watcher", "filesystem", "events"]
 categories = ["filesystem"]
 # What a published package holds, next to this file and the README. The tests stay in the
-# repository: half of them need `pathwatch_sim`, which is not published.
+# repository.
 include = ["src/**/*.rs", "examples/**/*.rs", "LICENSE"]
 
 [lints]
@@ -28,5 +28,4 @@ libc = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
 
 [dev-dependencies]
-pathwatch_sim = { path = "../pathwatch_sim" }
 tempfile = { workspace = true }

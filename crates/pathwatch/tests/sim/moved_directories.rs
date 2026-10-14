@@ -2,15 +2,13 @@
 //! A story makes the disk, calls `watch`, changes the disk and compares the events that come
 //! out (`C`, `U`, `D` and the path). `on_all` tells one story on every backend.
 
-#![cfg(unix)]
-
 use std::{path::Path, time::Duration};
 
-use pathwatch::{ErrorKind, engine::Options};
-use pathwatch_sim::{
+use crate::fixtures::{
   Driver, Mode, NONE, RECURSIVE, SimBackend, caught_up, flush, ignore_node_modules, known,
   on_a_small_stack, on_all, on_modes, settled, sorted, taken, window, window_then_settled,
 };
+use pathwatch::{ErrorKind, engine::Options};
 
 fn driver(mode: Mode) -> Driver<SimBackend> {
   Driver::sim(mode, Options::default())

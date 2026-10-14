@@ -3,8 +3,6 @@
 //! replayed and cut down. It plays the handler by rules that are written down here a second
 //! time, not by the engine's. `README.md` has the commands for the big runs and for one seed.
 
-#![cfg(unix)]
-
 use std::{
   collections::{BTreeMap, BTreeSet},
   fmt::Write as _,
@@ -18,15 +16,15 @@ use std::{
   time::{Duration, Instant},
 };
 
+use crate::fixtures::{
+  Deliver, Mode, SimBackend, SimFs, can_be_watched, check_fingerprints, followed,
+};
 use pathwatch::{
   EntryKind, Event, EventKind,
   backend::Signal,
   engine::{Engine, Ignored, Options, Output},
   fs::{FileType, Fs},
   poll::PollBackend,
-};
-use pathwatch_sim::{
-  Deliver, Mode, SimBackend, SimFs, can_be_watched, check_fingerprints, followed,
 };
 
 // ---- random numbers ----
@@ -577,13 +575,13 @@ fn random_ops(seed: u64, config: &Config) -> Vec<Op> {
 
 // ---- the rules of the design, written down a second time ----
 //
-// The walk of the disk and the look at one file are in `pathwatch_sim` (`caught_up.rs`), where
+// The walk of the disk and the look at one file are in the fixtures (`caught_up.rs`), where
 // the driver of the other tests uses them too.
 
 /// The files a handler must know when nothing is in flight, read from the disk and the watched
 /// paths alone.
 fn reportable(fs: &SimFs, filter: u8, watched: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
-  pathwatch_sim::reportable(fs, &|path, kind| ignored(filter, path, kind), watched)
+  crate::fixtures::reportable(fs, &|path, kind| ignored(filter, path, kind), watched)
 }
 
 /// Whether the handler keeps a file at `path` that it knows when the watched paths are

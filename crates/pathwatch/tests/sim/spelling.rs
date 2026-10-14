@@ -4,15 +4,13 @@
 //! not have makes the directory check the names that can be it. The events (`C`, `U`, `D` and
 //! the path) carry the registered spelling.
 
-#![cfg(unix)]
-
 use std::{sync::Arc, time::Duration};
 
-use pathwatch::engine::{Ignored, Options};
-use pathwatch_sim::{
+use crate::fixtures::{
   Driver, Mode, NONE, RECURSIVE, caught_up, on_a_small_stack, on_all, on_modes, settled, taken,
   window,
 };
+use pathwatch::engine::{Ignored, Options};
 
 /// The engine is told that the disk takes two spellings of a name for one.
 fn loose() -> Options {
@@ -194,7 +192,7 @@ fn the_other_spelling_of_a_directory_next_to_unrelated_names() {
     // `main.js` makes `/p/src` tell its contents: where a watch covers a tree, it is this one.
     d.watch(&["/p/src/main.js", "/p/src/Components/App.js"]);
     assert_eq!(
-      pathwatch_sim::known(&d),
+      crate::fixtures::known(&d),
       ["/p/src/Components/App.js", "/p/src/main.js"],
       "{mode:?}"
     );
@@ -231,7 +229,7 @@ fn a_strict_disk_costs_one_look() {
   d.fs.mkdir_all("/p/src").unwrap();
   d.fs.write("/p/src/app.js", "1").unwrap();
   d.watch(&["/p/src/App.js"]);
-  assert_eq!(pathwatch_sim::known(&d), NONE);
+  assert_eq!(crate::fixtures::known(&d), NONE);
 
   let before = d.fs.calls();
   d.fs.write("/p/src/other.js", "1").unwrap();
@@ -469,7 +467,7 @@ fn the_hint_for_the_old_spelling_comes_late() {
       events.append(&mut taken(&mut d));
     }
     assert_eq!(events, ["C /p/R/App.js", "D /p/R/app.js"], "{mode:?}");
-    assert_eq!(pathwatch_sim::known(&d), ["/p/R/App.js"], "{mode:?}");
+    assert_eq!(crate::fixtures::known(&d), ["/p/R/App.js"], "{mode:?}");
     caught_up(&mut d);
   }
 }

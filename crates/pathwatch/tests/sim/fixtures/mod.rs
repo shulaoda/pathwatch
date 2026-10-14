@@ -61,20 +61,18 @@
 //! Paths are Unix paths (`/a/b`), so this crate and its tests are empty on a host that is not
 //! Unix.
 
-#![cfg(unix)]
-
 mod backend;
 mod caught_up;
 mod driver;
 mod fs;
 
-pub use crate::{
+pub use self::{
   backend::{Mode, RECURSIVE, SimBackend, SimRaw, WatchCall},
   caught_up::{can_be_watched, check_fingerprints, followed, reportable},
   driver::{
     Deliver, Driver, NONE, Sim, asked, at, caught_up, flush, ignore_node_modules, known,
     not_caught_up, on_a_small_stack, on_all, on_modes, os_watches, settled, show, sorted, taken,
-    until_delete_pending, window, window_then_settled,
+    window, window_then_settled,
   },
   fs::SimFs,
 };

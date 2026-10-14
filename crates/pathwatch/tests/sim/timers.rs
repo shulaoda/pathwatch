@@ -2,15 +2,13 @@
 //! A story moves the clock by hand (`advance`, `step`) and compares `Engine::deadline` and the
 //! events of each batch (`C`, `U`, `D` and the path).
 
-#![cfg(unix)]
-
 use std::time::Duration;
 
-use pathwatch::{ErrorKind, engine::Options, poll::PollBackend};
-use pathwatch_sim::{
+use crate::fixtures::{
   Deliver, Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, caught_up, ignore_node_modules, settled,
   show, taken, window,
 };
+use pathwatch::{ErrorKind, engine::Options, poll::PollBackend};
 
 fn driver(mode: Mode) -> Driver<SimBackend> {
   Driver::sim(mode, Options::default())

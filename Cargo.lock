@@ -72,18 +72,9 @@ dependencies = [
  "bitflags",
  "hashbrown",
  "libc",
- "pathwatch_sim",
  "rustc-hash",
  "tempfile",
  "windows-sys",
-]
-
-[[package]]
-name = "pathwatch_sim"
-version = "0.0.0"
-dependencies = [
- "pathwatch",
- "rustc-hash",
 ]
 
 [[package]]

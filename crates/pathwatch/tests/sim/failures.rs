@@ -2,8 +2,6 @@
 //! directory cannot be read, the disk does not answer. A story makes the disk, calls `watch`,
 //! changes the disk and compares the events that come out (`C`, `U`, `D` and the path).
 
-#![cfg(unix)]
-
 use std::{
   io,
   sync::{
@@ -12,14 +10,14 @@ use std::{
   },
 };
 
+use crate::fixtures::{
+  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, caught_up, flush, not_caught_up, on_all,
+  on_modes, settled, sorted, taken, window, window_then_settled,
+};
 use pathwatch::{
   ErrorKind,
   backend::Signal,
   engine::{Options, Output},
-};
-use pathwatch_sim::{
-  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, caught_up, flush, not_caught_up, on_all,
-  on_modes, settled, sorted, taken, window, window_then_settled,
 };
 
 fn driver(mode: Mode) -> Driver<SimBackend> {

@@ -65,7 +65,7 @@ jobs:
       # The big fuzz runs on seeds of the day, as a release build: new seeds every day, and the
       # engine once without the debug checks. A failure names its seed.
       - if: runner.os == 'Linux'
-        run: PATHWATCH_FUZZ_FIRST=$(( $(date +%s) / 86400 * 100000 )) cargo test --release -p pathwatch_sim --test fuzz big -- --ignored
+        run: PATHWATCH_FUZZ_FIRST=$(( $(date +%s) / 86400 * 100000 )) cargo test --release -p pathwatch --test sim fuzz::big -- --ignored
 
   # The targets that no runner has: the crate and its tests are linted for each of them.
   targets:

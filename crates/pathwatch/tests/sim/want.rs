@@ -3,18 +3,16 @@
 //! A story compares the calls to the backend (`asked`), where an OS watch is (`os_watches`),
 //! and the events (`C`, `U`, `D` and the path).
 
-#![cfg(unix)]
-
 use std::time::Duration;
 
+use crate::fixtures::{
+  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, SimFs, asked, at, caught_up, known, on_all,
+  os_watches, settled, sorted, window, window_then_settled,
+};
 use pathwatch::{
   backend::Want::{Contents, Names},
   engine::Options,
   poll::PollBackend,
-};
-use pathwatch_sim::{
-  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, SimFs, asked, at, caught_up, known, on_all,
-  os_watches, settled, sorted, window, window_then_settled,
 };
 
 /// How long the clock may move in a story where no poll runs: less than the poll interval.
@@ -256,7 +254,7 @@ fn a_directory_comes_at_a_watched_path() {
 /// the directory above tells its contents, as for every watched path with nothing at it.
 #[test]
 fn a_watched_directory_that_the_filter_ignores() {
-  let mut d = Driver::sim(Mode::Inode, pathwatch_sim::ignore_node_modules());
+  let mut d = Driver::sim(Mode::Inode, crate::fixtures::ignore_node_modules());
   d.fs.mkdir_all("/p/node_modules").unwrap();
   d.watch(&["/p/node_modules"]);
   // The look for the kind asks the filter too: `/p` is asked once, for its contents.

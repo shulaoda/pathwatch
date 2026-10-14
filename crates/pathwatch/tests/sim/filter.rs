@@ -3,8 +3,6 @@
 //! `D` and the path). The stories with `node_modules` use a filter that looks at the last name
 //! only, which the contract of the filter does not allow: they pin what happens then.
 
-#![cfg(unix)]
-
 use std::{
   cell::RefCell,
   path::{Path, PathBuf},
@@ -14,11 +12,11 @@ use std::{
   },
 };
 
-use pathwatch::{EntryKind, engine::Options};
-use pathwatch_sim::{
+use crate::fixtures::{
   Driver, Mode, NONE, RECURSIVE, Sim, asked, caught_up, flush, ignore_node_modules, on_all,
   on_modes, sorted, taken,
 };
+use pathwatch::{EntryKind, engine::Options};
 
 /// What a filter was asked, in the order of the calls.
 type Asked = Arc<Mutex<Vec<(PathBuf, EntryKind)>>>;

@@ -4,11 +4,7 @@
 //! The disk and the backend of these stories ask for no memory themselves, so every request
 //! that is counted is one of the engine. Each test counts on its own thread.
 
-#![cfg(unix)]
-
 use std::{
-  alloc::{GlobalAlloc, Layout, System},
-  cell::Cell,
   ffi::{OsStr, OsString},
   io,
   path::{Path, PathBuf},
@@ -26,43 +22,11 @@ use pathwatch::{
   fs::{DirId, Entry, FileType, Fs, Meta},
 };
 
-/// The system allocator, with a counter for each thread.
-struct Counting;
-
-thread_local! {
-  /// How often this thread asked for memory.
-  static REQUESTS: Cell<u64> = const { Cell::new(0) };
-}
-
-// SAFETY: every call goes to the system allocator with the arguments it came with. The counter
-// does not touch the memory.
-unsafe impl GlobalAlloc for Counting {
-  unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-    REQUESTS.set(REQUESTS.get() + 1);
-    // SAFETY: the caller keeps the rules of `GlobalAlloc::alloc`.
-    unsafe { System.alloc(layout) }
-  }
-
-  unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
-    // SAFETY: the caller keeps the rules of `GlobalAlloc::dealloc`.
-    unsafe { System.dealloc(block, layout) }
-  }
-
-  unsafe fn realloc(&self, block: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    REQUESTS.set(REQUESTS.get() + 1);
-    // SAFETY: the caller keeps the rules of `GlobalAlloc::realloc`.
-    unsafe { System.realloc(block, layout, new_size) }
-  }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
-
 /// How often `work` asks for memory.
 fn requests(work: impl FnOnce()) -> u64 {
-  let before = REQUESTS.get();
+  let before = crate::counting::requests();
   work();
-  REQUESTS.get() - before
+  crate::counting::requests() - before
 }
 
 /// A disk that asks for no memory: a name with a dot is a file, and every other name is a

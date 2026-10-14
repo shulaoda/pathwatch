@@ -17,7 +17,7 @@ use pathwatch::{
 };
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
-use crate::backend::{Act, Kernel, Mode, SimRaw, WatchCall, lost_notices};
+use super::backend::{Act, Kernel, Mode, SimRaw, WatchCall, lost_notices};
 
 /// The id of the inode of `/`.
 const ROOT: u64 = 0;
@@ -40,7 +40,6 @@ impl SimFs {
       changed: 0,
       born: 0,
       denied: false,
-      unlistable: false,
     };
     let state = State {
       inodes: FxHashMap::from_iter([(ROOT, root)]),
@@ -319,17 +318,6 @@ impl SimFs {
     self.lock().ignore_case = ignore_case;
   }
 
-  /// Takes away or gives back the permission to list a directory, while it can still be
-  /// entered (`x` without `r`).
-  pub fn set_unlistable(&self, path: impl AsRef<Path>, unlistable: bool) -> io::Result<()> {
-    let mut state = self.lock();
-    let id = state.resolve(path.as_ref(), true)?;
-    if let Some(inode) = state.inodes.get_mut(&id) {
-      inode.unlistable = unlistable;
-    }
-    Ok(())
-  }
-
   /// Another disk is mounted at `/name`: a directory that is made there takes names the other
   /// way than `set_ignore_case` says, and so does every directory that is made in it. Set it
   /// before the directory is made.
@@ -479,7 +467,7 @@ impl Fs for SimFs {
     let state = self.lock();
     let id = state.look_up(dir, true)?;
     let entries = state.entries(id)?;
-    if state.inodes[&id].denied || state.inodes[&id].unlistable {
+    if state.inodes[&id].denied {
       return Err(error(io::ErrorKind::PermissionDenied));
     }
     for (name, child) in entries {
@@ -782,7 +770,6 @@ impl State {
         changed: now,
         born: now,
         denied: false,
-        unlistable: false,
       },
     );
     self.entries_mut(dir).insert(name.to_owned(), id);
@@ -896,8 +883,6 @@ struct Inode {
   changed: u64,
   born: u64,
   denied: bool,
-  /// The directory can be entered but not listed.
-  unlistable: bool,
 }
 
 enum Content {

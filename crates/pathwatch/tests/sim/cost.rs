@@ -1,23 +1,21 @@
 //! What the engine costs, as numbers. No test here fails on a number: each one prints the time
 //! of the engine, the time inside the simulation and the allocations, and a person compares two
 //! runs on the same machine. A small engine time can be off by a fifth (see `stopwatch`).
-//! Run it with `cargo test --release -p pathwatch_sim --test cost -- --ignored --nocapture`.
-
-#![cfg(unix)]
+//! Run it with `cargo test --release -p pathwatch --test sim cost:: -- --ignored --nocapture`.
 
 use std::{
-  alloc::{GlobalAlloc, Layout, System},
   collections::HashMap,
   ffi::{OsStr, OsString},
   io,
   path::{Path, PathBuf},
   sync::{
     Arc, Mutex, MutexGuard, OnceLock, PoisonError,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU64, Ordering},
   },
   time::{Duration, Instant, SystemTime},
 };
 
+use crate::fixtures::{Mode, SimBackend, SimFs};
 use pathwatch::{
   EventKind,
   backend::{Backend, Committed, Coverage, DirKey, Hint, Signal, Want},
@@ -25,53 +23,10 @@ use pathwatch::{
   fs::{Entry, Fs, Meta},
   poll::PollBackend,
 };
-use pathwatch_sim::{Mode, SimBackend, SimFs};
 
 // ---- counting memory ----
 
-/// The system allocator, with two counters.
-struct Counting;
-
-/// How often memory was asked for.
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-/// The bytes that are allocated now.
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-
-// SAFETY: every call goes to the system allocator with the arguments it came with. The counters
-// do not touch the memory.
-unsafe impl GlobalAlloc for Counting {
-  unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-    ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-    LIVE.fetch_add(layout.size(), Ordering::Relaxed);
-    // SAFETY: the caller keeps the rules of `GlobalAlloc::alloc`.
-    unsafe { System.alloc(layout) }
-  }
-
-  unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
-    LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-    // SAFETY: the caller keeps the rules of `GlobalAlloc::dealloc`.
-    unsafe { System.dealloc(block, layout) }
-  }
-
-  unsafe fn realloc(&self, block: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-    LIVE.fetch_add(new_size, Ordering::Relaxed);
-    LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-    // SAFETY: the caller keeps the rules of `GlobalAlloc::realloc`.
-    unsafe { System.realloc(block, layout, new_size) }
-  }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
-
-fn allocations() -> u64 {
-  ALLOCATIONS.load(Ordering::Relaxed)
-}
-
-fn live() -> usize {
-  LIVE.load(Ordering::Relaxed)
-}
+use crate::counting::{allocations, live};
 
 // ---- telling the engine from the simulation ----
 

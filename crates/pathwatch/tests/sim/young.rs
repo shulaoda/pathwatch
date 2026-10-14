@@ -3,15 +3,13 @@
 //! A story makes the disk, calls `watch`, changes the disk and compares the events that come
 //! out (`C`, `U`, `D` and the path).
 
-#![cfg(unix)]
-
 use std::{path::Path, time::Duration};
 
-use pathwatch::{engine::Options, poll::PollBackend};
-use pathwatch_sim::{
+use crate::fixtures::{
   Deliver, Driver, Mode, NONE, Sim, SimBackend, caught_up, known, on_all, settled, show, taken,
   window,
 };
+use pathwatch::{engine::Options, poll::PollBackend};
 
 fn poll_with_coarse_time(step: Duration, options: Options) -> Driver<PollBackend> {
   let d = Driver::poll(options);

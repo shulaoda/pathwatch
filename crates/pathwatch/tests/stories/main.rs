@@ -16,6 +16,11 @@
 
 mod contract;
 mod disk;
+/// The fixtures of `tests/sim`: the simulated disk and its backends. The stories use a part.
+#[cfg(unix)]
+#[path = "../sim/fixtures/mod.rs"]
+#[expect(dead_code, unused_imports, reason = "the stories use a part of the fixtures")]
+mod fixtures;
 mod projects;
 mod promises;
 #[cfg(unix)]

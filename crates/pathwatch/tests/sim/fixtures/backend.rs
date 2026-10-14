@@ -10,7 +10,7 @@ use std::{
 use pathwatch::backend::{Backend, Committed, Coverage, DirKey, Hint, Want, watch_limit};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::fs::SimFs;
+use super::fs::SimFs;
 
 /// Which OS watch API the backend plays.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

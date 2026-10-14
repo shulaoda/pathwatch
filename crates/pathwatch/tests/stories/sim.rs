@@ -1,11 +1,11 @@
-//! The simulated disk of `pathwatch_sim`: an engine on a disk in memory, with each simulated OS
+//! The simulated disk of `tests/sim/fixtures`: an engine on a disk in memory, with each simulated OS
 //! watch API and with polling. Time passes only when the world lets everything settle, so a
 //! story takes no time here, and its end is checked against the disk (`caught_up`).
 
 use std::path::{Path, PathBuf};
 
+use crate::fixtures::{Deliver, Driver, Mode, caught_up};
 use pathwatch::{EventKind, engine::Options, poll::PollBackend};
-use pathwatch_sim::{Deliver, Driver, Mode, caught_up};
 
 use crate::{Settings, World, differences, expected_history, history_of};
 

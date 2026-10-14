@@ -2,12 +2,10 @@
 //! finds there. A test is named for its row. `flush` runs one look, and `pending` lists the
 //! deletes that are held after it.
 
-#![cfg(unix)]
-
 use std::{path::Path, time::Duration};
 
+use crate::fixtures::{Driver, Mode, NONE, SimBackend, caught_up, settled, taken};
 use pathwatch::engine::Options;
-use pathwatch_sim::{Driver, Mode, NONE, SimBackend, caught_up, settled, taken};
 
 /// A driver whose disk has the directory `/p/r`.
 fn driver(mode: Mode) -> Driver<SimBackend> {

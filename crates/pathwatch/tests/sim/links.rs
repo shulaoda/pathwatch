@@ -2,14 +2,12 @@
 //! A story makes the disk, calls `watch`, changes the disk and compares the events that come
 //! out (`C`, `U`, `D` and the path). `on_all` tells one story on every backend.
 
-#![cfg(unix)]
-
 use std::{io, path::Path, sync::Arc, time::Duration};
 
-use pathwatch::engine::Options;
-use pathwatch_sim::{
+use crate::fixtures::{
   Deliver, Driver, Mode, NONE, SimBackend, caught_up, flush, on_all, settled, sorted, taken, window,
 };
+use pathwatch::engine::Options;
 
 fn driver(mode: Mode) -> Driver<SimBackend> {
   Driver::sim(mode, Options::default())
@@ -108,7 +106,7 @@ fn a_link_made_in_two_steps() {
         d.fs.take_raw(usize::MAX);
         d
       };
-      let second_step = move |fs: &pathwatch_sim::SimFs| {
+      let second_step = move |fs: &crate::fixtures::SimFs| {
         fs.remove_all(link).unwrap();
         fs.symlink("/t", link).unwrap();
       };

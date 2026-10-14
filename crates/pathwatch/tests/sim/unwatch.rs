@@ -3,18 +3,16 @@
 //! A story makes the disk, calls `watch`, changes the disk and compares the events that come
 //! out (`C`, `U`, `D` and the path).
 
-#![cfg(unix)]
-
 use std::{path::PathBuf, time::Duration};
 
+use crate::fixtures::{
+  Deliver, Driver, Mode, NONE, RECURSIVE, Sim, SimFs, asked, at, caught_up, ignore_node_modules,
+  known, on_a_small_stack, on_all, on_modes, os_watches, settled, sorted, taken, window,
+};
 use pathwatch::{
   backend::Want::{self, Contents, Names},
   engine::Options,
   poll::PollBackend,
-};
-use pathwatch_sim::{
-  Deliver, Driver, Mode, NONE, RECURSIVE, Sim, SimFs, asked, at, caught_up, ignore_node_modules,
-  known, on_a_small_stack, on_all, on_modes, os_watches, settled, sorted, taken, window,
 };
 
 /// `unwatch` of a directory above a chain deeper than the stack of a thread takes: the names
@@ -277,7 +275,7 @@ fn unwatch_gives_a_watch_back_that_has_a_notification_on_its_way() {
 /// content is known.
 #[test]
 fn unwatch_opens_no_gap_for_what_stays() {
-  fn prepare(d: &mut Driver<pathwatch_sim::SimBackend>) {
+  fn prepare(d: &mut Driver<crate::fixtures::SimBackend>) {
     d.fs.mkdir_all("/p/R/lib").unwrap();
     d.fs.write("/p/R/lib/a.js", "1").unwrap();
     d.watch(&["/p/R", "/p/R/lib/a.js"]);
@@ -700,7 +698,7 @@ fn same_as_a_new_watcher<B: Deliver>(make: &dyn Fn() -> Driver<B>, kept: &[&str]
   project(&old.fs);
   old.watch(&[kept, taken].concat());
   old.unwatch(taken);
-  assert_eq!(pathwatch_sim::taken(&mut old), NONE, "{case}");
+  assert_eq!(crate::fixtures::taken(&mut old), NONE, "{case}");
   let mut new = make();
   project(&new.fs);
   new.watch(kept);

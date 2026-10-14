@@ -126,9 +126,8 @@ The table is these rules in examples. `R` is a watched path.
 | `backend` | The `Backend` trait and its types. |
 | `inotify`, `fsevents`, `windows`, `poll` | One backend each, in one file. Of the crate they use `backend`, and the calls of the system in `fs` that the engine makes too. |
 
-The modules that are not the API are `pub` but hidden from the docs: the tests need them. A
-second crate, `pathwatch_sim`, is not published: the fixtures and the tests of the engine
-(section 8).
+The modules that are not the API are `pub` but hidden from the docs: the tests need them. The
+tests of the engine on a simulated disk, and their fixtures, are in `tests/sim` (section 8).
 
 - A **backend** sets up OS watches when the engine asks, and its thread copies raw OS
   notifications into the queue. On the watcher thread the backend turns a raw notification into
@@ -854,7 +853,7 @@ ignore everything below a directory that it ignores (a **closed** filter). A fil
 looks at the last name is allowed, and gives the same answers as a closed one for everything
 below an ignored directory: `/p/node_modules/pkg/x.js` is never reported, whether `/p` or the
 file itself is watched, since `node_modules` is on the way. The stories in
-`pathwatch_sim/tests/filter.rs` pin it; the fuzzer uses a closed filter and one for a name.
+`tests/sim/filter.rs` pin it; the fuzzer uses a closed filter and one for a name.
 
 **The kind is always known.** It comes from `lstat` or from a listing. An entry that is gone
 is never asked about: what the tree stored decides. The path has the registered spelling.
@@ -1446,8 +1445,8 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
 
 ## 8. Tests
 
-**The simulator** (`crates/pathwatch_sim`: the fixtures in `src/`, the tests in `tests/`; on
-Unix hosts). `SimFs` is a file system in memory with inodes, a clock, a change time for each
+**The simulator** (`crates/pathwatch/tests/sim`: the fixtures in `fixtures/`, the tests
+beside them; on Unix hosts). `SimFs` is a file system in memory with inodes, a clock, a change time for each
 entry, and a mode that ignores the case of letters. `SimBackend` plays an OS watch API on it in
 three modes: by inode (inotify), by path prefix with real paths (FSEvents), by handle for a tree
 (Windows). A stream of the second mode ends when a directory at or above its path is renamed or
@@ -1510,7 +1509,7 @@ The test files of the simulator:
   proves which). Each story runs on the real disk, once with the backend of the OS and once
   with polling, both at the same time; a story that needs no more than the words of `World`
   (files, directories, links, renames, `watch`, `unwatch`, `expect`) runs first on each
-  simulated backend of `pathwatch_sim`, where it takes no time and its end is checked against
+  simulated backend of `tests/sim`, where it takes no time and its end is checked against
   the disk. On the real disk these tests wait, they do not compute. Measured on macOS, each test alone: of
   56 s, 34 s are the quiet time of 300 ms after each `expect`, 17 s the wait for the events
   (the debounce, the delete delay, the poll of a link once a second, and about 10 ms of the
@@ -1521,10 +1520,10 @@ How to run them (the README has the commands for the other platforms and the lin
 ```sh
 cargo test --workspace                # everything for this OS; 250 fuzz seeds for each backend
 PATHWATCH_FUZZ_FIRST=100000 PATHWATCH_FUZZ_SEEDS=20000 \
-  cargo test --release -p pathwatch_sim --test fuzz big -- --ignored          # the long fuzz
+  cargo test --release -p pathwatch --test sim fuzz::big -- --ignored         # the long fuzz
 PATHWATCH_FUZZ_SEED=1234 \
-  cargo test -p pathwatch_sim --test fuzz replay -- --ignored --nocapture     # one seed again
-cargo test --release -p pathwatch_sim --test cost -- --ignored --nocapture    # the cost program
+  cargo test -p pathwatch --test sim fuzz::replay -- --ignored --nocapture    # one seed again
+cargo test --release -p pathwatch --test sim cost:: -- --ignored --nocapture  # the cost program
 ```
 
 ## 9. Not in version 1

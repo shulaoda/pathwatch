@@ -17,7 +17,7 @@ use pathwatch::{
   poll::PollBackend,
 };
 
-use crate::{Mode, SimBackend, SimFs, SimRaw, WatchCall, check_fingerprints, reportable};
+use super::{Mode, SimBackend, SimFs, SimRaw, WatchCall, check_fingerprints, reportable};
 
 /// An engine on a [`SimFs`], with a clock that only the test moves.
 ///
@@ -284,8 +284,6 @@ pub trait Sim {
   fn settled(&mut self) -> Vec<String>;
   /// See [`caught_up`].
   fn caught_up(&mut self);
-  /// See [`not_caught_up`].
-  fn not_caught_up(&mut self, why: &str);
   fn known(&self) -> Vec<String>;
   /// How many deletes are pending.
   fn pending_deletes(&self) -> usize;
@@ -328,10 +326,6 @@ impl<B: Deliver> Sim for Driver<B> {
 
   fn caught_up(&mut self) {
     caught_up(self);
-  }
-
-  fn not_caught_up(&mut self, why: &str) {
-    not_caught_up(self, why);
   }
 
   fn known(&self) -> Vec<String> {
@@ -462,18 +456,6 @@ pub fn os_watches(fs: &SimFs) -> Vec<(String, Want)> {
 /// One row of a list that [`asked`] or [`os_watches`] is compared with.
 pub fn at<W>(dir: &str, want: W) -> (String, W) {
   (dir.to_owned(), want)
-}
-
-/// Delivers and ticks until the `Delete` of `path` is pending.
-pub fn until_delete_pending<B: Deliver>(driver: &mut Driver<B>, path: &str) {
-  for _ in 0..1000 {
-    driver.deliver(usize::MAX);
-    if driver.engine.pending_deletes().contains(Path::new(path)) {
-      return;
-    }
-    assert!(driver.step(), "nothing is due and the delete of {path} is not pending");
-  }
-  panic!("the delete of {path} was never pending");
 }
 
 pub fn ignore_node_modules() -> Options {

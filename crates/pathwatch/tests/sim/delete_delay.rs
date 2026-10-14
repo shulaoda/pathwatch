@@ -3,15 +3,13 @@
 //! A story makes the disk, calls `watch`, changes the disk and compares the events that come
 //! out (`C`, `U`, `D` and the path).
 
-#![cfg(unix)]
-
 use std::{collections::BTreeMap, io, time::Duration};
 
-use pathwatch::{ErrorKind, engine::Options};
-use pathwatch_sim::{
+use crate::fixtures::{
   Deliver, Driver, Mode, NONE, Sim, SimBackend, SimFs, caught_up, flush, on_all, settled, show,
   taken, window, window_then_settled,
 };
+use pathwatch::{ErrorKind, engine::Options};
 
 fn inode() -> Driver<SimBackend> {
   Driver::sim(Mode::Inode, Options::default())
