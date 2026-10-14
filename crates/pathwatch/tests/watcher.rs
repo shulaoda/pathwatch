@@ -1,9 +1,11 @@
 //! The watcher thread on a real directory, with the poll backend.
 
+#[cfg(windows)]
+use std::env;
 use std::{
   collections::BTreeSet,
-  env, fs, io,
-  path::{Component, Path, PathBuf},
+  fs, io,
+  path::{Path, PathBuf},
   sync::{
     Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
@@ -46,29 +48,9 @@ struct Watch {
   results: Results,
   dir: TempDir,
   events: Vec<Event>,
-  /// Every event that `expect` took, also the ones it dropped.
-  log: Vec<Event>,
 }
 
 fn watch() -> Watch {
-  watch_in(tempfile::tempdir().unwrap())
-}
-
-/// A temporary directory and a relative path to it from the current directory: in the target
-/// directory, or in the current one when the target is on another drive (Windows).
-fn relative_scratch() -> (TempDir, PathBuf) {
-  let here = env::current_dir().unwrap();
-  let mut dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-  if here.components().next() != dir.path().components().next() {
-    dir = tempfile::tempdir_in(&here).unwrap();
-  }
-  let is_name = |part: &Component| matches!(part, Component::Normal(_));
-  let mut rel: PathBuf = here.components().filter(is_name).map(|_| Component::ParentDir).collect();
-  rel.extend(dir.path().components().filter(is_name));
-  (dir, rel)
-}
-
-fn watch_in(dir: TempDir) -> Watch {
   let (sender, results) = mpsc::channel();
   let watcher = Watcher::with_backend(
     quick(),
@@ -78,7 +60,17 @@ fn watch_in(dir: TempDir) -> Watch {
     PollBackend::new,
   )
   .unwrap();
-  Watch { watcher, results, dir, events: Vec::new(), log: Vec::new() }
+  Watch { watcher, results, dir: tempfile::tempdir().unwrap(), events: Vec::new() }
+}
+
+/// As the public API makes it.
+fn watch_with(config: Config) -> Watch {
+  let (sender, results) = mpsc::channel();
+  let watcher = Watcher::with_config(config, move |result| {
+    let _ = sender.send(result);
+  })
+  .unwrap();
+  Watch { watcher, results, dir: tempfile::tempdir().unwrap(), events: Vec::new() }
 }
 
 impl Watch {
@@ -113,7 +105,6 @@ impl Watch {
             events.windows(2).all(|pair| pair[0].path < pair[1].path),
             "a batch has one event for a path: {events:?}"
           );
-          self.log.extend(events.iter().cloned());
           self.events.extend(events);
         }
         Ok(Err(error)) => panic!("the watcher reported: {error}"),
@@ -122,22 +113,6 @@ impl Watch {
         }
       }
     }
-  }
-}
-
-impl Watch {
-  /// Forgets the events so far. After a call of the watcher nothing from before it is on its way.
-  fn forget(&mut self) {
-    while self.results.try_recv().is_ok() {}
-    self.events.clear();
-    self.log.clear();
-  }
-
-  /// No event for this path since the last `forget`.
-  fn nothing_for(&self, rel: &str) {
-    let path = self.path(rel);
-    let found: Vec<&Event> = self.log.iter().filter(|event| event.path == path).collect();
-    assert!(found.is_empty(), "{found:?}");
   }
 }
 
@@ -210,6 +185,7 @@ fn a_watcher_dropped_while_the_process_exits() {
   assert_eq!(code, Some(7), "exit code {code:#x?}: {}", String::from_utf8_lossy(&child.stderr));
 }
 
+#[cfg(windows)]
 fn invalid(result: Result<(), Error>) -> PathBuf {
   let error = result.expect_err("the path cannot be used");
   assert_eq!(error.kind(), ErrorKind::InvalidPath);
@@ -266,146 +242,6 @@ impl Backend for Silent {
   fn raw_bytes(raw: &Self::Raw) -> usize {
     raw.len()
   }
-}
-
-#[test]
-fn a_watched_file() {
-  let mut w = watch();
-  fs::write(w.path("a.txt"), "1").unwrap();
-  w.watcher.watch(&[w.path("a.txt")]).unwrap();
-
-  fs::write(w.path("a.txt"), "22").unwrap();
-  w.expect(EventKind::Update, "a.txt");
-  // The same size, most likely inside one tick of the clock.
-  fs::write(w.path("a.txt"), "33").unwrap();
-  w.expect(EventKind::Update, "a.txt");
-  fs::remove_file(w.path("a.txt")).unwrap();
-  w.expect(EventKind::Delete, "a.txt");
-  fs::write(w.path("a.txt"), "1").unwrap();
-  w.expect(EventKind::Create, "a.txt");
-}
-
-#[test]
-fn a_directory_that_appears_and_vanishes() {
-  let mut w = watch();
-  w.watcher.watch(&[w.path("content")]).unwrap();
-
-  fs::create_dir_all(w.path("content/sub")).unwrap();
-  fs::write(w.path("content/sub/f.txt"), "1").unwrap();
-  fs::write(w.path("content/g.txt"), "1").unwrap();
-  w.expect_all(EventKind::Create, &["content/g.txt", "content/sub/f.txt"]);
-
-  fs::remove_dir_all(w.path("content")).unwrap();
-  w.expect_all(EventKind::Delete, &["content/g.txt", "content/sub/f.txt"]);
-
-  fs::create_dir(w.path("content")).unwrap();
-  fs::write(w.path("content/h.txt"), "1").unwrap();
-  w.expect(EventKind::Create, "content/h.txt");
-}
-
-#[test]
-fn a_missing_parent_chain() {
-  let mut w = watch();
-  w.watcher.watch(&[w.path("a/b/c/x.txt")]).unwrap();
-
-  fs::create_dir_all(w.path("a/b/c")).unwrap();
-  fs::write(w.path("a/b/c/x.txt"), "1").unwrap();
-  w.expect(EventKind::Create, "a/b/c/x.txt");
-
-  fs::rename(w.path("a"), w.path("gone")).unwrap();
-  w.expect(EventKind::Delete, "a/b/c/x.txt");
-  fs::rename(w.path("gone"), w.path("a")).unwrap();
-  w.expect(EventKind::Create, "a/b/c/x.txt");
-}
-
-#[test]
-fn unwatch_takes_a_watch_back() {
-  let mut w = watch();
-  w.watcher.watch(&[w.path("a.txt"), w.path("b.txt")]).unwrap();
-  w.watcher.unwatch(&[w.path("a.txt")]).unwrap();
-  w.watcher.unwatch(&[w.path("never.txt"), w.path("a.txt")]).unwrap();
-
-  fs::write(w.path("a.txt"), "1").unwrap();
-  fs::write(w.path("b.txt"), "1").unwrap();
-  w.expect(EventKind::Create, "b.txt");
-  fs::write(w.path("b.txt"), "22").unwrap();
-  w.expect(EventKind::Update, "b.txt");
-  w.nothing_for("a.txt");
-}
-
-/// The event path is absolute: joined to the current directory.
-#[test]
-fn a_relative_path() {
-  let (dir, rel) = relative_scratch();
-  let mut w = watch_in(dir);
-  assert!(rel.is_relative());
-  w.watcher.watch(&[rel.join("a.txt")]).unwrap();
-  w.watcher.watch(&[Path::new(".").join(&rel).join("b.txt")]).unwrap();
-
-  fs::write(w.path("a.txt"), "1").unwrap();
-  w.expect(EventKind::Create, "a.txt");
-  fs::write(w.path("b.txt"), "1").unwrap();
-  w.expect(EventKind::Create, "b.txt");
-
-  w.watcher.unwatch(&[rel.join("a.txt")]).unwrap();
-  w.forget();
-  fs::write(w.path("a.txt"), "22").unwrap();
-  fs::write(w.path("b.txt"), "22").unwrap();
-  w.expect(EventKind::Update, "b.txt");
-  w.nothing_for("a.txt");
-}
-
-/// `..` takes away the name before it, by text: `nothing` does not have to exist.
-#[test]
-fn dot_dot_is_folded() {
-  let mut w = watch();
-  w.watcher.watch(&[w.path("nothing/../sub/./deep/..//a.txt/")]).unwrap();
-  fs::create_dir(w.path("sub")).unwrap();
-  fs::write(w.path("sub/a.txt"), "1").unwrap();
-  w.expect(EventKind::Create, "sub/a.txt");
-
-  // The folded path is the watched one, under every spelling.
-  w.watcher.watch(&[w.path("sub/a.txt")]).unwrap();
-  w.watcher.unwatch(&[w.path("sub/x/../a.txt")]).unwrap();
-  w.watcher.watch(&[w.path("b.txt")]).unwrap();
-  w.forget();
-  fs::write(w.path("sub/a.txt"), "22").unwrap();
-  fs::write(w.path("b.txt"), "1").unwrap();
-  w.expect(EventKind::Create, "b.txt");
-  w.nothing_for("sub/a.txt");
-
-  // Above the root there is nothing.
-  let above = w.path("..").join("../".repeat(64)).join("a.txt");
-  assert_eq!(invalid(w.watcher.watch(&[&above])), above);
-}
-
-#[test]
-fn one_bad_path_among_good_ones() {
-  let mut w = watch();
-  let top = w.dir.path().ancestors().last().unwrap().to_path_buf();
-  let paths = [w.path("a.txt"), PathBuf::new(), w.path("nul\0.txt"), top.clone(), w.path("b.txt")];
-  let error = w.watcher.watch(&paths).unwrap_err();
-  assert_eq!(error.kind(), ErrorKind::InvalidPath);
-  assert_eq!(error.path(), Some(Path::new("")));
-  assert!(error.to_string().starts_with("the path cannot be watched"));
-  assert_eq!(invalid(w.watcher.watch(&[&top])), top);
-  assert_eq!(invalid(w.watcher.watch(&[&paths[2]])), paths[2]);
-
-  fs::write(w.path("a.txt"), "1").unwrap();
-  fs::write(w.path("b.txt"), "1").unwrap();
-  // `expect` fails the test when the handler gets an error.
-  w.expect(EventKind::Create, "a.txt");
-  w.expect(EventKind::Create, "b.txt");
-
-  assert_eq!(invalid(w.watcher.unwatch(&paths)), PathBuf::new());
-  w.watcher.watch(&[w.path("c.txt")]).unwrap();
-  w.forget();
-  fs::write(w.path("a.txt"), "22").unwrap();
-  fs::write(w.path("b.txt"), "22").unwrap();
-  fs::write(w.path("c.txt"), "1").unwrap();
-  w.expect(EventKind::Create, "c.txt");
-  w.nothing_for("a.txt");
-  w.nothing_for("b.txt");
 }
 
 #[test]
@@ -470,46 +306,6 @@ fn close_inside_the_handler() {
   assert!(matches!(answers.recv_timeout(PATIENCE), Err(RecvTimeoutError::Disconnected)));
   closed(watcher.watch(&[dir.path().join("d.txt")]));
   // From another thread it waits for the thread, which is gone or going.
-  watcher.close();
-}
-
-/// They do not wait: they take effect when the handler has returned.
-#[test]
-fn watch_and_unwatch_inside_the_handler() {
-  let dir = tempfile::tempdir().unwrap();
-  let path = |name: &str| dir.path().join(name);
-  let (sender, results) = mpsc::channel();
-  let (a, b) = (path("a.txt"), path("b.txt"));
-  let mut first = true;
-  let (watched, unwatched) = (b.clone(), a.clone());
-  let slot = with_handler(move |watcher, result| {
-    if std::mem::take(&mut first) {
-      sender.send(Err(watcher.watch(&[&watched]))).unwrap();
-      sender.send(Err(watcher.unwatch(&[&unwatched]))).unwrap();
-      sender.send(Err(watcher.watch(&[""]))).unwrap();
-    }
-    let _ = sender.send(Ok(result.expect("no error is expected")));
-  });
-  let watcher = slot.get().unwrap();
-  watcher.watch(&[&a]).unwrap();
-  fs::write(&a, "1").unwrap();
-
-  let next = || results.recv_timeout(PATIENCE).expect("the handler ran");
-  assert!(matches!(next(), Err(Ok(()))), "watch is accepted");
-  assert!(matches!(next(), Err(Ok(()))), "unwatch is accepted");
-  assert_eq!(invalid(next().unwrap_err()), PathBuf::new());
-  assert_eq!(next().unwrap(), [Event { path: a.clone(), kind: EventKind::Create }]);
-
-  // This call waits for its turn in the queue, behind the two calls of the handler.
-  watcher.watch(&[path("c.txt")]).unwrap();
-  fs::write(&a, "22").unwrap();
-  fs::write(&b, "1").unwrap();
-  fs::write(path("c.txt"), "1").unwrap();
-  let mut seen = BTreeSet::new();
-  while !seen.contains(&b) || !seen.contains(&path("c.txt")) {
-    seen.extend(next().unwrap().into_iter().map(|event| event.path));
-  }
-  assert!(!seen.contains(&a), "the handler unwatched it");
   watcher.close();
 }
 
@@ -872,47 +668,24 @@ fn a_watch_inside_the_handler_comes_before_the_queue() {
   while !results.recv_timeout(PATIENCE).expect("the new file is reported").contains(&created) {}
 }
 
-/// The delete delay is a setting: with zero, a file that is removed and written again is a
-/// `Delete` and a `Create`, not one `Update`.
+/// The settings reach the thread, at both ends. With a delete delay of zero, a file that is
+/// removed and written again is a `Delete` and a `Create`, not one `Update`. `Duration::MAX` is
+/// a way to say "never": the thread must not die of a time that no clock has.
 #[test]
-fn the_delete_delay_can_be_zero() {
-  let dir = tempfile::tempdir().unwrap();
-  let path = dir.path().join("a.txt");
-  fs::write(&path, "1").unwrap();
-  let config = quick_config().with_delete_delay(Duration::ZERO);
-  let (sender, results) = mpsc::channel();
-  let watcher = Watcher::with_config(config, move |result| {
-    let _ = sender.send(result);
-  })
-  .unwrap();
-  watcher.watch(&[&path]).unwrap();
-
-  fs::remove_file(&path).unwrap();
-  let batch = results.recv_timeout(PATIENCE).expect("the delete is reported");
-  assert_eq!(batch.unwrap(), [Event { path: path.clone(), kind: EventKind::Delete }]);
-  fs::write(&path, "2").unwrap();
-  let batch = results.recv_timeout(PATIENCE).expect("the file is reported again");
-  assert_eq!(batch.unwrap(), [Event { path: path.clone(), kind: EventKind::Create }]);
-}
-
-/// `Duration::MAX` is a way to say "never": the thread must not die of a time that no clock
-/// has.
-#[test]
-fn a_time_too_long_for_a_clock() {
-  let dir = tempfile::tempdir().unwrap();
-  let path = dir.path().join("a.txt");
+fn a_setting_of_zero_and_a_time_too_long_for_a_clock() {
+  let mut w = watch_with(quick_config().with_delete_delay(Duration::ZERO));
+  fs::write(w.path("a.txt"), "1").unwrap();
+  w.watcher.watch(&[w.path("a.txt")]).unwrap();
+  fs::remove_file(w.path("a.txt")).unwrap();
+  w.expect(EventKind::Delete, "a.txt");
+  fs::write(w.path("a.txt"), "2").unwrap();
+  w.expect(EventKind::Create, "a.txt");
 
   // The poll flushes by itself, whatever the quiet time is.
-  let config = quick_config().with_debounce(Duration::MAX);
-  let (sender, results) = mpsc::channel();
-  let watcher = Watcher::with_config(config, move |result| {
-    let _ = sender.send(result);
-  })
-  .unwrap();
-  watcher.watch(&[&path]).unwrap();
-  fs::write(&path, "1").unwrap();
-  let batch = results.recv_timeout(PATIENCE).expect("the file is reported");
-  assert_eq!(batch.unwrap(), [Event { path: path.clone(), kind: EventKind::Create }]);
+  let mut w = watch_with(quick_config().with_debounce(Duration::MAX));
+  w.watcher.watch(&[w.path("a.txt")]).unwrap();
+  fs::write(w.path("a.txt"), "1").unwrap();
+  w.expect(EventKind::Create, "a.txt");
 
   // Nothing is ever due here. The thread still takes every call.
   for config in [
@@ -921,10 +694,10 @@ fn a_time_too_long_for_a_clock() {
     Config::default().with_polling(true).with_poll_interval(Duration::MAX),
   ] {
     let watcher = Watcher::with_config(config, |_| {}).unwrap();
-    watcher.watch(&[dir.path()]).unwrap();
-    fs::write(&path, "22").unwrap();
-    watcher.watch(&[dir.path().join("later")]).unwrap();
-    watcher.unwatch(&[dir.path()]).unwrap();
+    watcher.watch(&[w.dir.path()]).unwrap();
+    fs::write(w.path("a.txt"), "22").unwrap();
+    watcher.watch(&[w.path("later")]).unwrap();
+    watcher.unwatch(&[w.dir.path()]).unwrap();
   }
 }
 

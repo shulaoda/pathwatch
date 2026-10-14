@@ -201,6 +201,8 @@ fn unwatch_of_a_file_and_of_a_directory() {
     w.watch(&["r", "f.txt", "missing.txt", "stays", "stays.txt"]);
 
     w.unwatch(&["r", "f.txt", "missing.txt"]);
+    // A path that is not watched is skipped: never watched, or taken back already.
+    w.unwatch(&["never.txt", "f.txt"]);
     w.expect(&[]);
 
     w.write("r/a.txt", "22");
@@ -269,13 +271,21 @@ fn a_relative_path_with_dot_dot() {
     w.write("c.txt", "1");
     w.expect(&[(Create, "a.txt"), (Create, "sub/b.txt"), (Create, "c.txt")]);
 
-    // The clean path is the watched one: `unwatch` finds it under every spelling.
-    w.watcher.unwatch(&[w.path("sub/../a.txt")]).unwrap();
+    // The clean path is the watched one: `unwatch` finds it under every spelling, and a path
+    // watched under two spellings is one watch. The names that `..` takes away need not exist.
+    w.watcher.watch(&[w.path("sub/b.txt")]).unwrap();
+    w.watcher.unwatch(&[w.path("sub/x/../../a.txt")]).unwrap();
     w.watcher.unwatch(&[rel.join("sub/b.txt")]).unwrap();
     w.write("a.txt", "22");
     w.write("sub/b.txt", "22");
     w.write("c.txt", "22");
     w.expect(&[(Update, "c.txt")]);
+
+    // Above the root there is nothing: the error names the path as it was given.
+    let above = w.path("..").join("../".repeat(64)).join("a.txt");
+    let error = w.watcher.watch(&[&above]).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidPath);
+    assert_eq!(error.path(), Some(above.as_path()));
   });
 }
 
@@ -283,10 +293,16 @@ fn a_relative_path_with_dot_dot() {
 fn one_bad_path_among_good_ones() {
   on_disk(|w| {
     let bad = w.path("nul\0.txt");
-    let paths = [w.path("a.txt"), bad.clone(), w.path("r"), PathBuf::new()];
+    let paths = [w.path("a.txt"), PathBuf::new(), bad.clone(), w.path("r")];
     let error = w.watcher.watch(&paths).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidPath);
-    assert_eq!(error.path(), Some(bad.as_path()), "the first bad path");
+    assert_eq!(error.path(), Some(Path::new("")), "the first bad path");
+    assert!(error.to_string().starts_with("the path cannot be watched"), "{error}");
+    // The root of the disk alone.
+    let root = w.dir.path().ancestors().last().unwrap().to_path_buf();
+    let error = w.watcher.watch(&[&root]).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidPath);
+    assert_eq!(error.path(), Some(root.as_path()));
 
     w.write("a.txt", "1");
     w.write("r/b.txt", "1");
@@ -294,7 +310,7 @@ fn one_bad_path_among_good_ones() {
 
     let error = w.watcher.unwatch(&paths).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidPath);
-    assert_eq!(error.path(), Some(bad.as_path()));
+    assert_eq!(error.path(), Some(Path::new("")));
     w.watch(&["c.txt"]);
     w.write("a.txt", "22");
     w.write("r/b.txt", "22");

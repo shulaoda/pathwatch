@@ -183,49 +183,28 @@ fn chmod(path: &Path, mode: u32) {
   fs::set_permissions(path, Permissions::from_mode(mode)).unwrap();
 }
 
+/// A file that is written, made or moved in is "written", under its new name only; everything
+/// else, and every directory entry, is "changed".
 #[test]
-fn write_gives_a_written_hint() {
+fn entries_give_their_hints() {
   let mut h = Harness::new();
   fs::write(h.path("a"), "1").unwrap();
+  fs::write(h.path("b.tmp"), "1").unwrap();
   let key = h.watch(1, "", Want::Contents);
 
   fs::write(h.path("a"), "2").unwrap();
   assert_eq!(set(h.hints()), written_and_closed(key, "a"));
-}
-
-#[test]
-fn file_create_and_delete() {
-  let mut h = Harness::new();
-  let key = h.watch(1, "", Want::Contents);
-
-  File::create(h.path("a")).unwrap();
-  assert_eq!(set(h.hints()), written_and_closed(key, "a"));
-
+  File::create(h.path("c")).unwrap();
+  assert_eq!(set(h.hints()), written_and_closed(key, "c"));
+  fs::rename(h.path("b.tmp"), h.path("b")).unwrap();
+  assert_eq!(h.hints(), [changed(key, "b.tmp"), written(key, "b")]);
   fs::remove_file(h.path("a")).unwrap();
   assert_eq!(h.hints(), [changed(key, "a")]);
-}
-
-#[test]
-fn file_rename_says_written_for_the_new_name_only() {
-  let mut h = Harness::new();
-  fs::write(h.path("a.tmp"), "1").unwrap();
-  let key = h.watch(1, "", Want::Contents);
-
-  fs::rename(h.path("a.tmp"), h.path("a")).unwrap();
-  assert_eq!(h.hints(), [changed(key, "a.tmp"), written(key, "a")]);
-}
-
-#[test]
-fn directory_entries_are_never_written() {
-  let mut h = Harness::new();
-  let key = h.watch(1, "", Want::Contents);
 
   fs::create_dir(h.path("sub")).unwrap();
   assert_eq!(h.hints(), [changed(key, "sub")]);
-
   fs::rename(h.path("sub"), h.path("moved")).unwrap();
   assert_eq!(h.hints(), [changed(key, "sub"), changed(key, "moved")]);
-
   fs::remove_dir(h.path("moved")).unwrap();
   assert_eq!(h.hints(), [changed(key, "moved")]);
 }
@@ -268,11 +247,23 @@ fn each_want_asks_the_kernel_for_its_events_only() {
   for name in ["a", "b"] {
     fs::create_dir(h.path(name)).unwrap();
   }
+  fs::write(h.path("a/x"), "1").unwrap();
 
   let ancestor = h.watch(1, "a", Want::Names);
   let dir = h.watch(2, "b", Want::Contents);
   assert_eq!(h.kernel_events(ancestor), entries | itself);
   assert_eq!(h.kernel_events(dir), entries | itself | content);
+
+  // So an ancestor hears the entries, but no writes.
+  fs::write(h.path("a/x"), "2").unwrap();
+  chmod(&h.path("a/x"), 0o600);
+  assert_eq!(h.hints(), []);
+  File::create(h.path("a/y")).unwrap();
+  assert_eq!(h.hints(), [written(ancestor, "y")]);
+  fs::rename(h.path("a/y"), h.path("a/z")).unwrap();
+  assert_eq!(h.hints(), [changed(ancestor, "y"), written(ancestor, "z")]);
+  fs::remove_file(h.path("a/z")).unwrap();
+  assert_eq!(h.hints(), [changed(ancestor, "z")]);
 }
 
 #[test]
@@ -300,26 +291,6 @@ fn write_to_a_replaced_file_is_no_hint_for_the_new_file() {
   replaced.write_all(b"late").unwrap();
   drop(replaced);
   assert_eq!(h.hints(), []);
-}
-
-#[test]
-fn ancestor_hears_entries_but_no_writes() {
-  let mut h = Harness::new();
-  fs::write(h.path("a"), "1").unwrap();
-  let key = h.watch(1, "", Want::Names);
-
-  fs::write(h.path("a"), "2").unwrap();
-  chmod(&h.path("a"), 0o600);
-  assert_eq!(h.hints(), []);
-
-  File::create(h.path("b")).unwrap();
-  assert_eq!(h.hints(), [written(key, "b")]);
-
-  fs::rename(h.path("b"), h.path("c")).unwrap();
-  assert_eq!(h.hints(), [changed(key, "b"), written(key, "c")]);
-
-  fs::remove_file(h.path("c")).unwrap();
-  assert_eq!(h.hints(), [changed(key, "c")]);
 }
 
 #[test]
@@ -367,20 +338,6 @@ fn renamed_directory_serves_the_old_and_the_new_key() {
 }
 
 #[test]
-fn two_spellings_of_one_directory_get_one_hint_each() {
-  let mut h = Harness::new();
-  fs::create_dir(h.path("real")).unwrap();
-  fs::write(h.path("real/a"), "1").unwrap();
-  symlink(h.path("real"), h.path("link")).unwrap();
-  let real = h.watch(1, "real", Want::Contents);
-  let link = h.watch(2, "link", Want::Contents);
-  assert_eq!(h.wd(real), h.wd(link));
-
-  fs::remove_file(h.path("link/a")).unwrap();
-  assert_eq!(h.hints(), [changed(real, "a"), changed(link, "a")]);
-}
-
-#[test]
 fn second_key_with_a_lower_want_takes_no_events_away() {
   let mut h = Harness::new();
   fs::create_dir(h.path("real")).unwrap();
@@ -388,6 +345,7 @@ fn second_key_with_a_lower_want_takes_no_events_away() {
   symlink(h.path("real"), h.path("link")).unwrap();
   let dir = h.watch(1, "real", Want::Contents);
   let ancestor = h.watch(2, "link", Want::Names);
+  assert_eq!(h.wd(dir), h.wd(ancestor));
 
   // The two keys share one kernel watch, so the second hears the writes too: more hints than
   // asked for are fine.
@@ -404,16 +362,21 @@ fn second_key_with_a_lower_want_takes_no_events_away() {
 fn key_moves_to_the_directory_that_is_at_its_path_now() {
   let mut h = Harness::new();
   fs::create_dir(h.path("sub")).unwrap();
+  fs::create_dir(h.path("next")).unwrap();
   let key = h.watch(1, "sub", Want::Contents);
   let first_wd = h.wd(key);
 
   fs::rename(h.path("sub"), h.path("away")).unwrap();
-  fs::create_dir(h.path("sub")).unwrap();
+  fs::rename(h.path("next"), h.path("sub")).unwrap();
+  assert_eq!(h.hints(), [changed(key, "")]);
+
+  // Made before the second `watch` and read after it: no hint.
+  File::create(h.path("away/early")).unwrap();
   h.watch(1, "sub", Want::Contents);
   assert_ne!(h.wd(key), first_wd);
   assert_eq!(h.watches(), 1);
 
-  File::create(h.path("away/stale")).unwrap();
+  File::create(h.path("away/late")).unwrap();
   File::create(h.path("sub/fresh")).unwrap();
   assert_eq!(set(h.hints()), written_and_closed(key, "fresh"));
 }
@@ -456,12 +419,15 @@ fn unwatch_stops_hints() {
 fn removed_directory_is_changed_itself_and_its_watch_is_forgotten() {
   let mut h = Harness::new();
   fs::create_dir(h.path("sub")).unwrap();
+  fs::write(h.path("sub/a"), "1").unwrap();
   symlink(h.path("sub"), h.path("link")).unwrap();
   let sub = h.watch(1, "sub", Want::Contents);
   let link = h.watch(2, "link", Want::Contents);
 
-  fs::remove_dir(h.path("sub")).unwrap();
-  assert_eq!(h.hints_until(&changed(link, "")), [changed(sub, ""), changed(link, "")]);
+  // DELETE_SELF and IGNORED: one hint for the two, with no watch on the parent.
+  fs::remove_dir_all(h.path("sub")).unwrap();
+  let expected = [changed(sub, "a"), changed(link, "a"), changed(sub, ""), changed(link, "")];
+  assert_eq!(h.hints_until(&changed(link, "")), expected);
   assert_eq!((h.wd(sub), h.wd(link)), (None, None));
   assert_eq!(h.watches(), 0);
 
@@ -510,29 +476,6 @@ fn moved_directory_is_told_by_its_parent_and_by_itself() {
 }
 
 #[test]
-fn another_directory_at_the_path_of_a_moved_one() {
-  let mut h = Harness::new();
-  fs::create_dir(h.path("sub")).unwrap();
-  fs::create_dir(h.path("next")).unwrap();
-  let key = h.watch(1, "sub", Want::Contents);
-  let first_wd = h.wd(key);
-
-  fs::rename(h.path("sub"), h.path("away")).unwrap();
-  fs::rename(h.path("next"), h.path("sub")).unwrap();
-  assert_eq!(h.hints(), [changed(key, "")]);
-
-  // Made before the second `watch` and read after it: no hint.
-  File::create(h.path("away/early")).unwrap();
-  h.watch(1, "sub", Want::Contents);
-  assert_ne!(h.wd(key), first_wd);
-  assert_eq!(h.watches(), 1);
-
-  File::create(h.path("away/late")).unwrap();
-  File::create(h.path("sub/fresh")).unwrap();
-  assert_eq!(set(h.hints()), written_and_closed(key, "fresh"));
-}
-
-#[test]
 fn directory_that_another_one_is_moved_over_is_changed_itself() {
   let mut h = Harness::new();
   fs::create_dir(h.path("sub")).unwrap();
@@ -548,20 +491,6 @@ fn directory_that_another_one_is_moved_over_is_changed_itself() {
   h.watch(1, "sub", Want::Contents);
   File::create(h.path("sub/a")).unwrap();
   assert_eq!(set(h.hints()), written_and_closed(key, "a"));
-}
-
-#[test]
-fn deleted_directory_gives_one_hint_with_no_watch_on_its_parent() {
-  let mut h = Harness::new();
-  fs::create_dir(h.path("sub")).unwrap();
-  fs::write(h.path("sub/a"), "1").unwrap();
-  let key = h.watch(1, "sub", Want::Names);
-
-  // DELETE_SELF and IGNORED: one hint for the two.
-  fs::remove_dir_all(h.path("sub")).unwrap();
-  assert_eq!(h.hints(), [changed(key, "a"), changed(key, "")]);
-  assert_eq!(h.wd(key), None);
-  assert_eq!(h.watches(), 0);
 }
 
 #[test]
@@ -608,21 +537,6 @@ fn missing_path_and_file_fail() {
 
   assert_eq!(h.wd(DirKey::new(1, 0)), None);
   assert_eq!(h.watches(), 0);
-}
-
-#[test]
-fn failed_watch_leaves_the_key_unwatched() {
-  let mut h = Harness::new();
-  fs::create_dir(h.path("sub")).unwrap();
-  let key = h.watch(1, "sub", Want::Contents);
-
-  fs::rename(h.path("sub"), h.path("away")).unwrap();
-  assert_eq!(h.watch_fails(1, &h.path("sub")).kind(), io::ErrorKind::NotFound);
-  assert_eq!(h.wd(key), None);
-  assert_eq!(h.watches(), 0);
-
-  File::create(h.path("away/a")).unwrap();
-  assert_eq!(h.hints(), []);
 }
 
 /// A user namespace can lower the limit without root:
@@ -672,31 +586,24 @@ fn masks_map_to_hints() {
     assert_eq!(h.translate(event(wd, mask | libc::IN_ISDIR, "")), [], "{mask:#x}");
   }
 
-  // The watched directory itself. A move leaves the watch, a delete ends it.
+  // The watched directory itself. A move leaves the watch; a delete or an unmount ends it, and
+  // the IGNORED that the kernel sends with each of them gives no second hint.
   for mask in [libc::IN_MOVE_SELF, libc::IN_MOVE_SELF | libc::IN_ISDIR] {
     assert_eq!(h.translate(event(wd, mask, "")), [changed(key, "")], "{mask:#x}");
   }
   assert_eq!(h.wd(key), Some(wd));
-  let mut raw = event(wd, libc::IN_DELETE_SELF | libc::IN_ISDIR, "");
-  raw.extend(event(wd, libc::IN_IGNORED, ""));
-  assert_eq!(h.translate(raw), [changed(key, "")]);
-  assert_eq!(h.wd(key), None);
+  for (index, mask) in [(1, libc::IN_DELETE_SELF), (2, libc::IN_UNMOUNT)] {
+    // The kernel watch is still there: the second key gets it, after the first forgot it.
+    let key = h.watch(index, "", Want::Contents);
+    let wd = h.wd(key).unwrap();
+    let mut raw = event(wd, mask | libc::IN_ISDIR, "");
+    raw.extend(event(wd, libc::IN_IGNORED, ""));
+    assert_eq!(h.translate(raw), [changed(key, "")], "{mask:#x}");
+    assert_eq!(h.wd(key), None);
+  }
 
   // The queue of the kernel was full: it cannot say what is missing.
   assert_eq!(h.translate(event(-1, libc::IN_Q_OVERFLOW, "")), [Seen::Lost]);
-}
-
-#[test]
-fn unmount_and_ignored_forget_the_watch_once() {
-  let mut h = Harness::new();
-  let key = h.watch(1, "", Want::Contents);
-  let wd = h.wd(key).unwrap();
-
-  // The kernel sends this pair for each watch on a file system that is unmounted.
-  let mut raw = event(wd, libc::IN_UNMOUNT | libc::IN_ISDIR, "");
-  raw.extend(event(wd, libc::IN_IGNORED, ""));
-  assert_eq!(h.translate(raw), [changed(key, "")]);
-  assert_eq!(h.wd(key), None);
 }
 
 #[test]

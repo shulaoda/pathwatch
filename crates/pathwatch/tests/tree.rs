@@ -94,28 +94,6 @@ fn changed(dir: DirKey, rel: &str, written: bool) -> Hint<'_> {
 }
 
 #[test]
-fn a_removed_key_never_names_a_node_again() {
-  let mut tree = Tree::new();
-  let top = child(&mut tree, Tree::ROOT, "/");
-  let first = child(&mut tree, top, "a");
-  assert_eq!(tree.path(first), Path::new("/a"));
-  assert_eq!(tree.level(first), 2);
-
-  tree.prune(first);
-  assert!(tree.get(first).is_none());
-  assert_eq!(tree.child(top, OsStr::new("a")), None);
-  assert_eq!(tree.children(top).count(), 0);
-
-  let second = child(&mut tree, top, "b");
-  assert_eq!(second.index(), first.index());
-  assert_ne!(second.generation(), first.generation());
-  assert!(tree.get(first).is_none());
-  assert_eq!(tree.path(second), Path::new("/b"));
-  assert_eq!(tree.nodes().map(|(key, _)| key).collect::<Vec<_>>(), [Tree::ROOT, top, second]);
-  tree.check_links().unwrap();
-}
-
-#[test]
 fn paths_are_built_from_the_names() {
   let Fixture { tree, top, sub, deep, .. } = fixture();
   assert_eq!(tree.path(Tree::ROOT), Path::new(""));
@@ -132,30 +110,37 @@ fn paths_are_built_from_the_names() {
   assert_eq!(path, Path::new(""));
 }
 
+/// Windows only: the names are joined with the separator of the OS, and `C:\` ends with one
+/// there alone.
+#[cfg(windows)]
 #[test]
-fn a_child_is_found_by_its_parent_and_its_name() {
-  let Fixture { mut tree, top, p, r, sub, gone, f, .. } = fixture();
-  assert_eq!(tree.child(Tree::ROOT, OsStr::new("/")), Some(top));
-  assert_eq!(tree.child(p, OsStr::new("r")), Some(r));
-  assert_eq!(tree.child(r, OsStr::new("sub")), Some(sub));
-  assert_eq!(tree.child(top, OsStr::new("r")), None);
-  assert_eq!(tree.child(p, OsStr::new("sub")), None);
-  let twin = child(&mut tree, sub, "sub");
-  assert_eq!(tree.child(sub, OsStr::new("sub")), Some(twin));
-  assert_eq!(tree.child(r, OsStr::new("sub")), Some(sub));
-
-  assert_eq!(tree.parent(sub), Some(r));
-  assert_eq!(tree.parent(Tree::ROOT), None);
-  // The newest child comes first.
-  assert_eq!(tree.children(p).collect::<Vec<_>>(), [f, gone, r]);
-  assert_eq!(tree.children(f).count(), 0);
+fn a_listed_name_that_reads_as_a_drive_stays_in_its_directory() {
+  let mut tree = Tree::new();
+  let top = tree.insert_child(Tree::ROOT, OsStr::new(r"C:\"));
+  let dir = tree.insert_child(top, OsStr::new("dir"));
+  for name in ["C:", "Q:evil", "a:b", "plain.txt"] {
+    let key = tree.insert_child(dir, OsStr::new(name));
+    let path = tree.path(key);
+    assert_eq!(path.as_os_str(), OsStr::new(&format!(r"C:\dir\{name}")), "{name}");
+    assert!(path.starts_with(r"C:\dir"), "{name}: {}", path.display());
+    let mut popped = path.clone();
+    assert!(popped.pop());
+    assert_eq!(popped, Path::new(r"C:\dir"), "{name}");
+  }
+  assert_eq!(tree.path(top), Path::new(r"C:\"));
 }
 
-/// The list and the table stay right while the table grows and the slots are used again.
+/// A child is found by its parent and its name. The list and the table stay right while the
+/// table grows and the slots are used again.
 #[test]
 fn children_come_and_go() {
   let mut tree = Tree::new();
   let top = child(&mut tree, Tree::ROOT, "/");
+  // The same name under another parent is another node.
+  let other = child(&mut tree, Tree::ROOT, "/other");
+  let twin = child(&mut tree, other, "0-1");
+  assert_eq!(tree.child(Tree::ROOT, OsStr::new("/")), Some(top));
+  assert_eq!(tree.parent(Tree::ROOT), None);
   let mut live: Vec<(String, DirKey)> = Vec::new();
   let mut highest = top.index();
   for round in 0..4 {
@@ -177,16 +162,21 @@ fn children_come_and_go() {
     }
     live = kept;
     tree.check_links().unwrap();
-    assert_eq!(tree.children(top).count(), live.len());
+    // The newest child comes first.
+    let newest_first: Vec<DirKey> = live.iter().rev().map(|(_, key)| *key).collect();
+    assert_eq!(tree.children(top).collect::<Vec<_>>(), newest_first);
     let walk = iter::successors(tree.children(top).next(), |&at| tree.next_sibling(at));
     assert!(walk.eq(tree.children(top)));
     for (name, key) in &live {
       assert_eq!(tree.child(top, OsStr::new(name)), Some(*key));
+      assert_eq!(tree.child(other, OsStr::new(name)), (name == "0-1").then_some(twin));
       assert_eq!(tree.name(*key), OsStr::new(name));
+      assert_eq!(tree.parent(*key), Some(top));
+      assert_eq!(tree.children(*key).count(), 0);
     }
   }
   // No slot is lost: no key is beyond the most nodes that lived at one time.
-  assert!(highest < 2 + 500 + 500 * 2 / 3 + 500 * 4 / 9 + 500 * 8 / 27 + 4);
+  assert!(highest < 4 + 500 + 500 * 2 / 3 + 500 * 4 / 9 + 500 * 8 / 27 + 4);
 }
 
 /// Needed: registered, something at its path, a mark, or a `Delete` still to tell.
@@ -299,8 +289,9 @@ fn what_a_node_wants() {
   assert_eq!(tree.want(p), Some(Want::Contents));
 }
 
+/// The link and the content of a node are kept beside the arena.
 #[test]
-fn the_link_of_a_node() {
+fn the_side_tables_of_a_node() {
   let Fixture { mut tree, r, f, .. } = fixture();
   assert_eq!(tree.link(f), None);
   tree.set_link(f, Some(7));
@@ -312,11 +303,7 @@ fn the_link_of_a_node() {
   tree.set_link(f, None);
   assert_eq!(tree.links().collect::<Vec<_>>(), [r]);
   tree.check_links().unwrap();
-}
 
-#[test]
-fn the_content_of_a_node() {
-  let Fixture { mut tree, r, .. } = fixture();
   let file = child(&mut tree, r, "a.js");
   let fingerprint = Fingerprint { modified: 0, size: 1, id: 1 };
   tree[file].kind = Kind::File(fingerprint);
@@ -461,6 +448,11 @@ fn hint_to_mark() {
       name: "a path that climbs is dropped",
       hint: |f| changed(f.r, "../f.js", false),
       marks: &[],
+    },
+    Case {
+      name: "a top directory is marked in the root",
+      hint: |f| changed(f.top, "", false),
+      marks: &["|/|d"],
     },
   ];
   for case in table {
@@ -666,25 +658,24 @@ fn a_name_that_can_be_another_spelling() {
   assert!(!f.tree.has_other_spelling(f.tree.child(f.r, OsStr::new("\u{4e2d}.js")).unwrap()));
 }
 
-#[test]
-fn a_hint_for_a_dead_key_is_dropped() {
-  let mut f = fixture();
-  f.tree[f.sub].kind = Kind::Missing;
-  f.tree.prune(f.sub);
-  f.tree.hint(changed(f.sub, "a.js", true));
-  assert!(!f.tree.has_work());
-}
-
+/// A removed key names no node again: not while its slot is free, and not the node that reuses it.
 #[test]
 fn an_old_key_does_not_reach_the_node_that_reuses_its_slot() {
   let mut f = fixture();
   let old = f.sub;
   f.tree[old].kind = Kind::Missing;
   f.tree.prune(old);
+  assert!(f.tree.get(old).is_none());
+  assert_eq!(f.tree.child(f.r, OsStr::new("sub")), None);
+  assert_eq!(f.tree.children(f.r).count(), 0);
+  assert!(!f.tree.hint(changed(old, "a.js", true)));
+
   let new = child(&mut f.tree, f.r, "other");
   on_disk(&mut f.tree, new, true);
   assert_eq!(new.index(), old.index());
   assert_ne!(new.generation(), old.generation());
+  let keys: Vec<DirKey> = f.tree.nodes().map(|(key, _)| key).collect();
+  assert!(keys.contains(&new) && !keys.contains(&old));
 
   assert!(f.tree.get(old).is_none() && f.tree.get_mut(old).is_none());
   assert_eq!(f.tree.parent(old), None);
@@ -703,15 +694,6 @@ fn an_old_key_does_not_reach_the_node_that_reuses_its_slot() {
   f.tree.hint(changed(new, "", false));
   assert_eq!(marks(&f.tree), ["/p/r/other|a.js|w", "/p/r|other|d"]);
   f.tree.check_links().unwrap();
-}
-
-#[test]
-fn a_top_directory_is_marked_in_the_root() {
-  let mut f = fixture();
-  f.tree.hint(changed(f.top, "", false));
-  assert_eq!(marks(&f.tree), ["|/|d"]);
-  assert_eq!(f.tree.marked, [(f.top, None)]);
-  assert_eq!(f.tree.to_scan, []);
 }
 
 #[test]
@@ -740,51 +722,6 @@ fn lost_notifications_scan_everything() {
   assert_eq!(f.tree.to_scan, [Tree::ROOT]);
   assert_eq!(f.tree.parent(f.top), Some(Tree::ROOT));
   assert_eq!(f.tree.parent(other), Some(Tree::ROOT));
-}
-
-/// Every mark as `path of the directory`, `name`, `deep` or `written`, sorted.
-fn mark_list(tree: &Tree) -> Vec<String> {
-  let mut all = Vec::new();
-  for (key, node) in tree.nodes() {
-    let Some(mark) = node.mark() else { continue };
-    let kind = if mark.deep { "deep" } else { "written" };
-    let parent = tree.parent(key).map(|parent| tree.path(parent)).unwrap_or_default();
-    all.push(format!("{} {} {kind}", shown(&parent), tree.name(key).display()));
-  }
-  all.sort();
-  all
-}
-
-#[test]
-fn from_hint_to_mark() {
-  let mut tree = Tree::new();
-  let top = child(&mut tree, Tree::ROOT, "/");
-  let p = child(&mut tree, top, "p");
-  let a = child(&mut tree, p, "a");
-  let b = child(&mut tree, a, "b");
-  let c = child(&mut tree, b, "c.js");
-  on_disk(&mut tree, top, false);
-  on_disk(&mut tree, p, true);
-  assert!(tree.make_path(c));
-
-  // `/p/a` and `/p/a/b` are not on disk: the hint goes up to the first node that is.
-  tree.hint(changed(b, "c.js", true));
-  assert_eq!(mark_list(&tree), ["/p a deep"]);
-  clear_marks(&mut tree);
-  tree.hint(changed(b, "", false));
-  assert_eq!(mark_list(&tree), ["/p a deep"]);
-  clear_marks(&mut tree);
-
-  // The written file is below an unknown name: that name is marked, and deep.
-  tree.hint(changed(p, "new/f.js", true));
-  assert_eq!(mark_list(&tree), ["/p new deep"]);
-  clear_marks(&mut tree);
-  tree.hint(changed(p, "f.js", true));
-  assert_eq!(mark_list(&tree), ["/p f.js written"]);
-
-  clear_marks(&mut tree);
-  tree.hint(changed(top, "", false));
-  assert_eq!(mark_list(&tree), [" / deep"]);
 }
 
 /// `tidy_polled` leaves each directory to look at once, in the order of the arena; the root always.

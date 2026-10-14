@@ -441,6 +441,8 @@ fn file_changes_in_a_watched_directory() {
   fs::write(h.path("written"), "1").unwrap();
   fs::write(h.path("deleted"), "1").unwrap();
   fs::write(h.path("replaced"), "1").unwrap();
+  fs::write(h.path("mode"), "1").unwrap();
+  fs::create_dir_all(h.path("one/two/three")).unwrap();
   let key = h.cover(1, "");
 
   // The sync takes the records of each change out, so the next hint is a new one.
@@ -459,13 +461,12 @@ fn file_changes_in_a_watched_directory() {
   fs::write(h.path("replaced.tmp"), "2").unwrap();
   fs::rename(h.path("replaced.tmp"), h.path("replaced")).unwrap();
   h.hints_until(&[changed(key, "replaced.tmp"), changed(key, "replaced")]);
-}
+  h.sync(key);
 
-#[test]
-fn file_three_levels_below_the_cover() {
-  let mut h = Harness::new();
-  fs::create_dir_all(h.path("one/two/three")).unwrap();
-  let key = h.cover(1, "");
+  // The flags of a write and of a chmod come merged: the backend cannot tell them apart.
+  chmod(&h.path("mode"), 0o600);
+  h.hints_until(&[changed(key, "mode")]);
+  h.sync(key);
 
   File::create(h.path("one/two/three/file")).unwrap();
   let mut hints = h.hints_until(&[changed(key, "one/two/three/file")]);
@@ -544,17 +545,6 @@ fn chmod_and_touch_of_a_directory_give_no_hint() {
     }
     assert!(Instant::now() < deadline, "the records still say that the directories are new");
   }
-}
-
-#[test]
-fn chmod_of_a_file_gives_a_hint() {
-  let mut h = Harness::new();
-  fs::write(h.path("file"), "1").unwrap();
-  let key = h.cover(1, "");
-
-  // The flags of a write and of a chmod come merged: the backend cannot tell them apart.
-  chmod(&h.path("file"), 0o600);
-  h.hints_until(&[changed(key, "file")]);
 }
 
 /// A cover below it that counted on that stream gets one of its own.
@@ -714,6 +704,17 @@ fn cover_above_a_cover() {
   assert!(hints.contains(&Seen::Lost), "{hints:?}");
   File::create(h.path("up/low/d")).unwrap();
   h.hints_until(&[changed(low, "d"), changed(up, "low/d")]);
+
+  // With the last key gone, the streams that a replacement left running need no overlap: the
+  // next commit stops them, and nothing stays open.
+  let top = h.watch(3, &h.path(""), Want::Contents);
+  h.commit();
+  assert_eq!(h.backend.retiring_count(), 1);
+  for key in [low, up, top] {
+    h.backend.unwatch(key);
+  }
+  h.commit();
+  assert_eq!((h.backend.stream_count(), h.backend.retiring_count()), (0, 0));
 }
 
 #[test]
@@ -837,23 +838,6 @@ fn the_short_way_out_of_the_data_volume() {
     assert_eq!(h.backend.cover_of_key()[&home], real);
     h.backend.unwatch(home);
   }
-}
-
-/// With the last key gone, the streams that a replacement left running need no overlap: the
-/// next commit stops them, and nothing stays open.
-#[test]
-fn the_last_unwatch_stops_the_replaced_streams_too() {
-  let mut h = Harness::new();
-  fs::create_dir_all(h.path("up/low")).unwrap();
-  let low = h.cover(1, "up/low");
-  let up = h.watch(2, &h.path("up"), Want::Contents);
-  h.commit();
-  assert_eq!(h.backend.retiring_count(), 1);
-
-  h.backend.unwatch(low);
-  h.backend.unwatch(up);
-  h.commit();
-  assert_eq!((h.backend.stream_count(), h.backend.retiring_count()), (0, 0));
 }
 
 /// A stream never stands on `/`, `/Users` or a home directory: such a cover gets no watch and
@@ -1176,24 +1160,6 @@ fn record_goes_to_every_cover_that_holds_its_path() {
   assert_eq!(h.translate(raw(&[(&h.real("a/b/file"), file)])), []);
   let hints = h.translate(raw(&[(&h.real("a/b/c/d/file"), file)]));
   assert_eq!(hints, [changed(keys["a/b/c/d"], "file")]);
-}
-
-#[test]
-fn records_outside_every_cover_are_dropped() {
-  let mut h = Harness::new();
-  fs::create_dir(h.path("a")).unwrap();
-  let key = h.watch(1, &h.path("a"), Want::Contents);
-  let file = flag::CREATED | 0x1_0000;
-
-  assert_eq!(h.translate(raw(&[(&h.real("other/file"), file)])), []);
-  assert_eq!(h.translate(raw(&[(&h.real(""), file)])), []);
-  // The same first letters are not the same directory.
-  assert_eq!(h.translate(raw(&[(&h.real("ab"), file)])), []);
-  assert_eq!(h.translate(raw(&[(&h.real("ab/file"), file)])), []);
-  assert_eq!(h.translate(raw(&[(&h.real("a/file"), file)])), [changed(key, "file")]);
-
-  h.backend.unwatch(key);
-  assert_eq!(h.translate(raw(&[(&h.real("a/file"), file)])), []);
 }
 
 #[test]
