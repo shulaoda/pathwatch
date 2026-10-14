@@ -2,7 +2,10 @@
 //! watch API and with polling. Time passes only when the world lets everything settle, so a
 //! story takes no time here, and its end is checked against the disk (`caught_up`).
 
-use std::path::{Path, PathBuf};
+use std::{
+  path::{Path, PathBuf},
+  time::Duration,
+};
 
 use crate::fixtures::{Deliver, Driver, Mode, caught_up};
 use pathwatch::{EventKind, engine::Options, poll::PollBackend};
@@ -119,6 +122,10 @@ impl<B: Deliver> World for Sim<B> {
   fn symlink(&mut self, target: &str, link: &str) -> bool {
     self.driver.fs.symlink(self.path(target), self.path(link)).unwrap();
     true
+  }
+
+  fn pass(&mut self, time: Duration) {
+    self.driver.advance(time);
   }
 
   fn expect(&mut self, expected: &[(EventKind, &str)]) {

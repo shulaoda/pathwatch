@@ -416,6 +416,10 @@ impl World for Disk {
     Disk::symlink(self, target, link)
   }
 
+  fn pass(&mut self, time: Duration) {
+    thread::sleep(time);
+  }
+
   fn expect(&mut self, expected: &[(EventKind, &str)]) {
     Disk::expect(self, expected);
   }

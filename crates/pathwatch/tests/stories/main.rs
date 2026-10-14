@@ -64,6 +64,10 @@ pub trait World {
   /// without the developer mode), so the story has nothing to check.
   fn symlink(&mut self, target: &str, link: &str) -> bool;
 
+  /// Time passes. The one way to see that nothing comes after a while: a story uses it where a
+  /// late event would be a mistake.
+  fn pass(&mut self, time: Duration);
+
   /// Waits until the events since the last `expect` are the expected ones, and then nothing
   /// else comes. For one path the order counts; an `Update` right after a `Create` or an
   /// `Update` of the same path is fine.

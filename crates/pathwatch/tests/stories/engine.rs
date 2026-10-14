@@ -220,6 +220,34 @@ fn changes_behind_a_link_on_the_way() {
   });
 }
 
+/// A watched path that is a link to a file: the file is read by its real path, so a write of
+/// the target is one `Update` and nothing comes after it, and the link pointed at another file
+/// is an `Update` too.
+#[test]
+fn a_watched_link_to_a_file_is_read_through_its_target() {
+  everywhere(|w| {
+    w.write("shared/config.json", "1");
+    w.mkdir("p");
+    if !w.symlink("shared/config.json", "p/config.json") {
+      return;
+    }
+    w.watch(&["p/config.json"]);
+    w.expect(&[]);
+    w.write("shared/config.json", "22");
+    w.expect(&[(Update, "p/config.json")]);
+    // The file is young for two seconds: a look that could not read it would report once more.
+    w.pass(Duration::from_millis(2500));
+    w.expect(&[]);
+
+    w.write("shared/other.json", "333");
+    w.remove("p/config.json");
+    w.symlink("shared/other.json", "p/config.json");
+    w.expect(&[(Update, "p/config.json")]);
+    w.pass(Duration::from_millis(2500));
+    w.expect(&[]);
+  });
+}
+
 /// A link to a directory inside a watched directory is a file entry, until a watched path
 /// goes through it: then the link is followed and is no file any more, and what is behind it
 /// is a part of the watched directory.

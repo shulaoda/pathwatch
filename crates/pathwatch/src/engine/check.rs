@@ -492,7 +492,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let hash = if young || compare {
       // The reads are timed apart: the rest after a poll counts them once (design.md 5.13).
       let started = self.fs.ticks();
-      let hashed = self.content_hash(path, kind, fingerprint.size);
+      let hashed = self.content_hash(key, path, kind, fingerprint.size);
       self.read_took += self.fs.ticks().saturating_sub(started);
       match hashed {
         Ok(hash) => hash,
@@ -544,9 +544,24 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// A hash of the content of a regular file, or of the target of a link. `None`: nothing to
   /// compare.
-  fn content_hash(&self, path: &Path, kind: FileType, size: u64) -> io::Result<Option<u64>> {
+  fn content_hash(
+    &self,
+    key: DirKey,
+    path: &Path,
+    kind: FileType,
+    size: u64,
+  ) -> io::Result<Option<u64>> {
     match kind {
-      FileType::File if size <= HASH_LIMIT => self.fs.hash(path, HASH_LIMIT),
+      FileType::File if size <= HASH_LIMIT => {
+        // A registered link is followed for its fingerprint, and so for its content: the open
+        // refuses a link, so the file is read by its real path.
+        if self.tree.link(key).is_some() {
+          let real = self.fs.real_path(path)?;
+          self.fs.hash(&real, HASH_LIMIT)
+        } else {
+          self.fs.hash(path, HASH_LIMIT)
+        }
+      }
       FileType::Symlink => self.fs.link_target(path).map(|target| Some(hash_of(&target))),
       _ => Ok(None),
     }

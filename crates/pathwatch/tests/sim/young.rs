@@ -153,7 +153,7 @@ fn a_file_with_a_whole_second_is_young_for_2_s() {
 /// No OS watch covers the file, so no "written" hint can make up for a wrong guess: it is young
 /// for 2 s, whatever its time stamp looks like. Three ways to be there: the poll backend, a
 /// watch that the OS had no room for, and a watched path that is a link (nothing watches what
-/// is behind it, and the link itself cannot be read for a hash).
+/// is behind it; the file is read by its real path).
 #[test]
 fn a_file_that_only_the_poll_looks_at_is_young_for_2_s() {
   fn run<B: Deliver>(mut d: Driver<B>, path: &str, on: &str) {
@@ -165,16 +165,7 @@ fn a_file_that_only_the_poll_looks_at_is_young_for_2_s() {
     assert_eq!(d.fs.calls().hash, 1, "{on}");
     assert_eq!(scans_that_hash(&mut d, 20), 20, "{on}");
     d.advance(Duration::from_secs(2));
-    if path == "/p/link" {
-      // A link cannot be opened (`O_NOFOLLOW`): nothing was compared while it was young, so the
-      // first look that finds it old reports one `Update` for all (5.8), and reads nothing.
-      d.engine.overflow(d.now);
-      assert!(d.step());
-      assert_eq!(taken(&mut d), ["U /p/link"], "{on}");
-      assert_eq!(scans_that_hash(&mut d, 10), 0, "{on}");
-    } else {
-      assert_eq!(scans_that_hash(&mut d, 10), 1, "{on}");
-    }
+    assert_eq!(scans_that_hash(&mut d, 10), 1, "{on}");
     caught_up(&mut d);
   }
   run(Driver::poll(Options::default()), "/p/real/a", "the poll backend");

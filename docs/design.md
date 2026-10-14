@@ -657,10 +657,11 @@ Two guards:
 2. **Young files.** A file is young when its modification time is close to the flush (or in the
    future). When a young regular file is stored, the engine also stores a hash of its content.
    At the next check with an equal fingerprint the hash decides. When the file is no longer
-   young, the hash is compared one last time and dropped. A link is never opened: the hash of
-   a link is the hash of its target, and the read of a file opens the entry so that a link
-   that took the place of the file since the look is not followed, and a FIFO or a device is
-   not waited for (`O_NOFOLLOW` and `O_NONBLOCK`; on Windows a reparse point that stands for
+   young, the hash is compared one last time and dropped. A link entry is never opened: its
+   hash is the hash of the text of its target. A watched path that is a link is followed for
+   its fingerprint, and so for its content: the file is read by its real path. Any other read
+   opens the entry so that a link that took the place of the file since the look is not
+   followed, and a FIFO or a device is not waited for (`O_NOFOLLOW` and `O_NONBLOCK`; on Windows a reparse point that stands for
    another name is refused). A file above 16 MiB is not hashed, and the read stops at the
    limit when the file grew since the look: such a file, and a file that cannot be read, has
    nothing to compare:
