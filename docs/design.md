@@ -801,9 +801,13 @@ on the list whose directory is on disk:
 
 The marks and scans go through the normal flush, and the next poll is paced (5.13). With a
 native backend the timer is one second and the polled nodes are few: the root, the directories
-that the backend answered `NotWatched` for, and what failed. With the poll backend every
-answer is `NotWatched`, so every node is polled, and the timer is the poll interval. **Polling
-is this timer with the poll backend.**
+that the backend answered `NotWatched` for, and what failed. The timer runs only while the list
+holds more than the root, a child of the root is not on disk (a drive that is not there yet), a
+registered name is a link (5.14), or a flush left work behind because the disk stopped
+answering, which the next poll takes up: with inotify, which watches the directories above too,
+the thread sleeps until a notification comes. With the poll backend every answer is
+`NotWatched`, so every node is polled, and the timer is the poll interval. **Polling is this
+timer with the poll backend.**
 
 **Asked again.** `NotWatched` is not for ever. A commit can start an OS watch for a tree that
 holds a polled directory (FSEvents: a stream path that went up to a common directory, or a

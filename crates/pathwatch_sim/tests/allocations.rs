@@ -127,7 +127,11 @@ struct Direct {
 impl Backend for Direct {
   type Raw = (DirKey, &'static str);
 
-  fn watch(&mut self, key: DirKey, dir: &Path, _: Want) -> Coverage {
+  /// As FSEvents and Windows: a directory asked for its names only is left to the poll.
+  fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
+    if want == Want::Names {
+      return Coverage::NotWatched;
+    }
     self.keys.lock().unwrap().push((dir.to_path_buf(), key));
     Coverage::Watched
   }
@@ -210,7 +214,8 @@ fn a_change_asks_for_the_path_of_its_event_only() {
   }
 }
 
-/// A poll with nothing to find, next to OS watches for every directory: it asks for no memory.
+/// A poll with nothing to find, of the directories above the one with the OS watch: it asks for
+/// no memory.
 #[test]
 fn a_poll_asks_for_nothing() {
   let mut s = story();

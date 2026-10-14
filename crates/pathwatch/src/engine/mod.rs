@@ -244,8 +244,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     let took = self.flush(now, true);
     self.finish(out);
-    self.poll_at.get_or_insert(now + took + self.options.poll_interval);
-    self.stop_poll_if_idle();
+    self.set_poll(now + took + self.options.poll_interval);
   }
 
   /// Takes back what `watch` did for every path, and reports nothing for them.
@@ -257,9 +256,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     self.narrow_all();
     // What still stands may need another watch now, or another look.
-    self.flush(now, true);
+    let took = self.flush(now, true);
     self.finish(out);
-    self.stop_poll_if_idle();
+    self.set_poll(now + took + self.options.poll_interval);
   }
 
   /// Takes one signal of the backend: it only makes marks, and [`Engine::tick`] reads the disk.
@@ -280,6 +279,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         // The poll that was set with the old interval may be far away.
         let next = now + self.options.poll_interval;
         self.poll_at = self.poll_at.map(|at| at.min(next));
+        self.set_poll(next);
       }
     }
     if left_work {
@@ -320,16 +320,34 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let rest = (looks * REST).saturating_add(self.read_took).min(LONGEST_REST);
       self.poll_at = Some(now + took + self.options.poll_interval.max(rest));
     }
-    self.stop_poll_if_idle();
+    self.set_poll(now + took + self.options.poll_interval);
   }
 
-  fn stop_poll_if_idle(&mut self) {
+  /// Keeps the timer running while a poll has something to look at, and stops it otherwise:
+  /// with inotify every directory above a watched path has a watch of its own, and the thread
+  /// sleeps until a notification comes.
+  fn set_poll(&mut self, at: Instant) {
     if !self.tree[Tree::ROOT].is_registered() {
-      self.poll_at = None;
       // Only a poll tidies the list of the timer: without one, every `watch` would leave its
       // directories on it.
       self.tree.tidy_polled();
     }
+    if self.has_poll_work() {
+      self.poll_at.get_or_insert(at);
+    } else {
+      self.poll_at = None;
+    }
+  }
+
+  /// Whether a poll has anything to look at: a directory on the list other than the root (a
+  /// stale key keeps the timer for one round, which tidies the list), a child of the root that
+  /// is not on disk (a drive that is not there yet), a registered name that is a link (5.14),
+  /// or work that a flush left (the disk stopped answering): the next poll takes it up.
+  fn has_poll_work(&self) -> bool {
+    self.tree.polled.iter().any(|&key| key != Tree::ROOT)
+      || self.tree.children(Tree::ROOT).any(|top| !self.tree[top].is_dir())
+      || self.tree.links().next().is_some()
+      || self.tree.has_work()
   }
 
   /// Moves the flush to one quiet time from now, but not past the longest wait.

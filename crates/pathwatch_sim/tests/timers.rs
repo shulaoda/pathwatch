@@ -59,8 +59,8 @@ fn the_flush_waits_for_the_quiet_time() {
   assert!(d.step());
   assert_eq!(d.now, start + Duration::from_millis(16));
   assert_eq!(taken(&mut d), ["U /p/a"]);
-  // The next poll is the only thing left.
-  assert_eq!(d.engine.deadline(), Some(start + Duration::from_secs(1)));
+  // inotify watches the directory too: nothing is left for the timer.
+  assert_eq!(d.engine.deadline(), None);
   caught_up(&mut d);
 }
 
@@ -146,12 +146,11 @@ fn no_batch_starves_and_a_failed_watch_is_asked_again() {
   assert_eq!(d.fs.calls().watch, watches + polls);
   d.fs.set_watch_limit(None);
   Sim::settled(&mut d);
-  let (watches, lstats, start) = (d.fs.calls().watch, d.fs.calls().lstat, d.now);
+  let (watches, lstats) = (d.fs.calls().watch, d.fs.calls().lstat);
   Sim::settled(&mut d);
-  // The watch works: no more tries, and the directory is polled no more. All that a poll still
-  // does is the check of `/` from the root.
-  let polls = (d.now - start).as_secs();
-  assert_eq!((d.fs.calls().watch, d.fs.calls().lstat), (watches, lstats + polls));
+  // The watch works: no more tries, and nothing is left for the timer.
+  assert_eq!((d.fs.calls().watch, d.fs.calls().lstat), (watches, lstats));
+  assert_eq!(d.engine.deadline(), None);
   assert_eq!(Sim::errors(&d), [ErrorKind::WatchLimit]);
   caught_up(&mut d);
 }
@@ -439,19 +438,27 @@ fn nothing_is_due_when_nothing_is_watched() {
     d.fs.write("/p/a.js", "1").unwrap();
     d.fs.write("/p/lib/pkg/x.js", "1").unwrap();
     d.watch(&["/p/a.js", "/p/lib/pkg/x.js"]);
-    assert_eq!(d.engine.deadline(), Some(d.now + second), "{on}");
-    let poll = d.engine.deadline();
+    // inotify watches the directories above too: nothing is left for the timer.
+    let polls = on != "Inode";
+    let poll = polls.then_some(d.now + second);
+    assert_eq!(d.engine.deadline(), poll, "{on}");
     // One watched path is left: the poll stays, also when nothing is at the path any more.
     d.unwatch(&["/p/a.js"]);
     assert_eq!(d.engine.deadline(), poll, "{on}");
     d.fs.remove_all("/p/lib/pkg").unwrap();
     assert_eq!(settled(&mut d), ["D /p/lib/pkg/x.js"], "{on}");
-    assert!(d.engine.deadline().is_some(), "{on}");
+    assert_eq!(d.engine.deadline().is_some(), polls, "{on}");
     d.unwatch(&["/p/lib/pkg/x.js"]);
     assert_eq!(d.engine.deadline(), None, "{on}");
 
     d.watch(&["/p/a.js"]);
+    assert_eq!(d.engine.deadline(), polls.then_some(d.now + second), "{on}");
+    // A watched path that is a link is checked by the poll on every system.
+    d.fs.symlink("a.js", "/p/l.js").unwrap();
+    d.watch(&["/p/l.js"]);
     assert_eq!(d.engine.deadline(), Some(d.now + second), "{on}");
+    d.unwatch(&["/p/l.js"]);
+    assert_eq!(d.engine.deadline().is_some(), polls, "{on}");
     d.unwatch(&["/p/a.js"]);
     assert_eq!(d.engine.deadline(), None, "{on}");
     caught_up(&mut d);
@@ -478,9 +485,10 @@ fn a_quiet_time_longer_than_the_poll_interval() {
     d.deliver(usize::MAX);
     let hint_at = d.now;
 
-    // Two polls, a second apart, report nothing of it.
+    // Two polls, a second apart, report nothing of it. With inotify no poll runs.
     let flush_at = hint_at + Duration::from_secs(3);
-    for _ in 0..2 {
+    let polls = if mode == Mode::Inode { 0 } else { 2 };
+    for _ in 0..polls {
       assert!(d.step());
       assert!(d.now < flush_at, "{mode:?}");
       assert_eq!(taken(&mut d), NONE, "{mode:?}");

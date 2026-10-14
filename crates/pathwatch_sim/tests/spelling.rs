@@ -156,8 +156,8 @@ fn only_a_name_that_can_be_the_hinted_one_is_checked() {
   // A name of ideographs is only itself, like a name of ASCII letters.
   d.fs.write("/p/src/\u{4e2d}\u{6587}.js", "1").unwrap();
   assert_eq!(d.deliver(usize::MAX), 52);
-  // No hint left work: nothing is due but the poll, and the disk was not asked.
-  assert_eq!(d.engine.deadline(), Some(d.now + std::time::Duration::from_secs(1)));
+  // No hint left work: nothing is due, and the disk was not asked.
+  assert_eq!(d.engine.deadline(), None);
   assert_eq!(d.fs.calls(), before);
 
   for round in 0..50 {
@@ -204,8 +204,10 @@ fn the_other_spelling_of_a_directory_next_to_unrelated_names() {
     d.fs.write("/p/src/out.js", "1").unwrap();
     d.fs.write("/p/src/component", "1").unwrap();
     assert!(d.deliver(usize::MAX) >= 2, "{mode:?}");
-    // No hint left work: nothing is due but the poll, and the disk was not asked.
-    assert_eq!(d.engine.deadline(), Some(d.now + std::time::Duration::from_secs(1)), "{mode:?}");
+    // No hint left work: nothing is due but the poll of the directories above, where the OS
+    // does not watch them, and the disk was not asked.
+    let poll = (mode != Mode::Inode).then(|| d.now + std::time::Duration::from_secs(1));
+    assert_eq!(d.engine.deadline(), poll, "{mode:?}");
     assert_eq!(d.fs.calls(), before, "{mode:?}");
 
     d.fs.write("/p/src/components/App.js", "22").unwrap();
@@ -234,8 +236,8 @@ fn a_strict_disk_costs_one_look() {
   let before = d.fs.calls();
   d.fs.write("/p/src/other.js", "1").unwrap();
   assert_eq!(d.deliver(usize::MAX), 1);
-  // The hint left no work: nothing is due but the poll.
-  assert_eq!(d.engine.deadline(), Some(d.now + std::time::Duration::from_secs(1)));
+  // The hint left no work: nothing is due.
+  assert_eq!(d.engine.deadline(), None);
   assert_eq!(d.fs.calls(), before);
 
   d.fs.write("/p/src/app.js", "22").unwrap();
