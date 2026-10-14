@@ -90,7 +90,7 @@ watcher, so it should only pass the batch on.
 | `Config` method | Default | Meaning |
 |---|---|---|
 | `with_ignored(f)` | nothing is ignored | `f(path, kind) -> bool`, where `kind` is `EntryKind::File` or `EntryKind::Dir`. A path for which it returns `true` is never reported, and an ignored directory is never read or watched. It must give the same answer for the same input, and should ignore everything below a directory that it ignores. It decides about the paths you watch too (promise 10). |
-| `with_debounce(d)` | 10 ms on macOS, 20 ms elsewhere | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch goes out 500 ms after the first change since the last batch, or `4 × d` after it if that is longer, plus the time that the check of the disk takes. Zero: no waiting. The most is a year, also for the poll interval. A `watch` or `unwatch` call ends the quiet time; a poll that runs meanwhile does not, but a change it finds by itself is reported. Under polling there is no quiet time: a change is found by the next round. |
+| `with_debounce(d)` | 10 ms on macOS, 20 ms elsewhere | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch goes out `4 × d` after the first change since the last batch, and 500 ms after it at most (never before `d`), plus the time that the check of the disk takes. Zero: no waiting. The most is a year, also for the poll interval. A `watch` or `unwatch` call ends the quiet time; a poll that runs meanwhile does not, but a change it finds by itself is reported. Under polling there is no quiet time: a change is found by the next round. |
 | `with_delete_delay(d)` | 10 ms on macOS, 50 ms elsewhere; none under polling | How long a `Delete` waits for the path to come back. A file that is removed and written again within `d` is one `Update`; a real delete is reported `d` after the OS said that the path is gone, or after the quiet time if that is longer. Zero: no waiting, and such a file is a `Delete` and a `Create`. Under polling there is none, as there is no quiet time, and as in chokidar, notify and watchdog: a round that falls into a save that leaves the path empty for a moment reports a `Delete` and a `Create` (vim on Linux, polled every 100 ms: 4 of 100 saves). The most is a year. |
 | `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
 | `with_poll_interval(d)` | 100 ms | The pause between two rounds of polling, and at least as long as the round took: polling takes half of a core at most. The least is 1 ms. A round looks at every watched file once (20,000 files: about 50 ms on APFS). |
@@ -290,10 +290,10 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   plus the time of a round (20,000 files: about 50 ms on APFS), or within twice the round when
   the round is longer than the interval. The files written in the last two seconds are read
   in each round (on Windows a read right after a write waits for the virus scanner).
-- **Under a flood** of changes a batch goes out 500 ms after the first change since the last
-  batch, plus the time that the check of the disk takes: a check with thousands of changed
-  paths takes a second and more (measured: 30,000 files made by eight threads, the longest
-  gap 2 s).
+- **Under a flood** of changes a batch goes out four quiet times (40 ms on macOS, 80 ms
+  elsewhere) after the first change since the last batch, plus the time that the check of the
+  disk takes: a check with thousands of changed paths takes a second and more (measured:
+  30,000 files made by eight threads, the longest gap 2 s).
 - **A `Delete`** comes one delete delay (10 ms on macOS, 50 ms elsewhere) after the OS said
   that the path is gone, or one quiet time if that is longer, once the path was found empty
   twice (under polling, at the round that finds it gone); under a flood it comes with the next batch. It comes at once

@@ -62,10 +62,11 @@ fn the_flush_waits_for_the_quiet_time() {
   caught_up(&mut d);
 }
 
-/// The longest wait grows with the quiet time: four times a quiet time of 200 ms. Hints that
-/// come every 150 ms never leave 200 ms of quiet, and the batch goes out after 800 ms.
+/// The longest wait is four quiet times, and 500 ms at most: with a quiet time of 200 ms, hints
+/// that come every 150 ms never leave 200 ms of quiet, and each batch goes out 500 ms after its
+/// first hint.
 #[test]
-fn the_longest_wait_is_four_quiet_times() {
+fn the_longest_wait_is_500_ms_at_most() {
   // No poll comes in between: a poll checks what waits, too.
   let (debounce, poll_interval) = (Duration::from_millis(200), Duration::from_secs(60));
   let mut d = Driver::sim(Mode::Inode, Options { debounce, poll_interval, ..Options::default() });
@@ -78,8 +79,8 @@ fn the_longest_wait_is_four_quiet_times() {
   for round in 0..12_u64 {
     d.fs.write("/p/a", format!("write {round}")).unwrap();
     d.deliver(usize::MAX);
-    if round < 5 {
-      let due = (round * 150 + 200).min(800);
+    if round < 4 {
+      let due = (round * 150 + 200).min(500);
       assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(due)));
     }
     // To the next write, or to the flush if that comes first.
@@ -91,43 +92,52 @@ fn the_longest_wait_is_four_quiet_times() {
     d.advance(next_write - d.now);
   }
   let update = vec!["U /p/a".to_owned()];
-  assert_eq!(batches, [(800, update.clone()), (1700, update)]);
+  assert_eq!(batches, [(500, update.clone()), (1100, update.clone()), (1700, update)]);
   caught_up(&mut d);
 }
 
-/// The timers. Hints that keep coming move the flush, but they never starve a batch: it
-/// goes out 500 ms after its first hint at the latest. And a watch that failed is asked for
-/// again by each poll until it works; then the directory is polled no more.
+/// The timers. Hints that keep coming move the flush, but they never starve a batch: it goes
+/// out four quiet times after its first hint, 500 ms at most, and never before one quiet time.
+/// And a watch that failed is asked for again by each poll until it works; then the directory
+/// is polled no more.
 #[test]
 fn no_batch_starves_and_a_failed_watch_is_asked_again() {
-  let mut d = Driver::sim(Mode::Inode, Options::default());
-  d.fs.mkdir_all("/p/logs").unwrap();
-  d.fs.write("/p/a.js", "1").unwrap();
-  d.fs.write("/p/logs/x.log", "").unwrap();
-  d.watch(&["/p"]);
-  let start = d.now;
-  // A tool appends to a log every 3 ms, for more than a second. No 10 ms pass without a hint.
-  d.fs.write("/p/a.js", "22").unwrap();
-  let mut batches = Vec::new();
-  for round in 1..=400 {
-    d.fs.write("/p/logs/x.log", "line\n".repeat(round)).unwrap();
-    d.deliver(usize::MAX);
-    if round == 3 {
-      // The flush is due 10 ms after the last hint, not after the first one.
-      assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(6 + 10)));
+  for (quiet, longest) in [(10_u64, 40_u64), (200, 500), (1000, 1000)] {
+    let options = Options { debounce: Duration::from_millis(quiet), ..Options::default() };
+    let mut d = Driver::sim(Mode::Inode, options);
+    d.fs.mkdir_all("/p/logs").unwrap();
+    d.fs.write("/p/a.js", "1").unwrap();
+    d.fs.write("/p/logs/x.log", "").unwrap();
+    d.watch(&["/p"]);
+    let start = d.now;
+    // A tool appends to a log every 3 ms. No quiet time passes without a hint.
+    d.fs.write("/p/a.js", "22").unwrap();
+    // The ticks come every 3 ms: the first one at the longest wait or after it.
+    let tick = longest.div_ceil(3) * 3;
+    let mut batches = Vec::new();
+    for round in 1..=usize::try_from(2 * tick / 3 + 1).unwrap() {
+      d.fs.write("/p/logs/x.log", "line\n".repeat(round)).unwrap();
+      d.deliver(usize::MAX);
+      if round == 3 {
+        // The flush is due one quiet time after the last hint, not after the first one.
+        let due = Duration::from_millis((6 + quiet).min(longest));
+        assert_eq!(d.engine.deadline(), Some(start + due));
+      }
+      d.advance(Duration::from_millis(3));
+      d.tick();
+      let events = show(&d.take_events());
+      if !events.is_empty() {
+        batches.push(((d.now - start).as_millis(), events));
+      }
     }
-    d.advance(Duration::from_millis(3));
-    d.tick();
-    let events = show(&d.take_events());
-    if !events.is_empty() {
-      batches.push(((d.now - start).as_millis(), events));
-    }
+    // The first tick after the longest wait, and the first tick that long after the hint that
+    // followed it.
+    let log = "U /p/logs/x.log".to_owned();
+    let first = vec!["U /p/a.js".to_owned(), log.clone()];
+    assert_eq!(batches, [(u128::from(tick), first), (u128::from(2 * tick), vec![log])]);
+    assert_eq!(Sim::settled(&mut d), ["U /p/logs/x.log"]);
+    caught_up(&mut d);
   }
-  // The first tick after 500 ms, and the first tick 500 ms after the hint that followed it.
-  let log = "U /p/logs/x.log".to_owned();
-  assert_eq!(batches, [(501, vec!["U /p/a.js".to_owned(), log.clone()]), (1002, vec![log])]);
-  assert_eq!(Sim::settled(&mut d), ["U /p/logs/x.log"]);
-  caught_up(&mut d);
 
   let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir_all("/p/r/sub").unwrap();

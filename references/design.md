@@ -951,8 +951,15 @@ asked for is in place before anything that came in meanwhile.
 **The debounce.** The disk is checked when no hint came for the quiet time: every hint that
 leaves work moves the flush to one quiet time after it. So a save in several steps is one
 batch. Hints that keep coming do not hold a batch back for ever: counted from the first hint
-after the last flush, the flush comes after 500 ms at the latest, or after four quiet times if
-that is longer. The default quiet time is 20 ms where the OS tells at once (inotify,
+after the last flush, the flush comes after four quiet times at the latest, and after 500 ms
+at most unless the quiet time is longer (`Engine::schedule`), as lodash's `maxWait` counts
+from the first call. Measured on Linux with a file in the watched tree written every 5 ms: an
+edit next to it waited 364 ms (p50) when the longest wait was 500 ms, and 25 to 28 ms with
+four quiet times; on macOS FSEvents leaves gaps of about 10 ms, and the edit waited 22 ms
+either way. A burst of 2,000 edits went out in 3 batches on macOS instead of 1, and all were
+there as soon (2026-10-15). @parcel/watcher counts its 500 ms from the last batch instead: the
+first change after half a second of quiet goes out at once, alone, and a check of the disk at
+that moment can catch a save half done (5.9). The default quiet time is 20 ms where the OS tells at once (inotify,
 Windows): long enough for the steps of one save (a temporary file, a rename) to be one batch,
 also on a busy machine, and short enough not to be felt; watchman and webpack wait the same.
 Measured on Linux with the saves of 5.9 on a busy machine: with 5 ms, 4 of 60 saves and 2

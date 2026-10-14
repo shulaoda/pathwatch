@@ -35,7 +35,8 @@ use crate::{
   tree::{Depth, KEPT, Mark, Node, Tree, emptied},
 };
 
-/// A batch goes out at least this often while hints keep coming, or every four quiet times.
+/// While hints keep coming, a batch goes out four quiet times after its first hint, and this
+/// long at most, unless the quiet time itself is longer.
 const LONGEST_WAIT: Duration = Duration::from_millis(500);
 
 /// The scans after a loss report rest this many times as long as they took: such work takes a
@@ -344,7 +345,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// Moves the flush to one quiet time from now, but not past the longest wait.
   fn schedule(&mut self, now: Instant) {
     let debounce = self.options.debounce;
-    let longest = debounce.saturating_mul(4).max(LONGEST_WAIT);
+    let longest = debounce.saturating_mul(4).min(LONGEST_WAIT).max(debounce);
     let latest = *self.flush_by.get_or_insert(now + longest);
     self.flush_at = Some((now + debounce).min(latest));
   }

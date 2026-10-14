@@ -60,8 +60,8 @@ impl Config {
   /// rename) to be one batch, also on a busy machine, and short enough not to be felt. FSEvents
   /// tells of a change about 10 ms after it, so macOS needs less.
   ///
-  /// While changes keep coming, a batch still goes out every 500 ms, or every four quiet times
-  /// if that is longer. The most is a year.
+  /// While changes keep coming, a batch still goes out four quiet times after the first of them,
+  /// and 500 ms after it at most, unless the quiet time is longer. The most is a year.
   #[must_use]
   pub fn with_debounce(mut self, debounce: Duration) -> Self {
     self.debounce = debounce;

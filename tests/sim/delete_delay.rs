@@ -761,13 +761,15 @@ fn a_pending_delete_and_a_change_of_kind() {
 }
 
 /// Hints keep coming, and a file is removed. The quiet time does not stretch the delete delay:
-/// the look at the longest wait finds nothing, the delay since the hint is over by then, and
-/// the `Delete` goes out with the next batch. The hints wait for their quiet time meanwhile:
+/// with a quiet time of 200 ms the longest wait is 500 ms, longer than the delay; the look then
+/// finds nothing, the delay since the hint is over by then, and the `Delete` goes out with the
+/// next batch. The hints wait for their quiet time meanwhile:
 /// the log gets its next `Update` at the longest wait, after the last of them.
 #[test]
 fn the_delete_delay_holds_while_hints_keep_coming() {
   // No poll comes in between.
-  let options = Options { poll_interval: Duration::from_secs(60), ..Options::default() };
+  let (debounce, poll_interval) = (Duration::from_millis(200), Duration::from_secs(60));
+  let options = Options { debounce, poll_interval, ..Options::default() };
   let mut d = Driver::sim(Mode::Inode, options);
   d.fs.mkdir_all("/p/logs").unwrap();
   d.fs.write("/p/a.js", "1").unwrap();
@@ -775,7 +777,7 @@ fn the_delete_delay_holds_while_hints_keep_coming() {
   d.watch(&["/p"]);
   let start = d.now;
   d.fs.remove("/p/a.js").unwrap();
-  // A tool appends to a log every 3 ms. No 10 ms pass without a hint.
+  // A tool appends to a log every 3 ms. No quiet time passes without a hint.
   let mut batches = Vec::new();
   for round in 1..=250 {
     d.fs.write("/p/logs/x.log", "line\n".repeat(round)).unwrap();
