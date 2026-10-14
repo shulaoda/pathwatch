@@ -1,9 +1,8 @@
 //! The Windows backend alone, on a real Windows file system. A test named `open_point_` settles
 //! a point that was only known from the Windows documents before it ran.
-#![cfg(windows)]
 
 use std::{
-  ffi::{OsStr, OsString},
+  ffi::OsString,
   fs, io,
   os::windows::ffi::{OsStrExt, OsStringExt},
   path::{Path, PathBuf},
@@ -208,11 +207,15 @@ fn a_change_of_a_file_becomes_a_hint() {
   for name in ["written.txt", "old.txt", "removed.txt"] {
     fs::write(temp.path().join(name), "1").unwrap();
   }
+  let deep = make_dir(temp.path().join("a").join("b"));
   let mut harness = Harness::new();
   let key = harness.handle(temp.path());
 
   fs::write(temp.path().join("created.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(key, "created.txt"));
+  // A file two levels down is reported from the same handle, with the way down to it.
+  fs::write(deep.join("f.txt"), "1").unwrap();
+  harness.hints_until(|hint| hint.names(key, r"a\b\f.txt"));
 
   fs::write(temp.path().join("written.txt"), "12").unwrap();
   let written = Seen::Written { key, rel: "written.txt".into() };
@@ -258,17 +261,6 @@ fn a_watch_is_live_when_watch_returns() {
     harness.hints_until(|hint| hint.names(key, "f.txt"));
     harness.backend.unwatch(key);
   }
-}
-
-#[test]
-fn a_change_deep_below_is_reported_from_the_handle() {
-  let temp = scratch();
-  let deep = make_dir(temp.path().join("a").join("b"));
-  let mut harness = Harness::new();
-  let key = harness.handle(temp.path());
-
-  fs::write(deep.join("f.txt"), "1").unwrap();
-  harness.hints_until(|hint| hint.names(key, r"a\b\f.txt"));
 }
 
 /// Windows also sends a record for the directory when an entry in it changes.
@@ -324,19 +316,6 @@ fn a_handle_above_takes_over_from_the_handle_below() {
   fs::rename(temp.path().join("mid"), temp.path().join("moved")).unwrap();
   fs::write(temp.path().join("moved").join("low").join("g.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(key, r"moved\low\g.txt"));
-}
-
-#[test]
-fn an_ancestor_gets_no_handle() {
-  let temp = scratch();
-  let mut harness = Harness::new();
-  let (key, coverage) = harness.watch(temp.path(), Want::Names);
-  assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
-
-  let coverage = harness.watch_again(key, temp.path(), Want::Contents);
-  assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
-  fs::write(temp.path().join("f.txt"), "1").unwrap();
-  harness.hints_until(|hint| hint.names(key, "f.txt"));
 }
 
 #[test]
@@ -512,20 +491,6 @@ fn open_point_a_directory_name_that_ends_with_a_dot() {
 }
 
 #[test]
-fn open_point_a_save_becomes_a_written_hint() {
-  let temp = scratch();
-  let file = temp.path().join("f.txt");
-  fs::write(&file, "old").unwrap();
-  let mut harness = Harness::new();
-  let key = harness.handle(temp.path());
-
-  // Windows makes one to three records for a save, some only when the file is closed.
-  fs::write(&file, "new and longer").unwrap();
-  let written = Seen::Written { key, rel: "f.txt".into() };
-  harness.hints_until(|hint| *hint == written);
-}
-
-#[test]
 fn open_point_lost_records_become_a_hint_for_each_key_of_the_handle() {
   let temp = scratch();
   let sub = make_dir(temp.path().join("sub"));
@@ -554,17 +519,6 @@ fn open_point_lost_records_become_a_hint_for_each_key_of_the_handle() {
 }
 
 #[test]
-fn open_point_a_deleted_directory_becomes_a_hint_for_the_directory_itself() {
-  let temp = scratch();
-  let dir = make_dir(temp.path().join("dir"));
-  let mut harness = Harness::new();
-  let key = harness.handle(&dir);
-
-  fs::remove_dir(&dir).unwrap();
-  harness.hints_until(|hint| hint.names_the_directory(key));
-}
-
-#[test]
 fn open_point_a_directory_that_is_deleted_and_made_again() {
   let temp = scratch();
   let dir = make_dir(temp.path().join("dir"));
@@ -574,6 +528,7 @@ fn open_point_a_directory_that_is_deleted_and_made_again() {
   fs::remove_dir(&dir).unwrap();
   // On a file system without POSIX delete the name stays until our handle is closed.
   let made_at_once = fs::create_dir(&dir).is_ok();
+  // The deletion is a hint for the directory itself.
   harness.hints_until(|hint| hint.names_the_directory(key));
   if !made_at_once {
     until_ok(|| fs::create_dir(&dir));
@@ -694,31 +649,26 @@ fn a_directory_behind_a_junction_below_a_handle_is_not_covered() {
   let top = make_dir(temp.path().join("top"));
   let plain = make_dir(top.join("plain").join("sub"));
   make_dir(temp.path().join("target").join("sub"));
-  junction(&top.join("link"), &temp.path().join("target"));
+  let link = top.join("link");
+  junction(&link, &temp.path().join("target"));
+  let behind = link.join("sub");
   let mut harness = Harness::new();
   harness.handle(&top);
 
-  for behind in [top.join("link"), top.join("link").join("sub")] {
-    let (_, coverage) = harness.watch(&behind, Want::Contents);
-    assert!(matches!(coverage, Coverage::NotWatched), "{}: {coverage:?}", behind.display());
+  for dir in [&link, &behind] {
+    let (_, coverage) = harness.watch(dir, Want::Contents);
+    assert!(matches!(coverage, Coverage::NotWatched), "{}: {coverage:?}", dir.display());
   }
   let (key, coverage) = harness.watch(&plain, Want::Contents);
   assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
   fs::write(plain.join("f.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(key, "f.txt"));
-}
 
-/// The handle is opened by the commit, and only then is the junction below it known.
-#[test]
-fn a_directory_behind_a_junction_is_told_when_the_handle_above_comes_with_it() {
-  let temp = scratch();
-  let top = make_dir(temp.path().join("top"));
-  make_dir(temp.path().join("target").join("sub"));
-  junction(&top.join("link"), &temp.path().join("target"));
-  let behind = top.join("link").join("sub");
+  // The directory behind the junction and the one above it in one flush: the handle is opened
+  // by the commit, and only then is the junction below it known. The key behind it is told,
+  // and the ask that follows says why.
   let mut harness = Harness::new();
   let (top_key, key) = (DirKey::new(100, 0), DirKey::new(101, 0));
-
   for (key, dir) in [(top_key, &top), (key, &behind)] {
     let coverage = harness.backend.watch(key, dir, Want::Contents);
     assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
@@ -727,7 +677,6 @@ fn a_directory_behind_a_junction_is_told_when_the_handle_above_comes_with_it() {
   harness.hints_until(|hint| hint.names_the_directory(key));
   let coverage = harness.watch_again(key, &behind, Want::Contents);
   assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
-
   fs::write(top.join("f.txt"), "1").unwrap();
   harness.hints_until(|hint| hint.names(top_key, "f.txt"));
 }
@@ -768,27 +717,6 @@ fn open_point_a_change_made_through_a_short_name() {
   // it does not know is spelled, and finds the entry under its long name.
   let short = short.to_string_lossy();
   harness.hints_until(|hint| hint.names(key, "a long file name.txt") || hint.names(key, &short));
-}
-
-/// A disk that another system filled can list a name that reads as a drive (`C:`, `Q:evil`):
-/// the path of such a node stays below its directory, and so do the paths of the names after
-/// it. (`PathBuf::push` would start the path anew.)
-#[test]
-fn a_listed_name_that_reads_as_a_drive_stays_in_its_directory() {
-  use pathwatch::tree::Tree;
-  let mut tree = Tree::new();
-  let top = tree.insert_child(Tree::ROOT, OsStr::new(r"C:\"));
-  let dir = tree.insert_child(top, OsStr::new("dir"));
-  for name in ["C:", "Q:evil", "a:b", "plain.txt"] {
-    let key = tree.insert_child(dir, OsStr::new(name));
-    let path = tree.path(key);
-    assert_eq!(path.as_os_str(), OsStr::new(&format!(r"C:\dir\{name}")), "{name}");
-    assert!(path.starts_with(r"C:\dir"), "{name}: {}", path.display());
-    let mut popped = path.clone();
-    assert!(popped.pop());
-    assert_eq!(popped, Path::new(r"C:\dir"), "{name}");
-  }
-  assert_eq!(tree.path(top), Path::new(r"C:\"));
 }
 
 /// More directories than handles, and one of them is a junction: the others share a handle

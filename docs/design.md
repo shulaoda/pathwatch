@@ -29,7 +29,7 @@ watcher.close();
 | `Watcher::new(handler)`, `with_config(config, handler)` | Start the watcher thread and the backend. They fail only when the thread cannot start. When the watch API of the OS cannot start, the handler is told once (`WatchLimit` or `Io`) and the watcher polls everything. |
 | `watch(paths)` | Register a batch and return when every path is watched and its state is known. What exists then is the **baseline** and is not reported. A path that is watched already is skipped. |
 | `unwatch(paths)` | Take back a `watch` of the very same paths, and report nothing but the change of a link inside a watched directory that is a plain file again (5.7). |
-| `close()` | Stops the backend and waits for the thread. After it the handler is not called again, and `watch` and `unwatch` return `Closed`. Dropping the watcher calls it. |
+| `close()` | Stops the backend and waits for the thread. After it the handler is not called again, and `watch` and `unwatch` return `Closed`. A check of the disk that runs ends at its next step, so the wait is one look at most. Dropping the watcher calls it. |
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
 | `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
@@ -214,7 +214,10 @@ their own path (150 bytes for a file: the backend keeps the real path of each di
 twice). While a `watch` call runs, the heap holds its paths once more, for the thread of the
 watcher, and the arena twice for a moment each time it grows. The lists of a flush keep their
 memory for the next flush only up to 16 KiB each (`emptied`): a longer one is given back when
-the flush ends.
+the flush ends. The usual work of a watcher that runs for days asks for no memory: a `watch`
+of paths that are watched already (in their clean form), an `unwatch` of a path and a poll
+allocate nothing, and a flush allocates for the paths of its events only
+(`tests/sim/allocations.rs` keeps the budgets).
 
 **`complete` is a rule.** A directory node is complete when its path is a watched path, or
 when its parent is complete, and in both cases the filter does not ignore it as a directory.
@@ -392,7 +395,9 @@ asks the disk for the name of that entry when
 
 A look is sure, and asks nothing, for a name that the listing of the running scan gave, and
 for an entry that the tree knows and that has no other spelling in the tree: the edit of a
-file that the tree knows costs what it costs on any disk.
+file that the tree knows costs what it costs on any disk. A link is never asked: the disk
+cannot say how it spells a link (the real path of a link is the path of its target), so the
+listing is believed for it.
 
 When the disk spells the name in another way, the directory has no entry of this name.
 
@@ -558,7 +563,8 @@ away and back while it was read, which the Windows backend does not report.
 `vanish(node)`: the directory is gone for good, or a file took its place. The kind of the node
 becomes "nothing"; `backend.unwatch` if the backend was asked for this node. For each child:
 forget it if it is a file (the end of the flush tells its `Delete`), `vanish` if it is a
-directory; its mark is dropped.
+directory; its mark is dropped. The walk keeps a list of the directories still to do, not a
+recursion: a tree deeper than the stack goes like any other.
 
 ### 5.6 A partial node becomes complete
 
@@ -950,7 +956,7 @@ kind of work rests for `9 × t`. So about a tenth of the time goes into it at mo
   its node until then. Every other mark is checked as always, and a hint that names a path
   with a waiting mark takes it out of the wait.
 - The poll: the next round starts after the poll interval, or after the rest, whichever is
-  longer. The rest of the poll is nine times the looks of the round plus the reads of young
+  longer; a `watch` call in between does not move it. The rest of the poll is nine times the looks of the round plus the reads of young
   files once: the looks come again at every round, a file is read for two seconds only. And
   it is five seconds at most (`LONGEST_REST`): a round that read a burst of files written just
   before it put the next one off for minutes (measured: 500 files, 2 to 20 s; 100,000, 153 s).
@@ -1369,7 +1375,7 @@ What stays open:
 
 ### 7.3 ReadDirectoryChangesW (`windows.rs`)
 
-The tests of this backend (`tests/windows.rs`, and `tests/windows_parts.rs` for the parts that
+The tests of this backend (`tests/windows/os.rs`, and `tests/windows/parts.rs` for the parts that
 make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Windows 11 with NTFS.
 
 - One thread owns one I/O completion port and every directory handle (`port`). A handle
@@ -1494,11 +1500,12 @@ The test files of the simulator:
 - Private functions (a `mod tests` at the end of the file): `tree/mod.rs`, `tree/names.rs`,
   `path.rs`, `fs/mod.rs`, `fs/windows.rs`, `engine/events.rs`, and helpers of the backends.
 - The tree alone (`tests/tree.rs`): the arena, the table, and the way from a hint to a mark.
-- The engine on a real directory with the poll backend and a clock that the test moves:
-  a file whose time is ahead of the clock (`tests/ahead.rs`, 5.8; it counts the reads), and
-  the rest after a poll (`tests/pacing.rs`, 5.13). The hash of a file on the real disk
-  (`tests/hash.rs`): the limit, and that nothing but a regular file is opened (5.8).
-- Each backend alone (`tests/inotify.rs`, `fsevents.rs`, `windows.rs`, each on its OS). `windows_parts.rs` runs on Windows only. In `fsevents.rs` a test
+- The engine on a real directory with the poll backend and a clock that the test moves
+  (`tests/poll.rs`): a file whose time is ahead of the clock (5.8; it counts the reads), the
+  rest after a poll (5.13), the engine after its backend stopped (5.10), and the hash of a
+  file: the limit, and that nothing but a regular file is opened (5.8).
+- Each backend alone (`tests/inotify.rs`, `fsevents.rs`, `windows/os.rs`, each on its OS);
+  `windows/parts.rs` runs on Windows only. In `fsevents.rs` a test
   that makes many changes runs alone, and after the others where it can (`Turn`): a flood
   makes FSEvents report losses, and a test next to it was seen to get one too. No test there
   starts when more than 50,000 files lie next to the test program (the probe in 7.2).
@@ -1506,7 +1513,9 @@ The test files of the simulator:
   side, relative paths, a bad path, the queue bound, a backend that cannot start.
 - The stories (`tests/stories`): `contract` (the rows of section 3), `projects` (what editors
   and big projects do), `promises` (the promises of the README; its first lines say which test
-  proves which). Each story runs on the real disk, once with the backend of the OS and once
+  proves which), `engine` (what the engine has to get right below the promises: a batch of
+  paths, a directory that becomes a watched path above others, files and links on the way,
+  directories that are renamed or replaced). Each story runs on the real disk, once with the backend of the OS and once
   with polling, both at the same time; a story that needs no more than the words of `World`
   (files, directories, links, renames, `watch`, `unwatch`, `expect`) runs first on each
   simulated backend of `tests/sim`, where it takes no time and its end is checked against

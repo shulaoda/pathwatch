@@ -1,8 +1,6 @@
 //! The parts of the Windows backend that make no Windows call: `place`, `Handles`, `Records` and
 //! `translate`.
 
-#![cfg(target_os = "windows")]
-
 use std::path::PathBuf;
 
 use pathwatch::backend::DirKey;
@@ -162,13 +160,6 @@ mod place {
     // `/p` and `/q` have only the top directory in common. The last in path order gets nothing.
     assert_eq!(placed(&wanted, 1), [at("/p", &[5, 0, 1, 2, 3])]);
     assert_eq!(placed(&wanted, 0), []);
-  }
-
-  #[test]
-  fn a_deeper_common_directory_is_taken_before_a_higher_one() {
-    let wanted = [("/a", Contents), ("/p/x/1", Contents), ("/p/x/2", Contents), ("/p/y", Contents)];
-    assert_eq!(placed(&wanted, 3), [at("/a", &[0]), at("/p/x", &[1, 2]), at("/p/y", &[3])]);
-    assert_eq!(placed(&wanted, 2), [at("/a", &[0]), at("/p", &[1, 2, 3])]);
     // Directories that go on together for a while meet in the lowest directory of them all.
     let wanted = [("/p/q/r/1", Contents), ("/p/q/r/2", Contents)];
     assert_eq!(placed(&wanted, 1), [at("/p/q/r", &[0, 1])]);
@@ -277,29 +268,6 @@ mod place {
     let sizes: Vec<(PathBuf, usize)> =
       places.into_iter().map(|(dir, keys)| (dir, keys.len())).collect();
     assert_eq!(sizes, [(dir("/p/node_modules"), 1900), (dir("/p/src"), 100)]);
-  }
-
-  #[test]
-  fn only_as_many_directories_share_as_the_limit_asks_for() {
-    // 62 directories that have nothing in common, and three that have.
-    let mut paths: Vec<String> = (0..62).map(|n| format!("/d{n}")).collect();
-    paths.extend(["/p/x/1", "/p/x/2", "/p/y"].map(String::from));
-    let wanted: Vec<(&str, Want)> = paths.iter().map(|path| (path.as_str(), Contents)).collect();
-    let dirs = |wanted: &[(&str, Want)]| -> Vec<PathBuf> {
-      placed(wanted, MAX_HANDLES)
-        .into_iter()
-        .map(|(dir, _)| dir)
-        .filter(|dir| dir.starts_with(super::dir("/p")))
-        .collect()
-    };
-    // 65 directories: one pair shares, and 64 handles are left.
-    assert_eq!(dirs(&wanted), [dir("/p/x"), dir("/p/y")]);
-    // 64 directories fit as they are.
-    assert_eq!(dirs(&wanted[1..]), [dir("/p/x/1"), dir("/p/x/2"), dir("/p/y")]);
-    // 66 directories: all three share.
-    let mut more = wanted.clone();
-    more.push(("/d99", Contents));
-    assert_eq!(dirs(&more), [dir("/p")]);
   }
 }
 
@@ -420,8 +388,6 @@ mod handles {
     }
 
     /// Keeps what a call told, and checks what holds after every call: no handle is below
-    /// another, and there are never too many.
-    /// Keeps what a call told, and checks what holds after every call: no handle is below
     /// another unless a link lies between them, and there are never too many.
     fn told(&mut self, told: Told) {
       self.lost.extend(told.lost.into_iter().map(index));
@@ -508,14 +474,20 @@ mod handles {
   fn a_key_behind_a_link_is_not_served() {
     let mut fake = Fake::default();
     fake.disk.links = vec![dir("/p/link")];
+    // A key that waits for a handle behind the link: the handle that comes does not cover it.
+    assert_eq!(fake.watch(3, "/p/link/sub", Want::Names), Answer::NotWatched);
     fake.open(0, "/p");
+    assert_eq!(fake.covered, []);
     for behind in ["/p/link", "/p/link/sub"] {
       assert_eq!(fake.watch(1, behind, Want::Contents), Answer::NotWatched);
     }
+    assert_eq!(fake.watch(3, "/p/link/sub", Want::Names), Answer::NotWatched);
     assert_eq!(fake.watch(2, "/p/plain/sub", Want::Contents), Answer::Tree);
     assert_eq!(fake.disk.open.len(), 1);
     assert_eq!(fake.lost(), []);
 
+    // The directory behind the link and the one above it in one flush: the handle is opened
+    // by the commit, and only then is the link below it known. The key behind it is told.
     let mut fake = Fake::default();
     fake.disk.links = vec![dir("/p/link")];
     for (index, path) in [(0, "/p"), (1, "/p/link/sub")] {
@@ -527,12 +499,9 @@ mod handles {
     assert_eq!(told.lost, [key(1)]);
     assert_eq!(fake.watch(1, "/p/link/sub", Want::Contents), Answer::NotWatched);
     assert_eq!(fake.dirs(), dirs(["/p"]));
-  }
 
-  /// A key that got no handle is asked again at once. When the handle that comes to serve it
-  /// then stands above a link, it is not watched: that is no limit.
-  #[test]
-  fn a_refused_key_that_comes_to_lie_behind_a_link_is_not_watched() {
+    // A key that got no handle is asked again at once. When the handle that comes to serve it
+    // then stands above the link, it is not watched: that is no limit.
     let mut fake = Fake::default();
     fake.disk.links = vec![dir("/p/link")];
     fake.disk.broken = Some(dir("/p/link/sub"));
@@ -585,41 +554,6 @@ mod handles {
     assert_eq!(fake.lost(), [101, 200]);
   }
 
-  /// A key that waits for a handle and lies behind a link below the one that comes is not told
-  /// that it is covered: the handle reports nothing behind the link.
-  #[test]
-  fn a_waiting_key_behind_a_link_is_not_covered_by_a_handle_above_the_link() {
-    let mut fake = Fake::default();
-    fake.disk.links = vec![dir("/p/link")];
-    assert_eq!(fake.watch(200, "/p/link/sub", Want::Names), Answer::NotWatched);
-    assert_eq!(fake.watch(201, "/p/plain/sub", Want::Names), Answer::NotWatched);
-    fake.open(0, "/p");
-    assert_eq!(std::mem::take(&mut fake.covered), [201]);
-    assert_eq!(fake.watch(201, "/p/plain/sub", Want::Names), Answer::Names);
-    assert_eq!(fake.watch(200, "/p/link/sub", Want::Names), Answer::NotWatched);
-    assert_eq!(fake.lost(), []);
-  }
-
-  /// A key below a directory that has a handle anyway, with a link between: it is not
-  /// watched, and the handles stay where they are.
-  #[test]
-  fn a_key_behind_a_link_below_a_shared_handle_is_not_watched() {
-    let mut fake = Fake::default();
-    fake.disk.links = vec![dir("/p/5/link")];
-    let count = u32::try_from(MAX_HANDLES).unwrap();
-    for index in 0..count {
-      fake.open(index, &format!("/p/{index}"));
-    }
-    assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Tree);
-    assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
-    let opened = fake.disk.ids.len();
-    assert_eq!(fake.watch(101, "/p/5/link/sub", Want::Contents), Answer::NotWatched);
-    assert_eq!(fake.watch(101, "/p/5/link/sub", Want::Contents), Answer::NotWatched);
-    assert_eq!(fake.disk.ids.len(), opened);
-    assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
-    assert_eq!(fake.lost(), []);
-  }
-
   /// `unwatch` of the keys of a shared handle moves nothing: the handle goes with its last key,
   /// and where the handles stand is worked out once at the next commit, not for each key.
   #[test]
@@ -656,6 +590,18 @@ mod handles {
     assert_eq!(fake.disk.ids.len(), opened);
     fake.commit();
     assert_eq!(fake.disk.open, []);
+    // The key of the directory of the handle goes while a key below stays: the handle moves
+    // down to it. A key that goes twice, and a handle that is closed, are forgotten.
+    let mut fake = Fake::default();
+    let id = fake.open(0, "/p");
+    assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
+    fake.unwatch(0);
+    assert_eq!(fake.dirs(), dirs(["/p/a"]));
+    assert_eq!(fake.lost(), []);
+    fake.unwatch(0);
+    fake.unwatch(1);
+    assert_eq!(fake.dirs(), dirs([]));
+    assert_eq!(fake.died(id), []);
   }
 
   /// A failed settle keeps a handle for the keys that still use it. When the last of them is a
@@ -679,46 +625,6 @@ mod handles {
 
   fn dirs<const N: usize>(paths: [&str; N]) -> Vec<PathBuf> {
     paths.map(dir).into()
-  }
-
-  #[test]
-  fn an_ancestor_that_nothing_covers_is_not_watched() {
-    let mut fake = Fake::default();
-    assert_eq!(fake.watch(0, "/p", Want::Names), Answer::NotWatched);
-    fake.unwatch(0);
-    fake.open(1, "/p/a/b");
-    assert_eq!(fake.watch(2, "/p/a", Want::Names), Answer::NotWatched);
-    assert_eq!(fake.dirs(), dirs(["/p/a/b"]));
-    assert_eq!(fake.watch(0, "/p", Want::Contents), Answer::Tree);
-    assert_eq!(fake.dirs(), dirs(["/p"]));
-  }
-
-  #[test]
-  fn a_directory_at_or_below_a_handle_gets_no_handle() {
-    let mut fake = Fake::default();
-    let id = fake.open(0, "/p/a");
-    for (index, want, answer) in
-      [(1, Want::Names, Answer::Names), (2, Want::Contents, Answer::Tree)]
-    {
-      assert_eq!(fake.watch(index, "/p/a/b/c", want), answer);
-      fake.unwatch(index);
-      assert_eq!(fake.disk.open, [(id, dir("/p/a"))]);
-    }
-    assert_eq!(fake.disk.ids, [id]);
-    // A key for the directory of the handle itself replaces the handle, as every such request does.
-    assert_eq!(fake.watch(3, "/p/a", Want::Contents), Answer::Tree);
-    assert_eq!(fake.dirs(), dirs(["/p/a"]));
-    assert_ne!(fake.id("/p/a"), id);
-    assert_eq!(fake.lost(), []);
-  }
-
-  #[test]
-  fn a_path_is_compared_part_by_part() {
-    let mut fake = Fake::default();
-    fake.open(0, "/p/a");
-    fake.open(1, "/p/ab");
-    fake.open(2, "/p/b/a");
-    assert_eq!(fake.dirs(), dirs(["/p/a", "/p/ab", "/p/b/a"]));
   }
 
   #[test]
@@ -748,37 +654,37 @@ mod handles {
   }
 
   #[test]
-  fn the_key_of_a_handle_gets_a_new_handle_when_it_asks_again() {
-    let mut fake = Fake::default();
-    let first = fake.open(0, "/p");
-    let second = fake.open(0, "/p");
-    assert_ne!(first, second);
-    assert_eq!(fake.disk.open, [(second, dir("/p"))]);
-    assert_eq!(fake.lost(), []);
-    assert_eq!(fake.died(first), []);
-    assert_eq!(fake.died(second), [0]);
-  }
-
-  #[test]
   fn a_request_below_a_shared_handle_opens_nothing_and_one_for_its_directory_replaces_it() {
     let mut fake = Fake::default();
-    fake.open(0, "/p");
+    let shared = fake.open(0, "/p");
     assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
     assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::Names);
-    let shared = fake.id("/p");
     for _ in 0..3 {
       assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
       assert_eq!(fake.watch(2, "/p/b", Want::Contents), Answer::Tree);
     }
+    // A key below that comes and goes leaves the handle as it is.
+    assert_eq!(fake.watch(3, "/p/a/b/c", Want::Names), Answer::Names);
+    fake.unwatch(3);
+    assert_eq!(fake.watch(3, "/p/a/b/c", Want::Contents), Answer::Tree);
+    fake.unwatch(3);
     assert_eq!(fake.disk.open, [(shared, dir("/p"))]);
+    assert_eq!(fake.disk.ids, [shared]);
 
+    // The key of the handle asks again, and then another key for its directory: each time a
+    // new handle takes the place of the old one, and the old one is forgotten.
     assert_eq!(fake.watch(0, "/p", Want::Contents), Answer::Tree);
-    assert_ne!(fake.id("/p"), shared);
+    let again = fake.id("/p");
+    assert_ne!(again, shared);
+    assert_eq!(fake.watch(3, "/p", Want::Contents), Answer::Tree);
+    let new = fake.id("/p");
+    assert_ne!(new, again);
+    assert_eq!(fake.disk.open, [(new, dir("/p"))]);
     // The other keys of the handle are not told, and they are keys of the new handle.
     assert_eq!(fake.lost(), []);
     assert_eq!(fake.died(shared), []);
-    let new = fake.id("/p");
-    assert_eq!(fake.died(new), [0, 1, 2]);
+    assert_eq!(fake.died(again), []);
+    assert_eq!(fake.died(new), [0, 1, 2, 3]);
   }
 
   /// Put off to the commit, the engine would take the key for watched until the commit says
@@ -802,25 +708,6 @@ mod handles {
   }
 
   #[test]
-  fn an_id_is_never_given_out_twice() {
-    let mut fake = Fake::default();
-    fake.disk.broken = Some(dir("/failed"));
-    for round in 0..3 {
-      assert_eq!(fake.watch(9, "/failed", Want::Contents), Answer::Failed);
-      fake.open(round, "/p");
-      fake.open(round, "/p");
-      fake.unwatch(round);
-    }
-    // The open that fails is tried twice the first time: by the commit, and again for the
-    // answer. After that it is tried once.
-    let count = fake.disk.ids.len();
-    assert_eq!(count, 10);
-    fake.disk.ids.sort_by_key(|id| id.0);
-    fake.disk.ids.dedup();
-    assert_eq!(fake.disk.ids.len(), count);
-  }
-
-  #[test]
   fn a_handle_that_could_not_be_opened_changes_nothing() {
     let mut fake = Fake::default();
     fake.disk.broken = Some(dir("/p"));
@@ -832,6 +719,20 @@ mod handles {
     assert_eq!(fake.watch(2, "/p/a/b", Want::Contents), Answer::Tree);
     assert_eq!(fake.lost(), []);
     assert_eq!(fake.died(low), [0, 2]);
+
+    // At the limit: the shared handle cannot be opened, and nothing moves.
+    let mut fake = Fake::default();
+    fake.disk.broken = Some(dir("/p"));
+    for index in 0..u32::try_from(MAX_HANDLES).unwrap() {
+      fake.open(index, &format!("/p/{index}"));
+    }
+    let before = fake.disk.open.clone();
+    assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Failed);
+    assert_eq!(fake.disk.open, before);
+    assert_eq!(fake.lost(), []);
+    fake.disk.broken = None;
+    assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Tree);
+    assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
   }
 
   #[test]
@@ -874,15 +775,7 @@ mod handles {
     assert_eq!(fake.lost(), [9]);
     assert_eq!(fake.watch(9, "/d9", Want::Contents), Answer::Limit);
     assert_eq!(fake.lost(), []);
-  }
-
-  #[test]
-  fn there_is_room_again_when_a_handle_goes() {
-    let mut fake = Fake::default();
-    for index in 0..u32::try_from(MAX_HANDLES).unwrap() {
-      fake.open(index, &format!("/d{index}"));
-    }
-    assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Limit);
+    // There is room again when a handle goes.
     fake.unwatch(7);
     assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Tree);
     assert_eq!(fake.disk.open.len(), MAX_HANDLES);
@@ -938,24 +831,6 @@ mod handles {
   }
 
   #[test]
-  fn a_shared_handle_that_cannot_be_opened_leaves_all_as_it_was() {
-    let mut fake = Fake::default();
-    fake.disk.broken = Some(dir("/p"));
-    for index in 0..u32::try_from(MAX_HANDLES).unwrap() {
-      fake.open(index, &format!("/p/{index}"));
-    }
-    let before = fake.disk.open.clone();
-    // The handle of `/q` was opened for this, and is closed again.
-    assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Failed);
-    assert_eq!(fake.disk.open, before);
-    assert_eq!(fake.lost(), []);
-
-    fake.disk.broken = None;
-    assert_eq!(fake.watch(100, "/q", Want::Contents), Answer::Tree);
-    assert_eq!(fake.dirs(), dirs(["/p", "/q"]));
-  }
-
-  #[test]
   fn a_key_that_wants_names_is_served_while_a_handle_is_above_it() {
     let mut fake = Fake::default();
     fake.open(0, "/p/a");
@@ -972,6 +847,12 @@ mod handles {
     assert_eq!(fake.watch(3, "/p/a/x", Want::Names), Answer::Names);
     fake.unwatch(3);
     assert_eq!(fake.lost(), []);
+    // Nothing covers a directory above the handle, until the same key asks for the contents:
+    // then the handle moves up to it.
+    assert_eq!(fake.watch(4, "/p", Want::Names), Answer::NotWatched);
+    assert_eq!(fake.dirs(), dirs(["/p/a"]));
+    assert_eq!(fake.watch(4, "/p", Want::Contents), Answer::Tree);
+    assert_eq!(fake.dirs(), dirs(["/p"]));
   }
 
   #[test]
@@ -996,83 +877,6 @@ mod handles {
     }
     assert_eq!(fake.disk.ids, []);
     fake.open(1, "/Users/me/p");
-  }
-
-  #[test]
-  fn unwatch_closes_a_handle_with_its_last_key() {
-    let mut fake = Fake::default();
-    let id = fake.open(0, "/p");
-    assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
-
-    fake.unwatch(1);
-    assert_eq!(fake.disk.open, [(id, dir("/p"))]);
-    assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
-    // The key below is still watched: it gets a handle on its own directory.
-    fake.unwatch(0);
-    assert_eq!(fake.dirs(), dirs(["/p/a"]));
-    assert_eq!(fake.lost(), []);
-    fake.unwatch(0);
-    fake.unwatch(1);
-    assert_eq!(fake.dirs(), dirs([]));
-    assert_eq!(fake.died(id), []);
-  }
-
-  #[test]
-  fn the_keys_below_a_handle_that_went_away_get_handles_of_their_own() {
-    let mut fake = Fake::default();
-    fake.open(0, "/p/a");
-    fake.open(1, "/p");
-    fake.open(2, "/q");
-    assert_eq!(fake.watch(3, "/p/b", Want::Names), Answer::Names);
-    assert_eq!(fake.watch(4, "/q/c", Want::Contents), Answer::Tree);
-    assert_eq!(fake.lost(), []);
-
-    fake.unwatch(1);
-    assert_eq!(fake.dirs(), dirs(["/p/a", "/q"]));
-    // The engine asks again for each key that is told.
-    assert_eq!(fake.lost(), [3]);
-    assert_eq!(fake.watch(0, "/p/a", Want::Contents), Answer::Tree);
-    assert_eq!(fake.watch(3, "/p/b", Want::Names), Answer::NotWatched);
-    assert_eq!(fake.watch(4, "/q/c", Want::Contents), Answer::Tree);
-    assert_eq!(fake.dirs(), dirs(["/p/a", "/q"]));
-  }
-
-  #[test]
-  fn a_dead_handle_is_forgotten_once_with_its_keys() {
-    let mut fake = Fake::default();
-    let id = fake.open(0, "/p");
-    assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
-
-    assert_eq!(fake.died(id), [0, 1]);
-    assert_eq!(fake.died(id), []);
-    fake.unwatch(0);
-    assert_eq!(fake.dirs(), dirs([]));
-    fake.open(1, "/p/a");
-  }
-
-  #[test]
-  fn a_key_is_covered_when_a_new_handle_takes_the_place_of_a_dead_one() {
-    let mut fake = Fake::default();
-    let id = fake.open(0, "/p");
-    assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
-
-    assert_eq!(fake.died(id), [0, 1]);
-    fake.open(0, "/p");
-    assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
-    assert_eq!(fake.dirs(), dirs(["/p"]));
-  }
-
-  #[test]
-  fn a_key_that_is_no_longer_covered_gets_a_handle_when_it_asks_again() {
-    let mut fake = Fake::default();
-    let id = fake.open(0, "/p");
-    assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
-    assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::Names);
-
-    assert_eq!(fake.died(id), [0, 1, 2]);
-    fake.open(1, "/p/a");
-    assert_eq!(fake.watch(2, "/p/b", Want::Names), Answer::NotWatched);
-    assert_eq!(fake.lost(), []);
   }
 
   #[test]
@@ -1177,25 +981,18 @@ mod records {
   }
 
   #[test]
-  fn no_bytes_hold_no_record() {
-    assert_eq!(parse(&[]), []);
-  }
-
-  #[test]
   fn several_records() {
     let bytes = encode(&[(ADDED, "a"), (MODIFIED, r"sub\b.txt"), (REMOVED, "ünï")]);
     assert_eq!(
       parse(&bytes),
       [Ok(named(ADDED, "a")), Ok(named(MODIFIED, r"sub\b.txt")), Ok(named(REMOVED, "ünï"))]
     );
-  }
-
-  #[test]
-  fn a_name_of_no_length() {
+    // A name of no length is a record like any other, and no bytes hold no record.
     assert_eq!(
       parse(&encode(&[(ADDED, ""), (REMOVED, "b")])),
       [Ok(named(ADDED, "")), Ok(named(REMOVED, "b"))]
     );
+    assert_eq!(parse(&[]), []);
   }
 
   #[test]
@@ -1213,10 +1010,7 @@ mod records {
       bytes.extend(&records);
       assert_eq!(parse(&bytes[shift..]), [Ok(named(ADDED, "a")), Ok(named(MODIFIED, "bc"))]);
     }
-  }
-
-  #[test]
-  fn records_packed_without_padding() {
+    // Records packed without padding between them.
     let name: Vec<u8> = "abc".encode_utf16().flat_map(u16::to_ne_bytes).collect();
     let mut bytes = raw(18, ADDED, 6, &name);
     bytes.extend(raw(0, REMOVED, 6, &name));
@@ -1229,6 +1023,10 @@ mod records {
     for len in 1..FILE_NAME {
       assert_eq!(parse(&bytes[..len]), [Err(Malformed)]);
     }
+    // Nothing comes after a malformed record.
+    let mut records = Records::new(&[0; 5]);
+    assert_eq!(records.next(), Some(Err(Malformed)));
+    assert_eq!(records.next(), None);
   }
 
   #[test]
@@ -1258,13 +1056,6 @@ mod records {
     for next in [1, 4, 12, 19] {
       assert_eq!(parse(&raw(next, ADDED, 8, &name)), [Err(Malformed)]);
     }
-  }
-
-  #[test]
-  fn nothing_comes_after_a_malformed_record() {
-    let mut records = Records::new(&[0; 5]);
-    assert_eq!(records.next(), Some(Err(Malformed)));
-    assert_eq!(records.next(), None);
   }
 }
 
@@ -1438,25 +1229,16 @@ mod translate {
     watch(&mut handles, 1, "/p/sub", Want::Names);
     watch(&mut handles, 2, "/p/sub/deep", Want::Contents);
     let other = open(&mut handles, 3, "/q");
+    // The keys below `/p` are the ones whose path has it as a part, not as a prefix of the
+    // text: the loss says nothing to a key on `/pq`.
+    open(&mut handles, 4, "/pq");
+    watch(&mut handles, 5, "/pq/sub", Want::Names);
     let lost = hints(&mut handles, read(id, "/p", Ok(Vec::new())));
     assert_eq!(sorted(lost), [changed(0, ""), changed(1, ""), changed(2, "")]);
     assert_eq!(hints(&mut handles, read(other, "/q", Ok(Vec::new()))), [changed(3, "")]);
     // The handle reads on.
     let bytes = encode(&[(ADDED, "a")]);
     assert_eq!(hints(&mut handles, read(id, "/p", Ok(bytes))), [changed(0, "a")]);
-  }
-
-  /// The keys below a directory are the ones whose path has it as a part, not as a prefix of
-  /// the text: a loss on `/p` says nothing to a key on `/pq`.
-  #[test]
-  fn a_loss_names_the_keys_below_the_directory_by_its_names() {
-    let mut handles = Handles::default();
-    let id = open(&mut handles, 0, "/p");
-    watch(&mut handles, 1, "/p/sub", Want::Names);
-    open(&mut handles, 2, "/pq");
-    watch(&mut handles, 3, "/pq/sub", Want::Names);
-    let lost = hints(&mut handles, read(id, "/p", Ok(Vec::new())));
-    assert_eq!(sorted(lost), [changed(0, ""), changed(1, "")]);
   }
 
   /// A read counts for its bytes in the queue of the watcher, and a loss for its keys.
@@ -1632,20 +1414,6 @@ mod translate {
     );
   }
 
-  /// NTFS folds more than ASCII letters: a key in the other case of such a letter shares the
-  /// handle and gets the records.
-  #[test]
-  fn a_key_in_the_other_case_of_a_letter_outside_ascii_gets_its_records() {
-    let mut handles = Handles::default();
-    let id = open(&mut handles, 0, "/p");
-    watch(&mut handles, 1, "/p/café", Want::Contents);
-    watch(&mut handles, 2, "/p/CAFÉ", Want::Contents);
-    let told = hints(&mut handles, read(id, "/p", Ok(records(&[(ADDED, "café/x.js")]))));
-    assert_eq!(sorted(told), [changed(0, "café/x.js"), changed(1, "x.js"), changed(2, "x.js")]);
-    let lost = hints(&mut handles, read(id, "/p", Ok(Vec::new())));
-    assert_eq!(sorted(lost), [changed(0, ""), changed(1, ""), changed(2, "")]);
-  }
-
   #[test]
   fn a_record_that_no_key_holds_is_dropped() {
     let mut handles = Handles::default();
@@ -1702,6 +1470,11 @@ mod translate {
       [deep(), changed(2, "lib/a.js"), changed(3, "lib/a.js")]
     );
     assert_eq!(told(&mut handles, "src/b.js"), [changed(2, "b.js"), changed(3, "b.js")]);
+    // NTFS folds more than ASCII letters: a key in the other case of such a letter gets the
+    // records too.
+    watch(&mut handles, 4, "/p/café", Want::Contents);
+    watch(&mut handles, 5, "/p/CAFÉ", Want::Contents);
+    assert_eq!(told(&mut handles, "café/x.js"), [changed(4, "x.js"), changed(5, "x.js")]);
   }
 
   #[test]

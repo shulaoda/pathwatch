@@ -346,10 +346,10 @@ crates/
                              disk and the backends are in `fixtures/`
       watcher.rs             the thread
       tree.rs                the tree of the engine, alone
-      ahead.rs               the engine with polling: a file with a time ahead of the clock
-      stopped.rs             the engine after its backend stopped
-      inotify.rs  fsevents.rs  windows.rs     each backend alone, on its OS
-      windows_parts.rs       the parts of the Windows backend that call no Windows (on Windows only)
+      poll.rs                the poll backend on a real directory, with a clock the test moves,
+                             and the hash of a file
+      inotify.rs  fsevents.rs  windows/     each backend alone, on its OS; `windows/parts.rs`
+                             holds the parts of that backend that call no Windows
     examples/                watch.rs, dev_server.rs
 docs/
   design.md                  how it works
@@ -371,11 +371,11 @@ This runs, on the machine it is called on:
 
 - the engine on a simulated disk, with a fuzzer (`crates/pathwatch/tests/sim`, on Unix hosts),
 - the backend of this OS against the real watch API (`crates/pathwatch/tests/inotify.rs`,
-  `fsevents.rs` or `windows.rs`),
+  `fsevents.rs` or `windows/os.rs`),
 - the watcher thread (`tests/watcher.rs`),
-- the tree alone (`tests/tree.rs`), and on a real directory the hash of a file (`tests/hash.rs`)
-  and the poll backend with a clock that the test moves (`tests/ahead.rs`, `tests/pacing.rs`),
-- on Windows, also the parts of its backend that call no Windows (`tests/windows_parts.rs`):
+- the tree alone (`tests/tree.rs`), and on a real directory the poll backend with a clock that
+  the test moves and the hash of a file (`tests/poll.rs`),
+- on Windows, also the parts of its backend that call no Windows (`tests/windows/parts.rs`):
   the backend is compiled there only,
 - the stories (`tests/stories`): each once with the backend of this OS and once with polling
   on the real disk, and a story that needs no more than files, directories, links and renames
