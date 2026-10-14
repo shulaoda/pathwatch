@@ -1,5 +1,5 @@
 //! pathwatch, used as its crate docs show: a handler that sends each batch to a channel, and
-//! `watch_all` for the paths.
+//! `watch` for the paths.
 //!
 //! `--debounce-ms <n>` sets `Config::with_debounce`; without it the default (50 ms) is used.
 
@@ -30,7 +30,7 @@ fn main() {
     let _ = sender.send(result);
   })
   .expect("the watcher thread starts");
-  if let Err(error) = watcher.watch_all(&job.paths) {
+  if let Err(error) = watcher.watch(&job.paths) {
     out.error(&error.to_string());
   }
   // The thread for stdin is started before `ready`, so the memory at `ready` holds

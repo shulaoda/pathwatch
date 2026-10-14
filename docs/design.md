@@ -19,16 +19,16 @@ let watcher = Watcher::with_config(config, |result| match result {
   Ok(events) => for event in events { /* event.path, event.kind */ },
   Err(error) => eprintln!("{error}"),
 })?;
-watcher.watch_all(["/project/src/index.js", "/project/content", "/project/not-there-yet.json"])?;
-watcher.unwatch("/project/content")?;
+watcher.watch(&["/project/src/index.js", "/project/content", "/project/not-there-yet.json"])?;
+watcher.unwatch(&["/project/content"])?;
 watcher.close();
 ```
 
 | Name | What it is |
 |---|---|
 | `Watcher::new(handler)`, `with_config(config, handler)` | Start the watcher thread and the backend. They fail only when the thread cannot start. When the watch API of the OS cannot start, the handler is told once (`WatchLimit` or `Io`) and the watcher polls everything. |
-| `watch(path)`, `watch_all(paths)` | Register a batch and return when every path is watched and its state is known. What exists then is the **baseline** and is not reported. A path that is watched already is skipped. |
-| `unwatch(path)`, `unwatch_all(paths)` | Take back a `watch` of the very same path, and report nothing but the change of a link inside a watched directory that is a plain file again (5.7). |
+| `watch(paths)` | Register a batch and return when every path is watched and its state is known. What exists then is the **baseline** and is not reported. A path that is watched already is skipped. |
+| `unwatch(paths)` | Take back a `watch` of the very same paths, and report nothing but the change of a link inside a watched directory that is a plain file again (5.7). |
 | `close()` | Stops the backend and waits for the thread. After it the handler is not called again, and `watch` and `unwatch` return `Closed`. Dropping the watcher calls it. |
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |

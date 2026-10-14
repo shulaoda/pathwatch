@@ -175,7 +175,7 @@ impl Watch {
     });
     let dir = tempfile::tempdir().unwrap();
     let markers = tempfile::tempdir().unwrap();
-    watcher.watch(markers.path()).unwrap();
+    watcher.watch(&[markers.path()]).unwrap();
     Self {
       watcher,
       results,
@@ -194,11 +194,11 @@ impl Watch {
   }
 
   fn watch(&self, rels: &[&str]) {
-    self.watcher.watch_all(rels.iter().map(|rel| self.path(rel))).unwrap();
+    self.watcher.watch(&rels.iter().map(|rel| self.path(rel)).collect::<Vec<_>>()).unwrap();
   }
 
   fn unwatch(&self, rels: &[&str]) {
-    self.watcher.unwatch_all(rels.iter().map(|rel| self.path(rel))).unwrap();
+    self.watcher.unwatch(&rels.iter().map(|rel| self.path(rel)).collect::<Vec<_>>()).unwrap();
   }
 
   /// Writes a file, making the directories above it.

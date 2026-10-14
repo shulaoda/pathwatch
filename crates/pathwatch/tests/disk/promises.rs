@@ -260,17 +260,17 @@ fn a_relative_path_with_dot_dot() {
     w.dir = dir;
     assert!(rel.is_relative());
 
-    w.watcher.watch(rel.join("a.txt")).unwrap();
-    w.watcher.watch(Path::new(".").join(&rel).join("nothing/../sub/./deep/..//b.txt/")).unwrap();
-    w.watcher.watch(w.path("x/y/../../c.txt")).unwrap();
+    w.watcher.watch(&[rel.join("a.txt")]).unwrap();
+    w.watcher.watch(&[Path::new(".").join(&rel).join("nothing/../sub/./deep/..//b.txt/")]).unwrap();
+    w.watcher.watch(&[w.path("x/y/../../c.txt")]).unwrap();
     w.write("a.txt", "1");
     w.write("sub/b.txt", "1");
     w.write("c.txt", "1");
     w.expect(&[(Create, "a.txt"), (Create, "sub/b.txt"), (Create, "c.txt")]);
 
     // The clean path is the watched one: `unwatch` finds it under every spelling.
-    w.watcher.unwatch(w.path("sub/../a.txt")).unwrap();
-    w.watcher.unwatch(rel.join("sub/b.txt")).unwrap();
+    w.watcher.unwatch(&[w.path("sub/../a.txt")]).unwrap();
+    w.watcher.unwatch(&[rel.join("sub/b.txt")]).unwrap();
     w.write("a.txt", "22");
     w.write("sub/b.txt", "22");
     w.write("c.txt", "22");
@@ -283,7 +283,7 @@ fn one_bad_path_among_good_ones() {
   each_backend(|w| {
     let bad = w.path("nul\0.txt");
     let paths = [w.path("a.txt"), bad.clone(), w.path("r"), PathBuf::new()];
-    let error = w.watcher.watch_all(&paths).unwrap_err();
+    let error = w.watcher.watch(&paths).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidPath);
     assert_eq!(error.path(), Some(bad.as_path()), "the first bad path");
 
@@ -291,7 +291,7 @@ fn one_bad_path_among_good_ones() {
     w.write("r/b.txt", "1");
     w.expect(&[(Create, "a.txt"), (Create, "r/b.txt")]);
 
-    let error = w.watcher.unwatch_all(&paths).unwrap_err();
+    let error = w.watcher.unwatch(&paths).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidPath);
     assert_eq!(error.path(), Some(bad.as_path()));
     w.watch(&["c.txt"]);
@@ -309,9 +309,9 @@ fn watch_and_unwatch_inside_the_handler() {
     for event in events {
       if event.kind == Create && event.path.ends_with("a.txt") {
         watcher
-          .watch_all([event.path.with_file_name("b.txt"), event.path.with_file_name("d")])
+          .watch(&[event.path.with_file_name("b.txt"), event.path.with_file_name("d")])
           .unwrap();
-        watcher.unwatch(&event.path).unwrap();
+        watcher.unwatch(&[&event.path]).unwrap();
       }
     }
   }
@@ -938,7 +938,7 @@ fn a_watched_path_with_the_drive_letter_in_the_other_case() {
     } else {
       drive.to_ascii_uppercase()
     };
-    w.watcher.watch_all([format!("{other}{}", &text[1..])]).unwrap();
+    w.watcher.watch(&[format!("{other}{}", &text[1..])]).unwrap();
 
     w.write("p/src/b.js", "22");
     w.write("p/src/c.js", "1");
@@ -965,7 +965,7 @@ fn close_inside_the_handler() {
     let end = w.results.recv_timeout(PATIENCE);
     assert!(matches!(end, Err(RecvTimeoutError::Disconnected)), "{}: {end:?}", w.backend);
 
-    let closed = w.watcher.watch(w.path("r/x")).unwrap_err();
+    let closed = w.watcher.watch(&[w.path("r/x")]).unwrap_err();
     assert_eq!(closed.kind(), ErrorKind::Closed, "{}", w.backend);
     w.watcher.close();
   });

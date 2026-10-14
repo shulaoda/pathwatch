@@ -27,7 +27,7 @@ fn main() -> Result<(), pathwatch::Error> {
   let watcher = Watcher::with_config(config, move |result| {
     let _ = sender.send(result);
   })?;
-  watcher.watch_all(&paths)?;
+  watcher.watch(&paths)?;
   println!("watching, stop with Ctrl-C");
 
   for result in batches {

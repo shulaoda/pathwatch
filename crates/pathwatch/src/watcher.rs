@@ -57,9 +57,8 @@ static NEXT_WATCHER: AtomicUsize = AtomicUsize::new(1);
 /// ```no_run
 /// # fn main() -> Result<(), pathwatch::Error> {
 /// let watcher = pathwatch::Watcher::new(|result| println!("{result:?}"))?;
-/// watcher.watch("src")?;
-/// watcher.watch_all(["package.json", "not-there-yet.json"])?;
-/// watcher.unwatch("src")?;
+/// watcher.watch(&["src", "package.json", "not-there-yet.json"])?;
+/// watcher.unwatch(&["src"])?;
 /// watcher.close();
 /// # Ok(())
 /// # }
@@ -139,10 +138,10 @@ impl Watcher {
     }
   }
 
-  /// Watches a path: a file, a directory with everything below it, or a path that does not exist
-  /// yet. The call returns when the path is watched. What exists then is not reported, every later
-  /// change is; it is silent only about files that the watcher did not know already. Watching a
-  /// path again does nothing.
+  /// Watches paths, in one step: each a file, a directory with everything below it, or a path
+  /// that does not exist yet. The call returns when every path is watched. What exists then is
+  /// not reported, every later change is; it is silent only about files that the watcher did not
+  /// know already. Watching a path again does nothing.
   ///
   /// A relative path is joined to the current directory; on Windows a path with a drive and no
   /// root (`C:name`) too, when the current directory is on that drive. The path is cleaned by
@@ -150,60 +149,37 @@ impl Watcher {
   /// symbolic link. No link is resolved and no letter case is changed. Every event path starts
   /// with it; a `\\?\` path of Windows is taken in its plain form.
   ///
-  /// From inside the handler the call does not wait: the path is watched when the handler has
+  /// From inside the handler the call does not wait: the paths are watched when the handler has
   /// returned.
-  ///
-  /// # Errors
-  ///
-  /// - [`ErrorKind::InvalidPath`]: the path cannot be used.
-  /// - [`ErrorKind::Closed`]: the watcher is closed.
-  ///
-  /// A path that the OS cannot watch or read is no error here: the handler gets it.
-  pub fn watch(&self, path: impl AsRef<Path>) -> Result<(), Error> {
-    self.watch_all([path])
-  }
-
-  /// [`watch`](Self::watch) for many paths in one step, which is faster than one call for
-  /// each.
   ///
   /// # Errors
   ///
   /// - [`ErrorKind::InvalidPath`]: a path cannot be used. It does not stop the others: every
   ///   usable path is watched, and the error names the first one that was skipped.
   /// - [`ErrorKind::Closed`]: the watcher is closed.
-  pub fn watch_all(&self, paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Result<(), Error> {
+  ///
+  /// A path that the OS cannot watch or read is no error here: the handler gets it.
+  pub fn watch(&self, paths: &[impl AsRef<Path>]) -> Result<(), Error> {
     self.command(paths, Command::Watch)
   }
 
-  /// Takes back a [`watch`](Self::watch) of this very path. A path that is not watched is skipped.
+  /// Takes back a [`watch`](Self::watch) of these very paths, in one step. A path that is not
+  /// watched is skipped.
   ///
-  /// Nothing is reported for it: the files that only this path covered are forgotten, a `Delete`
-  /// that was waiting below it is dropped, and a file that another watched path still covers
-  /// stays known. One exception: a link inside a watched directory that this path was followed
-  /// through is a plain file of that directory again, and that change is reported. It cannot cut
-  /// a part out of a watched directory: use [`Config::with_ignored`] for that.
+  /// Nothing is reported for a path taken back: the files that only it covered are forgotten, a
+  /// `Delete` that was waiting below it is dropped, and a file that another watched path still
+  /// covers stays known. One exception: a link inside a watched directory that the path was
+  /// followed through is a plain file of that directory again, and that change is reported. It
+  /// cannot cut a part out of a watched directory: use [`Config::with_ignored`] for that.
   ///
   /// From inside the handler the call does not wait.
-  ///
-  /// # Errors
-  ///
-  /// - [`ErrorKind::InvalidPath`]: the path cannot be used.
-  /// - [`ErrorKind::Closed`]: the watcher is closed.
-  pub fn unwatch(&self, path: impl AsRef<Path>) -> Result<(), Error> {
-    self.unwatch_all([path])
-  }
-
-  /// [`unwatch`](Self::unwatch) for many paths in one step.
   ///
   /// # Errors
   ///
   /// - [`ErrorKind::InvalidPath`]: a path cannot be used. The others are still unwatched, and
   ///   the error names the first one that was skipped.
   /// - [`ErrorKind::Closed`]: the watcher is closed.
-  pub fn unwatch_all(
-    &self,
-    paths: impl IntoIterator<Item = impl AsRef<Path>>,
-  ) -> Result<(), Error> {
+  pub fn unwatch(&self, paths: &[impl AsRef<Path>]) -> Result<(), Error> {
     self.command(paths, Command::Unwatch)
   }
 

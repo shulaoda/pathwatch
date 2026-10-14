@@ -12,7 +12,7 @@
 //!   let _ = sender.send(result);
 //! })?;
 //! // A directory, a file, and a path that does not exist yet.
-//! watcher.watch_all(["/project/src", "/project/package.json", "/project/not-there-yet.json"])?;
+//! watcher.watch(&["/project/src", "/project/package.json", "/project/not-there-yet.json"])?;
 //!
 //! for result in batches {
 //!   match result {

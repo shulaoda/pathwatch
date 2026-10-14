@@ -52,7 +52,7 @@ How the numbers are read:
 
 | Name | Library | How it is used |
 | --- | --- | --- |
-| `pathwatch` | this repository | `Watcher::with_config` with a handler that sends each batch to a channel, and `watch_all`. Default settings (50 ms debounce). |
+| `pathwatch` | this repository | `Watcher::with_config` with a handler that sends each batch to a channel, and `watch`. Default settings (50 ms debounce). |
 | `pathwatch-0` | this repository | The same with `with_debounce(Duration::ZERO)`. |
 | `notify-fork` | `rolldown-notify` from `github.com/rolldown/notify` | The way rolldown uses it today: `RecommendedWatcher::new` with a `Config`, `paths_mut()`, every path with `Recursive` and `TrackPath`. Ignore: `Config::with_ignored`. Polling: `PollWatcher`, and `ready` waits for its first scan: the watcher answers a call only after it. |
 | `chokidar` | chokidar 5 | `chokidar.watch(paths, { ignoreInitial: true })` and the `all` event. Ignore: a function for `ignored`. Polling: `usePolling` with `interval` and `binaryInterval`. |

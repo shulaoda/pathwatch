@@ -34,8 +34,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _ = batches.send(Some(result));
   })?;
   let mut extra = read_list();
-  watcher.watch_all([project.join("src"), list.clone()])?;
-  watcher.watch_all(&extra)?;
+  watcher.watch(&[project.join("src"), list.clone()])?;
+  watcher.watch(&extra)?;
   thread::spawn(move || {
     let _ = io::stdin().read_line(&mut String::new());
     let _ = sender.send(None);
@@ -51,9 +51,9 @@ fn main() -> Result<(), Box<dyn Error>> {
       }
     };
     if events.iter().any(|event| event.path.ends_with("watch-list.txt")) {
-      watcher.unwatch_all(&extra)?;
+      watcher.unwatch(&extra)?;
       extra = read_list();
-      watcher.watch_all(&extra)?;
+      watcher.watch(&extra)?;
       println!("{} extra paths are watched", extra.len());
     }
     println!("rebuild: {} files changed", events.len());

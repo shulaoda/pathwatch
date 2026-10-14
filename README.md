@@ -19,7 +19,7 @@ fn main() -> Result<(), pathwatch::Error> {
   })?;
 
   // A directory, a file, and a path that does not exist yet.
-  watcher.watch_all(["/project/src", "/project/package.json", "/project/not-there-yet.json"])?;
+  watcher.watch(&["/project/src", "/project/package.json", "/project/not-there-yet.json"])?;
 
   for result in batches {
     match result {
@@ -52,8 +52,8 @@ cargo run -p pathwatch --example dev_server -- path/to/project
 |---|---|
 | `Watcher::new(handler)` | Starts a watcher with the default `Config`. Nothing is watched yet. |
 | `Watcher::with_config(config, handler)` | The same, with your `Config`. |
-| `watch(path)`, `watch_all(paths)` | Watches a path: a file, a directory (with everything below it), or a path that does not exist yet. Returns when the path is watched. Watching a path again does nothing. |
-| `unwatch(path)`, `unwatch_all(paths)` | Takes back a `watch` of this very path. Nothing is reported for it, with one exception: a link inside a watched directory that this path was followed through is a plain file of that directory again, and that change is reported (promise 12). |
+| `watch(paths)` | Watches paths, in one step: each a file, a directory (with everything below it), or a path that does not exist yet. Returns when every path is watched. Watching a path again does nothing. |
+| `unwatch(paths)` | Takes back a `watch` of these very paths. Nothing is reported for them, with one exception: a link inside a watched directory that such a path was followed through is a plain file of that directory again, and that change is reported (promise 12). |
 | `close()` | Stops the watcher and waits for its thread: a check of the disk that runs ends at its next step. Dropping the `Watcher` does the same. |
 
 `watch`, `unwatch` and `close` can be called from any thread, and from inside the handler.
@@ -138,7 +138,7 @@ that tells the forms apart (every disk but the usual one of macOS).
 8. **Paths.** A relative path is joined to the current directory at the time of the call. `.`,
    `..` and repeated separators are cleaned by text; no link is resolved. A path that cannot be
    used (empty, a NUL in it, a file system root) is `InvalidPath`; the other paths of the same
-   `watch_all` call are watched. On Windows this also holds for a name that Windows does not
+   `watch` call are watched. On Windows this also holds for a name that Windows does not
    take as it is: one that ends with a dot or a space, or has a `:` (a stream of a file), a
    control character or one of `< > " | ? *` in it. A name of that kind that a watched
    directory holds (git, WSL and an unpacked archive make them) is a file like the others.
@@ -300,8 +300,8 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 
 | What | In pathwatch | Note |
 |---|---|---|
-| watch | `watch(path)`, `watch_all(paths)` | Offered. There is no recursive mode: a directory is always watched with everything below it. A path may be a file, or not exist yet. No globs. |
-| unwatch | `unwatch(path)`, `unwatch_all(paths)` | Offered differently: it takes back a `watch` of the same path. It cannot cut a part out of a watched directory; use the ignore filter. |
+| watch | `watch(paths)` | Offered. There is no recursive mode: a directory is always watched with everything below it. A path may be a file, or not exist yet. No globs. |
+| unwatch | `unwatch(paths)` | Offered differently: it takes back a `watch` of the same path. It cannot cut a part out of a watched directory; use the ignore filter. |
 | close | `close()`, or drop the watcher | Offered. |
 | ignored | `Config::with_ignored(f)` | Offered differently: one function, set when the watcher is made. No glob list, no change later. It decides about the paths you watch too: a path below an ignored directory, or ignored as a file and as a directory, is not watched. |
 | polling | `with_polling`, `with_poll_interval` | Offered. On top of that, a directory that the OS cannot watch is polled without an option, and so is everything when the watch API cannot start or stops: then at the poll interval of the settings. |
