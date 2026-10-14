@@ -957,11 +957,11 @@ and again: a poll, and the scans after a loss report. Each is paced by the time 
 
 - Loss reports: all scans that the loss reports of one flush asked for are timed together, and
   the next ones wait for the rest after them, which is half a second at most
-  (`LONGEST_LOSS_REST`): the rest is against a storm of loss reports, and a burst of new files
-  in a directory of 20,000, which FSEvents gives up on twice, must not wait two seconds for
-  its second half (measured: a scan of 200 ms, and a rest of nine times that). A mark that
-  only a loss report asked for stays on its node until then. Every other mark is checked as always, and a hint that names a path
-  with a waiting mark takes it out of the wait.
+  (`LONGEST_LOSS_REST`): the rest is against a storm of loss reports, and one long scan (a
+  directory of 20,000 entries takes about 200 ms) must not put the next loss report off by
+  seconds. A mark that only a loss report asked for stays on its node until then. Every other
+  mark is checked as always, and a hint that names a path with a waiting mark takes it out of
+  the wait.
 - The poll: the next round starts one poll interval after the end of this one, and at least
   one round's time later, so that polling takes half of the time at most; a `watch` call in
   between does not move it. The pause is the one knob of polling, as in notify and watchdog:

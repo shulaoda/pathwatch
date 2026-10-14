@@ -42,8 +42,7 @@ const LONGEST_WAIT: Duration = Duration::from_millis(500);
 /// tenth of the time at most.
 const REST: u32 = 9;
 /// The longest rest after the scans of a loss report: the rest is against a storm of them, and
-/// one burst in a big directory, which the OS gives up on twice, must not wait seconds for
-/// its second half.
+/// one long scan must not put the next loss report off by seconds.
 const LONGEST_LOSS_REST: Duration = Duration::from_millis(500);
 
 /// A flush counts for no more than this in the rest: the clock runs on while the machine
