@@ -11,6 +11,7 @@ use std::{
 use crate::{
   adapter::{Adapter, Child, Job, Line, Places, READY_PATIENCE},
   measure::{Sample, peak_rss_kb, sample, wait_for_end},
+  os::Daemon,
   record::{Base, Latency, Phase, Run, ms},
 };
 
@@ -99,6 +100,19 @@ impl Tally {
     }
   }
 
+  /// Adds what this tally of no change saw to the phase before it: lines that came after the
+  /// phase was written down.
+  fn add_late_to(self, phase: &mut Phase) {
+    phase.late += self.late + self.dir_events;
+    phase.extra += self.extra;
+    phase.access += self.access;
+    for sample in self.extra_samples {
+      if phase.extra_samples.len() < SAMPLES {
+        phase.extra_samples.push(sample);
+      }
+    }
+  }
+
   /// Adds what this tally saw to the phase. `start` is when the changes began. The changed
   /// paths and the directories above them go to `earlier`, for the steps that follow.
   fn add_to(
@@ -148,6 +162,14 @@ pub struct Session {
   earlier: HashSet<PathBuf>,
   /// The adapter is gone: every later phase is skipped.
   dead: bool,
+  /// The daemon whose backlog a phase waits for before it starts (`os`).
+  daemon: Option<Daemon>,
+  /// Each phase waits for the daemon before it starts. A scenario turns it off for phases that
+  /// keep the OS busy on purpose.
+  pub settle_before_phases: bool,
+  /// Single changes wait up to this long before each change, a different time for each and the
+  /// same for every adapter (S5).
+  pub pause_before_a_change: Duration,
 }
 
 impl Session {
@@ -156,6 +178,7 @@ impl Session {
   pub fn start(
     adapter: &Adapter,
     places: &Places,
+    daemon: Option<Daemon>,
     job: &Job,
     root: &Path,
     mut run: Run,
@@ -167,8 +190,16 @@ impl Session {
         return Err(Box::new(run));
       }
     };
-    let mut session =
-      Self { child, root: root.to_path_buf(), run, earlier: HashSet::new(), dead: false };
+    let mut session = Self {
+      child,
+      root: root.to_path_buf(),
+      run,
+      earlier: HashSet::new(),
+      dead: false,
+      daemon,
+      settle_before_phases: true,
+      pause_before_a_change: Duration::ZERO,
+    };
     let until = Instant::now() + READY_PATIENCE;
     let ready = loop {
       match session.child.next(until) {
@@ -214,13 +245,19 @@ impl Session {
     if self.dead {
       return;
     }
+    if self.settle_before_phases {
+      self.settle(name);
+    }
     let mut phase = Phase { name: name.to_owned(), ..Phase::default() };
     let mut times = Vec::new();
     let phase_start = Instant::now();
     let before = self.sample();
     let mut misses_in_a_row = 0;
-    for file in files {
+    for (index, file) in files.iter().enumerate() {
       let mut tally = Tally::new(std::slice::from_ref(file), &self.root);
+      // What comes in the pause is the business of the change before.
+      let pause = pause(index, self.pause_before_a_change);
+      self.pump_for(&mut tally, pause);
       let start = Instant::now();
       match change(file) {
         Ok(()) => self.pump(&mut tally, start + patience, None),
@@ -266,6 +303,9 @@ impl Session {
     if self.dead {
       return;
     }
+    if self.settle_before_phases {
+      self.settle(name);
+    }
     let mut phase = Phase { name: name.to_owned(), ..Phase::default() };
     let mut times = Vec::new();
     let mut tally = Tally::new(changed, &self.root);
@@ -294,6 +334,9 @@ impl Session {
   pub fn quiet(&mut self, name: &str, time: Duration) {
     if self.dead {
       return;
+    }
+    if self.settle_before_phases {
+      self.settle(name);
     }
     // What is still on its way from the phase before is not part of the quiet time.
     let mut earlier = Tally::new(&[], &self.root);
@@ -345,6 +388,20 @@ impl Session {
       cpu_ms: run.setup_cpu_ms,
       rss_kb: run.rss_ready_kb,
       footprint_kb: run.footprint_ready_kb,
+    }
+  }
+
+  /// Waits until the OS caught up with the changes before (`os`): the work of the phase before,
+  /// or of the run of another adapter, is not in the time of this phase. Lines that come
+  /// meanwhile belong to the phase before. The first phase comes right after `ready`, and
+  /// the wait before the start covered it.
+  pub fn settle(&mut self, before: &str) {
+    let Some(daemon) = self.daemon.filter(|_| !self.run.phases.is_empty()) else { return };
+    let mut late = Tally::new(&[], &self.root);
+    let waited = daemon.wait_idle(&mut |time| self.pump_for(&mut late, time));
+    self.run.waited(&waited, before);
+    if let Some(phase) = self.run.phases.last_mut() {
+      late.add_late_to(phase);
     }
   }
 
@@ -424,4 +481,17 @@ impl Session {
       phase.info.extend(numbers);
     }
   }
+}
+
+/// The pause before change `index`: from zero to `most`, the same for every adapter.
+fn pause(index: usize, most: Duration) -> Duration {
+  if most.is_zero() {
+    return Duration::ZERO;
+  }
+  // splitmix64 of the index: no pattern, and no state.
+  let mut x = (index as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+  x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+  x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+  x ^= x >> 31;
+  most.mul_f64((x >> 11) as f64 / (1u64 << 53) as f64)
 }

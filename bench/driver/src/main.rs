@@ -17,6 +17,7 @@ use std::{
 use driver::{
   adapter::{ADAPTERS, Adapter, Places, own_directory, venv_python},
   machine,
+  os::Daemon,
   record::{self, Report},
   scenarios::{self, SCENARIOS, Settings},
 };
@@ -139,6 +140,7 @@ fn main() {
     scale: flags.scale,
     quiet: Duration::from_secs_f64(flags.quiet_secs),
     noise_outside: flags.noise_outside,
+    daemon: Daemon::find(),
   };
   let machine = machine::machine(&tmp);
   let started = machine::now_utc();
@@ -163,14 +165,18 @@ fn main() {
   }
 
   let mut runs = Vec::new();
-  for scenario in &scenarios {
+  for (index, scenario) in scenarios.iter().enumerate() {
     // One round is every adapter once: what disturbs the machine for a while hits a round of
-    // all adapters, not every run of one.
+    // all adapters, not every run of one. Each round starts with another adapter, so that what
+    // the first run after another scenario meets is not always met by the same library.
     for round in 1..=flags.repeat.max(1) {
-      for adapter in &adapters {
+      let mut order = adapters.clone();
+      let first = (index + round - 1) % order.len().max(1);
+      order.rotate_left(first);
+      for adapter in &order {
         eprint!("{} {:<12} {round}/{} ", scenario.name, adapter.name, flags.repeat.max(1));
         let start = Instant::now();
-        let run = scenarios::run(&settings, scenario, adapter);
+        let run = scenarios::run(&settings, scenario, adapter, round);
         eprintln!("{} ({:.1} s)", run.status, start.elapsed().as_secs_f64());
         runs.push(run);
       }

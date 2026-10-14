@@ -76,6 +76,25 @@ Why this is fair:
 - All adapters write their lines in the same way: the events that wait go out in one write.
 - Each adapter is started once before anything is measured, because the first start of a new
   program is slow (on macOS the first start took 283 ms, and later ones 5 to 20 ms).
+- macOS: every change of the file system goes through one daemon, fseventsd, before an FSEvents
+  client hears of it, and a big directory keeps it busy after it is made or removed (a
+  directory of 20,000 files: 4 s after it is made, 12 s after it is removed, 4 to 5 s for a
+  burst of 2,000 new files in it). A run that starts meanwhile measures that backlog, and the
+  library that runs after a big tree pays for the one before it. So before each run and each
+  phase the driver waits until fseventsd used less than 5% of a core for half a second, two
+  minutes at most; the lines that come meanwhile count for the phase before. The tables say how
+  long the waits took in all. S3 waits before its noise starts, not before the phases that
+  the noise keeps busy. The tree of S7, one directory of 20,000 files, is not removed after
+  its run: fseventsd took more than two minutes to digest the removal of a few of them, and
+  the next run would start in that backlog. It is removed at the end of the driver, with the
+  temporary directory. Linux and Windows have no such daemon, and nothing is waited for.
+- The adapters take turns: each round of a scenario starts with another adapter, so what the
+  first run after another scenario meets is not always met by the same library.
+- S5: each single change waits a random time of 0 to 300 ms first, the same times for every
+  adapter. A library that polls in rounds finds a change at its next round, and a change made
+  right after the event of the one before lands at the start of a round, the worst place,
+  while a library with a timer for each file meets it at a random place. The pause gives every
+  library the same random places.
 - The driver raises its limit of open files to 65,536 and the adapters get it from the driver,
   so the limit of the shell (256 on macOS) does not decide a result.
 - Linux: the adapters run with `GLIBC_TUNABLES=glibc.malloc.hugetlb=0`. With the default of

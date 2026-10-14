@@ -99,6 +99,26 @@ pub struct Run {
   /// User plus system time of the whole life of the process.
   pub total_cpu_ms: f64,
   pub phases: Vec<Phase>,
+  /// How long the driver waited for the OS to be idle before the start and before each phase
+  /// (`os`), and how often it gave up.
+  #[serde(default)]
+  pub os_wait_ms: f64,
+  #[serde(default)]
+  pub os_waits_given_up: usize,
+}
+
+impl Run {
+  /// Writes down one wait for the OS. `before`: what the wait was for.
+  pub fn waited(&mut self, waited: &crate::os::Waited, before: &str) {
+    self.os_wait_ms += ms(waited.time);
+    if waited.gave_up {
+      self.os_waits_given_up += 1;
+      self.notes.push(format!(
+        "{before}: fseventsd was still busy after {} s, and the driver went on",
+        crate::os::LONGEST.as_secs()
+      ));
+    }
+  }
 }
 
 /// One step of a scenario: some changes, and what the adapter printed for them.

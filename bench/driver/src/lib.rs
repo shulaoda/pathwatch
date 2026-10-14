@@ -5,6 +5,7 @@
 pub mod adapter;
 pub mod machine;
 pub mod measure;
+pub mod os;
 pub mod record;
 pub mod scenarios;
 pub mod session;

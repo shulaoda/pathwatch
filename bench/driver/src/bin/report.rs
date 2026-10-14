@@ -95,6 +95,21 @@ fn markdown(report: &Report) -> String {
       report.settings.repeat
     );
   }
+  let waited: f64 = report.runs.iter().map(|run| run.os_wait_ms).sum();
+  if waited > 0.0 {
+    let gave_up: usize = report.runs.iter().map(|run| run.os_waits_given_up).sum();
+    let gave_up = if gave_up == 0 {
+      String::new()
+    } else {
+      format!(", and gave up {gave_up} times after {} s", driver::os::LONGEST.as_secs())
+    };
+    let _ = writeln!(
+      out,
+      "- Before each run and each phase the driver waited until fseventsd was idle: {:.0} s in \
+       all{gave_up}.",
+      waited / 1000.0
+    );
+  }
   let _ = writeln!(out, "- Times are in milliseconds, memory is in MiB.\n");
 
   let _ = writeln!(out, "## Versions\n");

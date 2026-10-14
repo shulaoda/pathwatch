@@ -12,6 +12,7 @@ use std::{
 
 use crate::{
   adapter::{Adapter, Job, Places},
+  os::Daemon,
   record::Run,
   session::Session,
   tree::{Shape, files_below, spread, write, write_all},
@@ -24,6 +25,9 @@ const POLL_PATIENCE: Duration = Duration::from_secs(10);
 /// The pause between making the tree and starting the adapter. FSEvents hands a new stream
 /// the changes of the last moments, so a tree that was made just now would give events.
 const SETTLE: Duration = Duration::from_millis(1500);
+/// S5: a single change waits this long at most, a different time for each change and the same
+/// for every adapter, so that it lands at a random place of a round of polling.
+const POLL_PAUSE: Duration = Duration::from_millis(300);
 
 /// What the flags of the driver set for every scenario.
 pub struct Settings<'a> {
@@ -36,6 +40,8 @@ pub struct Settings<'a> {
   pub quiet: Duration,
   /// S3: write the noise next to the project and not inside it.
   pub noise_outside: bool,
+  /// The daemon whose backlog the driver waits for before a run and a phase (`os`).
+  pub daemon: Option<Daemon>,
 }
 
 impl Settings<'_> {
@@ -50,21 +56,62 @@ pub struct Scenario {
   pub name: &'static str,
   pub title: &'static str,
   pub run: fn(&Settings, &Adapter, &Path, Run) -> Run,
+  /// The tree has a directory of tens of thousands of entries. fseventsd takes minutes to
+  /// digest its removal (measured: 12 s for one, more than 2 minutes after a few), and the next
+  /// run would start in that backlog, so the tree is removed with the temporary directory at
+  /// the end of the driver. Every other tree is removed after its run.
+  pub big_directory: bool,
 }
 
 pub const SCENARIOS: &[Scenario] = &[
-  Scenario { name: "s1", title: "module files: every file is watched by its own path", run: s1 },
-  Scenario { name: "s2", title: "project directory: one directory is watched", run: s2 },
-  Scenario { name: "s3", title: "noise: module files while another process writes", run: s3 },
-  Scenario { name: "s4", title: "ignored directory: writes into node_modules", run: s4 },
-  Scenario { name: "s5", title: "polling: module files, polled every 100 ms", run: s5 },
-  Scenario { name: "s6", title: "missing paths: watched before they exist", run: s6 },
-  Scenario { name: "s7", title: "big directory: one watched directory holds every file", run: s7 },
+  Scenario {
+    name: "s1",
+    title: "module files: every file is watched by its own path",
+    run: s1,
+    big_directory: false,
+  },
+  Scenario {
+    name: "s2",
+    title: "project directory: one directory is watched",
+    run: s2,
+    big_directory: false,
+  },
+  Scenario {
+    name: "s3",
+    title: "noise: module files while another process writes",
+    run: s3,
+    big_directory: false,
+  },
+  Scenario {
+    name: "s4",
+    title: "ignored directory: writes into node_modules",
+    run: s4,
+    big_directory: false,
+  },
+  Scenario {
+    name: "s5",
+    title: "polling: module files, polled every 100 ms",
+    run: s5,
+    big_directory: false,
+  },
+  Scenario {
+    name: "s6",
+    title: "missing paths: watched before they exist",
+    run: s6,
+    big_directory: false,
+  },
+  Scenario {
+    name: "s7",
+    title: "big directory: one watched directory holds every file",
+    run: s7,
+    big_directory: true,
+  },
 ];
 
-/// Runs one scenario with one adapter, in a fresh directory that is removed at the end.
+/// Runs one scenario with one adapter, in a fresh directory that is removed at the end, or
+/// put aside for the end of the driver (`Scenario::big_directory`).
 #[must_use]
-pub fn run(settings: &Settings, scenario: &Scenario, adapter: &Adapter) -> Run {
+pub fn run(settings: &Settings, scenario: &Scenario, adapter: &Adapter, round: usize) -> Run {
   let root = settings.tmp.join(format!("{}-{}", scenario.name, adapter.name));
   fs::create_dir_all(&root).expect("the driver can write in its temporary directory");
   let run = Run {
@@ -74,6 +121,11 @@ pub fn run(settings: &Settings, scenario: &Scenario, adapter: &Adapter) -> Run {
     ..Run::default()
   };
   let run = (scenario.run)(settings, adapter, &root, run);
+  if scenario.big_directory {
+    let aside = settings.tmp.join("removed-at-the-end");
+    let _ = fs::create_dir_all(&aside);
+    let _ = fs::rename(&root, aside.join(format!("{}-{}-{round}", scenario.name, adapter.name)));
+  }
   let _ = fs::remove_dir_all(&root);
   run
 }
@@ -81,9 +133,25 @@ pub fn run(settings: &Settings, scenario: &Scenario, adapter: &Adapter) -> Run {
 /// The numbers of an adapter that watches nothing.
 #[must_use]
 pub fn base(settings: &Settings, adapter: &Adapter) -> Option<crate::record::Base> {
-  let session =
-    Session::start(adapter, settings.places, &Job::default(), settings.tmp, Run::default());
+  let session = Session::start(
+    adapter,
+    settings.places,
+    settings.daemon,
+    &Job::default(),
+    settings.tmp,
+    Run::default(),
+  );
   session.ok().map(Session::into_base)
+}
+
+/// The pause between making the tree and starting the adapter: `SETTLE`, and then until the
+/// OS caught up with the tree and with the run before (`os`).
+fn settle(settings: &Settings, run: &mut Run) {
+  thread::sleep(SETTLE);
+  if let Some(daemon) = settings.daemon {
+    let waited = daemon.wait_idle(&mut thread::sleep);
+    run.waited(&waited, "the start");
+  }
 }
 
 fn sizes(run: &mut Run, entries: &[(&str, usize)]) {
@@ -101,10 +169,11 @@ fn s1(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
   let project = root.join("project");
   let files = shape.make(&project).expect("the tree can be made");
   sizes(&mut run, &[("files", files.len()), ("dirs", shape.dir_count()), ("watched", files.len())]);
-  thread::sleep(SETTLE);
+  settle(settings, &mut run);
 
   let job = Job { paths: files.clone(), ..Job::default() };
-  let mut session = match Session::start(adapter, settings.places, &job, root, run) {
+  let mut session = match Session::start(adapter, settings.places, settings.daemon, &job, root, run)
+  {
     Ok(session) => session,
     Err(run) => return *run,
   };
@@ -143,10 +212,11 @@ fn s2(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
   let outside = root.join("outside");
   moved.make(&outside).expect("the tree can be made");
   sizes(&mut run, &[("files", files.len()), ("dirs", shape.dir_count()), ("watched", 1)]);
-  thread::sleep(SETTLE);
+  settle(settings, &mut run);
 
   let job = Job { paths: vec![project.clone()], ..Job::default() };
-  let mut session = match Session::start(adapter, settings.places, &job, root, run) {
+  let mut session = match Session::start(adapter, settings.places, settings.daemon, &job, root, run)
+  {
     Ok(session) => session,
     Err(run) => return *run,
   };
@@ -188,15 +258,20 @@ fn s3(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
   fs::create_dir_all(&noise).expect("the directory can be made");
   let noise_files = settings.size(50_000, 1000);
   sizes(&mut run, &[("files", files.len()), ("dirs", shape.dir_count()), ("watched", files.len())]);
-  thread::sleep(SETTLE);
+  settle(settings, &mut run);
 
   let job = Job { paths: files.clone(), ..Job::default() };
-  let mut session = match Session::start(adapter, settings.places, &job, root, run) {
+  let mut session = match Session::start(adapter, settings.places, settings.daemon, &job, root, run)
+  {
     Ok(session) => session,
     Err(run) => return *run,
   };
   session.single_edits("first edit, right after ready", &files[..1], PATIENCE);
 
+  // The noise is the point of the next phases: the wait for an idle OS comes before it starts,
+  // and not before the phases that it keeps busy.
+  session.settle("single edits under noise");
+  session.settle_before_phases = false;
   let writer = NoiseWriter::start(&noise, noise_files);
   session.single_edits(
     "single edits under noise",
@@ -304,10 +379,11 @@ fn s4(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
       ("files written into node_modules", written.len()),
     ],
   );
-  thread::sleep(SETTLE);
+  settle(settings, &mut run);
 
   let job = Job { paths: vec![project.clone()], ignore: Some("node_modules"), ..Job::default() };
-  let mut session = match Session::start(adapter, settings.places, &job, root, run) {
+  let mut session = match Session::start(adapter, settings.places, settings.daemon, &job, root, run)
+  {
     Ok(session) => session,
     Err(run) => return *run,
   };
@@ -336,16 +412,22 @@ fn s5(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
   let project = root.join("project");
   let files = shape.make(&project).expect("the tree can be made");
   sizes(&mut run, &[("files", files.len()), ("dirs", shape.dir_count()), ("watched", files.len())]);
-  thread::sleep(SETTLE);
+  settle(settings, &mut run);
 
   let job = Job { paths: files.clone(), poll_ms: Some(100), ..Job::default() };
-  let mut session = match Session::start(adapter, settings.places, &job, root, run) {
+  let mut session = match Session::start(adapter, settings.places, settings.daemon, &job, root, run)
+  {
     Ok(session) => session,
     Err(run) => return *run,
   };
   session.single_edits("first edit, right after ready", &files[..1], POLL_PATIENCE);
   session.quiet("quiet", settings.quiet);
-  session.single_edits("single edits", &spread(&files, settings.size(50, 5)), POLL_PATIENCE);
+  session.pause_before_a_change = POLL_PAUSE;
+  session.single_edits(
+    "single edits",
+    &spread(&files, settings.size(50, 5)),
+    POLL_PAUSE + POLL_PATIENCE,
+  );
   session.end()
 }
 
@@ -357,10 +439,11 @@ fn s6(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
   fs::create_dir_all(&project).expect("the directory can be made");
   let files = shape.paths(&project);
   sizes(&mut run, &[("files", 0), ("dirs", 0), ("watched", files.len())]);
-  thread::sleep(SETTLE);
+  settle(settings, &mut run);
 
   let job = Job { paths: files.clone(), ..Job::default() };
-  let mut session = match Session::start(adapter, settings.places, &job, root, run) {
+  let mut session = match Session::start(adapter, settings.places, settings.daemon, &job, root, run)
+  {
     Ok(session) => session,
     Err(run) => return *run,
   };
@@ -381,10 +464,11 @@ fn s7(settings: &Settings, adapter: &Adapter, root: &Path, mut run: Run) -> Run 
   let files = named("module-", settings.size(20_000, 500));
   write_all(&files).expect("the tree can be made");
   sizes(&mut run, &[("files", files.len()), ("dirs", 1), ("watched", 1)]);
-  thread::sleep(SETTLE);
+  settle(settings, &mut run);
 
   let job = Job { paths: vec![project.clone()], ..Job::default() };
-  let mut session = match Session::start(adapter, settings.places, &job, root, run) {
+  let mut session = match Session::start(adapter, settings.places, settings.daemon, &job, root, run)
+  {
     Ok(session) => session,
     Err(run) => return *run,
   };
