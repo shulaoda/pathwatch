@@ -38,6 +38,10 @@ pub fn each_backend(settings: &Settings, inside: Option<Inside>, story: impl Fn(
   let name = thread::current().name().unwrap_or("a story").to_owned();
   thread::scope(|scope| {
     for polling in [false, true] {
+      if polling && settings.delete_delay.is_some() {
+        skipped("polling has no delete delay");
+        continue;
+      }
       let story = &story;
       let builder = thread::Builder::new().name(name.clone());
       let world = builder.spawn_scoped(scope, move || {

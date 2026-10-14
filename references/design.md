@@ -33,7 +33,7 @@ watcher.close();
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
 | `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
-| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 10 ms on macOS and 20 ms elsewhere (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and 50 ms elsewhere, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
+| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 10 ms on macOS and 20 ms elsewhere (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and 50 ms elsewhere, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
 
@@ -167,7 +167,7 @@ The words, each for one idea:
 | coverage | what the backend answers | `Coverage::{Watched, WatchedTree, NotWatched, Failed}` |
 | polled | no OS watch covers the directory, so the timer scans it | `Watch::Polled` |
 | held | a look found nothing at the node; what the tree has there, and below, stays until the second look | `Node::is_held`, `Tree::hold` |
-| delete delay | the time from the hint to the second look: 10 ms on macOS, 50 ms elsewhere | `Options::delete_delay` |
+| delete delay | the time from the hint to the second look: 10 ms on macOS, 50 ms elsewhere, none under polling | `Options::delete_delay` |
 | young | a file whose modification time is too close to the check to trust | `Content` |
 | quiet time | the debounce: how long no hint must come before the disk is checked | `Options::debounce` |
 | rest | the pause after work that no hint asked for by name: a poll, the scans after loss reports | `REST`, `rest_until` |
@@ -750,7 +750,12 @@ is not told at once.
   50 ms, none of 60 was. On macOS FSEvents tells about 10 ms after the change, and no save that
   was tried needed more than the quiet time: the delay is 10 ms, the quiet time, and so adds
   nothing to it (VS Code, vim, `sed -i`, `git checkout` and a JetBrains-like save, idle and
-  busy, measured on 2026-10-15).
+  busy, measured on 2026-10-15). When the watcher polls everything there is none, as there is
+  no quiet time (`Config::into_options`), and as in chokidar (`atomic` is off under `usePolling`), notify's
+  `PollWatcher`, watchdog's `PollingObserver` and watchpack: a round that falls into a save
+  that leaves the path empty reports a `Delete`, and the next round a `Create` (vim on Linux,
+  polled every 100 ms: 4 of 100 saves; with a delay of 10 ms or more, none). The engine still
+  has the second look under polling (`Options::delete_delay`), for when users ask for it.
 
 ### 5.10 Want, watch, poll
 
@@ -1542,7 +1547,8 @@ The test files of the simulator:
   with polling, both at the same time; a story that needs no more than the words of `World`
   (files, directories, links, renames, `watch`, `unwatch`, `expect`) runs first on each
   simulated backend of `tests/sim`, where it takes no time and its end is checked against
-  the disk. On the real disk these tests wait, they do not compute. Measured on macOS, each test alone: of
+  the disk. A story that sets a delete delay skips polling, which has none (5.9), and says
+  so. On the real disk these tests wait, they do not compute. Measured on macOS, each test alone: of
   56 s, 34 s are the quiet time of 300 ms after each `expect`, 17 s the wait for the events
   (the debounce, the delete delay, the poll of a link once a second, and about 10 ms of the
   OS), 4 s the changes that the tests make, and 0.2 s the `watch` calls.

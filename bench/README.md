@@ -304,8 +304,8 @@ The rules of the driver:
 - **The cost of the adapter is in the numbers**: one line of text for each event, and for Node
   the event loop. The floor of a latency is about 0.1 ms (pipe and thread of the driver).
 - **pathwatch waits on purpose.** By default it collects changes for 10 ms on macOS and 20 ms
-  elsewhere, and it holds a `Delete` for 10 ms on macOS and 50 ms elsewhere. So its latency is
-  at least that. `pathwatch-0` shows it without the first wait.
+  elsewhere, and it holds a `Delete` for 10 ms on macOS and 50 ms elsewhere (not under polling).
+  So its latency is at least that. `pathwatch-0` shows it without the first wait.
 - **The word of an event is not checked.** `first word` shows it, and that is all. On macOS
   `notify-fork` says `create` for many edits, because FSEvents repeats old flags of a path.
 - **Three runs are few.** `--repeat 3` shows whether two numbers are apart, not how a number

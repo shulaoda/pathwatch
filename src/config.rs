@@ -69,7 +69,10 @@ impl Config {
   }
 
   /// How long a `Delete` waits for the path to come back. Default: 10 ms on macOS, 50 ms
-  /// elsewhere.
+  /// elsewhere. It does not apply when the watcher polls everything, as the quiet time does not,
+  /// and as in chokidar, notify and watchdog: a round that falls into a save that leaves the
+  /// path empty for a moment reports a `Delete` and a `Create` (vim on Linux, polled every
+  /// 100 ms: 4 of 100 saves).
   ///
   /// A file that is removed and written again within this time is one `Update`, as the tools
   /// that replace a file that way expect (vim on Linux renames the file away and writes a new
@@ -129,7 +132,9 @@ impl Config {
     Options {
       ignored: self.ignored,
       debounce: self.debounce,
-      delete_delay: self.delete_delay,
+      // The poll looks only at its interval: it gives no hint for the quiet time to wait for,
+      // and no second look holds a `Delete` (`with_delete_delay`).
+      delete_delay: if polling { Duration::ZERO } else { self.delete_delay },
       poll_interval: if polling { self.poll_interval } else { FALLBACK_POLL_INTERVAL },
       poll_interval_alone: Some(self.poll_interval),
       // macOS and Windows: a disk takes two spellings of a name for one.

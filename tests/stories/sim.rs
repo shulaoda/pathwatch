@@ -10,7 +10,7 @@ use std::{
 use crate::fixtures::{Deliver, Driver, Mode, caught_up};
 use pathwatch::{EventKind, engine::Options, poll::PollBackend};
 
-use crate::{Settings, World, differences, expected_history, history_of};
+use crate::{Settings, World, differences, expected_history, history_of, skipped};
 
 /// The root of every story on the simulated disk.
 const ROOT: &str = "/project";
@@ -28,6 +28,12 @@ pub fn each_backend(settings: &Settings, story: &(impl Fn(&mut dyn World) + Sync
     story(&mut sim);
     sim.end();
   }
+  if settings.delete_delay.is_some() {
+    skipped("polling has no delete delay");
+    return;
+  }
+  // As `Config` makes it: the poll holds no `Delete`.
+  let options = Options { delete_delay: Duration::ZERO, ..options };
   let mut sim = Sim::new(Driver::<PollBackend>::poll(options), "sim polling", settings.loose_disk);
   story(&mut sim);
   sim.end();

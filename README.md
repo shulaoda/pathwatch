@@ -91,7 +91,7 @@ watcher, so it should only pass the batch on.
 |---|---|---|
 | `with_ignored(f)` | nothing is ignored | `f(path, kind) -> bool`, where `kind` is `EntryKind::File` or `EntryKind::Dir`. A path for which it returns `true` is never reported, and an ignored directory is never read or watched. It must give the same answer for the same input, and should ignore everything below a directory that it ignores. It decides about the paths you watch too (promise 10). |
 | `with_debounce(d)` | 10 ms on macOS, 20 ms elsewhere | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch goes out 500 ms after the first change since the last batch, or `4 × d` after it if that is longer, plus the time that the check of the disk takes. Zero: no waiting. The most is a year, also for the poll interval. A `watch` or `unwatch` call ends the quiet time; a poll that runs meanwhile does not, but a change it finds by itself is reported. Under polling there is no quiet time: a change is found by the next round. |
-| `with_delete_delay(d)` | 10 ms on macOS, 50 ms elsewhere | How long a `Delete` waits for the path to come back. A file that is removed and written again within `d` is one `Update`; a real delete is reported `d` after the OS said that the path is gone, or after the quiet time if that is longer. Zero: no waiting, and such a file is a `Delete` and a `Create`. The most is a year. |
+| `with_delete_delay(d)` | 10 ms on macOS, 50 ms elsewhere; none under polling | How long a `Delete` waits for the path to come back. A file that is removed and written again within `d` is one `Update`; a real delete is reported `d` after the OS said that the path is gone, or after the quiet time if that is longer. Zero: no waiting, and such a file is a `Delete` and a `Create`. Under polling there is none, as there is no quiet time, and as in chokidar, notify and watchdog: a round that falls into a save that leaves the path empty for a moment reports a `Delete` and a `Create` (vim on Linux, polled every 100 ms: 4 of 100 saves). The most is a year. |
 | `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
 | `with_poll_interval(d)` | 100 ms | The pause between two rounds of polling, and at least as long as the round took: polling takes half of a core at most. The least is 1 ms. A round looks at every watched file once (20,000 files: about 50 ms on APFS). |
 
@@ -118,7 +118,8 @@ with another Unicode form of a name. The story with sockets (1) is Unix only.
    files you were told about are the files on the disk.
 3. **`Update`.** `touch` is an `Update`; `chmod` is not. An atomic save (write a temporary
    file, rename it over) is an `Update`, with no `Delete` and no `Create`. So is a file that is
-   removed and written again within the delete delay (10 ms on macOS, 50 ms elsewhere). There can be more `Update`
+   removed and written again within the delete delay (10 ms on macOS, 50 ms elsewhere; none
+   under polling). There can be more `Update`
    events than writes. A file that is replaced again and again without a pause by a save that
    leaves the name free for a moment (`ReplaceFileW`, the save of .NET's `File.Replace`) can
    get a `Delete` and a `Create` when both looks of the delete delay fall into such moments
@@ -295,7 +296,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   gap 2 s).
 - **A `Delete`** comes one delete delay (10 ms on macOS, 50 ms elsewhere) after the OS said
   that the path is gone, or one quiet time if that is longer, once the path was found empty
-  twice; under a flood it comes with the next batch. It comes at once
+  twice (under polling, at the round that finds it gone); under a flood it comes with the next batch. It comes at once
   when a directory is found where the file was, or a file where the directory was, or when a
   file below a watched directory is renamed to another spelling of its name (another letter
   case, on macOS and Windows). An error of the disk that says nothing is never a `Delete`;
@@ -386,7 +387,7 @@ This runs, on the machine it is called on:
 - the stories (`tests/stories`): each once with the backend of this OS and once with polling
   on the real disk, and a story that needs no more than files, directories, links and renames
   also on each simulated backend of `tests/sim` (the note above the promises says which
-  of them run where).
+  of them run where). A story about the delete delay skips polling, which has none.
 
 | Platform | How |
 |---|---|

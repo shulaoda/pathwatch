@@ -85,6 +85,7 @@ pub trait World {
 #[derive(Clone, Default)]
 pub struct Settings {
   pub debounce: Option<Duration>,
+  /// A story that sets it is about the delete delay: it skips polling, which has none.
   pub delete_delay: Option<Duration>,
   pub ignored: Option<Ignored>,
   /// The story needs a disk that takes two spellings of a name for one. The simulated disk
