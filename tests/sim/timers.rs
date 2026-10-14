@@ -266,6 +266,37 @@ fn a_burst_of_lost_notifications_does_not_scan_without_a_pause() {
   }
 }
 
+/// After scans for lost notifications that took 200 ms, the next ones wait half a second, not
+/// nine times that: the rest is against a storm, not against one big directory.
+#[test]
+fn a_long_scan_after_a_loss_report_rests_half_a_second_at_most() {
+  for mode in Mode::ALL {
+    let mut d = Driver::sim(mode, Options::default());
+    d.fs.mkdir_all("/p/r/sub").unwrap();
+    d.fs.write("/p/r/sub/a", "1").unwrap();
+    d.watch(&["/p/r"]);
+
+    d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(200)));
+    d.engine.overflow(d.now);
+    assert!(d.step());
+    assert_eq!(d.fs.traps_run(), 1, "{mode:?}");
+    let scanned = d.now;
+
+    d.fs.write("/p/r/sub/b", "1").unwrap();
+    d.fs.write("/p/r/sub/a", "22").unwrap();
+    d.fs.take_raw(1);
+    d.engine.overflow(d.now);
+    d.deliver(usize::MAX);
+    assert!(d.step());
+    assert_eq!(taken(&mut d), ["U /p/r/sub/a"], "{mode:?}");
+    assert_eq!(d.engine.deadline(), Some(scanned + Duration::from_millis(700)), "{mode:?}");
+    assert!(d.step());
+    assert_eq!(taken(&mut d), ["C /p/r/sub/b"], "{mode:?}");
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
 /// Two watches lose notifications, and the scans for both run in one flush that takes 30 ms.
 /// The next loss report waits until 300 ms after the start of that flush: its 30 ms, and a rest
 /// of nine times that. The rest is for all loss reports together, not for each watch. A plain

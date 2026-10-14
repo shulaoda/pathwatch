@@ -957,8 +957,11 @@ and again: a poll, and the scans after a loss report. After such work that took 
 kind of work rests for `9 × t`. So about a tenth of the time goes into it at most.
 
 - Loss reports: all scans that the loss reports of one flush asked for are timed together, and
-  the next ones wait for the rest after them. A mark that only a loss report asked for stays on
-  its node until then. Every other mark is checked as always, and a hint that names a path
+  the next ones wait for the rest after them, which is half a second at most
+  (`LONGEST_LOSS_REST`): the rest is against a storm of loss reports, and a burst of new files
+  in a directory of 20,000, which FSEvents gives up on twice, must not wait two seconds for
+  its second half (measured: a scan of 200 ms, and a rest of nine times that). A mark that
+  only a loss report asked for stays on its node until then. Every other mark is checked as always, and a hint that names a path
   with a waiting mark takes it out of the wait.
 - The poll: the next round starts after the poll interval, or after the rest, whichever is
   longer; a `watch` call in between does not move it. The rest of the poll is nine times the looks of the round plus the reads of young
