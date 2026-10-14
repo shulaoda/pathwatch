@@ -1,9 +1,6 @@
-//! The watcher on the real disk. Each test runs twice at the same time, with the watch API of
-//! this system and with polling, in a fresh temporary directory. No test sleeps.
-
-mod contract;
-mod projects;
-mod promises;
+//! The real disk: a temporary directory, and a watcher with the watch API of this OS or with
+//! polling. A story runs on both at the same time. No story sleeps: it waits for the events it
+//! expects, and a marker file tells when everything before it has been reported.
 
 use std::{
   collections::{BTreeMap, BTreeSet},
@@ -20,52 +17,48 @@ use std::{
 use pathwatch::{Config, Error, Event, EventKind, Watcher};
 use tempfile::TempDir;
 
-const PATIENCE: Duration = Duration::from_secs(30);
+use crate::{History, Settings, World, differences, expected_history, history_of};
+
+pub const PATIENCE: Duration = Duration::from_secs(30);
 /// Longer than the default debounce and the delete delay together.
-const QUIET: Duration = Duration::from_millis(300);
+pub const QUIET: Duration = Duration::from_millis(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-fn each_backend(test: impl Fn(&mut Watch) + Sync) {
-  each_backend_with(&Config::default(), test);
-}
+/// Runs inside the handler, with the watcher and the batch, before the story gets the batch.
+pub type Inside = fn(&Watcher, &[Event]);
 
-/// Runs inside the handler, with the watcher and the batch, before the test gets the batch.
-type Inside = fn(&Watcher, &[Event]);
-
-fn each_backend_with(config: &Config, test: impl Fn(&mut Watch) + Sync) {
-  run_each_backend(config, None, test);
-}
-
-fn each_backend_inside(inside: Inside, test: impl Fn(&mut Watch) + Sync) {
-  run_each_backend(&Config::default(), Some(inside), test);
-}
-
-fn run_each_backend(config: &Config, inside: Option<Inside>, test: impl Fn(&mut Watch) + Sync) {
-  side_by_side(|polling| {
-    let config = config.clone().with_polling(polling).with_poll_interval(POLL_INTERVAL);
-    let mut watch = Watch::start(config, inside, backend_name(polling));
-    test(&mut watch);
-    assert!(watch.events.is_empty(), "{}: a test ends with `expect`", watch.backend);
-  });
-}
-
-/// Runs `run` with `false` for the native backend and `true` for polling, at the same time.
-fn side_by_side(run: impl Fn(bool) + Sync) {
+/// Runs the story with the watch API of this OS and with polling, at the same time.
+pub fn each_backend(settings: &Settings, inside: Option<Inside>, story: impl Fn(&mut Disk) + Sync) {
   thread::scope(|scope| {
     for polling in [false, true] {
-      let run = &run;
-      scope.spawn(move || run(polling));
+      let story = &story;
+      scope.spawn(move || {
+        let config = config(settings).with_polling(polling).with_poll_interval(POLL_INTERVAL);
+        let mut disk = Disk::start(config, inside, if polling { "polling" } else { "native" });
+        story(&mut disk);
+        assert!(disk.events.is_empty(), "{}: a story ends with `expect`", disk.backend);
+      });
     }
   });
 }
 
-fn backend_name(polling: bool) -> &'static str {
-  if polling { "polling" } else { "native" }
+fn config(settings: &Settings) -> Config {
+  let mut config = Config::default();
+  if let Some(debounce) = settings.debounce {
+    config = config.with_debounce(debounce);
+  }
+  if let Some(delay) = settings.delete_delay {
+    config = config.with_delete_delay(delay);
+  }
+  if let Some(ignored) = settings.ignored.clone() {
+    config = config.with_ignored(move |path, kind| ignored(path, kind));
+  }
+  config
 }
 
 /// A temporary directory and a relative path to it from the current directory: in the target
 /// directory, or in the current one when the target is on another drive (Windows).
-fn relative_scratch() -> (TempDir, PathBuf) {
+pub fn relative_scratch() -> (TempDir, PathBuf) {
   let here = env::current_dir().unwrap();
   let mut dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
   if here.components().next() != dir.path().components().next() {
@@ -78,9 +71,8 @@ fn relative_scratch() -> (TempDir, PathBuf) {
 }
 
 /// Makes a symbolic link at `link` to `target`, to a directory or to a file as the target is.
-/// `false`: this user may not make one (Windows without the developer mode), so the test has
-/// nothing to check.
-fn symlink(target: &Path, link: &Path) -> bool {
+/// `false`: this user may not make one (Windows without the developer mode).
+pub fn symlink(target: &Path, link: &Path) -> bool {
   #[cfg(unix)]
   {
     std::os::unix::fs::symlink(target, link).unwrap();
@@ -104,29 +96,26 @@ fn symlink(target: &Path, link: &Path) -> bool {
   }
 }
 
-struct Watch {
+pub struct Disk {
   // Dropped before the directories, so their removal is not watched.
-  watcher: Arc<Watcher>,
-  results: Receiver<Result<Vec<Event>, Error>>,
+  pub watcher: Arc<Watcher>,
+  pub results: Receiver<Result<Vec<Event>, Error>>,
   /// Not made canonical: on macOS it lies behind a link, and event paths must be the given ones.
-  dir: TempDir,
+  pub dir: TempDir,
   /// A directory of its own for the markers of `sync`, watched from the start.
   markers: TempDir,
   /// The number of the last marker written, and of the last one reported.
   written: usize,
   reported: usize,
   /// The events since the last `expect`.
-  events: Vec<Event>,
+  pub events: Vec<Event>,
   /// The paths of `may_pass`.
   passing: Vec<PathBuf>,
-  backend: &'static str,
+  pub backend: &'static str,
 }
 
-/// The events of each path, in the order in which they came.
-type History = BTreeMap<PathBuf, Vec<EventKind>>;
-
 /// Files with their content.
-type Files = BTreeMap<PathBuf, Vec<u8>>;
+pub type Files = BTreeMap<PathBuf, Vec<u8>>;
 
 /// What a handler reads at the path: nothing for a path that is gone or a directory.
 fn content(path: &Path) -> Vec<u8> {
@@ -134,7 +123,7 @@ fn content(path: &Path) -> Vec<u8> {
 }
 
 /// Puts into `files` what a watched path at `path` stands for.
-fn files_at(path: &Path, files: &mut Files) {
+pub fn files_at(path: &Path, files: &mut Files) {
   if path.is_file() {
     files.insert(path.to_path_buf(), content(path));
   } else if let Ok(entries) = fs::read_dir(path) {
@@ -159,7 +148,7 @@ fn unknown(known: &Files, on_disk: &Files) -> String {
   )
 }
 
-impl Watch {
+impl Disk {
   fn start(config: Config, inside: Option<Inside>, backend: &'static str) -> Self {
     let (sender, results) = mpsc::channel();
     let watcher = Arc::new_cyclic(|this: &Weak<Watcher>| {
@@ -168,7 +157,7 @@ impl Watch {
         if let (Some(inside), Ok(events), Some(watcher)) = (inside, &result, this.upgrade()) {
           inside(&watcher, events);
         }
-        // The test may be over already.
+        // The story may be over already.
         let _ = sender.send(result);
       })
       .unwrap()
@@ -189,30 +178,30 @@ impl Watch {
     }
   }
 
-  fn path(&self, rel: &str) -> PathBuf {
+  pub fn path(&self, rel: &str) -> PathBuf {
     self.dir.path().join(rel)
   }
 
-  fn watch(&self, rels: &[&str]) {
+  pub fn watch(&self, rels: &[&str]) {
     self.watcher.watch(&rels.iter().map(|rel| self.path(rel)).collect::<Vec<_>>()).unwrap();
   }
 
-  fn unwatch(&self, rels: &[&str]) {
+  pub fn unwatch(&self, rels: &[&str]) {
     self.watcher.unwatch(&rels.iter().map(|rel| self.path(rel)).collect::<Vec<_>>()).unwrap();
   }
 
   /// Writes a file, making the directories above it.
-  fn write(&self, rel: &str, content: &str) {
+  pub fn write(&self, rel: &str, content: &str) {
     let path = self.path(rel);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, content).unwrap();
   }
 
-  fn mkdir(&self, rel: &str) {
+  pub fn mkdir(&self, rel: &str) {
     fs::create_dir_all(self.path(rel)).unwrap();
   }
 
-  fn remove(&self, rel: &str) {
+  pub fn remove(&self, rel: &str) {
     let path = self.path(rel);
     let kind = fs::symlink_metadata(&path).unwrap().file_type();
     // A link to a directory is removed as a file; Windows removes it as a directory.
@@ -227,18 +216,22 @@ impl Watch {
     }
   }
 
-  fn rename(&self, from: &str, to: &str) {
+  pub fn rename(&self, from: &str, to: &str) {
     fs::rename(self.path(from), self.path(to)).unwrap();
   }
 
-  fn set_modified(&self, rel: &str, time: SystemTime) {
+  pub fn symlink(&self, target: &str, link: &str) -> bool {
+    symlink(&self.path(target), &self.path(link))
+  }
+
+  pub fn set_modified(&self, rel: &str, time: SystemTime) {
     fs::File::options().write(true).open(self.path(rel)).unwrap().set_modified(time).unwrap();
   }
 
   /// Returns when every event of the changes made before the call has come: a marker file is
   /// reported, twice, since the poll that finds the first one may have started before the
   /// changes and looked at their places already. The second one starts after that poll.
-  fn sync(&mut self) {
+  pub fn sync(&mut self) {
     for _ in 0..2 {
       self.written += 1;
       fs::write(self.markers.path().join(self.written.to_string()), "").unwrap();
@@ -250,15 +243,12 @@ impl Watch {
     }
   }
 
-  /// The file at `rel` comes and goes between two `expect` calls: a `Create` and a `Delete` of
-  /// it are fine, and so is nothing.
-  fn may_pass(&mut self, rel: &str) {
+  pub fn may_pass(&mut self, rel: &str) {
     self.passing.push(self.path(rel));
   }
 
-  /// Waits until the events since the last `expect` are the expected ones. For one path the
-  /// order counts; an `Update` right after a `Create` or an `Update` of the same path is fine.
-  fn wait(&mut self, expected: &[(EventKind, &str)]) {
+  /// Waits until the events since the last `expect` are the expected ones.
+  pub fn wait(&mut self, expected: &[(EventKind, &str)]) {
     let expected = self.expected(expected);
     let end = Instant::now() + PATIENCE;
     while self.history() != expected {
@@ -268,7 +258,7 @@ impl Watch {
   }
 
   /// `wait`, and then nothing else may come for a quiet time. The events start empty after it.
-  fn expect(&mut self, expected: &[(EventKind, &str)]) {
+  pub fn expect(&mut self, expected: &[(EventKind, &str)]) {
     self.wait(expected);
     self.sync();
     let end = Instant::now() + QUIET;
@@ -279,10 +269,10 @@ impl Watch {
     self.events.clear();
   }
 
-  /// For a test that cannot tell which events come: every event must fit what the handler
+  /// For a story that cannot tell which events come: every event must fit what the handler
   /// knows, with the content it read when the event came, until that is `on_disk` and stays so
   /// for a quiet time. An `Update` that never came leaves the content the handler read before.
-  fn expect_known(&mut self, known: &mut Files, on_disk: &Files) {
+  pub fn expect_known(&mut self, known: &mut Files, on_disk: &Files) {
     let patience = Instant::now() + PATIENCE;
     loop {
       self.learn(known);
@@ -320,33 +310,15 @@ impl Watch {
   }
 
   fn expected(&self, expected: &[(EventKind, &str)]) -> History {
-    let mut history = History::new();
-    for &(kind, rel) in expected {
-      history.entry(self.path(rel)).or_default().push(kind);
-    }
-    history
+    expected_history(expected, |rel| self.path(rel))
   }
 
   fn history(&self) -> History {
-    let mut history = History::new();
-    for event in &self.events {
-      let kinds = history.entry(event.path.clone()).or_default();
-      let extra_update = event.kind == EventKind::Update
-        && matches!(kinds.last(), Some(EventKind::Create | EventKind::Update));
-      if !extra_update {
-        kinds.push(event.kind);
-      }
-    }
-    for path in &self.passing {
-      if history.get(path).is_some_and(|kinds| kinds == &[EventKind::Create, EventKind::Delete]) {
-        history.remove(path);
-      }
-    }
-    history
+    history_of(&self.events, &self.passing)
   }
 
   /// Takes the next batch, with the markers taken out. False: none came in time.
-  fn receive(&mut self, timeout: Duration) -> bool {
+  pub fn receive(&mut self, timeout: Duration) -> bool {
     match self.results.recv_timeout(timeout) {
       Ok(Ok(events)) => {
         assert!(!events.is_empty(), "{}: a batch is never empty", self.backend);
@@ -376,22 +348,52 @@ impl Watch {
   }
 }
 
-fn each(kind: EventKind, paths: &[String]) -> Vec<(EventKind, &str)> {
-  paths.iter().map(|path| (kind, path.as_str())).collect()
-}
+impl World for Disk {
+  fn path(&self, rel: &str) -> PathBuf {
+    Disk::path(self, rel)
+  }
 
-fn differences(expected: &History, got: &History) -> String {
-  let none = Vec::new();
-  let lines: Vec<String> = expected
-    .keys()
-    .chain(got.keys().filter(|path| !expected.contains_key(*path)))
-    .map(|path| (path, expected.get(path).unwrap_or(&none), got.get(path).unwrap_or(&none)))
-    .filter(|(_, expected, got)| expected != got)
-    .map(|(path, expected, got)| {
-      format!("  {}: expected {expected:?}, got {got:?}", path.display())
-    })
-    .collect();
-  // A big test can differ in thousands of paths.
-  let shown = lines.iter().take(20).cloned().collect::<Vec<_>>().join("\n");
-  format!("the events of {} paths are not the expected ones:\n{shown}", lines.len())
+  fn name(&self) -> &'static str {
+    self.backend
+  }
+
+  fn polls(&self) -> bool {
+    self.backend == "polling"
+  }
+
+  fn watch(&mut self, rels: &[&str]) {
+    Disk::watch(self, rels);
+  }
+
+  fn unwatch(&mut self, rels: &[&str]) {
+    Disk::unwatch(self, rels);
+  }
+
+  fn write(&mut self, rel: &str, content: &str) {
+    Disk::write(self, rel, content);
+  }
+
+  fn mkdir(&mut self, rel: &str) {
+    Disk::mkdir(self, rel);
+  }
+
+  fn remove(&mut self, rel: &str) {
+    Disk::remove(self, rel);
+  }
+
+  fn rename(&mut self, from: &str, to: &str) {
+    Disk::rename(self, from, to);
+  }
+
+  fn symlink(&mut self, target: &str, link: &str) -> bool {
+    Disk::symlink(self, target, link)
+  }
+
+  fn expect(&mut self, expected: &[(EventKind, &str)]) {
+    Disk::expect(self, expected);
+  }
+
+  fn may_pass(&mut self, rel: &str) {
+    Disk::may_pass(self, rel);
+  }
 }

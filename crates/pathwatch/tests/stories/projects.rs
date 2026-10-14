@@ -6,16 +6,15 @@ use std::{
   time::{Duration, Instant},
 };
 
-use pathwatch::{
-  Config, EntryKind,
-  EventKind::{Create, Delete, Update},
+use pathwatch::EventKind::{Create, Delete, Update};
+
+use crate::{
+  Disk, Settings, disk::files_at, each, everywhere, everywhere_with, on_disk, on_disk_with,
 };
 
-use crate::{Watch, each, each_backend, each_backend_with, files_at, symlink};
-
 /// A delete delay that the changes of a test fit into on a slow machine.
-fn slow_delete() -> Config {
-  Config::default().with_delete_delay(Duration::from_secs(2))
+fn slow_delete() -> Settings {
+  Settings::delete_delay(Duration::from_secs(2))
 }
 
 /// Longer than the poll of the directories above a watched path (a second), and shorter than
@@ -35,7 +34,7 @@ impl Random {
 
 /// One change at a random place. Many fail (the place is missing, or a file is in the way).
 /// A write puts `serial` into the file: its own content.
-fn random_change(w: &Watch, random: &mut Random, serial: usize) {
+fn random_change(w: &Disk, random: &mut Random, serial: usize) {
   let kind = random.below(10);
   let mut place = |least: usize| {
     let mut path = w.path(["r", "r", "r", "alone", "outside"][random.below(5)]);
@@ -61,7 +60,7 @@ fn random_change(w: &Watch, random: &mut Random, serial: usize) {
 
 #[test]
 fn an_editor_saves_a_file() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("src/a.txt", "0");
     w.watch(&["src"]);
     w.may_pass("src/a.txt.tmp");
@@ -84,8 +83,8 @@ fn an_editor_saves_a_file() {
 fn mkdir_p_and_a_file_at_once() {
   // Every round waits for a quiet time, so it is short. With polling the pause grows with what
   // is watched: twice the rounds take four times as long.
-  let config = Config::default().with_debounce(Duration::from_millis(5));
-  each_backend_with(&config, |w| {
+  let settings = Settings::debounce(Duration::from_millis(5));
+  on_disk_with(&settings, |w| {
     w.mkdir("r");
     w.watch(&["r"]);
 
@@ -106,7 +105,7 @@ fn mkdir_p_and_a_file_at_once() {
 
 #[test]
 fn a_big_tree_is_moved_in_and_out() {
-  each_backend(|w| {
+  everywhere(|w| {
     let mut files = Vec::new();
     for (dir, sub, file) in
       (0..10).flat_map(|d| (0..10).flat_map(move |s| (0..20).map(move |f| (d, s, f))))
@@ -128,7 +127,7 @@ fn a_big_tree_is_moved_in_and_out() {
 /// The same directory comes back, with other content.
 #[test]
 fn a_directory_is_moved_away_changed_and_moved_back() {
-  each_backend_with(&slow_delete(), |w| {
+  everywhere_with(&slow_delete(), |w| {
     w.write("r/sub/stays.txt", "1");
     w.write("r/sub/goes.txt", "1");
     w.write("r/sub/deep/changes.txt", "1");
@@ -154,7 +153,7 @@ fn a_directory_is_moved_away_changed_and_moved_back() {
 /// not be noticed (README, "Holes").
 #[test]
 fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
-  each_backend_with(&slow_delete(), |w| {
+  on_disk_with(&slow_delete(), |w| {
     w.write("r/x/a/changes.js", "1");
     w.write("r/x/a/goes.js", "1");
     // Windows refuses to rename a directory above an open directory handle.
@@ -180,7 +179,7 @@ fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
 /// The renamed directory is on the real path behind the link, where the watch of macOS stands.
 #[test]
 fn a_directory_above_the_target_of_a_link_is_moved_away_changed_and_moved_back() {
-  each_backend_with(&slow_delete(), |w| {
+  on_disk_with(&slow_delete(), |w| {
     w.write("store/x/real/changes.js", "1");
     w.write("store/x/real/goes.js", "1");
     w.mkdir("r");
@@ -189,7 +188,7 @@ fn a_directory_above_the_target_of_a_link_is_moved_away_changed_and_moved_back()
     if cfg!(windows) && w.backend == "native" {
       return;
     }
-    if !symlink(&w.path("store/x/real"), &w.path("r/link")) {
+    if !w.symlink("store/x/real", "r/link") {
       return;
     }
     w.watch(&["r/link"]);
@@ -211,7 +210,7 @@ fn a_directory_above_the_target_of_a_link_is_moved_away_changed_and_moved_back()
 #[test]
 #[expect(clippy::print_stderr, reason = "the test tells how long the batch took")]
 fn a_big_batch_of_single_files() {
-  each_backend(|w| {
+  on_disk(|w| {
     let mut files = Vec::new();
     for (dir, file) in (0..2000).flat_map(|d| (0..10).map(move |f| (d, f))) {
       let path = format!("{dir}/{file}.js");
@@ -243,9 +242,7 @@ fn a_big_batch_of_single_files() {
 
 #[test]
 fn node_modules_is_ignored() {
-  let config = Config::default()
-    .with_ignored(|path, kind| kind == EntryKind::Dir && path.ends_with("node_modules"));
-  each_backend_with(&config, |w| {
+  everywhere_with(&Settings::ignore_node_modules(), |w| {
     w.write("proj/src/a.js", "1");
     w.write("proj/node_modules/dep/index.js", "1");
     w.watch(&["proj"]);
@@ -267,9 +264,9 @@ fn node_modules_is_ignored() {
 /// Every change is reported once for each spelling, whichever one the writer used.
 #[test]
 fn two_spellings_of_one_directory() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("real/a.txt", "1");
-    if !symlink(&w.path("real"), &w.path("link")) {
+    if !w.symlink("real", "link") {
       return;
     }
     w.watch(&["real", "link"]);
@@ -287,7 +284,7 @@ fn two_spellings_of_one_directory() {
 /// was given to `watch`.
 #[test]
 fn watched_paths_in_another_spelling() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("src/app.js", "1");
     w.write("src/components/ui/button.js", "1");
     // Nothing to test on a disk that tells `App.js` from `app.js`.
@@ -311,10 +308,10 @@ fn watched_paths_in_another_spelling() {
 /// is a link.
 #[test]
 fn watched_paths_below_a_symlinked_prefix() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("store/proj/src/a.js", "1");
     w.write("store/proj/config.json", "1");
-    if !symlink(&w.path("store"), &w.path("prefix")) {
+    if !w.symlink("store", "prefix") {
       return;
     }
     w.watch(&["prefix/proj/src", "prefix/proj/config.json", "prefix/proj/later/x.js"]);
@@ -333,7 +330,7 @@ fn watched_paths_below_a_symlinked_prefix() {
     // Nothing watches a link: the poll finds that it points elsewhere now.
     w.write("other/proj/src/c.js", "1");
     w.remove("prefix");
-    assert!(symlink(&w.path("other"), &w.path("prefix")));
+    assert!(w.symlink("other", "prefix"));
     w.expect(&[
       (Delete, "prefix/proj/src/a.js"),
       (Delete, "prefix/proj/src/sub/b.js"),
@@ -350,7 +347,7 @@ fn watched_paths_below_a_symlinked_prefix() {
 fn random_changes_end_in_the_state_of_the_disk() {
   const CHANGES: usize = 150;
 
-  each_backend(|w| {
+  on_disk(|w| {
     w.mkdir("r");
     w.mkdir("outside");
     let watched = ["r", "alone/a/x"];

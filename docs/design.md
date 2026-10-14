@@ -1505,10 +1505,13 @@ The test files of the simulator:
   starts when more than 50,000 files lie next to the test program (the probe in 7.2).
 - The watcher thread (`tests/watcher.rs`): `watch`, `unwatch`, `close` and `drop` from every
   side, relative paths, a bad path, the queue bound, a backend that cannot start.
-- The real disk (`tests/disk`), each test once with the backend of the OS and once with
-  polling, both at the same time: `contract` (the rows of section 3), `projects` (what editors
+- The stories (`tests/stories`): `contract` (the rows of section 3), `projects` (what editors
   and big projects do), `promises` (the promises of the README; its first lines say which test
-  proves which). These tests wait, they do not compute. Measured on macOS, each test alone: of
+  proves which). Each story runs on the real disk, once with the backend of the OS and once
+  with polling, both at the same time; a story that needs no more than the words of `World`
+  (files, directories, links, renames, `watch`, `unwatch`, `expect`) runs first on each
+  simulated backend of `pathwatch_sim`, where it takes no time and its end is checked against
+  the disk. On the real disk these tests wait, they do not compute. Measured on macOS, each test alone: of
   56 s, 34 s are the quiet time of 300 ms after each `expect`, 17 s the wait for the events
   (the debounce, the delete delay, the poll of a link once a second, and about 10 ms of the
   OS), 4 s the changes that the tests make, and 0.2 s the `watch` calls.

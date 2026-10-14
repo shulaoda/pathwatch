@@ -28,4 +28,5 @@ libc = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
 
 [dev-dependencies]
+pathwatch_sim = { path = "../pathwatch_sim" }
 tempfile = { workspace = true }

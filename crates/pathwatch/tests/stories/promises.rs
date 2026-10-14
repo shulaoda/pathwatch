@@ -4,7 +4,7 @@
 //! 1. A watched path is a file, a directory or nothing: `c::s1`, `c::s9`, `c::s4`,
 //!    `a_file_is_anything_that_is_not_a_directory`.
 //! 2. Events are the difference to the disk, one for a path in a batch:
-//!    `p::random_changes_end_in_the_state_of_the_disk`; `Watch::receive` checks every batch.
+//!    `p::random_changes_end_in_the_state_of_the_disk`; `Disk::receive` checks every batch.
 //!    On Windows also `a_name_that_windows_reads_as_another_is_reported`.
 //! 3. `Update`: `touch_is_an_update_and_chmod_is_not`, `c::s2`,
 //!    `c::s3_deleted_and_created_again_inside_the_delete_delay`.
@@ -40,14 +40,15 @@ use std::{
 };
 
 use pathwatch::{
-  Config, EntryKind, ErrorKind, Event,
+  EntryKind, ErrorKind, Event,
   EventKind::{Create, Delete, Update},
   Watcher,
 };
 
 use crate::{
-  Inside, PATIENCE, each, each_backend, each_backend_inside, each_backend_with, relative_scratch,
-  symlink,
+  Inside, Settings,
+  disk::{PATIENCE, relative_scratch},
+  each, everywhere, everywhere_with, on_disk, on_disk_inside,
 };
 
 #[cfg(unix)]
@@ -55,7 +56,7 @@ use crate::{
 fn a_file_is_anything_that_is_not_a_directory() {
   use std::os::unix::{fs::symlink, net::UnixListener};
 
-  each_backend(|w| {
+  on_disk(|w| {
     w.mkdir("r");
     // macOS 26 says nothing when a socket is made: there the sockets exist before the watch,
     // and only their removal is heard.
@@ -85,7 +86,7 @@ fn a_file_is_anything_that_is_not_a_directory() {
 
 #[test]
 fn touch_is_an_update_and_chmod_is_not() {
-  each_backend(|w| {
+  on_disk(|w| {
     w.write("r/a.txt", "1");
     w.write("r/b.txt", "1");
     w.write("f.txt", "1");
@@ -110,7 +111,7 @@ fn touch_is_an_update_and_chmod_is_not() {
 
 #[test]
 fn what_exists_at_watch_time_is_not_reported() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r/a.txt", "1");
     w.write("r/sub/b.txt", "1");
     w.write("f.txt", "1");
@@ -133,7 +134,7 @@ fn what_exists_at_watch_time_is_not_reported() {
 /// `a` and `a/b` are names on the way to the two watched paths.
 #[test]
 fn a_name_on_the_way_changes_its_kind() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.watch(&["a/b/r.txt", "a/b/dir", "seen.txt"]);
 
     // Missing to file. The other file lets the test wait for the watcher.
@@ -169,7 +170,7 @@ fn a_name_on_the_way_changes_its_kind() {
 fn a_missing_chain_that_appears_at_once_is_reported_promptly() {
   const CHAINS: usize = 10;
 
-  each_backend(|w| {
+  on_disk(|w| {
     let files: Vec<String> = (0..CHAINS).map(|chain| format!("{chain}/a/b/c/r.txt")).collect();
     let watched: Vec<String> = (0..CHAINS)
       .map(|chain| if chain % 2 == 0 { files[chain].clone() } else { format!("{chain}/a/b") })
@@ -192,7 +193,7 @@ fn a_missing_chain_that_appears_at_once_is_reported_promptly() {
 
 #[test]
 fn unwatch_of_a_file_and_of_a_directory() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r/a.txt", "1");
     w.write("r/sub/b.txt", "1");
     w.write("f.txt", "1");
@@ -226,7 +227,7 @@ fn unwatch_of_a_file_and_of_a_directory() {
 
 #[test]
 fn unwatch_keeps_what_another_watched_path_covers() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r/a.txt", "1");
     w.write("r/sub/b.txt", "1");
     w.write("r/other/c.txt", "1");
@@ -254,7 +255,7 @@ fn unwatch_keeps_what_another_watched_path_covers() {
 
 #[test]
 fn a_relative_path_with_dot_dot() {
-  each_backend(|w| {
+  on_disk(|w| {
     // From the current directory up to the root, and down to the temporary directory.
     let (dir, rel) = relative_scratch();
     w.dir = dir;
@@ -280,7 +281,7 @@ fn a_relative_path_with_dot_dot() {
 
 #[test]
 fn one_bad_path_among_good_ones() {
-  each_backend(|w| {
+  on_disk(|w| {
     let bad = w.path("nul\0.txt");
     let paths = [w.path("a.txt"), bad.clone(), w.path("r"), PathBuf::new()];
     let error = w.watcher.watch(&paths).unwrap_err();
@@ -316,7 +317,7 @@ fn watch_and_unwatch_inside_the_handler() {
     }
   }
 
-  each_backend_inside(inside, |w| {
+  on_disk_inside(inside, |w| {
     w.write("d/old.txt", "1");
     w.watch(&["a.txt", "c.txt"]);
 
@@ -337,14 +338,14 @@ fn watch_and_unwatch_inside_the_handler() {
 #[test]
 fn an_ignored_directory_is_not_read() {
   let asked = Arc::new(Mutex::new(Vec::new()));
-  let config = {
+  let settings = {
     let asked = Arc::clone(&asked);
-    Config::default().with_ignored(move |path, kind| {
+    Settings::ignored(move |path, kind| {
       asked.lock().unwrap().push(path.to_path_buf());
       kind == EntryKind::Dir && path.ends_with("node_modules")
     })
   };
-  each_backend_with(&config, |w| {
+  everywhere_with(&settings, |w| {
     w.write("r/node_modules/pkg/index.js", "1");
     w.write("r/src/a.js", "1");
     w.watch(&["r"]);
@@ -374,14 +375,14 @@ fn an_ignored_directory_is_not_read() {
 #[test]
 fn an_ignored_directory_comes_and_goes() {
   let asked = Arc::new(Mutex::new(Vec::new()));
-  let config = {
+  let settings = {
     let asked = Arc::clone(&asked);
-    Config::default().with_ignored(move |path, kind| {
+    Settings::ignored(move |path, kind| {
       asked.lock().unwrap().push(path.to_path_buf());
       kind == EntryKind::Dir && path.ends_with("node_modules")
     })
   };
-  each_backend_with(&config, |w| {
+  everywhere_with(&settings, |w| {
     w.write("away/node_modules/pkg/index.js", "1");
     w.write("away/node_modules/top.js", "1");
     w.write("r/a.js", "1");
@@ -418,12 +419,12 @@ fn an_ignored_directory_comes_and_goes() {
 /// it goes. One ignored for both kinds is never anything.
 #[test]
 fn a_watched_path_that_the_filter_ignores_counts_as_missing() {
-  let config = Config::default().with_ignored(|path, kind| {
+  let settings = Settings::ignored(|path, kind| {
     path.ends_with("secret.txt")
       || (kind == EntryKind::Dir && path.ends_with("dist"))
       || (kind == EntryKind::File && path.extension().is_some_and(|extension| extension == "log"))
   });
-  each_backend_with(&config, |w| {
+  everywhere_with(&settings, |w| {
     w.write("p/dist/a.js", "1");
     w.write("r/old.log", "1");
     w.watch(&["secret.txt", "p/dist", "r", "r/new.log"]);
@@ -459,9 +460,7 @@ fn a_watched_path_that_the_filter_ignores_counts_as_missing() {
 /// nothing. The filter looks at the last name only.
 #[test]
 fn a_watched_path_below_an_ignored_directory_gets_nothing() {
-  let config = Config::default()
-    .with_ignored(|path, kind| kind == EntryKind::Dir && path.ends_with("node_modules"));
-  each_backend_with(&config, |w| {
+  everywhere_with(&Settings::ignore_node_modules(), |w| {
     w.write("p/node_modules/top.js", "1");
     w.write("p/node_modules/pkg/index.js", "1");
     w.write("p/seen.js", "1");
@@ -484,7 +483,7 @@ fn a_watched_path_below_an_ignored_directory_gets_nothing() {
 
 #[test]
 fn nothing_is_reported_beside_a_watched_path() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("p/dir/a.txt", "1");
     w.write("p/file.txt", "1");
     w.write("p/beside/b.txt", "1");
@@ -514,9 +513,9 @@ fn nothing_is_reported_beside_a_watched_path() {
 /// poll.
 #[test]
 fn a_watched_link_to_a_file_is_followed() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("real/f.txt", "1");
-    if !symlink(&w.path("real/f.txt"), &w.path("link.txt")) {
+    if !w.symlink("real/f.txt", "link.txt") {
       return;
     }
     w.watch(&["link.txt"]);
@@ -533,16 +532,16 @@ fn a_watched_link_to_a_file_is_followed() {
 
 #[test]
 fn a_link_inside_a_watched_directory_is_a_file() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("outside/dir/a.txt", "1");
     w.write("outside/f.txt", "1");
     w.mkdir("r");
     w.watch(&["r"]);
 
-    if !symlink(&w.path("outside/dir"), &w.path("r/to_dir")) {
+    if !w.symlink("outside/dir", "r/to_dir") {
       return;
     }
-    assert!(symlink(&w.path("outside/f.txt"), &w.path("r/to_file")));
+    assert!(w.symlink("outside/f.txt", "r/to_file"));
     w.expect(&[(Create, "r/to_dir"), (Create, "r/to_file")]);
 
     w.write("outside/dir/a.txt", "22");
@@ -561,7 +560,7 @@ fn a_link_inside_a_watched_directory_is_a_file() {
 /// macOS, and two on every other disk, where there is nothing to test.
 #[test]
 fn a_watched_file_in_another_unicode_form() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("src/cafe\u{301}.txt", "1");
     // Nothing to test on a disk that tells the two forms apart.
     if !w.path("src/caf\u{e9}.txt").exists() {
@@ -580,7 +579,7 @@ fn a_watched_file_in_another_unicode_form() {
 
 #[test]
 fn names_below_a_watched_directory_are_spelled_as_on_the_disk() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("proj/Src/Old.TXT", "1");
     // Where the disk takes two spellings for one, the directory is watched in another case.
     let loose = w.path("PROJ").exists();
@@ -607,7 +606,7 @@ fn names_below_a_watched_directory_are_spelled_as_on_the_disk() {
 
 #[test]
 fn a_file_is_renamed_to_another_letter_case() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r/ReadMe.md", "1");
     w.watch(&["r"]);
 
@@ -621,7 +620,7 @@ fn a_file_is_renamed_to_another_letter_case() {
 /// The OS names a file that is gone as the caller spelled it then.
 #[test]
 fn a_file_goes_through_another_spelling_of_its_name() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r/App.js", "1");
     w.write("r/Other.js", "1");
     // Only a disk that takes two spellings of a name for one finds a file in this way.
@@ -642,7 +641,7 @@ fn a_file_goes_through_another_spelling_of_its_name() {
 /// disk has.
 #[test]
 fn every_watched_spelling_of_a_file_gets_its_events() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r/app.js", "1");
     // Only a disk that takes two spellings of a name for one finds a file in this way.
     if !w.path("R").exists() {
@@ -662,7 +661,7 @@ fn every_watched_spelling_of_a_file_gets_its_events() {
 
 #[test]
 fn watched_paths_through_another_spelling_inside_a_watched_directory() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r/src/a.js", "1");
     w.write("r/src/lib/b.js", "1");
     if !w.path("R").exists() {
@@ -691,7 +690,7 @@ fn watched_paths_through_another_spelling_inside_a_watched_directory() {
 
 #[test]
 fn a_directory_is_renamed_to_another_letter_case() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r/Src/a.js", "1");
     w.write("r/Src/deep/b.js", "1");
     w.watch(&["r"]);
@@ -712,7 +711,7 @@ fn a_directory_is_renamed_to_another_letter_case() {
 /// The watched path still finds its directory, and the events keep the spelling of the caller.
 #[test]
 fn a_directory_above_a_watched_path_is_renamed_to_another_letter_case() {
-  each_backend(|w| {
+  on_disk(|w| {
     w.write("r/x/a/old.js", "1");
     if !w.path("R").exists() {
       return;
@@ -738,7 +737,7 @@ fn a_directory_above_a_watched_path_is_renamed_to_another_letter_case() {
 #[cfg(windows)]
 #[test]
 fn a_name_that_windows_reads_as_another_is_reported() {
-  each_backend(|w| {
+  on_disk(|w| {
     w.write("w/foo", "the other one");
     w.watch(&["w"]);
     // Only a path in the `\\?\` form lets std make such a name.
@@ -838,7 +837,7 @@ fn a_junction_made_in_two_steps() {
     assert!(set != 0, "{}", io::Error::last_os_error());
   }
 
-  each_backend(|w| {
+  on_disk(|w| {
     w.write("t/a.txt", "1");
     w.write("t/sub/b.txt", "1");
     w.mkdir("w");
@@ -883,7 +882,7 @@ fn a_pending_deletion_that_is_taken_back() {
     },
   };
 
-  each_backend(|w| {
+  on_disk(|w| {
     w.write("d/held.txt", "1");
     w.watch(&["d"]);
     let mut holder = fs::OpenOptions::new()
@@ -926,7 +925,7 @@ fn a_pending_deletion_that_is_taken_back() {
 #[cfg(windows)]
 #[test]
 fn a_watched_path_with_the_drive_letter_in_the_other_case() {
-  each_backend(|w| {
+  on_disk(|w| {
     w.write("p/src/a.js", "1");
     w.write("p/src/b.js", "1");
     w.watch(&["p"]);
@@ -953,7 +952,7 @@ fn a_watched_path_with_the_drive_letter_in_the_other_case() {
 #[test]
 fn close_inside_the_handler() {
   let inside: Inside = |watcher, _events| watcher.close();
-  each_backend_inside(inside, |w| {
+  on_disk_inside(inside, |w| {
     w.mkdir("r");
     w.watch(&["r"]);
     w.write("r/a.txt", "1");
@@ -982,7 +981,7 @@ fn a_directory_held_by_another_program_is_no_error() {
     Foundation::GENERIC_READ, Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
   };
 
-  each_backend(|w| {
+  on_disk(|w| {
     w.mkdir("r/held");
     w.write("r/other.txt", "1");
     let holder = fs::OpenOptions::new()
@@ -1009,7 +1008,7 @@ fn a_directory_held_by_another_program_is_no_error() {
 fn a_write_by_a_writer_that_keeps_the_file_open_is_reported() {
   use std::io::Write;
 
-  each_backend(|w| {
+  on_disk(|w| {
     w.write("r/log.txt", "1");
     let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
     fs::File::options()

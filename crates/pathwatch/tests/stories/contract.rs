@@ -3,16 +3,13 @@
 
 use std::time::{Duration, SystemTime};
 
-use pathwatch::{
-  Config, EntryKind,
-  EventKind::{Create, Delete, Update},
-};
+use pathwatch::EventKind::{Create, Delete, Update};
 
-use crate::{each_backend, each_backend_with};
+use crate::{Settings, everywhere, everywhere_with, on_disk, on_disk_with};
 
 #[test]
 fn s1_a_write_in_place() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r.txt", "1");
     w.watch(&["r.txt"]);
 
@@ -29,7 +26,7 @@ fn s1_a_write_in_place() {
 /// write itself (not FSEvents, not the poll: README, "Holes").
 #[test]
 fn s1_a_write_in_place_that_keeps_the_time_and_the_size() {
-  each_backend(|w| {
+  on_disk(|w| {
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
     let whole = SystemTime::UNIX_EPOCH + Duration::from_secs(now.as_secs() + 1);
     let old = whole - Duration::from_secs(3600);
@@ -54,7 +51,7 @@ fn s1_a_write_in_place_that_keeps_the_time_and_the_size() {
 
 #[test]
 fn s2_an_atomic_save() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r.txt", "1");
     w.watch(&["r.txt"]);
 
@@ -68,7 +65,7 @@ fn s2_an_atomic_save() {
 
 #[test]
 fn s3_deleted_and_created_again() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r.txt", "1");
     w.watch(&["r.txt"]);
 
@@ -84,7 +81,7 @@ fn s3_deleted_and_created_again_inside_the_delete_delay() {
   // A delay of 100 ms is too short for a slow machine.
   const DELETE_DELAY: Duration = Duration::from_secs(2);
 
-  each_backend_with(&Config::default().with_delete_delay(DELETE_DELAY), |w| {
+  on_disk_with(&Settings::delete_delay(DELETE_DELAY), |w| {
     w.write("r.txt", "1");
     w.watch(&["r.txt"]);
 
@@ -100,7 +97,7 @@ fn s3_deleted_and_created_again_inside_the_delete_delay() {
 
 #[test]
 fn s4_a_missing_path_becomes_a_file() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.watch(&["r.txt"]);
 
     w.write("r.txt", "1");
@@ -112,7 +109,7 @@ fn s4_a_missing_path_becomes_a_file() {
 
 #[test]
 fn s5_a_missing_path_becomes_a_directory() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.watch(&["r"]);
 
     w.write("r/f.txt", "1");
@@ -122,7 +119,7 @@ fn s5_a_missing_path_becomes_a_directory() {
 
 #[test]
 fn s6_missing_ancestors() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.watch(&["a/b/c/r.txt"]);
 
     w.write("a/b/c/r.txt", "1");
@@ -132,7 +129,7 @@ fn s6_missing_ancestors() {
 
 #[test]
 fn s7_a_file_becomes_a_directory() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r", "1");
     w.watch(&["r"]);
 
@@ -145,7 +142,7 @@ fn s7_a_file_becomes_a_directory() {
 
 #[test]
 fn s8_a_directory_becomes_a_file() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r/x.txt", "1");
     w.write("r/sub/y.txt", "1");
     w.watch(&["r"]);
@@ -158,7 +155,7 @@ fn s8_a_directory_becomes_a_file() {
 
 #[test]
 fn s9_new_files_in_a_directory() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.mkdir("r");
     w.watch(&["r"]);
 
@@ -172,7 +169,7 @@ fn s9_new_files_in_a_directory() {
 
 #[test]
 fn s10_a_tree_is_moved_in() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.mkdir("r");
     w.write("outside/tree/a.txt", "1");
     w.write("outside/tree/sub/b.txt", "1");
@@ -190,7 +187,7 @@ fn s10_a_tree_is_moved_in() {
 
 #[test]
 fn s11_a_directory_is_moved_out_or_removed() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r/one/a.txt", "1");
     w.write("r/one/sub/b.txt", "1");
     w.write("r/two/c.txt", "1");
@@ -208,7 +205,7 @@ fn s11_a_directory_is_moved_out_or_removed() {
 
 #[test]
 fn s12_the_watched_directory_goes_and_comes_back() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("r/a.txt", "1");
     w.write("r/sub/b.txt", "1");
     w.watch(&["r"]);
@@ -227,7 +224,7 @@ fn s12_the_watched_directory_goes_and_comes_back() {
 
 #[test]
 fn s13_the_directory_of_a_watched_file_is_renamed() {
-  each_backend(|w| {
+  everywhere(|w| {
     w.write("proj/lib/a.js", "1");
     w.watch(&["proj/lib/a.js"]);
 
@@ -240,9 +237,7 @@ fn s13_the_directory_of_a_watched_file_is_renamed() {
 
 #[test]
 fn s14_an_ignored_directory() {
-  let config = Config::default()
-    .with_ignored(|path, kind| kind == EntryKind::Dir && path.ends_with("node_modules"));
-  each_backend_with(&config, |w| {
+  everywhere_with(&Settings::ignore_node_modules(), |w| {
     w.write("r/node_modules/before.js", "1");
     w.watch(&["r"]);
 

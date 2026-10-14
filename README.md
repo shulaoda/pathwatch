@@ -99,7 +99,7 @@ The settings cannot be changed after the watcher is made.
 
 ## Promises
 
-Each of these has a test on the real disk (`crates/pathwatch/tests/disk`; the first lines of
+Each of these has a story (`crates/pathwatch/tests/stories`; the first lines of
 `promises.rs` say which). They run on every OS, with three exceptions: the test with sockets
 (1) runs on Unix only; the tests that rename a directory above a watched one (6, 13) run on
 Windows with polling only, since Windows refuses the rename while a handle is open; and a
@@ -339,7 +339,8 @@ crates/
       engine/                the engine: watched_paths, check, filter, scan, os_watch, events
       tree/  fs/  path.rs
     tests/
-      disk/                  the promises above, on the real disk
+      stories/               the promises above: each story on the real disk, and on the
+                             simulated disk of `pathwatch_sim` where its words allow
       watcher.rs             the thread
       tree.rs                the tree of the engine, alone
       ahead.rs               the engine with polling: a file with a time ahead of the clock
@@ -376,8 +377,10 @@ This runs, on the machine it is called on:
   and the poll backend with a clock that the test moves (`tests/ahead.rs`, `tests/pacing.rs`),
 - on Windows, also the parts of its backend that call no Windows (`tests/windows_parts.rs`):
   the backend is compiled there only,
-- the promises on the real disk, each once with the backend of this OS and once with polling
-  (`tests/disk`; the note above the promises says which of them run where).
+- the stories (`tests/stories`): each once with the backend of this OS and once with polling
+  on the real disk, and a story that needs no more than files, directories, links and renames
+  also on each simulated backend of `pathwatch_sim` (the note above the promises says which
+  of them run where).
 
 | Platform | How |
 |---|---|

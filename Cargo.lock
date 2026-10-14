@@ -72,6 +72,7 @@ dependencies = [
  "bitflags",
  "hashbrown",
  "libc",
+ "pathwatch_sim",
  "rustc-hash",
  "tempfile",
  "windows-sys",
