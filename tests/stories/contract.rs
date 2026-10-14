@@ -1,4 +1,4 @@
-//! The behavior contract: one test for each row S1 to S14 of the table in `docs/design.md`.
+//! The behavior contract: one test for each row S1 to S14 of the table in `references/design.md`.
 //! `r` is the watched path.
 
 use std::time::{Duration, SystemTime};

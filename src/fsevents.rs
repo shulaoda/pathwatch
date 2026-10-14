@@ -1,5 +1,5 @@
 //! The FSEvents backend of macOS: streams, the covers that the keys stand for, and the check
-//! that each stream still stands where it was started. The design is in `docs/design.md` 7.2.
+//! that each stream still stands where it was started. The design is in `references/design.md` 7.2.
 
 use std::{
   collections::{BTreeMap, VecDeque},
@@ -416,7 +416,7 @@ impl Streams {
   /// asked at each commit: a directory above it that was renamed, also only in the case of
   /// its letters, or removed, leaves the stream at a path where nothing is, and the stream
   /// says nothing. Such a path is trusted no more, and every cover at or below it is reported
-  /// lost (`docs/design.md` 7.2).
+  /// lost (`references/design.md` 7.2).
   fn still_in_place(&mut self) -> Raw {
     let moved_away = |path: &&Path| !fs::canonicalize(path).is_ok_and(|real| real == *path);
     let gone: Vec<PathBuf> = self.paths.keys().filter(moved_away).map(Path::to_owned).collect();
@@ -440,7 +440,7 @@ impl Streams {
     }
   }
 
-  /// The check after the start (`docs/design.md` 7.2): a stream path, or a name between it
+  /// The check after the start (`references/design.md` 7.2): a stream path, or a name between it
   /// and a cover, can have changed between `watch` and the start of the stream.
   fn moved_since_asked(&mut self, started: &[PathBuf], covers: &Covers) -> Raw {
     let mut moved = Raw::default();

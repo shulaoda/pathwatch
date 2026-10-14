@@ -44,7 +44,6 @@
 //!
 //! A new test goes into the file in `tests/` that fits it:
 //!
-//! - `scenarios`: the rows S1 to S14 of the behavior contract in `docs/design.md`.
 //! - `check_table`: one test for each row of the table of `check`.
 //! - `baseline`, `young`, `delete_delay`, `unwatch`: one rule of the engine each.
 //! - `want`: what the backend is asked for a directory, and where an OS watch is put.

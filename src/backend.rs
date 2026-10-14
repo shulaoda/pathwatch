@@ -1,5 +1,5 @@
 //! The `Backend` trait: what the engine asks of an OS watch API. The rules for a backend are in
-//! `docs/design.md`, section 6.
+//! `references/design.md`, section 6.
 
 use std::{error, fmt, io, path::Path, sync::Arc};
 

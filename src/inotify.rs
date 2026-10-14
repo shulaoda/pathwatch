@@ -1,4 +1,4 @@
-//! The inotify backend: one kernel watch for each directory. See `docs/design.md` 7.1.
+//! The inotify backend: one kernel watch for each directory. See `references/design.md` 7.1.
 
 use std::{
   collections::hash_map::Entry,

@@ -251,7 +251,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   macOS the same holds when one is renamed, also only to another case of its letters (`src`
   to `Src`); and one that is renamed away and back within that second, with changes made
   below it meanwhile, is not noticed: the watch stands at the text of its path and heard
-  nothing while the path was another one (`docs/design.md` 7.2).
+  nothing while the path was another one (`references/design.md` 7.2).
 - **macOS: many watched paths and a busy disk.** Events come late when the watcher has many
   separate paths and other programs write a lot. Measured while 50,000 other files were
   written: 0.1 s with 100 paths, 0.9 s with 500, 1.8 s with 1,000, 3.5 s with 2,000. Nothing is
@@ -356,7 +356,7 @@ tests/
   inotify.rs  fsevents.rs  windows/     each backend alone, on its OS; `windows/parts.rs`
                          holds the parts of that backend that call no Windows
 examples/                watch.rs, dev_server.rs
-docs/
+references/
   design.md                  how it works
 bench/                       the comparison with other watchers: a workspace of its own,
                              with the tables of the last full runs in BENCHMARK.md

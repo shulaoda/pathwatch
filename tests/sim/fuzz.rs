@@ -821,7 +821,7 @@ struct Run<B: Deliver> {
   denied: Vec<String>,
   offline: bool,
   /// The prefix backend was not told about a move. A poll has to see it before the disk
-  /// changes again: `docs/design.md` lists "away and back before the next poll" as a
+  /// changes again: `references/design.md` lists "away and back before the next poll" as a
   /// known hole.
   poll_first: bool,
 }

@@ -1,5 +1,5 @@
 //! macOS: a listing with what `lstat` tells of each entry, in one call, and the name of one
-//! entry as the disk spells it. A file is taken from the listing on APFS only (`docs/design.md`
+//! entry as the disk spells it. A file is taken from the listing on APFS only (`references/design.md`
 //! 5.4).
 
 use std::{

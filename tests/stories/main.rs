@@ -10,7 +10,7 @@
 //! open, the clock of the disk, the watcher itself) runs on the real disk alone, with
 //! [`on_disk`], and gets the [`Disk`] with everything it has.
 //!
-//! - `contract`: the rows S1 to S14 of `docs/design.md`.
+//! - `contract`: the rows S1 to S14 of `references/design.md`.
 //! - `promises`: the promises of the README.
 //! - `projects`: what editors, package managers and big projects do.
 //! - `engine`: what the engine has to get right below the promises.

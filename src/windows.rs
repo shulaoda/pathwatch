@@ -1,5 +1,5 @@
 //! The Windows backend: `ReadDirectoryChangesW` on at most 64 directory handles. See
-//! `docs/design.md` 7.3.
+//! `references/design.md` 7.3.
 
 use std::{
   ffi::OsString,
