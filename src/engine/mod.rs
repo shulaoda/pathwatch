@@ -38,13 +38,9 @@ use crate::{
 /// A batch goes out at least this often while hints keep coming, or every four quiet times.
 const LONGEST_WAIT: Duration = Duration::from_millis(500);
 
-/// A poll, or the scans after a loss, rests this many times as long as it took: such work
-/// takes a tenth of the time at most.
+/// The scans after a loss report rest this many times as long as they took: such work takes a
+/// tenth of the time at most.
 const REST: u32 = 9;
-
-/// The longest rest after a poll: a round that read a burst of young files must not put the
-/// next one off for minutes.
-const LONGEST_REST: Duration = Duration::from_secs(5);
 /// The longest rest after the scans of a loss report: the rest is against a storm of them, and
 /// one burst in a big directory, which the OS gives up on twice, must not wait seconds for
 /// its second half.
@@ -155,9 +151,6 @@ pub struct Engine<B: Backend, F: Fs> {
   commit_took: Duration,
   /// A watch was given back since the last commit: the backend may move its watches then.
   gave_back: bool,
-  /// How long the reads of contents took since the last tick: the rest after a poll counts them
-  /// once.
-  read_took: Duration,
   /// The nodes the flush changed: `finish` reads their events. A key can be stale.
   touched: Vec<DirKey>,
   /// The directories that give their own watch back after the next commit.
@@ -212,7 +205,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       flush_ticks: Duration::ZERO,
       commit_took: Duration::ZERO,
       gave_back: false,
-      read_took: Duration::ZERO,
       touched: Vec::new(),
       covered: Vec::new(),
       narrowing: Vec::new(),
@@ -313,16 +305,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if !flush && !poll && !second_look {
       return;
     }
-    self.read_took = Duration::ZERO;
     let took = self.flush(now, flush);
     self.finish(out);
     if poll {
-      // The next poll counts from the end of this one, after a rest for a slow one: nine times
-      // the looks, which come again at every round, and the reads of young files once, since a
-      // file is read for two seconds only. The rest is bounded (design.md 5.13).
-      let looks = took.saturating_sub(self.read_took);
-      let rest = (looks * REST).saturating_add(self.read_took).min(LONGEST_REST);
-      self.poll_at = Some(now + took + self.options.poll_interval.max(rest));
+      // The next poll counts from the end of this one: a pause of the poll interval, and at
+      // least as long as the round took, so that polling takes half of the time at most.
+      self.poll_at = Some(now + took + self.options.poll_interval.max(took));
     }
     self.set_poll(now + took + self.options.poll_interval);
   }

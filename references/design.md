@@ -953,8 +953,7 @@ the node (`written`) holds. The delete delay is not touched by any of this: it c
 hint, or from the look that found nothing.
 
 **Pacing.** Two kinds of work are asked for by no hint that names a path, and can come again
-and again: a poll, and the scans after a loss report. After such work that took `t`, the same
-kind of work rests for `9 × t`. So about a tenth of the time goes into it at most.
+and again: a poll, and the scans after a loss report. Each is paced by the time it took.
 
 - Loss reports: all scans that the loss reports of one flush asked for are timed together, and
   the next ones wait for the rest after them, which is half a second at most
@@ -963,18 +962,19 @@ kind of work rests for `9 × t`. So about a tenth of the time goes into it at mo
   its second half (measured: a scan of 200 ms, and a rest of nine times that). A mark that
   only a loss report asked for stays on its node until then. Every other mark is checked as always, and a hint that names a path
   with a waiting mark takes it out of the wait.
-- The poll: the next round starts after the poll interval, or after the rest, whichever is
-  longer; a `watch` call in between does not move it. The rest of the poll is nine times the looks of the round plus the reads of young
-  files once: the looks come again at every round, a file is read for two seconds only. And
-  it is five seconds at most (`LONGEST_REST`): a round that read a burst of files written just
-  before it put the next one off for minutes (measured: 500 files, 2 to 20 s; 100,000, 153 s).
+- The poll: the next round starts one poll interval after the end of this one, and at least
+  one round's time later, so that polling takes half of the time at most; a `watch` call in
+  between does not move it. The pause is the one knob of polling, as in notify and watchdog:
+  a round looks at every watched file once (20,000 files in 2,000 directories: 22,000 `lstat`,
+  50 ms on APFS, measured), and a user with many files raises the interval. (A rest of nine
+  times the looks, a tenth of a core at most, was the rule for a while: it made the interval a
+  floor that the user could not see, and 20,000 files polled every half second.)
 
-The time is the time of the looks at the disk, of the whole flush that the poll or the scans
-ran in: the checks that hints asked for in the same flush count with it. What the backend
-takes to make watches live (`commit`) is left out: it is paid once, not at every look. And a
-flush counts for a minute at most (`LONGEST_FLUSH`): the clock runs on while the machine
-sleeps, and a flush that the sleep fell into would rest for hours. So a round that really
-takes more than a minute rests nine minutes, not nine times its length.
+The time is the time of the whole flush that the poll or the scans ran in: the checks that
+hints asked for in the same flush count with it, and so do the reads of young files. What the
+backend takes to make watches live (`commit`) is left out: it is paid once, not at every look.
+And a flush counts for a minute at most (`LONGEST_FLUSH`): the clock runs on while the machine
+sleeps, and a flush that the sleep fell into would pause for hours.
 
 ### 5.14 Symbolic links
 
@@ -1643,6 +1643,7 @@ the order in which a change meets them.
 - **Twin.** Another node of the same directory that can be the same name as this one.
 - **Unlisted.** A registered node whose entry the directory above lists under another spelling.
   It is the path of its caller, and no entry of that directory.
-- **Rest.** After a poll, or after the scans that a loss report asked for, took a time `t`, such
-  work waits `9 × t` before it runs again.
+- **Rest.** After the scans that a loss report asked for took a time `t`, such scans wait
+  `9 × t` before they run again, half a second at most. The pause after a poll is the poll
+  interval, and at least the time the round took.
 - **Settle** (tests). Deliver every notification and run every deadline until nothing is left.

@@ -102,10 +102,12 @@ impl Config {
     self
   }
 
-  /// The shortest pause between two rounds of polling, when the watcher polls everything.
-  /// Default: 100 ms. It is never below 1 ms and never above a year.
+  /// The pause between two rounds of polling, when the watcher polls everything. Default:
+  /// 100 ms. It is never below 1 ms and never above a year.
   ///
-  /// Polling takes about a tenth of a core at most, so the pause is longer for many paths.
+  /// A round that takes longer than the pause is followed by a pause as long as itself: polling
+  /// takes half of a core at most. A round looks at every watched file once (20,000 files: about
+  /// 50 ms on APFS), so with many files a longer pause saves the CPU.
   #[must_use]
   pub fn with_poll_interval(mut self, interval: Duration) -> Self {
     self.poll_interval = interval.max(SHORTEST_POLL_INTERVAL);

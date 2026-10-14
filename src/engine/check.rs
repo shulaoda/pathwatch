@@ -490,11 +490,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let kept = old.and_then(|(old, content)| content.filter(|_| old == fingerprint));
     let compare = matches!(kept, Some(Content::Hash(_)));
     let hash = if young || compare {
-      // The reads are timed apart: the rest after a poll counts them once (design.md 5.13).
-      let started = self.fs.ticks();
-      let hashed = self.content_hash(key, path, kind, fingerprint.size);
-      self.read_took += self.fs.ticks().saturating_sub(started);
-      match hashed {
+      match self.content_hash(key, path, kind, fingerprint.size) {
         Ok(hash) => hash,
         // Gone after the `lstat`: this check says nothing, and the next flush looks again.
         Err(error) if is_missing(&error) => {

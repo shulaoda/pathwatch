@@ -1,5 +1,5 @@
 //! The poll backend and the reads of the disk on a real directory, with a clock that the test
-//! moves: a file whose time is far ahead of the clock, the rest after a poll, the engine after
+//! moves: a file whose time is far ahead of the clock, the pause after a poll, the engine after
 //! its backend stopped, and the hash of a file.
 
 use std::{
@@ -24,7 +24,7 @@ const INTERVAL: Duration = Duration::from_millis(100);
 
 /// The real disk, with a count of the files whose content was read, and a clock that moves by
 /// a price for each listing and for each read of a content, and by nothing else: with no
-/// price, no rest after a slow poll moves the next one past the step of a test.
+/// price, no pause after a slow poll moves the next one past the step of a test.
 struct Disk {
   reads: Rc<Cell<usize>>,
   listing: Duration,
@@ -205,31 +205,24 @@ fn pause_after_a_poll(files: usize, listing: Duration, read: Duration) -> Durati
   next.saturating_duration_since(now)
 }
 
-/// The looks of a round come again at every round: the rest is nine times what they took.
+/// A round that takes longer than the poll interval is followed by a pause as long as itself:
+/// polling takes half of the time at most.
 #[test]
-fn the_looks_of_a_round_rest_nine_times_as_long() {
+fn a_slow_round_is_followed_by_a_pause_as_long() {
   // A listing costs 300 ms, and the reads of the young files cost nothing.
   let pause = pause_after_a_poll(20, Duration::from_millis(300), Duration::ZERO);
-  // The round took at least one listing, and the rest is nine times the looks.
-  assert!(pause >= Duration::from_secs(3), "{pause:?}");
-  assert!(pause < Duration::from_secs(15), "{pause:?}");
+  // The round took at least one listing, and the pause is as long as the round.
+  assert!(pause >= Duration::from_millis(600), "{pause:?}");
+  assert!(pause < Duration::from_secs(2), "{pause:?}");
 }
 
-/// The reads of young files are paid once: a round that read twenty files just written rests
-/// for the time of the reads, not nine times as long.
+/// The reads of young files count in the round: a round that read twenty files just written
+/// is followed by a pause as long as the reads took.
 #[test]
-fn the_reads_of_young_files_are_paid_once() {
+fn the_reads_of_young_files_count_in_the_round() {
   let pause = pause_after_a_poll(20, Duration::ZERO, Duration::from_millis(10));
-  // Twenty reads of 10 ms: the round took 200 ms, and the rest is 200 ms, not 1.8 s.
+  // Twenty reads of 10 ms: the round took 200 ms, and so does the pause.
   assert_eq!(pause, Duration::from_millis(200 + 200), "{pause:?}");
-}
-
-/// The rest is five seconds at most: a burst of young files does not put the next poll off for
-/// minutes.
-#[test]
-fn the_rest_is_five_seconds_at_most() {
-  let pause = pause_after_a_poll(20, Duration::ZERO, Duration::from_secs(1));
-  assert_eq!(pause, Duration::from_secs(20 + 5), "{pause:?}");
 }
 
 /// The engine after its backend stopped: it polls as often as a watcher that only polls.

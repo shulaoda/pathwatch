@@ -177,10 +177,10 @@ fn a_later_watch_call_does_not_move_the_poll() {
   caught_up(&mut d);
 }
 
-/// A poll round that takes 50 ms is followed by a rest of nine times that. A round that takes
-/// no time is followed by the poll interval.
+/// A poll round that takes longer than the poll interval is followed by a pause as long as the
+/// round. A round that takes no time is followed by the poll interval.
 #[test]
-fn a_slow_poll_round_is_followed_by_a_rest() {
+fn a_slow_poll_round_is_followed_by_a_pause_as_long() {
   let options = Options { poll_interval: Duration::from_millis(100), ..Options::default() };
   let mut d = Driver::poll(options);
   d.fs.mkdir_all("/p/R").unwrap();
@@ -191,10 +191,10 @@ fn a_slow_poll_round_is_followed_by_a_rest() {
   assert!(d.step());
   assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(200)));
 
-  d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(50)));
+  d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(250)));
   assert!(d.step());
   assert_eq!(d.fs.traps_run(), 1);
-  // 200 ms, the 50 ms of the round, and 450 ms of rest.
+  // 200 ms, the 250 ms of the round, and a pause of 250 ms: longer than the interval.
   assert_eq!(d.engine.deadline(), Some(start + Duration::from_millis(700)));
   // A change is found by the next round, not sooner.
   d.fs.write("/p/R/a", "22").unwrap();
@@ -217,19 +217,19 @@ fn the_time_of_a_commit_is_not_paced() {
 
   // The first call of a poll round is the commit of the backend.
   let commits = d.fs.calls().commit;
-  d.fs.at_call(0, |fs| fs.advance(Duration::from_millis(250)));
+  d.fs.at_call(0, |fs| fs.advance(Duration::from_millis(1500)));
   assert!(d.step());
   assert_eq!((d.fs.traps_run(), d.fs.calls().commit), (1, commits + 1));
   assert_eq!(d.engine.deadline(), Some(start + second * 2));
 
   // The second call is a look at the disk.
   let lstats = d.fs.calls().lstat;
-  d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(250)));
+  d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(1500)));
   assert!(d.step());
   assert_eq!(d.fs.traps_run(), 2);
   assert!(d.fs.calls().lstat > lstats);
-  // The 250 ms of the round, and a rest of nine times that.
-  assert_eq!(d.engine.deadline(), Some(start + second * 2 + Duration::from_millis(2500)));
+  // The 1.5 s of the round, and a pause as long: longer than the interval of a second.
+  assert_eq!(d.engine.deadline(), Some(start + second * 2 + Duration::from_millis(3000)));
   caught_up(&mut d);
 }
 

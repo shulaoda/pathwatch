@@ -93,7 +93,7 @@ watcher, so it should only pass the batch on.
 | `with_debounce(d)` | 20 ms | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch goes out 500 ms after the first change since the last batch, or `4 × d` after it if that is longer, plus the time that the check of the disk takes. Zero: no waiting. The most is a year, also for the poll interval. A `watch` or `unwatch` call ends the quiet time; a poll that runs meanwhile does not, but a change it finds by itself is reported. Under polling there is no quiet time: a change is found by the next round. |
 | `with_delete_delay(d)` | 100 ms | How long a `Delete` waits for the path to come back. A file that is removed and written again within `d` is one `Update`; a real delete is reported `d` after the OS said that the path is gone. Zero: no waiting, and such a file is a `Delete` and a `Create`. The most is a year. |
 | `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
-| `with_poll_interval(d)` | 100 ms | The shortest pause between two rounds of polling. The least is 1 ms. After a slow round the pause is longer: nine times as long as the looks of the round took, plus the time of the reads of the files written in the last two seconds (on Windows a read right after a write waits for the virus scanner), and five seconds at most. |
+| `with_poll_interval(d)` | 100 ms | The pause between two rounds of polling, and at least as long as the round took: polling takes half of a core at most. The least is 1 ms. A round looks at every watched file once (20,000 files: about 50 ms on APFS). |
 
 The settings cannot be changed after the watcher is made.
 
@@ -285,10 +285,10 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 - **Normally** an event comes within the quiet time (20 ms) plus what the OS takes to tell
   about a change (about 1 to 15 ms). For a watched path that is a link to a file, a write to
   the file behind it is found by the poll of the links: within a second.
-- **With polling** a change is found by the next round: within the poll interval (100 ms), or
-  later after a slow round: the pause is nine times as long as the looks of the round took,
-  plus the time of the reads of the files written in the last two seconds, and five seconds
-  at most.
+- **With polling** a change is found by the next round: within the poll interval (100 ms)
+  plus the time of a round (20,000 files: about 50 ms on APFS), or within twice the round when
+  the round is longer than the interval. The files written in the last two seconds are read
+  in each round (on Windows a read right after a write waits for the virus scanner).
 - **Under a flood** of changes a batch goes out 500 ms after the first change since the last
   batch, plus the time that the check of the disk takes: a check with thousands of changed
   paths takes a second and more (measured: 30,000 files made by eight threads, the longest
@@ -301,7 +301,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   "permission denied" counts as missing.
 - **Lost notifications** (the OS dropped some, or more than 16 MiB of them waited for the
   watcher) are repaired by reading the disk again. These scans are paced: after one that took
-  `t`, the next one waits `9 × t`.
+  `t`, the next one waits `9 × t`, and half a second at most.
 
 ## Coming from notify, chokidar or @parcel/watcher
 
