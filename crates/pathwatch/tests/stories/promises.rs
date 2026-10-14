@@ -48,7 +48,7 @@ use pathwatch::{
 use crate::{
   Inside, Settings,
   disk::{PATIENCE, relative_scratch},
-  each, everywhere, everywhere_with, on_disk, on_disk_inside,
+  each, everywhere, everywhere_with, on_disk, on_disk_inside, on_disk_with, skipped,
 };
 
 #[cfg(unix)]
@@ -576,10 +576,10 @@ fn a_link_inside_a_watched_directory_is_a_file() {
 /// macOS, and two on every other disk, where there is nothing to test.
 #[test]
 fn a_watched_file_in_another_unicode_form() {
-  everywhere(|w| {
+  on_disk(|w| {
     w.write("src/cafe\u{301}.txt", "1");
-    // Nothing to test on a disk that tells the two forms apart.
     if !w.path("src/caf\u{e9}.txt").exists() {
+      skipped("only the usual disk of macOS takes one Unicode form of a name for the other");
       return;
     }
     w.watch(&["src/caf\u{e9}.txt"]);
@@ -598,7 +598,7 @@ fn names_below_a_watched_directory_are_spelled_as_on_the_disk() {
   everywhere(|w| {
     w.write("proj/Src/Old.TXT", "1");
     // Where the disk takes two spellings for one, the directory is watched in another case.
-    let loose = w.path("PROJ").exists();
+    let loose = w.folds_case();
     let root = if loose { "PROJ" } else { "proj" };
     let at = |rel: &str| format!("{root}/{rel}");
     w.watch(&[root]);
@@ -636,13 +636,9 @@ fn a_file_is_renamed_to_another_letter_case() {
 /// The OS names a file that is gone as the caller spelled it then.
 #[test]
 fn a_file_goes_through_another_spelling_of_its_name() {
-  everywhere(|w| {
+  everywhere_with(&Settings::loose(), |w| {
     w.write("r/App.js", "1");
     w.write("r/Other.js", "1");
-    // Only a disk that takes two spellings of a name for one finds a file in this way.
-    if !w.path("R").exists() {
-      return;
-    }
     w.watch(&["r"]);
 
     w.remove("r/APP.JS");
@@ -657,12 +653,8 @@ fn a_file_goes_through_another_spelling_of_its_name() {
 /// disk has.
 #[test]
 fn every_watched_spelling_of_a_file_gets_its_events() {
-  everywhere(|w| {
+  everywhere_with(&Settings::loose(), |w| {
     w.write("r/app.js", "1");
-    // Only a disk that takes two spellings of a name for one finds a file in this way.
-    if !w.path("R").exists() {
-      return;
-    }
     w.watch(&["r", "r/App.js", "r/APP.JS"]);
 
     w.write("r/app.js", "22");
@@ -677,12 +669,9 @@ fn every_watched_spelling_of_a_file_gets_its_events() {
 
 #[test]
 fn watched_paths_through_another_spelling_inside_a_watched_directory() {
-  everywhere(|w| {
+  everywhere_with(&Settings::loose(), |w| {
     w.write("r/src/a.js", "1");
     w.write("r/src/lib/b.js", "1");
-    if !w.path("R").exists() {
-      return;
-    }
     w.watch(&["r", "r/SRC/a.js", "r/Src/LIB"]);
 
     w.write("r/src/a.js", "22");
@@ -727,13 +716,11 @@ fn a_directory_is_renamed_to_another_letter_case() {
 /// The watched path still finds its directory, and the events keep the spelling of the caller.
 #[test]
 fn a_directory_above_a_watched_path_is_renamed_to_another_letter_case() {
-  on_disk(|w| {
+  on_disk_with(&Settings::loose(), |w| {
     w.write("r/x/a/old.js", "1");
-    if !w.path("R").exists() {
-      return;
-    }
     // Windows refuses to rename a directory above an open directory handle.
     if cfg!(windows) && w.backend == "native" {
+      skipped("Windows refuses to rename a directory above an open handle");
       return;
     }
     w.watch(&["r/x/a"]);

@@ -100,12 +100,16 @@ The settings cannot be changed after the watcher is made.
 ## Promises
 
 Each of these has a story (`crates/pathwatch/tests/stories`; the first lines of
-`promises.rs` say which). They run on every OS, with three exceptions: the test with sockets
-(1) runs on Unix only; the tests that rename a directory above a watched one (6, 13) run on
-Windows with polling only, since Windows refuses the rename while a handle is open; and a
-test that makes a symbolic link (12, and one each of 6 and 13) stops early on Windows when the
-user may not make links, as the tests with another Unicode form of a name (13) do on a disk
-that tells the forms apart (every disk but the usual one of macOS).
+`promises.rs` say which). A story runs on the simulated disk with each simulated backend
+and on the real disk with the backend of this OS and with polling, and the events are the
+same everywhere. A story that needs a disk that takes two spellings of a name for one (13)
+says so (`Settings::loose`): the simulated disk is made so, and the real disk is probed. A
+world that a story skips is never silent: the story says so on stderr (`skipped: ...`).
+That happens on the real disk of Linux for the stories of 13, on Windows with the native
+backend for the stories that rename a directory above a watched one (6, 13: Windows refuses
+the rename while a handle is open), on Windows when the user may not make a symbolic link
+(12, and one each of 6 and 13), and everywhere but the usual disk of macOS for the story
+with another Unicode form of a name. The story with sockets (1) is Unix only.
 
 1. **A watched path is a file, a directory or nothing.** A file is anything that is not a
    directory: also a socket, and a symbolic link inside a watched directory.

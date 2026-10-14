@@ -9,7 +9,7 @@ use std::{
 use pathwatch::EventKind::{Create, Delete, Update};
 
 use crate::{
-  Disk, Settings, disk::files_at, each, everywhere, everywhere_with, on_disk, on_disk_with,
+  Disk, Settings, disk::files_at, each, everywhere, everywhere_with, on_disk, on_disk_with, skipped,
 };
 
 /// A delete delay that the changes of a test fit into on a slow machine.
@@ -158,6 +158,7 @@ fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
     w.write("r/x/a/goes.js", "1");
     // Windows refuses to rename a directory above an open directory handle.
     if cfg!(windows) && w.backend == "native" {
+      skipped("Windows refuses to rename a directory above an open handle");
       return;
     }
     w.watch(&["r/x/a"]);
@@ -186,6 +187,7 @@ fn a_directory_above_the_target_of_a_link_is_moved_away_changed_and_moved_back()
     // Windows refuses to rename a directory above an open directory handle, which the handle
     // opened through the link is.
     if cfg!(windows) && w.backend == "native" {
+      skipped("Windows refuses to rename a directory above an open handle");
       return;
     }
     if !w.symlink("store/x/real", "r/link") {
@@ -284,13 +286,9 @@ fn two_spellings_of_one_directory() {
 /// was given to `watch`.
 #[test]
 fn watched_paths_in_another_spelling() {
-  everywhere(|w| {
+  everywhere_with(&Settings::loose(), |w| {
     w.write("src/app.js", "1");
     w.write("src/components/ui/button.js", "1");
-    // Nothing to test on a disk that tells `App.js` from `app.js`.
-    if !w.path("src/App.js").exists() {
-      return;
-    }
     w.watch(&["src/App.js", "src/Components/UI/Button.js"]);
 
     w.write("src/app.js", "22");

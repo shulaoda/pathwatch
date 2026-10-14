@@ -7,7 +7,7 @@ use std::{
   env, fs,
   path::{Component, Path, PathBuf},
   sync::{
-    Arc, Weak,
+    Arc, OnceLock, Weak,
     mpsc::{self, Receiver, RecvTimeoutError},
   },
   thread,
@@ -17,7 +17,7 @@ use std::{
 use pathwatch::{Config, Error, Event, EventKind, Watcher};
 use tempfile::TempDir;
 
-use crate::{History, Settings, World, differences, expected_history, history_of};
+use crate::{History, Settings, World, differences, expected_history, history_of, skipped};
 
 pub const PATIENCE: Duration = Duration::from_secs(30);
 /// Longer than the default debounce and the delete delay together.
@@ -27,17 +27,26 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Runs inside the handler, with the watcher and the batch, before the story gets the batch.
 pub type Inside = fn(&Watcher, &[Event]);
 
-/// Runs the story with the watch API of this OS and with polling, at the same time.
+/// Runs the story with the watch API of this OS and with polling, at the same time. A story
+/// that needs a disk that takes two spellings of a name for one is skipped on one that does not.
 pub fn each_backend(settings: &Settings, inside: Option<Inside>, story: impl Fn(&mut Disk) + Sync) {
+  if settings.loose_disk && !folds_case() {
+    skipped("the real disk tells two spellings of a name apart");
+    return;
+  }
+  // Each world runs on a thread named like the story, so that a skip can name it.
+  let name = thread::current().name().unwrap_or("a story").to_owned();
   thread::scope(|scope| {
     for polling in [false, true] {
       let story = &story;
-      scope.spawn(move || {
+      let builder = thread::Builder::new().name(name.clone());
+      let world = builder.spawn_scoped(scope, move || {
         let config = config(settings).with_polling(polling).with_poll_interval(POLL_INTERVAL);
         let mut disk = Disk::start(config, inside, if polling { "polling" } else { "native" });
         story(&mut disk);
         assert!(disk.events.is_empty(), "{}: a story ends with `expect`", disk.backend);
       });
+      world.unwrap();
     }
   });
 }
@@ -54,6 +63,16 @@ fn config(settings: &Settings) -> Config {
     config = config.with_ignored(move |path, kind| ignored(path, kind));
   }
   config
+}
+
+/// Whether the temporary directory takes two spellings of a name for one, probed once.
+fn folds_case() -> bool {
+  static FOLDS: OnceLock<bool> = OnceLock::new();
+  *FOLDS.get_or_init(|| {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("probe"), "").unwrap();
+    dir.path().join("PROBE").exists()
+  })
 }
 
 /// A temporary directory and a relative path to it from the current directory: in the target
@@ -221,7 +240,11 @@ impl Disk {
   }
 
   pub fn symlink(&self, target: &str, link: &str) -> bool {
-    symlink(&self.path(target), &self.path(link))
+    let made = symlink(&self.path(target), &self.path(link));
+    if !made {
+      skipped("this user may not make a symbolic link");
+    }
+    made
   }
 
   pub fn set_modified(&self, rel: &str, time: SystemTime) {
@@ -359,6 +382,10 @@ impl World for Disk {
 
   fn polls(&self) -> bool {
     self.backend == "polling"
+  }
+
+  fn folds_case(&self) -> bool {
+    folds_case()
   }
 
   fn watch(&mut self, rels: &[&str]) {

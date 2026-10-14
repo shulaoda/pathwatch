@@ -48,6 +48,8 @@ pub trait World {
   fn name(&self) -> &'static str;
   /// Whether the world polls the disk in place of an OS watch.
   fn polls(&self) -> bool;
+  /// Whether the disk takes two spellings of a name for one (the case of letters).
+  fn folds_case(&self) -> bool;
 
   fn watch(&mut self, rels: &[&str]);
   fn unwatch(&mut self, rels: &[&str]);
@@ -71,15 +73,22 @@ pub trait World {
   fn may_pass(&mut self, rel: &str);
 }
 
-/// What a story asks of the watcher. `None`: the default.
+/// What a story asks of the watcher and of the disk. `None`: the default.
 #[derive(Clone, Default)]
 pub struct Settings {
   pub debounce: Option<Duration>,
   pub delete_delay: Option<Duration>,
   pub ignored: Option<Ignored>,
+  /// The story needs a disk that takes two spellings of a name for one. The simulated disk
+  /// is made so; the real disk is probed, and the story is skipped where it is not so.
+  pub loose_disk: bool,
 }
 
 impl Settings {
+  pub fn loose() -> Self {
+    Self { loose_disk: true, ..Self::default() }
+  }
+
   pub fn delete_delay(delay: Duration) -> Self {
     Self { delete_delay: Some(delay), ..Self::default() }
   }
@@ -122,6 +131,14 @@ pub fn on_disk_with(settings: &Settings, story: impl Fn(&mut Disk) + Sync) {
 /// `on_disk`, with `inside` run inside the handler for each batch, before the story gets it.
 pub fn on_disk_inside(inside: Inside, story: impl Fn(&mut Disk) + Sync) {
   disk::each_backend(&Settings::default(), Some(inside), story);
+}
+
+/// Says on stderr that the running story skips a world, and why: a skipped world is never
+/// silent. The name of the story is the name of its thread.
+#[expect(clippy::print_stderr, reason = "a skipped world must be seen")]
+pub fn skipped(why: &str) {
+  let thread = std::thread::current();
+  eprintln!("skipped: {}: {why}", thread.name().unwrap_or("a story"));
 }
 
 /// The events of each path, in the order in which they came.

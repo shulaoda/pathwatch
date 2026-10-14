@@ -44,31 +44,6 @@ fn thousands_of_case_twins_that_come_and_go() {
   });
 }
 
-/// A single watched file, registered as `App.js` while the disk says `app.js`. Its `Update`,
-/// `Delete` and `Create` come, under the registered spelling.
-#[test]
-fn a_watched_file_in_another_spelling() {
-  on_all(&loose(), |d, on| {
-    d.fs().set_ignore_case(true);
-    d.fs().mkdir_all("/p/src").unwrap();
-    d.fs().write("/p/src/app.js", "1").unwrap();
-    d.fs().write("/p/src/other.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/src/App.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/src/App.js"], "{on}");
-
-    d.fs().write("/p/src/app.js", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/src/App.js"], "{on}");
-    d.fs().remove("/p/src/app.js").unwrap();
-    assert_eq!(d.settled(), ["D /p/src/App.js"], "{on}");
-    // It comes back in a third spelling.
-    d.fs().write("/p/src/APP.JS", "1").unwrap();
-    assert_eq!(d.window(), ["C /p/src/App.js"], "{on}");
-    d.fs().write("/p/src/APP.JS", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/src/App.js"], "{on}");
-    d.caught_up();
-  });
-}
-
 /// The other spelling is in a directory name on the way: `Components` is registered, the disk
 /// says `components`, and a watch above reports `components/ui/App.js`. The check of a
 /// registered directory name goes deep, so the file below it is found. The same file is
@@ -246,33 +221,6 @@ fn a_strict_disk_costs_one_look() {
   caught_up(&mut d);
 }
 
-/// Two watches are two questions. The watch of the directory reports the file as the disk
-/// spells it, and the watched path reports it in the spelling of its caller.
-#[test]
-fn a_watched_path_in_another_spelling_inside_a_watched_directory() {
-  on_all(&loose(), |d, on| {
-    d.fs().set_ignore_case(true);
-    d.fs().mkdir_all("/p/R").unwrap();
-    d.fs().write("/p/R/app.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/R", "/p/R/App.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/R/App.js", "/p/R/app.js"], "{on}");
-
-    d.fs().write("/p/R/app.js", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/R/App.js", "U /p/R/app.js"], "{on}");
-    d.fs().remove("/p/R/app.js").unwrap();
-    assert_eq!(d.settled(), ["D /p/R/App.js", "D /p/R/app.js"], "{on}");
-    d.fs().write("/p/R/app.js", "333").unwrap();
-    assert_eq!(d.settled(), ["C /p/R/App.js", "C /p/R/app.js"], "{on}");
-
-    // The entry goes and comes back as `App.js`, and no hint names `app.js`: the directory
-    // has no entry of that name any more.
-    d.fs().remove("/p/R/App.js").unwrap();
-    d.fs().write("/p/R/App.js", "4444").unwrap();
-    assert_eq!(d.settled(), ["U /p/R/App.js", "D /p/R/app.js"], "{on}");
-    d.caught_up();
-  });
-}
-
 /// A file at a name that only leads to a watched path, inside a watched directory. The file is
 /// an entry of the directory while the disk spells it like the watched path. When the disk
 /// spells it in another way, it is gone under this name at once: it is there, so no second
@@ -294,33 +242,6 @@ fn a_file_at_a_name_on_the_way_changes_its_spelling() {
     d.fs().remove("/p/SRC").unwrap();
     d.fs().symlink("/nowhere", "/p/src").unwrap();
     assert_eq!(d.window(), ["D /p/SRC", "C /p/src"], "{on}");
-    d.caught_up();
-  });
-}
-
-/// The same one level up: a watched directory, and below it a watched file and a watched
-/// directory that are reached through another spelling of a directory in it. The hint comes
-/// for the directory at the top, and the walk goes on through each spelling.
-#[test]
-fn watched_paths_through_another_spelling_of_a_directory_inside_a_watched_directory() {
-  on_all(&loose(), |d, on| {
-    d.fs().set_ignore_case(true);
-    d.fs().mkdir_all("/p/src/lib").unwrap();
-    d.fs().write("/p/src/a.js", "1").unwrap();
-    d.fs().write("/p/src/lib/b.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p", "/p/SRC/a.js", "/p/Src/LIB"]), NONE, "{on}");
-
-    d.fs().write("/p/src/a.js", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/SRC/a.js", "U /p/src/a.js"], "{on}");
-    d.fs().write("/p/src/lib/b.js", "22").unwrap();
-    d.fs().write("/p/src/lib/c.js", "1").unwrap();
-    let expected =
-      ["U /p/Src/LIB/b.js", "C /p/Src/LIB/c.js", "U /p/src/lib/b.js", "C /p/src/lib/c.js"];
-    assert_eq!(d.window(), expected, "{on}");
-    d.fs().remove("/p/src/a.js").unwrap();
-    d.fs().remove("/p/src/lib/b.js").unwrap();
-    let expected = ["D /p/SRC/a.js", "D /p/Src/LIB/b.js", "D /p/src/a.js", "D /p/src/lib/b.js"];
-    assert_eq!(d.settled(), expected, "{on}");
     d.caught_up();
   });
 }
@@ -518,27 +439,6 @@ fn a_watched_file_is_renamed_to_another_letter_case() {
   });
 }
 
-/// Two watched paths that are two spellings of one file: each of them gets its events. The
-/// hint names the file as the disk spells it, and the other registered name is looked at too.
-#[test]
-fn two_watched_paths_that_are_two_spellings_of_one_file() {
-  on_all(&loose(), |d, on| {
-    d.fs().set_ignore_case(true);
-    d.fs().mkdir_all("/p/src").unwrap();
-    d.fs().write("/p/src/app.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/src/App.js", "/p/src/app.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/src/App.js", "/p/src/app.js"], "{on}");
-
-    d.fs().write("/p/src/app.js", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/src/App.js", "U /p/src/app.js"], "{on}");
-    d.fs().remove("/p/src/APP.JS").unwrap();
-    assert_eq!(d.settled(), ["D /p/src/App.js", "D /p/src/app.js"], "{on}");
-    d.fs().write("/p/src/app.js", "333").unwrap();
-    assert_eq!(d.settled(), ["C /p/src/App.js", "C /p/src/app.js"], "{on}");
-    d.caught_up();
-  });
-}
-
 /// The same with a letter outside ASCII in the names. The table of the tree does not find
 /// the other name, so it comes from the list of such names.
 #[test]
@@ -679,30 +579,6 @@ fn a_new_entry_costs_one_look_and_one_question() {
     assert_eq!(since(before, &d), [2, 2, 0], "{entries}");
     caught_up(&mut d);
   }
-}
-
-/// The OS names an entry that is gone as the caller spelled it. The file that the caller
-/// meant is found by its name without the case of the letters, and no listing is made.
-#[test]
-fn an_entry_goes_through_another_spelling_of_its_name() {
-  on_all(&loose(), |d, on| {
-    d.fs().set_ignore_case(true);
-    d.fs().mkdir_all("/p/R").unwrap();
-    d.fs().write("/p/R/app.js", "1").unwrap();
-    d.fs().write("/p/R/other.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/R"]), NONE, "{on}");
-
-    d.fs().remove("/p/R/APP.JS").unwrap();
-    assert_eq!(d.settled(), ["D /p/R/app.js"], "{on}");
-    d.fs().rename("/p/R/Other.js", "/p/away.js").unwrap();
-    assert_eq!(d.settled(), ["D /p/R/other.js"], "{on}");
-    d.caught_up();
-
-    // The name is free: a file that comes there is a new one.
-    d.fs().write("/p/R/app.js", "22").unwrap();
-    assert_eq!(d.settled(), ["C /p/R/app.js"], "{on}");
-    d.caught_up();
-  });
 }
 
 /// A name with a letter outside ASCII: the table of the tree does not find its other

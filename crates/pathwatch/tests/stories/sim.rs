@@ -21,11 +21,11 @@ pub fn each_backend(settings: &Settings, story: &(impl Fn(&mut dyn World) + Sync
       Mode::Prefix => "sim FSEvents",
       Mode::Handle => "sim Windows",
     };
-    let mut sim = Sim::new(Driver::sim(mode, options.clone()), name);
+    let mut sim = Sim::new(Driver::sim(mode, options.clone()), name, settings.loose_disk);
     story(&mut sim);
     sim.end();
   }
-  let mut sim = Sim::new(Driver::<PollBackend>::poll(options), "sim polling");
+  let mut sim = Sim::new(Driver::<PollBackend>::poll(options), "sim polling", settings.loose_disk);
   story(&mut sim);
   sim.end();
 }
@@ -39,19 +39,22 @@ fn options(settings: &Settings) -> Options {
     options.delete_delay = delay;
   }
   options.ignored.clone_from(&settings.ignored);
+  options.loose_spelling = settings.loose_disk;
   options
 }
 
 pub struct Sim<B: Deliver> {
   driver: Driver<B>,
   name: &'static str,
+  loose: bool,
   passing: Vec<PathBuf>,
 }
 
 impl<B: Deliver> Sim<B> {
-  fn new(driver: Driver<B>, name: &'static str) -> Self {
+  fn new(driver: Driver<B>, name: &'static str, loose: bool) -> Self {
+    driver.fs.set_ignore_case(loose);
     driver.fs.mkdir_all(ROOT).unwrap();
-    Self { driver, name, passing: Vec::new() }
+    Self { driver, name, loose, passing: Vec::new() }
   }
 
   /// The end of the story: everything settles, and the engine has caught up with the disk.
@@ -75,6 +78,10 @@ impl<B: Deliver> World for Sim<B> {
 
   fn polls(&self) -> bool {
     self.name == "sim polling"
+  }
+
+  fn folds_case(&self) -> bool {
+    self.loose
   }
 
   fn watch(&mut self, rels: &[&str]) {
