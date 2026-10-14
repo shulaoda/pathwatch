@@ -235,6 +235,9 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   in the case of its ASCII letters still gets its events. Below a watched directory a change
   made through another spelling of a name can be reported under a name the disk does not
   have, or not at all, and a rename that changes only the case leaves the old name known.
+- **Linux: a watched file written through another hard link of it**, under a name in a
+  directory that is not watched, gets no event: inotify reports a write under the name the
+  writer used. Polling finds it, and so does macOS.
 - **A young file above 16 MiB, or one that cannot be read, under polling:** it gets one
   `Update` when it is 2 s old, also when nothing changed, and also when it was written just
   before `watch`.

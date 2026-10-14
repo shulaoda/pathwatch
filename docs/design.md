@@ -1516,7 +1516,8 @@ The test files of the simulator:
   and big projects do), `promises` (the promises of the README; its first lines say which test
   proves which), `engine` (what the engine has to get right below the promises: a batch of
   paths, a directory that becomes a watched path above others, files and links on the way,
-  directories that are renamed or replaced). Each story runs on the real disk, once with the backend of the OS and once
+  directories that are renamed or replaced), `operations` (every way a user writes, renames
+  and links a file; a hard link; two watchers in one process). Each story runs on the real disk, once with the backend of the OS and once
   with polling, both at the same time; a story that needs no more than the words of `World`
   (files, directories, links, renames, `watch`, `unwatch`, `expect`) runs first on each
   simulated backend of `tests/sim`, where it takes no time and its end is checked against

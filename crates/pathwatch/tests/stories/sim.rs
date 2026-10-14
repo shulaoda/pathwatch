@@ -101,6 +101,13 @@ impl<B: Deliver> World for Sim<B> {
     self.driver.fs.write(path, content).unwrap();
   }
 
+  fn append(&mut self, rel: &str, content: &str) {
+    let path = self.path(rel);
+    let mut bytes = self.driver.fs.read(&path).expect("a file to append to");
+    bytes.extend_from_slice(content.as_bytes());
+    self.driver.fs.write(path, bytes).unwrap();
+  }
+
   fn mkdir(&mut self, rel: &str) {
     self.driver.fs.mkdir_all(self.path(rel)).unwrap();
   }

@@ -14,6 +14,7 @@
 //! - `promises`: the promises of the README.
 //! - `projects`: what editors, package managers and big projects do.
 //! - `engine`: what the engine has to get right below the promises.
+//! - `operations`: every way a user writes, renames and links a file.
 
 mod contract;
 mod disk;
@@ -23,6 +24,7 @@ mod engine;
 #[path = "../sim/fixtures/mod.rs"]
 #[expect(dead_code, unused_imports, reason = "the stories use a part of the fixtures")]
 mod fixtures;
+mod operations;
 mod projects;
 mod promises;
 #[cfg(unix)]
@@ -56,6 +58,8 @@ pub trait World {
 
   /// Writes a file, making the directories above it.
   fn write(&mut self, rel: &str, content: &str);
+  /// Appends to a file that is there.
+  fn append(&mut self, rel: &str, content: &str);
   fn mkdir(&mut self, rel: &str);
   /// Removes a file, a link, or a directory with everything in it.
   fn remove(&mut self, rel: &str);

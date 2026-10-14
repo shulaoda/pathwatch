@@ -216,6 +216,12 @@ impl Disk {
     fs::write(path, content).unwrap();
   }
 
+  pub fn append(&self, rel: &str, content: &str) {
+    use std::io::Write as _;
+    let mut file = fs::File::options().append(true).open(self.path(rel)).unwrap();
+    file.write_all(content.as_bytes()).unwrap();
+  }
+
   pub fn mkdir(&self, rel: &str) {
     fs::create_dir_all(self.path(rel)).unwrap();
   }
@@ -398,6 +404,10 @@ impl World for Disk {
 
   fn write(&mut self, rel: &str, content: &str) {
     Disk::write(self, rel, content);
+  }
+
+  fn append(&mut self, rel: &str, content: &str) {
+    Disk::append(self, rel, content);
   }
 
   fn mkdir(&mut self, rel: &str) {
