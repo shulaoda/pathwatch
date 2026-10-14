@@ -114,12 +114,18 @@ impl Node {
 
   /// What the filter said about a file, or a directory, at the path. `None`: it was not asked.
   pub fn ignored(&self, kind: EntryKind) -> Option<bool> {
-    let (asked, ignored) = filter_flags(kind);
-    self.flags.contains(asked).then(|| self.flags.contains(ignored))
+    let (asked, answer) = match kind {
+      EntryKind::File => (Flags::FILE_ASKED, Flags::FILE_IGNORED),
+      EntryKind::Dir => (Flags::DIR_ASKED, Flags::DIR_IGNORED),
+    };
+    self.flags.contains(asked).then(|| self.flags.contains(answer))
   }
 
   pub fn set_ignored(&mut self, kind: EntryKind, ignored: bool) {
-    let (asked, answer) = filter_flags(kind);
+    let (asked, answer) = match kind {
+      EntryKind::File => (Flags::FILE_ASKED, Flags::FILE_IGNORED),
+      EntryKind::Dir => (Flags::DIR_ASKED, Flags::DIR_IGNORED),
+    };
     self.flags.insert(asked);
     self.flags.set(answer, ignored);
   }
@@ -143,12 +149,5 @@ impl Node {
     self.flags.set(Flags::MARK_DEEP, mark.is_some_and(|mark| mark.deep));
     self.flags.set(Flags::MARK_WRITTEN, mark.is_some_and(|mark| mark.written));
     self.flags.set(Flags::MARK_LOST, mark.is_some_and(|mark| mark.lost));
-  }
-}
-
-fn filter_flags(kind: EntryKind) -> (Flags, Flags) {
-  match kind {
-    EntryKind::File => (Flags::FILE_ASKED, Flags::FILE_IGNORED),
-    EntryKind::Dir => (Flags::DIR_ASKED, Flags::DIR_IGNORED),
   }
 }
