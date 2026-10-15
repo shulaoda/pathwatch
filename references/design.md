@@ -33,7 +33,7 @@ watcher.close();
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
 | `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
-| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, 10 ms on macOS and 20 ms elsewhere (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and 50 ms elsewhere, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
+| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, none on macOS and 20 ms elsewhere (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and 50 ms elsewhere, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
 
@@ -747,11 +747,11 @@ is not told at once.
 - **The default** is 50 ms where the OS tells at once (inotify, Windows): vim on Linux renames
   the file away and writes a new one, and on a busy machine the path was missing for long
   enough that no delay made 4 of 20 saves a `Delete` and a `Create`, and 30 ms 2 of 60; with
-  50 ms, none of 60 was. On macOS FSEvents tells about 10 ms after the change, and no save that
-  was tried needed more than the quiet time: the delay is 10 ms, the quiet time, and so adds
-  nothing to it (VS Code, vim, `sed -i`, `git checkout` and a JetBrains-like save, idle and
-  busy, measured on 2026-10-15). When the watcher polls everything there is none, as there is
-  no quiet time (`Config::into_options`), and as in chokidar (`atomic` is off under `usePolling`), notify's
+  50 ms, none of 60 was. On macOS FSEvents tells about 10 ms after the change, when a save is
+  done (5.13): the delay is 10 ms there, a guard that costs little, and the only wait, as
+  there is no quiet time (with a quiet time of 10 ms or 20 ms and no delay, none of VS Code,
+  vim, `sed -i`, `git checkout` and a JetBrains-like save was wrong, idle or busy). When the watcher polls everything there is none, as there is no quiet time
+  (`Config::into_options`), and as in chokidar (`atomic` is off under `usePolling`), notify's
   `PollWatcher`, watchdog's `PollingObserver` and watchpack: a round that falls into a save
   that leaves the path empty reports a `Delete`, and the next round a `Create` (vim on Linux,
   polled every 100 ms: 4 of 100 saves; with a delay of 10 ms or more, none). The engine still
@@ -965,9 +965,13 @@ also on a busy machine, and short enough not to be felt; watchman and webpack wa
 Measured on Linux with the saves of 5.9 on a busy machine: with 5 ms, 4 of 60 saves and 2
 files of 1,000 that `git checkout` wrote were reported twice, the first time half written;
 with 10 ms, none. On macOS FSEvents tells about 10 ms after the change, by when a save is
-done: no value was wrong there, and from 10 ms on no temporary file was reported either, so
-the default is 10 ms. A quiet time of zero would report the temporary file of a save in a
-watched directory: a `Create` and a `Delete` for a file that no one wants to know. The marks
+done: no value was wrong there, idle, busy, and under a flood of 30,000 writes a second,
+when it tells at once (a 1 MB save was told 1 ms after it, still one `Update`). So the
+default there is zero, as in watchdog, notify and Node, and an edit is told twice as soon
+(12 ms instead of 24). The price: a temporary file that lives longer than FSEvents waits is
+reported, a `Create` and a `Delete` for a file that no one wants to know (the swap file of
+vim: up to one pair a save; with 10 ms, none when idle, and fewer under a flood), and a
+flood comes in more, smaller batches. The marks
 of hints wait for that time, and nothing else takes them: the quiet time can be longer than
 the poll interval, and a poll or a second look that runs before it checks its own work and
 leaves them. Two exceptions, each because a look is made anyway: a

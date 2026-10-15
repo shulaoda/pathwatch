@@ -29,9 +29,9 @@ pub enum EntryKind {
 
 impl Default for Config {
   fn default() -> Self {
-    // FSEvents tells of a change about 10 ms after it, when the steps of a save are mostly done:
-    // less wait is needed than where the OS tells at once (`references/design.md` 5.13).
-    let (debounce, delete_delay) = if cfg!(target_os = "macos") { (10, 10) } else { (20, 50) };
+    // FSEvents tells of a change about 10 ms after it, when the steps of a save are done: that
+    // is the quiet time already (`references/design.md` 5.13).
+    let (debounce, delete_delay) = if cfg!(target_os = "macos") { (0, 10) } else { (20, 50) };
     Self {
       ignored: None,
       debounce: Duration::from_millis(debounce),
@@ -55,10 +55,11 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
-  /// The quiet time: a batch goes out when no change was noticed for this long. Default: 10 ms
-  /// on macOS, 20 ms elsewhere: long enough for the steps of one save (a temporary file, a
-  /// rename) to be one batch, also on a busy machine, and short enough not to be felt. FSEvents
-  /// tells of a change about 10 ms after it, so macOS needs less.
+  /// The quiet time: a batch goes out when no change was noticed for this long. Default: 20 ms,
+  /// long enough for the steps of one save (a temporary file, a rename) to be one batch, also
+  /// on a busy machine, and short enough not to be felt. On macOS none: FSEvents tells of a
+  /// change about 10 ms after it, when a save is done, but a temporary file that lives longer
+  /// (the swap file of vim) is reported, a `Create` and a `Delete`.
   ///
   /// While changes keep coming, a batch still goes out four quiet times after the first of them,
   /// and 500 ms after it at most, unless the quiet time is longer. The most is a year.

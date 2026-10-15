@@ -52,8 +52,8 @@ How the numbers are read:
 
 | Name | Library | How it is used |
 | --- | --- | --- |
-| `pathwatch` | this repository | `Watcher::with_config` with a handler that sends each batch to a channel, and `watch`. Default settings (debounce 10 ms on macOS, 20 ms elsewhere). |
-| `pathwatch-0` | this repository | The same with `with_debounce(Duration::ZERO)`. |
+| `pathwatch` | this repository | `Watcher::with_config` with a handler that sends each batch to a channel, and `watch`. Default settings (no debounce on macOS, 20 ms elsewhere). |
+| `pathwatch-0` | this repository | The same with `with_debounce(Duration::ZERO)`, which is the default on macOS. |
 | `notify-fork` | `rolldown-notify` from `github.com/rolldown/notify` | The way rolldown uses it today: `RecommendedWatcher::new` with a `Config`, `paths_mut()`, every path with `Recursive` and `TrackPath`. Ignore: `Config::with_ignored`. Polling: `PollWatcher`, and `ready` waits for its first scan: the watcher answers a call only after it. |
 | `chokidar` | chokidar 5 | `chokidar.watch(paths, { ignoreInitial: true })` and the `all` event. Ignore: a function for `ignored`. Polling: `usePolling` with `interval` and `binaryInterval`. |
 | `fs-watch` | Node itself | `fs.watch(dir, { recursive: true })`, once, for the lowest directory that holds all paths. It is the floor: no library. Polling: `fs.watchFile` for each path. It has no ignore rule. |
@@ -321,9 +321,10 @@ The rules of the driver:
   atomic save and the noise in `project/dist`. A real program would filter by hand.
 - **The cost of the adapter is in the numbers**: one line of text for each event, and for Node
   the event loop. The floor of a latency is about 0.1 ms (pipe and thread of the driver).
-- **pathwatch waits on purpose.** By default it collects changes for 10 ms on macOS and 20 ms
-  elsewhere, and it holds a `Delete` for 10 ms on macOS and 50 ms elsewhere (not under polling).
-  So its latency is at least that. `pathwatch-0` shows it without the first wait.
+- **pathwatch waits on purpose.** By default it collects changes for 20 ms (not on macOS), and
+  it holds a `Delete` for 10 ms on macOS and 50 ms elsewhere (not under polling). So its
+  latency is at least that. `pathwatch-0` shows it without the first wait; on macOS the two
+  are the same.
 - **The word of an event is not checked.** `first word` shows it, and that is all. On macOS
   `notify-fork` says `create` for many edits, because FSEvents repeats old flags of a path.
 - **Three runs are few.** `--repeat 3` shows whether two numbers are apart, not how a number
