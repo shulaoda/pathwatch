@@ -53,7 +53,7 @@ How the numbers are read:
 | Name | Library | How it is used |
 | --- | --- | --- |
 | `pathwatch` | this repository | `Watcher::with_config` with a handler that sends each batch to a channel, and `watch`. Default settings (no debounce on macOS, 20 ms elsewhere). |
-| `pathwatch-0` | this repository | The same with `with_debounce(Duration::ZERO)`, which is the default on macOS. |
+| `pathwatch-0` | this repository | The same with `with_debounce(Duration::ZERO)`, which is the default on macOS: there it runs only when `--adapters` names it. |
 | `notify-fork` | `rolldown-notify` from `github.com/rolldown/notify` | The way rolldown uses it today: `RecommendedWatcher::new` with a `Config`, `paths_mut()`, every path with `Recursive` and `TrackPath`. Ignore: `Config::with_ignored`. Polling: `PollWatcher`, and `ready` waits for its first scan: the watcher answers a call only after it. |
 | `chokidar` | chokidar 5 | `chokidar.watch(paths, { ignoreInitial: true })` and the `all` event. Ignore: a function for `ignored`. Polling: `usePolling` with `interval` and `binaryInterval`. |
 | `fs-watch` | Node itself | `fs.watch(dir, { recursive: true })`, once, for the lowest directory that holds all paths. It is the floor: no library. Polling: `fs.watchFile` for each path. It has no ignore rule. |
@@ -250,9 +250,9 @@ Where pathwatch is behind:
 | Part | Meaning |
 | --- | --- |
 | which numbers | The time and the CPU time of the setup, the memory above the base (the footprint, or the resident size where there is no footprint), and for each phase the p50, the max and the CPU time. Lower is better in each. |
-| who is compared | `pathwatch` and `pathwatch-0` with the best of the other libraries in that number. A library counts in a phase only when it missed no change there and did not stop early, and in the numbers of the setup only when it stopped early in no phase of the run. |
+| who is compared | `pathwatch` and `pathwatch-0` (when it ran) with the best of the other libraries in that number. A library counts in a phase only when it missed no change there and did not stop early, and in the numbers of the setup only when it stopped early in no phase of the run. |
 | behind | More than 10% above the best other, and by more than 1 ms or 0.5 MiB. |
-| the three tables | Behind with both settings; behind only with the default settings (what the quiet time costs); behind only without the wait. |
+| the three tables | Behind with both settings; behind only with the default settings (what the quiet time costs); behind only without the wait. Without `pathwatch-0` (macOS) there is one table. |
 | `middle (lowest to highest)` | With more runs than one: the middle run, and how far the runs are apart. Two numbers whose ranges overlap are not apart. |
 | times | `pathwatch-0` divided by the best other (`pathwatch` where `pathwatch-0` has no number). |
 | below the tables | In how many numbers each setting is the best or near it, and every phase in which pathwatch missed a change, gave an event too many, or printed an error. |

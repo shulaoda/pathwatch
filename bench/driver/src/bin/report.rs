@@ -349,16 +349,24 @@ fn behind(out: &mut String, report: &Report) {
   if !report.runs.iter().any(|run| OURS.contains(&run.adapter.as_str())) {
     return;
   }
+  // On macOS the default has no quiet time, and `pathwatch-0` is not run.
+  let with_zero = report.runs.iter().any(|run| run.adapter == OURS[1]);
   let _ = writeln!(out, "## Where pathwatch is behind\n");
+  let settings = if with_zero {
+    "`pathwatch` has the default settings, and `pathwatch-0` is the same without the quiet time \
+     that pathwatch waits on purpose. `times` is `pathwatch-0` next to the best other, and \
+     `pathwatch` where there is no `pathwatch-0`."
+  } else {
+    "`pathwatch` has the default settings, and `times` is it next to the best other \
+     (`pathwatch-0` was not run: on macOS it is the same)."
+  };
   let _ = writeln!(
     out,
     "Every number in which pathwatch is more than 10% behind the best other library, and by \
      more than 1 ms or 0.5 MiB. Only a library that did the job counts: it missed no change of \
      the phase, and for the setup it stopped early in no phase of the run. A burst counts by \
      its `max`, the time until the events for all its paths had come, and a phase of one \
-     single change is not compared. `pathwatch` has the default settings, and `pathwatch-0` is \
-     the same without the quiet time that pathwatch waits on purpose. `times` is `pathwatch-0` next to the best other, \
-     and `pathwatch` where there is no `pathwatch-0`. With more runs than one, a number is \
+     single change is not compared. {settings} With more runs than one, a number is \
      `middle (lowest to highest)`.\n"
   );
   let cell = |number: &Number, values: Option<&Vec<f64>>| {
@@ -422,25 +430,45 @@ fn behind(out: &mut String, report: &Report) {
   }
   let head =
     ["scenario", "where", "number", "pathwatch", "pathwatch-0", "best other", "which", "times"];
-  let titles = [
-    "Behind with and without the wait",
-    "Behind only with the wait: the price of the quiet time",
-    "Behind only without the wait",
-  ];
-  for (title, rows) in titles.iter().zip(rows) {
-    let _ = writeln!(out, "### {title}\n");
+  if with_zero {
+    let titles = [
+      "Behind with and without the wait",
+      "Behind only with the wait: the price of the quiet time",
+      "Behind only without the wait",
+    ];
+    for (title, rows) in titles.iter().zip(rows) {
+      let _ = writeln!(out, "### {title}\n");
+      if rows.is_empty() {
+        let _ = writeln!(out, "In no number.\n");
+      } else {
+        table(out, &head, rows);
+      }
+    }
+    let _ = writeln!(
+      out,
+      "Of {compared} numbers that can be compared, `pathwatch` is the best or near it (inside \
+       the limits above) in {}, and `pathwatch-0` in {}.\n",
+      near_best[0], near_best[1]
+    );
+  } else {
+    // Without `pathwatch-0` every row is in the first table, and its column is empty.
+    let [mut rows, ..] = rows;
+    for row in &mut rows {
+      row.remove(4);
+    }
+    let head: Vec<&str> = head.into_iter().filter(|name| *name != OURS[1]).collect();
     if rows.is_empty() {
       let _ = writeln!(out, "In no number.\n");
     } else {
       table(out, &head, rows);
     }
+    let _ = writeln!(
+      out,
+      "Of {compared} numbers that can be compared, `pathwatch` is the best or near it (inside \
+       the limits above) in {}.\n",
+      near_best[0]
+    );
   }
-  let _ = writeln!(
-    out,
-    "Of {compared} numbers that can be compared, `pathwatch` is the best or near it (inside \
-     the limits above) in {}, and `pathwatch-0` in {}.\n",
-    near_best[0], near_best[1]
-  );
 
   let ours = |run: &&Run| OURS.contains(&run.adapter.as_str());
   let mut wrong = Vec::new();

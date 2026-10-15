@@ -32,7 +32,8 @@ bench [flags]
                        show the middle run, and how far the runs are apart
   --scenarios <list>   s1,s2,s3,s4,s5,s6,s7 (default: all)
   --adapters <list>    pathwatch,pathwatch-0,notify-fork,chokidar,fs-watch,fsnotify,watchdog
-                       (default: all), or `rust` for the first three
+                       (default: all, on macOS all but pathwatch-0, the same there as
+                       pathwatch), or `rust` for the first three
   --tmp <dir>          where the trees are made (default: the temporary directory of the system)
   --js <dir>           the directory of the Node adapters with their node_modules
                        (default: bench/js)
@@ -235,11 +236,12 @@ fn has(names: &[String], name: &str) -> bool {
 }
 
 /// The adapters that the flags ask for and that can run. An adapter whose program is missing
-/// is skipped with a word about it.
+/// is skipped with a word about it. On macOS `pathwatch-0` runs only when it is named: there the
+/// default of pathwatch has no quiet time either.
 fn chosen_adapters(names: Option<&[String]>, places: &Places) -> Vec<&'static Adapter> {
   let rust = ["pathwatch", "pathwatch-0", "notify-fork"];
   let wanted = |adapter: &Adapter| match names {
-    None => true,
+    None => !(cfg!(target_os = "macos") && adapter.name == "pathwatch-0"),
     Some(names) => has(names, adapter.name) || (has(names, "rust") && rust.contains(&adapter.name)),
   };
   let mut adapters = Vec::new();
