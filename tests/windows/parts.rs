@@ -378,8 +378,8 @@ mod handles {
 
     /// `unwatch` alone, as the engine calls it for each directory of a flush.
     fn unwatch_only(&mut self, index: u32) {
-      let told = self.handles.unwatch(key(index), &mut self.disk);
-      self.told(told);
+      self.handles.unwatch(key(index), &mut self.disk);
+      self.check();
     }
 
     fn commit(&mut self) {
@@ -387,11 +387,16 @@ mod handles {
       self.told(told);
     }
 
-    /// Keeps what a call told, and checks what holds after every call: no handle is below
-    /// another unless a link lies between them, and there are never too many.
+    /// Keeps what a call told, and checks what holds after it.
     fn told(&mut self, told: Told) {
       self.lost.extend(told.lost.into_iter().map(index));
       self.covered.extend(told.covered.into_iter().map(index));
+      self.check();
+    }
+
+    /// What holds after every call: no handle is below another unless a link lies between
+    /// them, and there are never too many.
+    fn check(&self) {
       for (_, above) in &self.disk.open {
         for (_, below) in &self.disk.open {
           if below == above || !below.starts_with(above) {
@@ -1141,7 +1146,7 @@ mod translate {
 
   /// What a read on the handle `watch` on `path` gave.
   fn read(watch: WatchId, path: &str, result: io::Result<Vec<u8>>) -> Raw {
-    Raw::Read { watch, dir: dir(path), extended: false, result }
+    Raw::Read { watch, dir: dir(path).into(), extended: false, result }
   }
 
   /// Records whose names have `/` between their parts: Windows puts `\` there.
@@ -1184,7 +1189,7 @@ mod translate {
       (ADDED, "made", true),
       (REMOVED, "gone", true),
     ]);
-    let raw = Raw::Read { watch: id, dir: dir("/p"), extended: true, result: Ok(bytes) };
+    let raw = Raw::Read { watch: id, dir: dir("/p").into(), extended: true, result: Ok(bytes) };
     assert_eq!(
       hints(&mut handles, raw),
       [

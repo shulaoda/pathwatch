@@ -1552,11 +1552,15 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   only waited for a handle, or got none at the last commit. A handle whose read fails is
   given up and its keys are told; when the next handle on the directory dies too before it
   delivered anything, the ask after that is answered `Failed` with the error of the read: the
-  directory is polled, and tried again at each poll.
+  directory is polled, and tried again at each poll. The tables of the keys are given back
+  when most of their keys are gone, as the tables of inotify are (7.1).
 - Filter: `FILE_NAME | DIR_NAME | SIZE | LAST_WRITE`. 64 KiB buffer. The bytes of a
-  completed read are read on the watcher thread (`Records`, `translate`). The reads ask for
-  the longer records (`ReadDirectoryChangesExW`, Windows 10 1709 and later) where Windows
-  and the disk have them: they tell whether an entry is a directory.
+  completed read are read on the watcher thread (`Records`, `translate`): the raw
+  notification holds the bytes and shares the path of the handle, and the path of each
+  record, with its lower-case spelling, is made into room that `translate` keeps from one
+  record to the next, so a flood of records asks for no memory. The reads ask for the longer
+  records (`ReadDirectoryChangesExW`, Windows 10 1709 and later) where Windows and the disk
+  have them: they tell whether an entry is a directory.
 - **Hints.** A record goes to every key whose directory holds its path, the deepest first,
   with the names compared in lower case (rule 7): two watched paths that are two spellings of
   one directory both get it, and so does each key above. A key above gets a hint it may not

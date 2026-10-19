@@ -2,18 +2,17 @@
 //! `references/design.md` 7.3.
 
 use std::{
-  ffi::OsString,
   io, mem,
-  os::windows::ffi::OsStringExt,
   path::{Path, PathBuf},
+  sync::Arc,
 };
 
+use self::{handles::lower_case, port::Port, records::FILE_ACTION_MODIFIED};
 pub use self::{
   handles::{Handles, MAX_HANDLES, System, Told, WatchId},
   place::{Place, place},
   records::{Malformed, Record, Records},
 };
-use self::{port::Port, records::FILE_ACTION_MODIFIED};
 use crate::backend::{Backend, Committed, Coverage, DirKey, Hint, Sink, Want};
 
 #[derive(Debug)]
@@ -34,11 +33,14 @@ impl WindowsBackend {
     self.handles.serves(key)
   }
 
-  fn tell(&mut self, told: Told) {
+  /// Keeps what a call of the handles told, and waits for the handles that it closed: a
+  /// directory above one of them can be renamed when the call of the backend returns.
+  fn settled(&mut self, told: Told) {
     self.covered.extend(told.covered);
     if !told.lost.is_empty() {
       self.sink.raw(Raw::Lost(told.lost));
     }
+    self.port.wait_for_closes();
   }
 }
 
@@ -47,21 +49,18 @@ impl Backend for WindowsBackend {
 
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
     let (coverage, told) = self.handles.watch(key, dir, want, &mut self.port);
-    self.tell(told);
-    self.port.wait_for_closes();
+    self.settled(told);
     coverage
   }
 
   fn unwatch(&mut self, key: DirKey) {
-    let told = self.handles.unwatch(key, &mut self.port);
-    self.tell(told);
+    self.handles.unwatch(key, &mut self.port);
     self.port.wait_for_closes();
   }
 
   fn commit(&mut self) -> Committed {
     let told = self.handles.commit(&mut self.port);
-    self.tell(told);
-    self.port.wait_for_closes();
+    self.settled(told);
     Committed { now_watched: mem::take(&mut self.covered), failed: Vec::new() }
   }
 
@@ -71,7 +70,7 @@ impl Backend for WindowsBackend {
 
   fn raw_bytes(raw: &Self::Raw) -> usize {
     match raw {
-      Raw::Read { dir, result, .. } => dir.as_os_str().len() + result.as_ref().map_or(0, Vec::len),
+      Raw::Read { result, .. } => result.as_ref().map_or(0, Vec::len),
       Raw::Lost(keys) => size_of_val(keys.as_slice()),
     }
   }
@@ -79,7 +78,13 @@ impl Backend for WindowsBackend {
 
 #[derive(Debug)]
 pub enum Raw {
-  Read { watch: WatchId, dir: PathBuf, extended: bool, result: io::Result<Vec<u8>> },
+  /// What one read on the handle `watch`, which stands on `dir`, gave.
+  Read {
+    watch: WatchId,
+    dir: Arc<Path>,
+    extended: bool,
+    result: io::Result<Vec<u8>>,
+  },
   Lost(Vec<DirKey>),
 }
 
@@ -99,30 +104,32 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
     return handles.below(&dir).into_iter().for_each(|key| hint(lost(key)));
   }
   handles.delivered(watch);
-  let mut name = Vec::new();
   let records = if extended { Records::extended(&bytes) } else { Records::new(&bytes) };
+  // The path of a record and its lower-case spelling go into the same room each time.
+  let (mut path, mut lower, mut text) = (PathBuf::new(), PathBuf::new(), String::new());
   for record in records {
     let Ok(record) = record else {
       hint(Hint::Lost);
       return;
     };
     let written = record.action == FILE_ACTION_MODIFIED;
-    name.clear();
-    name.extend(record.name());
-    if name.is_empty() {
+    if record.is_unnamed() {
       handles.below(&dir).into_iter().for_each(|key| hint(lost(key)));
       continue;
     }
     if written && record.is_dir == Some(true) {
       continue;
     }
-    let path = dir.join(OsString::from_wide(&name));
+    path.clear();
+    path.push(&*dir);
+    record.push_name(&mut path, &mut text);
+    lower_case(&path, &mut lower, &mut text);
     // Windows says "modified" for a directory when an entry in it changes, and that entry has
     // a record of its own.
-    if written && handles.holds_a_key(&path) {
+    if written && handles.holds_a_key(&lower) {
       continue;
     }
-    handles.route(&path, &mut |key, rel| {
+    handles.route(&path, &lower, &mut |key, rel| {
       hint(if written { Hint::Written { dir: key, rel } } else { Hint::Changed { dir: key, rel } });
     });
   }
@@ -268,7 +275,6 @@ mod place {
 
 mod handles {
   use std::{
-    borrow::Cow,
     io, mem,
     path::{Component, Path, PathBuf},
   };
@@ -276,7 +282,7 @@ mod handles {
   use rustc_hash::{FxHashMap, FxHashSet};
 
   use super::place::{may_hold_a_handle, place};
-  use crate::backend::{Coverage, DirKey, Want, watch_limit};
+  use crate::backend::{Coverage, DirKey, Want, same, watch_limit};
 
   pub const MAX_HANDLES: usize = 64;
 
@@ -314,8 +320,7 @@ mod handles {
   #[derive(Debug)]
   struct Death {
     count: u8,
-    kind: io::ErrorKind,
-    text: String,
+    error: io::Error,
   }
 
   #[derive(Debug, Default)]
@@ -363,7 +368,7 @@ mod handles {
       if self.dead.get(dir).is_some_and(|death| death.count >= 2)
         && let Some(death) = self.dead.remove(dir)
       {
-        return (Coverage::Failed(io::Error::new(death.kind, death.text)), told);
+        return (Coverage::Failed(death.error), told);
       }
 
       self.remember(key, dir, want, None);
@@ -384,11 +389,10 @@ mod handles {
       (coverage, told)
     }
 
-    pub fn unwatch(&mut self, key: DirKey, system: &mut dyn System) -> Told {
+    pub fn unwatch(&mut self, key: DirKey, system: &mut dyn System) {
       self.waiting.remove(&key);
       self.refused.remove(&key);
       self.drop_key(key, system);
-      Told::default()
     }
 
     pub fn commit(&mut self, system: &mut dyn System) -> Told {
@@ -403,13 +407,8 @@ mod handles {
     pub fn closed(&mut self, id: WatchId, error: &io::Error) -> Vec<DirKey> {
       let Some(at) = self.open.iter().position(|handle| handle.id == id) else { return Vec::new() };
       let handle = self.open.swap_remove(at);
-      let death = self.dead.entry(handle.dir).or_insert(Death {
-        count: 0,
-        kind: error.kind(),
-        text: String::new(),
-      });
-      (death.count, death.kind, death.text) =
-        (death.count.saturating_add(1), error.kind(), error.to_string());
+      let count = self.dead.get(&handle.dir).map_or(0, |death| death.count);
+      self.dead.insert(handle.dir, Death { count: count.saturating_add(1), error: same(error) });
       let served = self.keys.iter().filter(|(_, served)| served.handle == Some(id));
       let keys: Vec<DirKey> = served.map(|(&key, _)| key).collect();
       for &key in &keys {
@@ -429,12 +428,12 @@ mod handles {
       }
     }
 
-    /// Every key whose directory holds `path`, the deepest first. A key above one that was
-    /// told gets a hint it may not need, which costs one walk; left out, it would miss the
-    /// path when the tree reaches it only from above: through another spelling of a name,
-    /// or from the other letter case of the drive, which is another top node.
-    pub(super) fn route(&self, path: &Path, found: &mut dyn FnMut(DirKey, &Path)) {
-      let lower = lower_case(path);
+    /// Every key whose directory holds `path`, the deepest first; `lower` is the path in lower
+    /// case (`lower_case`). A key above one that was told gets a hint it may not need, which
+    /// costs one walk; left out, it would miss the path when the tree reaches it only from
+    /// above: through another spelling of a name, or from the other letter case of the drive,
+    /// which is another top node.
+    pub(super) fn route(&self, path: &Path, lower: &Path, found: &mut dyn FnMut(DirKey, &Path)) {
       for (dir, lower_dir) in path.ancestors().zip(lower.ancestors()) {
         let Some(keys) = self.at.get(lower_dir) else { continue };
         let Ok(rel) = path.strip_prefix(dir) else { continue };
@@ -444,13 +443,13 @@ mod handles {
       }
     }
 
-    /// Whether a key stands at `path` itself, in any letter case.
-    pub(super) fn holds_a_key(&self, path: &Path) -> bool {
-      self.at.contains_key(&lower_case(path))
+    /// Whether a key stands at the path whose lower case is `lower`.
+    pub(super) fn holds_a_key(&self, lower: &Path) -> bool {
+      self.at.contains_key(lower)
     }
 
     pub(super) fn below(&self, dir: &Path) -> Vec<DirKey> {
-      let dir = lower_case(dir);
+      let dir = lowered(dir);
       let below = self.at.iter().filter(|(lower, _)| lower.starts_with(&dir));
       below.flat_map(|(_, keys)| keys).copied().collect()
     }
@@ -632,19 +631,29 @@ mod handles {
 
     fn remember(&mut self, key: DirKey, dir: &Path, want: Want, handle: Option<WatchId>) {
       self.forget(key);
-      self.at.entry(lower_case(dir)).or_default().push(key);
+      self.at.entry(lowered(dir)).or_default().push(key);
       self.keys.insert(key, Served { dir: dir.to_owned(), want, handle });
     }
 
     fn forget(&mut self, key: DirKey) -> Option<Served> {
       let gone = self.keys.remove(&key)?;
-      let lower = lower_case(&gone.dir);
-      let keys = self.at.get_mut(&lower)?;
-      keys.retain(|&other| other != key);
-      if keys.is_empty() {
-        self.at.remove(&lower);
+      let lower = lowered(&gone.dir);
+      if let Some(keys) = self.at.get_mut(&lower) {
+        keys.retain(|&other| other != key);
+        if keys.is_empty() {
+          self.at.remove(&lower);
+        }
       }
+      self.shrink();
       Some(gone)
+    }
+
+    /// The two tables are given back when most of their keys are gone.
+    fn shrink(&mut self) {
+      if self.keys.len() < self.keys.capacity() / 4 {
+        self.keys.shrink_to_fit();
+        self.at.shrink_to_fit();
+      }
     }
   }
 
@@ -662,22 +671,35 @@ mod handles {
     dir.ancestors().take(names).find(|path| is_link(path)).map(Path::to_owned)
   }
 
-  /// The path with its names in lower case: NTFS takes the two cases of a letter for one
-  /// name. A name that is no Unicode text gets the ASCII letters folded.
-  fn lower_case(path: &Path) -> PathBuf {
-    let lower = path.components().map(|part| match part {
-      Component::Normal(name) => match name.to_str() {
-        Some(text) => Cow::Owned(text.to_lowercase().into()),
-        None => Cow::Owned(name.to_ascii_lowercase()),
-      },
-      other => Cow::Borrowed(other.as_os_str()),
-    });
-    lower.collect()
+  /// `path` with its names in lower case, into `lower`: NTFS takes the two cases of a letter
+  /// for one name. `text` is room for one name on the way, so the call asks for no memory
+  /// once the two have grown. A name that is no Unicode text gets the ASCII letters folded.
+  pub(super) fn lower_case(path: &Path, lower: &mut PathBuf, text: &mut String) {
+    lower.clear();
+    for part in path.components() {
+      match part {
+        Component::Normal(name) => match name.to_str() {
+          Some(name) => {
+            text.clear();
+            text.extend(name.chars().flat_map(char::to_lowercase));
+            lower.push(&*text);
+          }
+          None => lower.push(name.to_ascii_lowercase()),
+        },
+        other => lower.push(other.as_os_str()),
+      }
+    }
+  }
+
+  fn lowered(path: &Path) -> PathBuf {
+    let (mut lower, mut text) = (PathBuf::new(), String::new());
+    lower_case(path, &mut lower, &mut text);
+    lower
   }
 }
 
 mod records {
-  use std::mem::offset_of;
+  use std::{ffi::OsString, mem::offset_of, os::windows::ffi::OsStringExt, path::PathBuf};
 
   pub(super) use windows_sys::Win32::Storage::FileSystem::FILE_ACTION_MODIFIED;
   use windows_sys::Win32::Storage::FileSystem::{
@@ -751,6 +773,23 @@ mod records {
     pub fn name(&self) -> impl Iterator<Item = u16> {
       self.name.as_chunks().0.iter().map(|&unit| u16::from_ne_bytes(unit))
     }
+
+    pub fn is_unnamed(&self) -> bool {
+      self.name.is_empty()
+    }
+
+    /// Puts the name below `path`, through `text`: a name is Unicode text unless it holds a
+    /// lone surrogate, and only such a one asks for memory.
+    pub fn push_name(&self, path: &mut PathBuf, text: &mut String) {
+      text.clear();
+      for unit in char::decode_utf16(self.name()) {
+        match unit {
+          Ok(character) => text.push(character),
+          Err(_) => return path.push(OsString::from_wide(&self.name().collect::<Vec<u16>>())),
+        }
+      }
+      path.push(&*text);
+    }
   }
 
   #[derive(Debug, PartialEq, Eq)]
@@ -791,8 +830,8 @@ mod port {
       fs::OpenOptionsExt,
       io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
-    path::{Path, PathBuf},
-    ptr,
+    path::Path,
+    ptr, slice,
     sync::{Arc, OnceLock, mpsc},
     thread,
   };
@@ -879,7 +918,7 @@ mod port {
       let worker = thread::Builder::new().name("pathwatch-windows".to_owned()).spawn({
         let iocp = Arc::clone(&iocp);
         move || {
-          let (watches, waiting) = (FxHashMap::default(), Vec::new());
+          let (watches, waiting) = (FxHashMap::default(), None);
           Worker { iocp, commands: receiver, sink, watches, next_token: 0, waiting }.run();
         }
       })?;
@@ -907,7 +946,7 @@ mod port {
   impl System for Port {
     fn open(&mut self, id: WatchId, dir: &Path) -> io::Result<()> {
       let (reply, answer) = mpsc::sync_channel(1);
-      self.send(Command::Open { id, dir: dir.to_owned(), reply }).inspect_err(|_| {
+      self.send(Command::Open { id, dir: Arc::from(dir), reply }).inspect_err(|_| {
         let _ = self.commands.send(Command::Close { id });
       })?;
       match answer.recv() {
@@ -940,7 +979,7 @@ mod port {
   enum Command {
     Open {
       id: WatchId,
-      dir: PathBuf,
+      dir: Arc<Path>,
       reply: mpsc::SyncSender<io::Result<()>>,
     },
     Close {
@@ -961,8 +1000,8 @@ mod port {
     sink: Sink<Raw>,
     watches: FxHashMap<usize, Watch>,
     next_token: usize,
-    /// The replies that wait for the closes.
-    waiting: Vec<mpsc::SyncSender<()>>,
+    /// The reply that waits for the closes.
+    waiting: Option<mpsc::SyncSender<()>>,
   }
 
   impl Worker {
@@ -992,7 +1031,7 @@ mod port {
           }
           Ok(Command::Close { id }) => self.close(id),
           Ok(Command::Closed { reply }) => {
-            self.waiting.push(reply);
+            self.waiting = Some(reply);
             self.answer_closed();
           }
           Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return false,
@@ -1001,14 +1040,14 @@ mod port {
       }
     }
 
-    fn open(&mut self, id: WatchId, path: &Path) -> io::Result<()> {
+    fn open(&mut self, id: WatchId, path: &Arc<Path>) -> io::Result<()> {
       let mut extended = read_extended().is_some();
       loop {
         let dir = open_dir(path)?;
         let token = self.next_token;
         self.next_token += 1;
         self.iocp.attach(&dir, token)?;
-        let mut watch = Watch::new(id, dir, path.to_path_buf(), extended);
+        let mut watch = Watch::new(id, dir, Arc::clone(path), extended);
         match watch.read() {
           Ok(()) => {
             self.watches.insert(token, watch);
@@ -1033,12 +1072,12 @@ mod port {
       self.answer_closed();
     }
 
-    /// The replies that wait for the closes get them once no handle is closing.
+    /// The reply that waits for the closes gets it once no handle is closing.
     fn answer_closed(&mut self) {
       if self.watches.values().any(|watch| watch.closing) {
         return;
       }
-      for reply in self.waiting.drain(..) {
+      if let Some(reply) = self.waiting.take() {
         let _ = reply.send(());
       }
     }
@@ -1119,7 +1158,7 @@ mod port {
   struct Watch {
     id: WatchId,
     dir: Option<File>,
-    path: PathBuf,
+    path: Arc<Path>,
     overlapped: Box<OVERLAPPED>,
     buffer: Box<[u64]>,
     pending: bool,
@@ -1130,7 +1169,7 @@ mod port {
   }
 
   impl Watch {
-    fn new(id: WatchId, dir: File, path: PathBuf, extended: bool) -> Self {
+    fn new(id: WatchId, dir: File, path: Arc<Path>, extended: bool) -> Self {
       Self {
         id,
         dir: Some(dir),
@@ -1174,18 +1213,14 @@ mod port {
     }
 
     fn raw(&self, result: io::Result<Vec<u8>>) -> Raw {
-      Raw::Read { watch: self.id, dir: self.path.clone(), extended: self.extended, result }
+      Raw::Read { watch: self.id, dir: Arc::clone(&self.path), extended: self.extended, result }
     }
 
+    /// The first `len` bytes of the buffer.
     fn records(&self, len: u32) -> Vec<u8> {
       let len = (len as usize).min(BUFFER_BYTES as usize);
-      let words = &self.buffer[..len.div_ceil(size_of::<u64>())];
-      let mut bytes = Vec::with_capacity(size_of_val(words));
-      for word in words {
-        bytes.extend_from_slice(&word.to_ne_bytes());
-      }
-      bytes.truncate(len);
-      bytes
+      // SAFETY: the buffer is `BUFFER_BYTES` long, and the bytes of its words are plain bytes.
+      unsafe { slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), len) }.to_vec()
     }
 
     /// Cancels the pending read. It fails when the read is over already: then its packet is
@@ -1202,9 +1237,10 @@ mod port {
 
   impl Drop for Watch {
     fn drop(&mut self) {
+      // The kernel may still write into the blocks of a pending read: they are left to it.
       if self.pending {
-        mem::forget(mem::take(&mut self.buffer));
-        mem::forget(mem::take(&mut self.overlapped));
+        Box::leak(mem::take(&mut self.buffer));
+        Box::leak(mem::take(&mut self.overlapped));
       }
     }
   }
