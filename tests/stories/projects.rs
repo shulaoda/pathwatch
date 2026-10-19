@@ -64,13 +64,26 @@ fn an_editor_saves_a_file() {
     w.write("src/a.txt", "0");
     w.watch(&["src"]);
     w.may_pass("src/a.txt.tmp");
-    w.may_pass("src/a.txt~");
 
     for round in 0..5 {
       w.write("src/a.txt.tmp", &format!("tmp {round}"));
       w.rename("src/a.txt.tmp", "src/a.txt");
       w.expect(&[(Update, "src/a.txt")]);
+    }
+  });
+}
 
+/// The path is empty between the rename and the write, which the delete delay hides. Polling
+/// has none: a round that falls into that moment sees a `Delete` and a `Create` (README,
+/// `with_delete_delay`), so the story skips it.
+#[test]
+fn an_editor_saves_a_file_with_a_backup() {
+  everywhere_with(&Settings::delete_delay(Duration::from_millis(100)), |w| {
+    w.write("src/a.txt", "0");
+    w.watch(&["src"]);
+    w.may_pass("src/a.txt~");
+
+    for round in 0..5 {
       w.rename("src/a.txt", "src/a.txt~");
       w.write("src/a.txt", &format!("backup {round}"));
       w.remove("src/a.txt~");
