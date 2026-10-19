@@ -10,7 +10,7 @@ use std::{
   sync::{
     Arc, Mutex, PoisonError,
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
+    mpsc::{self, Receiver, Sender, SyncSender},
   },
   thread::{self, JoinHandle},
   time::Instant,
@@ -315,11 +315,14 @@ impl Watcher {
     B: Backend,
     H: FnMut(Result<Vec<Event>, Error>) + Send + 'static,
   {
-    let (sender, receiver) = mpsc::channel::<Message<B::Raw>>();
+    let (post, inbox) = Inbox::<B::Raw>::new().map_err(|error| {
+      let error = context("the queue of the watcher could not be made", error);
+      Error::new(ErrorKind::Io, None, Some(error))
+    })?;
     let (inside, from_inside) = mpsc::channel::<Command>();
     let queue = Arc::new(Queue::default());
     let stop = Arc::new(AtomicBool::new(false));
-    let sink = sink::<B>(sender.clone(), Arc::clone(&queue));
+    let sink = sink::<B>(post.clone(), Arc::clone(&queue));
 
     let number = NEXT_WATCHER.fetch_add(1, Ordering::Relaxed);
     let thread = {
@@ -331,7 +334,7 @@ impl Watcher {
           Ok(backend) => {
             let mut engine = Engine::new(backend, StdFs, options);
             engine.stop_with(Arc::clone(&stop));
-            run(engine, handler, &receiver, &from_inside, &queue, &stop);
+            run(engine, handler, &inbox, &from_inside, &queue, &stop);
           }
           Err(error) => {
             // A limit says by itself what is missing and that the watcher polls.
@@ -344,7 +347,7 @@ impl Watcher {
             handler(Err(Error::new(kind, None, Some(error))));
             let mut engine = Engine::new(NoBackend::<B::Raw>(PhantomData), StdFs, fallback);
             engine.stop_with(Arc::clone(&stop));
-            run(engine, handler, &receiver, &from_inside, &queue, &stop);
+            run(engine, handler, &inbox, &from_inside, &queue, &stop);
           }
         }
       })
@@ -356,7 +359,7 @@ impl Watcher {
 
     Ok(Self {
       number,
-      send: Box::new(move |command| sender.send(Message::Command(command)).is_ok()),
+      send: Box::new(move |command| post.send(Message::Command(command))),
       inside,
       stop,
       thread: Mutex::new(Some(thread)),
@@ -383,6 +386,203 @@ enum Command {
 /// the command came from inside the handler.
 type Done = Option<SyncSender<()>>;
 
+/// The way into the queue of the watcher thread: a sender, and on Windows the wake-up of the
+/// thread (`inbox`).
+struct Post<R> {
+  /// Given up before the wake-up of the drop: a thread that wakes then finds the queue closed.
+  sender: Option<Sender<Message<R>>>,
+  #[cfg(windows)]
+  wake: Arc<inbox::Wake>,
+}
+
+impl<R> Post<R> {
+  /// `false`: the watcher thread is gone.
+  fn send(&self, message: Message<R>) -> bool {
+    let sent = self.sender.as_ref().is_some_and(|sender| sender.send(message).is_ok());
+    #[cfg(windows)]
+    self.wake.set();
+    sent
+  }
+}
+
+impl<R> Clone for Post<R> {
+  fn clone(&self) -> Self {
+    Self {
+      sender: self.sender.clone(),
+      #[cfg(windows)]
+      wake: Arc::clone(&self.wake),
+    }
+  }
+}
+
+impl<R> Drop for Post<R> {
+  fn drop(&mut self) {
+    self.sender = None;
+    #[cfg(windows)]
+    self.wake.set();
+  }
+}
+
+/// The queue as the watcher thread takes from it.
+struct Inbox<R> {
+  receiver: Receiver<Message<R>>,
+  #[cfg(windows)]
+  wake: Arc<inbox::Wake>,
+  #[cfg(windows)]
+  timer: inbox::Timer,
+}
+
+/// Every `Post` is gone.
+struct Closed;
+
+impl<R> Inbox<R> {
+  #[cfg_attr(
+    not(windows),
+    expect(clippy::unnecessary_wraps, reason = "the event and the timer of Windows can fail")
+  )]
+  fn new() -> io::Result<(Post<R>, Self)> {
+    let (sender, receiver) = mpsc::channel();
+    #[cfg(windows)]
+    {
+      let wake = Arc::new(inbox::Wake::new()?);
+      let post = Post { sender: Some(sender), wake: Arc::clone(&wake) };
+      Ok((post, Self { receiver, wake, timer: inbox::Timer::new()? }))
+    }
+    #[cfg(not(windows))]
+    Ok((Post { sender: Some(sender) }, Self { receiver }))
+  }
+
+  /// A message that waits, if any.
+  fn try_take(&self) -> Option<Message<R>> {
+    self.receiver.try_recv().ok()
+  }
+
+  /// The next message, or `None` when `deadline` came first.
+  #[cfg(windows)]
+  fn take(&self, deadline: Option<Instant>) -> Result<Option<Message<R>>, Closed> {
+    loop {
+      match self.receiver.try_recv() {
+        Ok(message) => return Ok(Some(message)),
+        Err(mpsc::TryRecvError::Disconnected) => return Err(Closed),
+        Err(mpsc::TryRecvError::Empty) => {}
+      }
+      if !self.timer.wait(&self.wake, deadline) {
+        return Ok(None);
+      }
+    }
+  }
+
+  /// The next message, or `None` when `deadline` came first.
+  #[cfg(not(windows))]
+  fn take(&self, deadline: Option<Instant>) -> Result<Option<Message<R>>, Closed> {
+    let Some(deadline) = deadline else {
+      return self.receiver.recv().map(Some).map_err(|mpsc::RecvError| Closed);
+    };
+    match self.receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+      Ok(message) => Ok(Some(message)),
+      Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+      Err(mpsc::RecvTimeoutError::Disconnected) => Err(Closed),
+    }
+  }
+}
+
+/// The wait of the watcher thread on Windows. A timed wait of a channel there ends at a tick of
+/// the clock, which comes every 15.6 ms unless a program asked for more: a wait of 20 ms takes
+/// 31 ms, and one of 1 ms takes 15.6 ms (measured). So the thread waits on an event that every
+/// sender sets, and on a timer of high resolution, which comes within half a millisecond.
+#[cfg(windows)]
+mod inbox {
+  use std::{
+    io,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    ptr, thread,
+    time::{Duration, Instant},
+  };
+
+  use windows_sys::Win32::{
+    Foundation::{HANDLE, WAIT_OBJECT_0},
+    System::Threading::{
+      CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, INFINITE,
+      SetEvent, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
+    },
+  };
+
+  /// An event that a sender sets and the next wait takes (it resets itself). A set that no wait
+  /// took yet stays: a message sent between a look at the queue and the wait is not missed.
+  pub struct Wake(OwnedHandle);
+
+  impl Wake {
+    pub fn new() -> io::Result<Self> {
+      // SAFETY: the call reads no memory of ours. With these arguments it makes an event that
+      // resets itself and is not set.
+      let event = unsafe { CreateEventW(ptr::null(), 0, 0, ptr::null()) };
+      if event.is_null() {
+        return Err(io::Error::last_os_error());
+      }
+      // SAFETY: the event is a new open handle that nothing else owns.
+      Ok(Self(unsafe { OwnedHandle::from_raw_handle(event) }))
+    }
+
+    pub fn set(&self) {
+      // SAFETY: the handle is open.
+      unsafe { SetEvent(self.0.as_raw_handle()) };
+    }
+  }
+
+  /// A timer of high resolution where Windows has one (10, 1803 and later), a plain one before.
+  pub struct Timer(OwnedHandle);
+
+  impl Timer {
+    pub fn new() -> io::Result<Self> {
+      // SAFETY: the call reads no memory of ours. With these arguments it makes a new timer.
+      let make = |flags| unsafe {
+        CreateWaitableTimerExW(ptr::null(), ptr::null(), flags, TIMER_ALL_ACCESS)
+      };
+      let mut timer = make(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION);
+      if timer.is_null() {
+        timer = make(0);
+      }
+      if timer.is_null() {
+        return Err(io::Error::last_os_error());
+      }
+      // SAFETY: the timer is a new open handle that nothing else owns.
+      Ok(Self(unsafe { OwnedHandle::from_raw_handle(timer) }))
+    }
+
+    /// Waits until `wake` is set, or until `until` when there is one. `false`: the time came.
+    pub fn wait(&self, wake: &Wake, until: Option<Instant>) -> bool {
+      let Some(until) = until else {
+        // SAFETY: the handle is open.
+        unsafe { WaitForSingleObject(wake.0.as_raw_handle(), INFINITE) };
+        return true;
+      };
+      let left = until.saturating_duration_since(Instant::now());
+      // Relative, in units of 100 ns, and negative to say so.
+      let due = -i64::try_from(left.as_nanos() / 100).unwrap_or(i64::MAX);
+      let timer = self.0.as_raw_handle();
+      // SAFETY: the handle is open, `due` lives through the call, and no routine is given.
+      let set = unsafe { SetWaitableTimer(timer, &raw const due, 0, None, ptr::null(), 0) };
+      if set == 0 {
+        // Not with an open handle. A wait on the event alone could miss the time: a short
+        // sleep, and the caller looks again.
+        thread::sleep(left.min(Duration::from_millis(1)));
+        return true;
+      }
+      let handles: [HANDLE; 2] = [wake.0.as_raw_handle(), timer];
+      // SAFETY: both handles are open, and the array lives through the call.
+      let which = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+      if which == WAIT_OBJECT_0 + 1 {
+        return false;
+      }
+      if which != WAIT_OBJECT_0 {
+        // Not with open handles. Against a spin, as above.
+        thread::sleep(left.min(Duration::from_millis(1)));
+      }
+      true
+    }
+  }
+}
+
 /// What the backend threads and the watcher thread share about the queue.
 #[derive(Default)]
 struct Queue {
@@ -396,7 +596,7 @@ struct Queue {
 
 /// The sink of the backend: it puts a signal into the queue. A backend thread never blocks:
 /// when too much waits, the signal is dropped and a flag says so.
-fn sink<B: Backend>(sender: Sender<Message<B::Raw>>, queue: Arc<Queue>) -> Sink<B::Raw> {
+fn sink<B: Backend>(post: Post<B::Raw>, queue: Arc<Queue>) -> Sink<B::Raw> {
   Sink::new(move |signal| {
     let bytes = size_of::<Message<B::Raw>>()
       + match &signal {
@@ -405,7 +605,7 @@ fn sink<B: Backend>(sender: Sender<Message<B::Raw>>, queue: Arc<Queue>) -> Sink<
       };
     if queue.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes <= QUEUE_BYTES {
       // It fails only when the watcher thread is gone.
-      let _ = sender.send(Message::Signal(signal, bytes));
+      post.send(Message::Signal(signal, bytes));
       return;
     }
     queue.bytes.fetch_sub(bytes, Ordering::AcqRel);
@@ -415,7 +615,7 @@ fn sink<B: Backend>(sender: Sender<Message<B::Raw>>, queue: Arc<Queue>) -> Sink<
     // The thread may sleep with no deadline, so it is woken up to read the flag. Only the
     // drop that sets the flag sends the message: a flood cannot fill the queue with them.
     if !queue.overflow.swap(true, Ordering::AcqRel) {
-      let _ = sender.send(Message::Wake);
+      post.send(Message::Wake);
     }
   })
 }
@@ -424,26 +624,17 @@ fn sink<B: Backend>(sender: Sender<Message<B::Raw>>, queue: Arc<Queue>) -> Sink<
 fn run<B: Backend>(
   mut engine: Engine<B, StdFs>,
   mut handler: impl FnMut(Result<Vec<Event>, Error>),
-  receiver: &Receiver<Message<B::Raw>>,
+  inbox: &Inbox<B::Raw>,
   inside: &Receiver<Command>,
   queue: &Queue,
   stop: &AtomicBool,
 ) {
   let mut out = Output::default();
   loop {
-    let mut next = match engine.deadline() {
+    let mut next = match inbox.take(engine.deadline()) {
+      Ok(message) => message,
       // The senders are gone: the watcher was dropped, and the thread ends like after `Stop`.
-      None => match receiver.recv() {
-        Ok(message) => Some(message),
-        Err(mpsc::RecvError) => return,
-      },
-      Some(deadline) => {
-        match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-          Ok(message) => Some(message),
-          Err(RecvTimeoutError::Timeout) => None,
-          Err(RecvTimeoutError::Disconnected) => return,
-        }
-      }
+      Err(Closed) => return,
     };
 
     let mut taken = 0;
@@ -474,7 +665,7 @@ fn run<B: Backend>(
         let _ = done.send(());
       }
       taken += 1;
-      next = if taken < MESSAGES_PER_TURN { receiver.try_recv().ok() } else { None };
+      next = if taken < MESSAGES_PER_TURN { inbox.try_take() } else { None };
     }
 
     if stop.load(Ordering::Acquire) {
@@ -598,4 +789,54 @@ fn rest_of_the_drive<'a>(path: &'a Path, current: &Path) -> Option<&'a Path> {
   }
   let Some(Component::Prefix(prefix)) = path.components().next() else { return None };
   path.strip_prefix(prefix.as_os_str()).ok()
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+  use std::{
+    thread,
+    time::{Duration, Instant},
+  };
+
+  use super::{Closed, Inbox, Message};
+
+  /// The wait ends with the deadline, not with the next tick of the clock (15.6 ms).
+  #[test]
+  fn a_wait_ends_at_its_deadline() {
+    let (_post, inbox) = Inbox::<()>::new().unwrap();
+    for (deadline, at_most) in [(2, 10), (20, 28)] {
+      let start = Instant::now();
+      let taken = inbox.take(Some(start + Duration::from_millis(deadline)));
+      let waited = start.elapsed();
+      assert!(matches!(taken, Ok(None)));
+      assert!(waited >= Duration::from_millis(deadline), "{waited:?} for {deadline} ms");
+      assert!(waited < Duration::from_millis(at_most), "{waited:?} for {deadline} ms");
+    }
+  }
+
+  #[test]
+  fn a_message_ends_the_wait() {
+    let (post, inbox) = Inbox::<()>::new().unwrap();
+    let sender = thread::spawn(move || {
+      thread::sleep(Duration::from_millis(5));
+      post.send(Message::Wake);
+      post
+    });
+    let start = Instant::now();
+    let taken = inbox.take(Some(start + Duration::from_secs(5)));
+    assert!(matches!(taken, Ok(Some(Message::Wake))));
+    assert!(start.elapsed() < Duration::from_millis(100), "{:?}", start.elapsed());
+    drop(sender.join().unwrap());
+  }
+
+  #[test]
+  fn the_last_post_dropped_ends_the_wait() {
+    let (post, inbox) = Inbox::<()>::new().unwrap();
+    let dropper = thread::spawn(move || {
+      thread::sleep(Duration::from_millis(5));
+      drop(post);
+    });
+    assert!(matches!(inbox.take(None), Err(Closed)));
+    dropper.join().unwrap();
+  }
 }

@@ -30,8 +30,16 @@ pub enum EntryKind {
 impl Default for Config {
   fn default() -> Self {
     // FSEvents tells of a change about 10 ms after it, when the steps of a save are done: that
-    // is the quiet time already (`references/design.md` 5.13).
-    let (debounce, delete_delay) = if cfg!(target_os = "macos") { (0, 10) } else { (20, 50) };
+    // is the quiet time already. On Windows the tools that replace a file leave the path
+    // missing for microseconds, and 10 ms of each was enough on an idle machine
+    // (`references/design.md` 5.9 and 5.13).
+    let (debounce, delete_delay) = if cfg!(target_os = "macos") {
+      (0, 10)
+    } else if cfg!(windows) {
+      (10, 10)
+    } else {
+      (20, 50)
+    };
     Self {
       ignored: None,
       debounce: Duration::from_millis(debounce),
@@ -55,11 +63,13 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
-  /// The quiet time: a batch goes out when no change was noticed for this long. Default: 20 ms,
-  /// long enough for the steps of one save (a temporary file, a rename) to be one batch, also
-  /// on a busy machine, and short enough not to be felt. On macOS none: FSEvents tells of a
-  /// change about 10 ms after it, when a save is done, but a temporary file that lives longer
-  /// (the swap file of vim) is reported, a `Create` and a `Delete`.
+  /// The quiet time: a batch goes out when no change was noticed for this long. Default: 20 ms
+  /// on Linux, long enough for the steps of one save (a temporary file, a rename) to be one
+  /// batch, also on a busy machine, and short enough not to be felt; 10 ms on Windows, where
+  /// the steps of a save are two records, at the open and at the close, and 10 ms held them
+  /// together on an idle machine. On macOS none: FSEvents tells of a change about 10 ms after
+  /// it, when a save is done, but a temporary file that lives longer (the swap file of vim) is
+  /// reported, a `Create` and a `Delete`.
   ///
   /// While changes keep coming, a batch still goes out four quiet times after the first of them,
   /// and 500 ms after it at most, unless the quiet time is longer. The most is a year.
@@ -69,8 +79,8 @@ impl Config {
     self
   }
 
-  /// How long a `Delete` waits for the path to come back. Default: 10 ms on macOS, 50 ms
-  /// elsewhere. It does not apply when the watcher polls everything, as the quiet time does not,
+  /// How long a `Delete` waits for the path to come back. Default: 10 ms on macOS and on
+  /// Windows, 50 ms on Linux. It does not apply when the watcher polls everything, as the quiet time does not,
   /// and as in chokidar, notify and watchdog: a round that falls into a save that leaves the
   /// path empty for a moment reports a `Delete` and a `Create` (vim on Linux, polled every
   /// 100 ms: 4 of 100 saves).

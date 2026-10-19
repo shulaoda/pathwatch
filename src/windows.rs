@@ -855,13 +855,14 @@ mod port {
     ptr, slice,
     sync::{Arc, OnceLock, mpsc},
     thread,
+    time::{Duration, Instant},
   };
 
   use rustc_hash::FxHashMap;
   use windows_sys::Win32::{
     Foundation::{
       ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_NOTIFY_ENUM_DIR,
-      HANDLE, INVALID_HANDLE_VALUE,
+      HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
     },
     Storage::FileSystem::{
       FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
@@ -922,6 +923,18 @@ mod port {
   const MAX_EMPTY_READS: u8 = 16;
 
   const STOP_WAIT_MS: u32 = 2000;
+
+  /// The kernel completes a read as soon as one record is in it. So after a read that came
+  /// back with less than this, the next read is queued `REARM_DELAY` later: while no read is
+  /// queued the kernel keeps the records in a buffer of its own, as big as ours, and the next
+  /// read takes them all. Without the rest a flood is one read, one packet and one wake-up of
+  /// two threads for each record (93,000 reads for the 63,000 records of 30,000 new files,
+  /// measured). A read that came back fuller is queued again at once: the flood is heavy.
+  const BATCH_BYTES: usize = BUFFER_BYTES as usize / 2;
+  /// The rest before the next read. A flood of 20,000 records a second fills 2 KiB of the
+  /// kernel's 64 KiB in it. The first record of a quiet handle is not delayed: the read that
+  /// waits for it comes back at once, and the rest comes after it.
+  const REARM_DELAY: Duration = Duration::from_millis(1);
 
   #[derive(Debug)]
   pub(super) struct Port {
@@ -1028,13 +1041,34 @@ mod port {
   impl Worker {
     fn run(mut self) {
       loop {
-        match self.iocp.wait(INFINITE) {
+        let packet = match self.next_rest() {
+          None => self.iocp.wait(INFINITE),
+          Some(at) => {
+            let now = Instant::now();
+            if at <= now {
+              self.rearm(now);
+              continue;
+            }
+            // The timeout of the port counts in ticks of the clock (15.6 ms): the port is
+            // looked at, and the thread sleeps the rest of the rest, which a sleep keeps to
+            // half a millisecond.
+            match self.iocp.wait(0) {
+              Packet::Timeout => {
+                thread::sleep(at.saturating_duration_since(now));
+                continue;
+              }
+              packet => packet,
+            }
+          }
+        };
+        match packet {
           Packet::Wake => {
             if !self.run_commands() {
               break;
             }
           }
           Packet::Completed { token, result } => self.completed(token, result),
+          Packet::Timeout => {}
           Packet::Nothing(error) => {
             self.sink.failed(error);
             break;
@@ -1042,6 +1076,24 @@ mod port {
         }
       }
       self.stop();
+    }
+
+    /// The earliest time at which a resting handle takes its next read.
+    fn next_rest(&self) -> Option<Instant> {
+      self.watches.values().filter_map(|watch| watch.rest_until).min()
+    }
+
+    /// Queues the next read of every handle whose rest is over.
+    fn rearm(&mut self, now: Instant) {
+      let over = |watch: &Watch| watch.rest_until.is_some_and(|at| at <= now);
+      let due: Vec<usize> = self.watches.iter().filter(|(_, w)| over(w)).map(|(&t, _)| t).collect();
+      for token in due {
+        let Some(watch) = self.watches.get_mut(&token) else { continue };
+        watch.rest_until = None;
+        if let Err(error) = watch.read() {
+          self.died(token, error);
+        }
+      }
     }
 
     fn run_commands(&mut self) -> bool {
@@ -1139,14 +1191,19 @@ mod port {
         }
       };
       watch.empty_reads = if records.is_empty() { watch.empty_reads + 1 } else { 0 };
+      let len = records.len();
       self.sink.raw(watch.raw(Ok(records)));
-      let next = if watch.empty_reads < MAX_EMPTY_READS {
-        watch.read()
+      if watch.empty_reads >= MAX_EMPTY_READS {
+        self.died(token, io::Error::other("every read of the handle comes back with no bytes"));
+        return;
+      }
+      // A read that came back nearly full, or with a loss (no bytes), is queued again at once.
+      if len == 0 || len >= BATCH_BYTES {
+        if let Err(error) = watch.read() {
+          self.died(token, error);
+        }
       } else {
-        Err(io::Error::other("every read of the handle comes back with no bytes"))
-      };
-      if let Err(error) = next {
-        self.died(token, error);
+        watch.rest_until = Some(Instant::now() + REARM_DELAY);
       }
     }
 
@@ -1170,7 +1227,7 @@ mod port {
             }
           }
           Packet::Wake => {}
-          Packet::Nothing(_) => break,
+          Packet::Timeout | Packet::Nothing(_) => break,
         }
       }
     }
@@ -1187,6 +1244,8 @@ mod port {
     extended: bool,
     /// The handle is given up: it is read until nothing is left, then closed.
     closing: bool,
+    /// No read is queued until then: the kernel gathers the records of a flood meanwhile.
+    rest_until: Option<Instant>,
   }
 
   impl Watch {
@@ -1201,6 +1260,7 @@ mod port {
         empty_reads: 0,
         extended,
         closing: false,
+        rest_until: None,
       }
     }
 
@@ -1311,6 +1371,9 @@ mod port {
       match (overlapped.is_null(), result) {
         (false, result) => Packet::Completed { token: key, result },
         (true, Ok(_)) => Packet::Wake,
+        (true, Err(error)) if error.raw_os_error() == Some(WAIT_TIMEOUT.cast_signed()) => {
+          Packet::Timeout
+        }
         (true, Err(error)) => Packet::Nothing(error),
       }
     }
@@ -1318,7 +1381,12 @@ mod port {
 
   enum Packet {
     Wake,
-    Completed { token: usize, result: io::Result<u32> },
+    Completed {
+      token: usize,
+      result: io::Result<u32>,
+    },
+    /// The time given to the wait is over.
+    Timeout,
     Nothing(io::Error),
   }
 

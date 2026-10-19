@@ -86,6 +86,8 @@ struct Harness {
   backend: WindowsBackend,
   signals: mpsc::Receiver<Signal<Raw>>,
   next_key: u32,
+  /// How many reads of the handles came back.
+  reads: usize,
 }
 
 impl Harness {
@@ -100,7 +102,7 @@ impl Harness {
       gate.pass();
       let _ = sender.send(signal);
     });
-    Self { backend: WindowsBackend::new(sink).unwrap(), signals, next_key: 0 }
+    Self { backend: WindowsBackend::new(sink).unwrap(), signals, next_key: 0, reads: 0 }
   }
 
   fn watch(&mut self, dir: &Path, want: Want) -> (DirKey, Coverage) {
@@ -140,6 +142,7 @@ impl Harness {
         Ok(Signal::Failed(error)) => panic!("the backend failed: {error}"),
         Err(error) => panic!("the hint did not come: {error}. Hints so far: {seen:?}"),
       };
+      self.reads += 1;
       let before = seen.len();
       seen.extend(self.hints_of(signal));
       if seen[before..].iter().any(&done) {
@@ -228,6 +231,25 @@ fn a_change_of_a_file_becomes_a_hint() {
 
   fs::remove_file(temp.path().join("removed.txt")).unwrap();
   harness.hints_until(|hint| hint.names(key, "removed.txt"));
+}
+
+/// The kernel completes a read as soon as one record is in it. The backend rests a millisecond
+/// before the next read, so the records of a flood come in batches, not one a read.
+#[test]
+fn a_flood_of_records_comes_in_batches() {
+  let temp = scratch();
+  let mut harness = Harness::new();
+  let key = harness.handle(temp.path());
+
+  // 300 files as fast as the disk takes them: at least two records each.
+  for n in 0..300 {
+    fs::write(temp.path().join(format!("f{n}.txt")), "1").unwrap();
+  }
+  fs::write(temp.path().join("last.txt"), "1").unwrap();
+  let seen = harness.hints_until(|hint| hint.names(key, "last.txt"));
+  let (reads, records) = (harness.reads, seen.len());
+  // Without the rest the reads are as many as the records (measured: one record a read).
+  assert!(reads * 2 <= records, "{reads} reads for {records} records");
 }
 
 #[test]

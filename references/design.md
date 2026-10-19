@@ -33,7 +33,7 @@ watcher.close();
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
 | `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `RemoteDisk`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
-| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, none on macOS and 20 ms elsewhere (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and 50 ms elsewhere, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
+| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, none on macOS, 10 ms on Windows and 20 ms on Linux (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and Windows and 50 ms on Linux, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
 
@@ -167,7 +167,7 @@ The words, each for one idea:
 | coverage | what the backend answers | `Coverage::{Watched, WatchedTree, NotWatched, Failed}` |
 | polled | no OS watch covers the directory, so the timer scans it | `Watch::Polled` |
 | held | a look found nothing at the node; what the tree has there, and below, stays until the second look | `Node::is_held`, `Tree::hold` |
-| delete delay | the time from the hint to the second look: 10 ms on macOS, 50 ms elsewhere, none under polling | `Options::delete_delay` |
+| delete delay | the time from the hint to the second look: 10 ms on macOS and Windows, 50 ms on Linux, none under polling | `Options::delete_delay` |
 | young | a file whose modification time is too close to the check to trust | `Content` |
 | quiet time | the debounce: how long no hint must come before the disk is checked | `Options::debounce` |
 | rest | the pause after work that no hint asked for by name: a poll, the scans after loss reports | `REST`, `rest_until` |
@@ -750,10 +750,14 @@ is not told at once.
 - A file that is not told yet is not held: when it is gone, it is forgotten.
 - If a node above a held node is found missing too, the upper one decides for both.
 - With a delay of zero (`with_delete_delay`) nothing is held: a `Delete` comes at the first look.
-- **The default** is 50 ms where the OS tells at once (inotify, Windows): vim on Linux renames
+- **The default** is 50 ms on Linux: vim renames
   the file away and writes a new one, and on a busy machine the path was missing for long
   enough that no delay made 4 of 20 saves a `Delete` and a `Create`, and 30 ms 2 of 60; with
-  50 ms, none of 60 was. On macOS FSEvents tells about 10 ms after the change, when a save is
+  50 ms, none of 60 was. On Windows it is 10 ms: the tools that remove a file and write it
+  again (a delete and a new file, a delete and a rename, a rename away and a new file, vim,
+  `git checkout` of 100 files) leave the path missing for microseconds, and with 10 ms none of
+  505 saves a round was a `Delete`, idle or under a load of 16 busy threads on 20 cores and a
+  writer of files next to the tree (2026-10-20, with each quiet time of 5.13). On macOS FSEvents tells about 10 ms after the change, when a save is
   done (5.13): the delay is 10 ms there, a guard that costs little, and the only wait, as
   there is no quiet time (with a quiet time of 10 ms or 20 ms and no delay, none of VS Code,
   vim, `sed -i`, `git checkout` and a JetBrains-like save was wrong, idle or busy). When the watcher polls everything there is none, as there is no quiet time
@@ -970,7 +974,13 @@ wakes the thread, so the flag is read at once. Commands (`watch`, `unwatch`) are
 and not counted. The loop takes at most 512 messages, then does what is due, so a flood cannot
 hold back a flush. A command from inside the handler goes a way of its own: the thread takes
 it when the handler has returned, before the next message of the queue, so what the handler
-asked for is in place before anything that came in meanwhile.
+asked for is in place before anything that came in meanwhile. On Windows the thread does not
+wait on the channel for a deadline: a timed wait of a channel ends at a tick of the clock, which
+comes every 15.6 ms unless a program asked for more (a wait of 20 ms took 31 ms, and one of
+1 ms 15.6 ms, measured), and that was the whole of the 11 ms between the quiet time and the
+reported edit. The thread waits on an event that every sender sets after its message and on a
+waitable timer of high resolution, which comes within half a millisecond (`watcher::inbox`);
+on the other systems the wait of the channel keeps the time.
 
 **The debounce.** The disk is checked when no hint came for the quiet time: every hint that
 leaves work moves the flush to one quiet time after it. So a save in several steps is one
@@ -983,12 +993,18 @@ four quiet times; on macOS FSEvents leaves gaps of about 10 ms, and the edit wai
 either way. A burst of 2,000 edits went out in 3 batches on macOS instead of 1, and all were
 there as soon (2026-10-15). @parcel/watcher counts its 500 ms from the last batch instead: the
 first change after half a second of quiet goes out at once, alone, and a check of the disk at
-that moment can catch a save half done (5.9). The default quiet time is 20 ms where the OS tells at once (inotify,
-Windows): long enough for the steps of one save (a temporary file, a rename) to be one batch,
+that moment can catch a save half done (5.9). The default quiet time is 20 ms on Linux: long enough for the steps of one save (a temporary file, a rename) to be one batch,
 also on a busy machine, and short enough not to be felt; watchman and webpack wait the same.
 Measured on Linux with the saves of 5.9 on a busy machine: with 5 ms, 4 of 60 saves and 2
 files of 1,000 that `git checkout` wrote were reported twice, the first time half written;
-with 10 ms, none. On macOS FSEvents tells about 10 ms after the change, by when a save is
+with 10 ms, none. On Windows a save is two records, one at the open that truncates the file
+and one at the close, and nothing for the writes between (measured): the quiet time can only
+hold those two together, and a flush that falls between them reports the file twice, as the
+record of the close is a `Written` hint (5.8). Measured with the saves of 5.9, 15 of each way,
+and `git checkout` of 100 files 4 times, idle and under a load of 16 busy threads on 20
+cores: with 20 ms nothing was wrong; with 10 ms only `git checkout` was, 1 file of 1,600 idle
+and 2 or 3 of 400 under the load; with 5 ms, 3 to 5 of 400, one of them half written. The
+default there is 10 ms, for the idle machine that editing happens on (2026-10-20). On macOS FSEvents tells about 10 ms after the change, by when a save is
 done: no value was wrong there, idle, busy, and under a flood of 30,000 writes a second,
 when it tells at once (a 1 MB save was told 1 ms after it, still one `Update`). So the
 default there is zero, as in watchdog, notify and Node, and an edit is told twice as soon
@@ -1587,6 +1603,15 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   empty `rel` for each of its keys. A short (8.3) name in a record is a name like any other:
   below a watched directory the engine asks the disk how it spells a name it does not know,
   and finds the entry under its long name; one that no key holds is dropped (README, "Holes").
+- The kernel completes a read as soon as one record is in it. After a read that came back
+  with less than half the buffer, the next read is queued a millisecond later: while no read
+  is queued the kernel keeps the records in a buffer of its own, as big as ours, and the next
+  read takes them all. Without the rest a flood is one read, one packet and one wake-up of the
+  worker and of the watcher thread for each record (93,000 reads for the 63,000 records of
+  30,000 new files in an ignored directory, 2 s of CPU; measured). The first record of a quiet
+  handle is not delayed, as the read that waits for it comes back at once; a read that came
+  back fuller is queued again at once, as the flood is heavy; a save of 20,000 records a
+  second fills 2 KiB of the kernel's 64 KiB in the rest.
 - Directories are compared by path text, and a handle reports nothing for what is behind a
   junction or a directory link below it. So each name between a handle and a key that it
   would serve is looked at (`leads_through_a_link`), and a key behind a link, below a
