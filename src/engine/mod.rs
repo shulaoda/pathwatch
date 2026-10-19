@@ -186,6 +186,12 @@ enum Once {
   AskedDisk(u64),
 }
 
+impl<B: Backend, F: Fs> fmt::Debug for Engine<B, F> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("Engine").field("backend", &self.backend.is_some()).finish_non_exhaustive()
+  }
+}
+
 impl<B: Backend, F: Fs> Engine<B, F> {
   pub fn new(backend: B, fs: F, mut options: Options) -> Self {
     for time in [&mut options.debounce, &mut options.delete_delay, &mut options.poll_interval] {

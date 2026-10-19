@@ -623,6 +623,12 @@ impl Tree {
   }
 }
 
+impl Default for Tree {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl Index<DirKey> for Tree {
   type Output = Node;
 

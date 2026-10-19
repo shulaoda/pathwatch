@@ -4,7 +4,7 @@
 use std::{
   borrow::Cow,
   cell::Cell,
-  env, io,
+  env, fmt, io,
   marker::PhantomData,
   path::{Path, PathBuf},
   sync::{
@@ -75,6 +75,12 @@ pub struct Watcher {
   stop: Arc<AtomicBool>,
   /// `close` takes it out to wait for the thread.
   thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl fmt::Debug for Watcher {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("Watcher").field("number", &self.number).finish_non_exhaustive()
+  }
 }
 
 impl Watcher {

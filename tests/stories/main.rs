@@ -32,6 +32,7 @@ mod sim;
 
 use std::{
   collections::BTreeMap,
+  fmt,
   path::{Path, PathBuf},
   sync::Arc,
   time::Duration,
@@ -91,6 +92,16 @@ pub struct Settings {
   /// The story needs a disk that takes two spellings of a name for one. The simulated disk
   /// is made so; the real disk is probed, and the story is skipped where it is not so.
   pub loose_disk: bool,
+}
+
+impl fmt::Debug for Settings {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("Settings")
+      .field("debounce", &self.debounce)
+      .field("delete_delay", &self.delete_delay)
+      .field("loose_disk", &self.loose_disk)
+      .finish_non_exhaustive()
+  }
 }
 
 impl Settings {

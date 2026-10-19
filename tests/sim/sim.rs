@@ -153,7 +153,7 @@ fn a_stream_that_one_key_leaves_and_another_joins_in_one_commit() {
 
 /// A watched file is written, and the notification is dropped without a word. The engine
 /// cannot know, so what it stored is not what the disk has: the settle says so.
-fn a_write_that_nobody_reports() -> Driver<crate::fixtures::SimBackend> {
+fn a_write_that_nobody_reports() -> Driver<SimBackend> {
   let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir("/p").unwrap();
   d.fs.write("/p/a.js", "1").unwrap();

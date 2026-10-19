@@ -393,7 +393,7 @@ fn meta(metadata: &Metadata, (file_id, dir_id): (u64, DirId)) -> Meta {
 
 #[cfg(unix)]
 fn changed(metadata: &Metadata, _modified: SystemTime) -> SystemTime {
-  use std::{os::unix::fs::MetadataExt, time::Duration};
+  use std::os::unix::fs::MetadataExt;
 
   // A time before 1970 counts as 1970.
   let seconds = u64::try_from(metadata.ctime()).unwrap_or(0);

@@ -347,13 +347,13 @@ mod tests {
     let table = [
       (r"C:\a\b", Some(r"C:\a\b")),
       (r"C:\a\b\", Some(r"C:\a\b")),
-      (r"C:/a/b", Some(r"C:\a\b")),
+      ("C:/a/b", Some(r"C:\a\b")),
       (r"C:\a\\b\.\c", Some(r"C:\a\b\c")),
       (r"c:\a", Some(r"c:\a")),
       (r"C:\a b\..c", Some(r"C:\a b\..c")),
       // A share.
       (r"\\server\share\a\b", Some(r"\\server\share\a\b")),
-      (r"//server/share/a", Some(r"\\server\share\a")),
+      ("//server/share/a", Some(r"\\server\share\a")),
       (r"\\server\share\\a\.\b\", Some(r"\\server\share\a\b")),
       // A verbatim path becomes the plain form.
       (r"\\?\C:\a\b", Some(r"C:\a\b")),
@@ -382,7 +382,7 @@ mod tests {
       (r"\\?\UNC\server\share\", None),
       // A separator too many before the share, not before the server.
       (r"\\server\\share\f", Some(r"\\server\share\f")),
-      (r"//server//share/f", Some(r"\\server\share\f")),
+      ("//server//share/f", Some(r"\\server\share\f")),
       (r"\\\server\share\f", None),
       ("///server/share/f", None),
       // No share, a device, a volume name, a `/` that a verbatim path would keep as a character.
@@ -422,7 +422,7 @@ mod tests {
   /// The length of a name fits in 16 bits as bytes, also for a top directory of two UTF-16 names.
   #[test]
   fn a_name_has_a_longest_length() {
-    assert!(u16::try_from(2 * 3 * MAX_NAME + 4).is_ok());
+    u16::try_from(2 * 3 * MAX_NAME + 4).unwrap();
 
     let (longest, too_long) = ("x".repeat(MAX_NAME), "x".repeat(MAX_NAME + 1));
     assert!(clean_unix(&format!("/a/{longest}/b")).is_some());

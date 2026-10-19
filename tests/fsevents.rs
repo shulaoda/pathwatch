@@ -1272,7 +1272,7 @@ fn missing_directory_fails_and_leaves_the_key_unwatched() {
   fs::remove_dir_all(h.path("dir")).unwrap();
   for want in [Want::Names, Want::Contents] {
     match h.backend.watch(key, &h.path("dir"), want) {
-      Coverage::Failed(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+      Coverage::Failed(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
       coverage => panic!("{coverage:?}"),
     }
   }

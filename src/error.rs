@@ -79,7 +79,7 @@ impl error::Error for Context {
 
 impl error::Error for Error {
   fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-    self.source.as_ref().map(|source| source as &(dyn error::Error + 'static))
+    Some(self.source.as_ref()?)
   }
 }
 

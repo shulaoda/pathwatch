@@ -32,7 +32,9 @@ fn thousands_of_case_twins_that_come_and_go() {
         .chars()
         .enumerate()
         .map(
-          |(at, letter)| if variant >> at & 1 == 1 { letter.to_ascii_uppercase() } else { letter },
+          |(at, letter)| {
+            if (variant >> at) & 1 == 1 { letter.to_ascii_uppercase() } else { letter }
+          },
         )
         .collect();
       let path = format!("/p/dir/{spelled}");

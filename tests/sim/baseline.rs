@@ -150,7 +150,7 @@ struct Due {
   second: &'static str,
   change: fn(&SimFs),
   /// The event that is due, and the files the handler knows in the end.
-  due: &'static str,
+  event: &'static str,
   known: &'static [&'static str],
 }
 
@@ -163,7 +163,7 @@ const DUE: [Due; 7] = [
     goes: None,
     second: "/p/d/f.js",
     change: |fs| fs.write("/p/d/f.js", "1").unwrap(),
-    due: "C /p/d/f.js",
+    event: "C /p/d/f.js",
     known: &["/p/d/f.js"],
   },
   Due {
@@ -176,7 +176,7 @@ const DUE: [Due; 7] = [
       fs.write("/p/r/a.js", "1").unwrap();
       fs.write("/p/r/b.js", "1").unwrap();
     },
-    due: "C /p/r/a.js",
+    event: "C /p/r/a.js",
     known: &["/p/r/a.js", "/p/r/b.js"],
   },
   Due {
@@ -190,7 +190,7 @@ const DUE: [Due; 7] = [
       fs.write("/p/gen/x.js", "1").unwrap();
       fs.write("/p/gen/y.js", "1").unwrap();
     },
-    due: "C /p/gen/x.js",
+    event: "C /p/gen/x.js",
     known: &["/p/gen/x.js", "/p/gen/y.js"],
   },
   Due {
@@ -204,7 +204,7 @@ const DUE: [Due; 7] = [
       fs.write("/p/gen/x.js", "1").unwrap();
       fs.write("/p/gen/y.js", "1").unwrap();
     },
-    due: "C /p/gen/x.js",
+    event: "C /p/gen/x.js",
     known: &["/p/gen/x.js", "/p/gen/y.js"],
   },
   Due {
@@ -217,7 +217,7 @@ const DUE: [Due; 7] = [
       fs.mkdir("/p/src/pages").unwrap();
       fs.write("/p/src/pages/x.js", "1").unwrap();
     },
-    due: "C /p/src/pages/x.js",
+    event: "C /p/src/pages/x.js",
     known: &["/p/src/pages/x.js"],
   },
   Due {
@@ -230,7 +230,7 @@ const DUE: [Due; 7] = [
     goes: Some(|fs| fs.remove("/p/d/f.js").unwrap()),
     second: "/p/d/f.js",
     change: |fs| fs.write("/p/d/f.js", "22").unwrap(),
-    due: "U /p/d/f.js",
+    event: "U /p/d/f.js",
     known: &["/p/d/f.js"],
   },
   Due {
@@ -248,7 +248,7 @@ const DUE: [Due; 7] = [
       fs.write("/q/gen/x.js", "22").unwrap();
       fs.rename("/q/gen", "/p/gen").unwrap();
     },
-    due: "U /p/gen/x.js",
+    event: "U /p/gen/x.js",
     known: &["/p/gen/x.js", "/p/gen/y.js"],
   },
 ];
@@ -284,8 +284,8 @@ fn due_at_every_moment<B: Deliver>(make: impl Fn() -> Driver<B>, story: &Due, on
     events.append(&mut settled(&mut d));
     let on = format!("{on}, {}, call {moment}: {events:?}", story.name);
     // A "written" notification that comes after the call may cost one more update.
-    let told = events.iter().filter(|event| *event == story.due).count();
-    assert!(told == 1 || (told > 1 && story.due.starts_with('U')), "{on}");
+    let told = events.iter().filter(|event| *event == story.event).count();
+    assert!(told == 1 || (told > 1 && story.event.starts_with('U')), "{on}");
     assert!(events.iter().all(|event| !event.starts_with('D')), "{on}");
     assert_eq!(known(&d), story.known, "{on}");
     caught_up(&mut d);

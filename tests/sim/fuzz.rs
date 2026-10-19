@@ -1266,7 +1266,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
       }
       Queue::DeliverHeld => {
         self.say(format!("deliver the {} held back", self.held.len()));
-        for raw in std::mem::take(&mut self.held) {
+        for raw in mem::take(&mut self.held) {
           self.signal(raw);
         }
       }
@@ -1374,7 +1374,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     self.say("settle".to_owned());
     self.fs.clear_traps();
     self.set_online();
-    for raw in std::mem::take(&mut self.held) {
+    for raw in mem::take(&mut self.held) {
       self.signal(raw);
     }
     let config = &self.config;

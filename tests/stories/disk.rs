@@ -4,7 +4,7 @@
 
 use std::{
   collections::{BTreeMap, BTreeSet},
-  env, fs,
+  env, fmt, fs,
   path::{Component, Path, PathBuf},
   sync::{
     Arc, OnceLock, Weak,
@@ -87,7 +87,7 @@ pub fn relative_scratch() -> (TempDir, PathBuf) {
   if here.components().next() != dir.path().components().next() {
     dir = tempfile::tempdir_in(&here).unwrap();
   }
-  let is_name = |part: &Component| matches!(part, Component::Normal(_));
+  let is_name = |part: &Component<'_>| matches!(part, Component::Normal(_));
   let mut rel: PathBuf = here.components().filter(is_name).map(|_| Component::ParentDir).collect();
   rel.extend(dir.path().components().filter(is_name));
   (dir, rel)
@@ -169,6 +169,12 @@ fn unknown(known: &Files, on_disk: &Files) -> String {
     other(on_disk, known),
     other(known, on_disk)
   )
+}
+
+impl fmt::Debug for Disk {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("Disk").field("backend", &self.backend).finish_non_exhaustive()
+  }
 }
 
 impl Disk {

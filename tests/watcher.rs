@@ -208,7 +208,7 @@ fn with_handler(
     })
     .unwrap()
   };
-  assert!(slot.set(watcher).is_ok());
+  slot.set(watcher).unwrap();
   slot
 }
 
@@ -648,7 +648,7 @@ fn a_watch_inside_the_handler_comes_before_the_queue() {
   };
   let sink = sink_in.recv().unwrap();
   watcher.watch(&[dir.path()]).unwrap();
-  assert!(slot.set(watcher).is_ok());
+  slot.set(watcher).unwrap();
 
   fs::write(dir.path().join("a.txt"), "1").unwrap();
   handler_waits.recv_timeout(PATIENCE).expect("the handler runs");

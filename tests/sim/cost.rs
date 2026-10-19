@@ -455,7 +455,7 @@ fn watch_project<B: Backend>(name: &str, start: impl Fn(SimFs) -> Run<B>) {
     let files = project(&fs);
     let mut run = start(fs);
     let before = live();
-    let out = run.watch(files.clone());
+    let out = run.watch(files);
     kept = live().saturating_sub(before);
     (looks, watches) = (run.fs.calls().lstat, run.fs.calls().watch);
     assert!(out.events.is_empty() && out.errors.is_empty(), "the baseline is silent");

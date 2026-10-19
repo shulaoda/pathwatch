@@ -606,7 +606,7 @@ impl Streams {
   /// Stops the replaced streams, with a loss report for the covers at and below their paths: a
   /// stream that stops takes what it has not delivered. A cover above them has a stream of its
   /// own: trusted stream paths never lie one below another.
-  fn stop(&mut self, stopped: Vec<Running>, covers: &Covers) {
+  fn stop(&self, stopped: Vec<Running>, covers: &Covers) {
     let paths = top_most(stopped.iter().flat_map(|old| old.paths.clone()).collect());
     let at = paths.iter().filter_map(|path| covers.by_dir.get(path));
     let below = covers.by_dir.below(&paths).map(|(_, keys)| keys);

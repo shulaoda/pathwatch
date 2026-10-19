@@ -293,7 +293,7 @@ fn a_relative_path_with_dot_dot() {
 fn one_bad_path_among_good_ones() {
   on_disk(|w| {
     let bad = w.path("nul\0.txt");
-    let paths = [w.path("a.txt"), PathBuf::new(), bad.clone(), w.path("r")];
+    let paths = [w.path("a.txt"), PathBuf::new(), bad, w.path("r")];
     let error = w.watcher.watch(&paths).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidPath);
     assert_eq!(error.path(), Some(Path::new("")), "the first bad path");
