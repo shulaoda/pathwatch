@@ -21,7 +21,7 @@ use std::{
   time::{Duration, Instant, SystemTime},
 };
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::{check::Listed, scan::ScanEntry};
 pub use crate::tree::Fingerprint;
@@ -177,6 +177,17 @@ pub struct Engine<B: Backend, F: Fs> {
 
   /// The errors for the next output, one of each kind.
   errors: Vec<Error>,
+  /// What happens once for the life of the engine.
+  once: FxHashSet<Once>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Once {
+  /// `WatchLimit` was reported: not again for each directory that finds no room.
+  ToldWatchLimit,
+  /// A disk, by its device, that an OS watch was given on was asked whether other machines
+  /// change it too.
+  AskedDisk(u64),
 }
 
 impl<B: Backend, F: Fs> Engine<B, F> {
@@ -216,6 +227,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       scans: Vec::new(),
       names: Vec::new(),
       errors: Vec::new(),
+      once: FxHashSet::default(),
     }
   }
 

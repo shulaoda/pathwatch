@@ -82,7 +82,8 @@ watcher, so it should only pass the batch on.
 - A batch is never empty and has at most one event for a path. Its order is not promised.
 - An event path is the watched path as you gave it, or that path and the rest below it.
 - An error means that something could not be watched or read. The watcher keeps running.
-  `error.kind()` is one of `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`.
+  `error.kind()` is one of `InvalidPath`, `WatchLimit`, `PermissionDenied`, `RemoteDisk`, `Io`,
+  `Closed`.
   The handler gets one error of a kind for a batch, with one path that shows the problem.
 
 ## Options
@@ -208,7 +209,6 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   moment (measured under polling: 2 to 10 % of the renames of a directory with 500
   subdirectories in it). A directory that another program holds with no sharing is no error
   for the watcher: it is looked at again until it can be listed.
-- **A write through another hard link** of a watched file is not reported.
 - **macOS: a socket or a FIFO that is made** is not reported (macOS 26; macOS 27 reports it).
   It is found when something else makes the watcher look at its directory. Its removal is
   reported.
@@ -218,13 +218,16 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   of a VM) has no young files: a file written just now looks old by the time of the watcher.
   A second write of the same size inside one step of the time stamps of that disk is not
   found by a look there; the OS reports it where it reports writes (Linux, Windows).
-- **A mount over a watched directory** is not noticed until something else makes the watcher
-  look there.
+- **A mount over a watched directory, or over a directory above one**, is noticed on Linux and
+  macOS (Windows was not checked). On Linux not where the watched path reaches the mount point
+  through a link: there it is noticed when something else makes the watcher look.
 - **A path longer than the OS allows** gets no events: `watch` takes it, the handler is told
   once (`Io`), and the path counts as missing.
-- **A directory on a network drive, or shared with another machine** (NFS, a folder of the
+- **A directory on a network drive, or shared with another machine** (NFS, SMB, a folder of the
   host in a virtual machine or a container): changes that the other machine makes are not
-  reported, and nothing tells the watcher so. `with_polling(true)` finds them.
+  reported. The handler is told once for each such disk (`RemoteDisk`; on Linux also for a local
+  disk through FUSE, which cannot be told apart from a shared folder of a VM; not on Windows,
+  where the server of SMB reports changes). `with_polling(true)` finds them.
 - **A watched path that is spelled with a look-alike character**, where the disk has plain
   letters, or the other way round: `ß` for `ss`, the long s for `s`, the Kelvin sign for `K`,
   a ligature like `ﬁ` for `fi`, a CJK compatibility ideograph for its ideograph. The disks of
@@ -247,12 +250,11 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 - **A watched path that is a link to a file**: a write to the file behind it is found by the
   same poll, within a second, with every backend. And a rewrite of the same size that puts the
   old modification time back is not reported for it on Linux either.
-- **macOS, Windows: the directories above a watched path** are polled once a second. When
-  one of them is made, made again, or removed, the events can come up to a second late. On
-  macOS the same holds when one is renamed, also only to another case of its letters (`src`
-  to `Src`); and one that is renamed away and back within that second, with changes made
-  below it meanwhile, is not noticed: the watch stands at the text of its path and heard
-  nothing while the path was another one (`references/design.md` 7.2).
+- **Windows: the directories above a watched path** are polled once a second. When one of
+  them is made, made again, or removed, the events can come up to a second late. On macOS
+  each of them is open for the events of the kernel instead, which tell at once; only when
+  the process has no open file left for them (`ulimit -n`) are they polled, and the watcher
+  reports it (`references/design.md` 7.2).
 - **macOS: many watched paths and a busy disk.** Events come late when the watcher has many
   separate paths and other programs write a lot. Measured while 50,000 other files were
   written: 0.1 s with 100 paths, 0.9 s with 500, 1.8 s with 1,000, 3.5 s with 2,000. Nothing is
@@ -327,8 +329,8 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 
 | OS | Watch API | Limits |
 |---|---|---|
-| Linux, Android | inotify | One kernel watch for each directory, so a big tree needs a high `fs.inotify.max_user_watches`. At the limit the handler gets `WatchLimit` and the directory is polled once a second. Otherwise only a watched path that is a link is polled; with none, the watcher sleeps between notifications. When inotify cannot start at all, the handler is told once and the watcher polls everything. Changes made on another machine (NFS, a folder shared with a VM) are not reported: use polling there. |
-| macOS | FSEvents | See "Holes". A process can run 512 streams; one watcher most often keeps 8 or fewer, and at most about 70: a `watch` call that needs new ones adds up to 8, and from 64 on all of them are replaced. No stream is put on `/`, `/Users` or the home directory: what could only be watched from there is polled once a second, as on Windows. |
+| Linux, Android | inotify | One kernel watch for each directory, so a big tree needs a high `fs.inotify.max_user_watches`. At the limit the handler gets `WatchLimit`, once, and each directory that finds no room is polled once a second. Otherwise only a watched path that is a link is polled; with none, the watcher sleeps between notifications. When inotify cannot start at all, the handler is told once and the watcher polls everything. Changes made on another machine (NFS, a folder shared with a VM) are not reported: the handler is told (`RemoteDisk`), and polling finds them. |
+| macOS | FSEvents | See "Holes". A process can run 512 streams; one watcher most often keeps 8 or fewer, and at most about 70: a `watch` call that needs new ones adds up to 8, and from 64 on the streams are placed again: the ones whose paths stay go on, and the others are replaced, while the old ones run on for half a second (up to about 140 streams for that time). No stream is put on `/`, `/Users` or the home directory: what could only be watched from there is polled once a second, as on Windows. Each directory on the way to a stream takes an open file, for the events of the kernel when it is renamed or removed, or a disk is mounted on it (a project of 20,000 watched files: about 50); all watchers of a process take half of its limit at most. |
 | Windows | `ReadDirectoryChangesW` | Tested on Windows 11 with NTFS only. At most 64 handles; more directories share a handle on a directory above them, and a directory behind a junction keeps one of its own. No handle is put on `C:\`, `C:\Users` or `C:\Users\<name>`: what could only be watched from there is polled. |
 | every other target | none: always polling | The cost grows with the number of watched files. On WASI (`wasm32-wasip1-threads`) the directories that the program may use lie below `/`, which is none of them: `/` counts as a directory all the same, so a path below a preopened directory is watched. |
 
@@ -423,8 +425,9 @@ cargo test -p pathwatch --test disk -- --nocapture
 # The FSEvents test that fills the stream limit of the process. It runs alone.
 cargo test -p pathwatch --test fsevents -- --ignored failed_start
 
-# The inotify test of the watch limit. It needs a lowered limit.
-unshare -Ur sh -c 'echo 8 > /proc/sys/user/max_inotify_watches &&
+# The inotify tests of the watch limit and of a mount. They need a lowered limit and mounts of
+# their own.
+unshare -Urm sh -c 'echo 8 > /proc/sys/user/max_inotify_watches &&
   cargo test -p pathwatch --test inotify -- --ignored'
 
 # Lints and the docs.

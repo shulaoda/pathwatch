@@ -1,6 +1,6 @@
 //! macOS: a listing with what `lstat` tells of each entry, in one call, and the name of one
-//! entry as the disk spells it. A file is taken from the listing on APFS only (`references/design.md`
-//! 5.4).
+//! entry as the disk spells it. A file or a directory is taken from the listing on APFS only
+//! (`references/design.md` 5.4).
 
 use std::{
   ffi::{CString, OsStr, OsString, c_char, c_void},
@@ -14,7 +14,7 @@ use std::{
   time::{Duration, SystemTime},
 };
 
-use super::{Entry, FileType};
+use super::{DirId, Entry, FileType, nanos};
 
 /// `struct attrlist`.
 #[repr(C)]
@@ -27,7 +27,7 @@ struct AttrList {
   pub file: u32,
   pub fork: u32,
 }
-/// `struct statfs`. Only the device and the name of the file system are read.
+/// `struct statfs`. Only the device, the flags and the name of the file system are read.
 #[repr(C)]
 struct StatFs {
   sizes_and_counts: [u64; 6],
@@ -40,14 +40,18 @@ const ATTR_BIT_MAP_COUNT: u16 = 5;
 const ATTR_CMN_NAME: u32 = 0x1;
 const ATTR_CMN_DEVID: u32 = 0x2;
 const ATTR_CMN_OBJTYPE: u32 = 0x8;
+const ATTR_CMN_CRTIME: u32 = 0x200;
 const ATTR_CMN_MODTIME: u32 = 0x400;
 const ATTR_CMN_FLAGS: u32 = 0x4_0000;
 const ATTR_CMN_FILEID: u32 = 0x0200_0000;
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
 const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+const ATTR_DIR_MOUNTSTATUS: u32 = 0x4;
 const ATTR_FILE_DATALENGTH: u32 = 0x200;
-/// What a look at a regular file reads, in the common attributes.
-const FILE: u32 = ATTR_CMN_DEVID | ATTR_CMN_MODTIME | ATTR_CMN_FLAGS | ATTR_CMN_FILEID;
+/// What a look at a regular file or a directory reads, in the common attributes: the birth time
+/// is in the identity of a directory.
+const LOOK: u32 =
+  ATTR_CMN_DEVID | ATTR_CMN_CRTIME | ATTR_CMN_MODTIME | ATTR_CMN_FLAGS | ATTR_CMN_FILEID;
 /// The content of the file is in a cloud, not on this disk.
 const SF_DATALESS: u32 = 0x4000_0000;
 const O_DIRECTORY: i32 = 0x0010_0000;
@@ -66,14 +70,26 @@ unsafe extern "C" {
   ) -> i32;
 }
 
-/// The device number of the disk under `dir`, if it is an APFS disk.
-pub fn apfs_volume(dir: &Path) -> Option<i32> {
+fn stat_fs(dir: &Path) -> Option<StatFs> {
   let c_path = CString::new(dir.as_os_str().as_bytes()).ok()?;
   // SAFETY: all zeros is a valid value of this plain struct of numbers.
   let mut answer: StatFs = unsafe { mem::zeroed() };
   // SAFETY: `c_path` ends with a NUL, and the call writes one whole `struct statfs`.
   let result = unsafe { statfs(c_path.as_ptr(), &raw mut answer) };
-  (result == 0 && answer.type_name.starts_with(b"apfs\0")).then_some(answer.id[0])
+  (result == 0).then_some(answer)
+}
+
+/// The device number of the disk under `dir`, if it is an APFS disk.
+pub fn apfs_volume(dir: &Path) -> Option<i32> {
+  stat_fs(dir).filter(|answer| answer.type_name.starts_with(b"apfs\0")).map(|answer| answer.id[0])
+}
+
+/// The name of the file system under `dir` (`nfs`, `smbfs`), if it is not on this machine.
+pub fn remote_disk(dir: &Path) -> Option<String> {
+  const MNT_LOCAL: u32 = 0x1000;
+  let answer = stat_fs(dir).filter(|answer| answer.owner_type_flags_subtype[2] & MNT_LOCAL == 0)?;
+  let name = answer.type_name.split(|&byte| byte == 0).next().unwrap_or_default();
+  Some(String::from_utf8_lossy(name).into_owned())
 }
 
 /// `volume` is what `apfs_volume` gave for `dir`. An entry on another device is given as a
@@ -84,9 +100,9 @@ pub fn read_dir(dir: &Path, volume: i32, each: &mut dyn FnMut(&OsStr, Entry)) ->
   let wanted = AttrList {
     bitmap_count: ATTR_BIT_MAP_COUNT,
     reserved: 0,
-    common: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | FILE,
+    common: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | LOOK,
     volume: 0,
-    dir: 0,
+    dir: ATTR_DIR_MOUNTSTATUS,
     file: ATTR_FILE_DATALENGTH,
     fork: 0,
   };
@@ -130,8 +146,8 @@ pub fn read_dir(dir: &Path, volume: i32, each: &mut dyn FnMut(&OsStr, Entry)) ->
 /// attributes in the order of their bits. `None`: it has no name.
 fn read(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   let mut fields = Fields { bytes: entry, at: size_of::<u32>() };
-  let [common, _, _, file, _] = [(); 5].map(|()| fields.u32());
-  let (common, file) = (common?, file?);
+  let [common, _, dir, file, _] = [(); 5].map(|()| fields.u32());
+  let (common, dir, file) = (common?, dir?, file?);
   let has = |attribute: u32| common & attribute != 0;
   let failed = has(ATTR_CMN_ERROR) && fields.u32()? != 0;
   if !has(ATTR_CMN_NAME) {
@@ -145,19 +161,30 @@ fn read(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   let device = if has(ATTR_CMN_DEVID) { Some(fields.i32()?) } else { None };
   let kind = if has(ATTR_CMN_OBJTYPE) { Some(fields.u32()?) } else { None };
   let Some(kind) = kind.map(file_type) else { return Some((name, Entry::Name)) };
-  let whole = common & FILE == FILE && file & ATTR_FILE_DATALENGTH != 0;
-  if failed || kind != FileType::File || !whole || device != Some(volume) {
+  let whole = common & LOOK == LOOK
+    && match kind {
+      FileType::File => file & ATTR_FILE_DATALENGTH != 0,
+      FileType::Dir => dir & ATTR_DIR_MOUNTSTATUS != 0,
+      FileType::Symlink | FileType::Other => false,
+    };
+  if failed || !whole || device != Some(volume) {
     return Some((name, Entry::Kind(kind)));
   }
-  let (modified, flags, file_id, size) =
-    (fields.time(), fields.u32()?, fields.u64()?, fields.u64()?);
-  // A time before 1970, and a file in a cloud, are left to `lstat`: not measured.
-  match modified {
-    Some(modified) if flags & SF_DATALESS == 0 => {
-      Some((name, Entry::File { modified, size, file_id }))
+  let (created, modified, flags, file_id) =
+    (fields.time(), fields.time(), fields.u32()?, fields.u64()?);
+  // A time before 1970, and a file in a cloud, are left to `lstat`: not measured. So is a
+  // directory that a disk is mounted on, as the listing tells of the one below the disk.
+  let told = match (kind, created, modified) {
+    (FileType::Dir, Some(created), _) if fields.u32()? == 0 => {
+      let volume = i64::from(volume).cast_unsigned();
+      Entry::Dir { id: DirId { volume, inode: file_id, birth: nanos(created) } }
     }
-    _ => Some((name, Entry::Kind(kind))),
-  }
+    (FileType::File, _, Some(modified)) if flags & SF_DATALESS == 0 => {
+      Entry::File { modified, size: fields.u64()?, file_id }
+    }
+    _ => Entry::Kind(kind),
+  };
+  Some((name, told))
 }
 
 struct Fields<'a> {

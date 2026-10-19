@@ -49,6 +49,12 @@ pub trait Fs {
     self.now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default()
   }
 
+  /// The kind of the file system of `dir` (`nfs`), when other machines can change it too: the OS
+  /// reports only what changes on this machine there.
+  fn remote_disk(&self, _dir: &Path) -> Option<String> {
+    None
+  }
+
   /// Whether a listing can be behind `lstat` for a file that its writer still has open (NTFS).
   /// Then the engine takes a file from a listing only where an OS watch reports the write.
   fn listing_lags(&self) -> bool {
@@ -210,9 +216,53 @@ impl Fs for StdFs {
     START.get_or_init(Instant::now).elapsed()
   }
 
+  fn remote_disk(&self, dir: &Path) -> Option<String> {
+    #[cfg(target_vendor = "apple")]
+    {
+      apple::remote_disk(dir)
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+      linux_remote_disk(dir)
+    }
+    // Windows: a server of SMB tells of its changes, and the handle reports them.
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    {
+      let _ = dir;
+      None
+    }
+  }
+
   fn listing_lags(&self) -> bool {
     cfg!(windows)
   }
+}
+
+/// Linux: the type of the file system tells, not its name (one shared folder of a VM was
+/// `fuseblk`, and later `virtiofs`). FUSE counts, as a folder of the host in a VM is one; so
+/// does a local disk through FUSE, which only costs it one error too many.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_remote_disk(dir: &Path) -> Option<String> {
+  use std::{ffi::CString, mem, os::unix::ffi::OsStrExt};
+
+  const KINDS: [(i128, &str); 6] = [
+    (0x6969, "nfs"),
+    (0x517b, "smb"),
+    (0xff53_4d42, "cifs"),
+    (0xfe53_4d42, "smb2"),
+    (0x0102_1997, "9p"),
+    (0x6573_5546, "fuse"),
+  ];
+  let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
+  // SAFETY: all zeros is a valid value of this plain struct of numbers.
+  let mut answer: libc::statfs = unsafe { mem::zeroed() };
+  // SAFETY: `path` ends with a NUL, and the call writes one whole `struct statfs`.
+  if unsafe { libc::statfs(path.as_ptr(), &raw mut answer) } != 0 {
+    return None;
+  }
+  // The type is 32 bits, in a field that is wider, or signed, on some targets.
+  let kind = i128::from(answer.f_type) & 0xffff_ffff;
+  KINDS.iter().find(|(magic, _)| *magic == kind).map(|(_, name)| (*name).to_owned())
 }
 
 /// Windows: what the calls of std do not tell, and what they cost too much for.
@@ -419,10 +469,11 @@ mod tests {
     assert!(filled.changed > permitted.changed);
   }
 
-  /// On APFS the listing tells of a file what `lstat` tells, also while it is open and written.
+  /// On APFS the listing tells of a file and of a directory what `lstat` tells, also while the
+  /// file is open and written.
   #[cfg(target_vendor = "apple")]
   #[test]
-  fn the_listing_tells_of_a_file_what_lstat_tells() {
+  fn the_listing_tells_what_lstat_tells() {
     use std::{
       io::{self, Write},
       os::unix::fs::symlink,
@@ -441,7 +492,7 @@ mod tests {
     StdFs.read_dir(top.path(), &mut |name, entry| seen.push((name.to_owned(), entry))).unwrap();
     seen.sort_by(|a, b| a.0.cmp(&b.0));
     let [
-      (_, Entry::Kind(FileType::Dir)),
+      (_, Entry::Dir { id }),
       (_, Entry::File { modified, size, file_id }),
       (_, Entry::Kind(FileType::Symlink)),
     ] = seen[..]
@@ -450,6 +501,7 @@ mod tests {
     };
     let meta = StdFs.lstat(&top.path().join("file")).unwrap();
     assert_eq!((modified, size, file_id), (meta.modified, meta.size, meta.file_id));
+    assert_eq!(id, StdFs.lstat(&top.path().join("dir")).unwrap().dir_id);
 
     // A pipe is no directory: the listing fails and does not wait for a writer.
     let pipe = top.path().join("pipe");

@@ -4,7 +4,7 @@ use std::{
   collections::hash_map::Entry,
   ffi::OsStr,
   fs::File,
-  io::{self, Read, Write},
+  io::{self, Read, Seek, SeekFrom, Write},
   iter,
   os::{
     fd::{AsRawFd, RawFd},
@@ -29,6 +29,11 @@ const WATCH_ENDED: u32 = libc::IN_IGNORED | libc::IN_UNMOUNT | libc::IN_DELETE_S
 const NEW_CONTENT: u32 = libc::IN_MODIFY | libc::IN_CREATE | libc::IN_MOVED_TO;
 const READ_BUFFER_LEN: usize = 64 * 1024;
 const READ_INTERVAL: Duration = Duration::from_millis(1);
+/// The kernel tells of each mount and unmount of the namespace by a priority event on it.
+const MOUNTS: &str = "/proc/self/mountinfo";
+/// The record of a mount point that the reader makes: no watch has this number, and an
+/// overflow has -1.
+const MOUNT_WD: i32 = -2;
 
 const ERROR_WATCH_LIMIT: &str =
   "inotify has no watch left for this user (raise fs.inotify.max_user_watches)";
@@ -59,6 +64,8 @@ impl Keys {
 struct Fds {
   inotify: File,
   stop: File,
+  /// `MOUNTS`, where it can be opened.
+  mounts: Option<File>,
 }
 
 impl InotifyBackend {
@@ -68,10 +75,12 @@ impl InotifyBackend {
       _ => error,
     };
     let (inotify, stop) = (ffi::inotify().map_err(no_room)?, ffi::eventfd().map_err(no_room)?);
-    let fds = Arc::new(Fds { inotify, stop });
+    let mounts = File::open(MOUNTS).ok();
+    let known = mounts.as_ref().and_then(read_mounts).unwrap_or_default();
+    let fds = Arc::new(Fds { inotify, stop, mounts });
     let reader = thread::Builder::new().name("pathwatch-inotify".to_owned()).spawn({
       let fds = Arc::clone(&fds);
-      move || forward(&fds, &sink)
+      move || forward(&fds, known, &sink)
     })?;
     Ok(Self {
       fds,
@@ -164,6 +173,10 @@ impl Backend for InotifyBackend {
     let mut rest = raw.as_slice();
     while let Some((event, tail)) = split_event(rest) {
       rest = tail;
+      if event.wd == MOUNT_WD {
+        hint(Hint::Mount { path: Path::new(OsStr::from_bytes(event.name)) });
+        continue;
+      }
       if event.mask & libc::IN_Q_OVERFLOW != 0 {
         hint(Hint::Lost);
         continue;
@@ -214,15 +227,26 @@ impl Drop for InotifyBackend {
   }
 }
 
-fn forward(fds: &Fds, sink: &Sink<Vec<u8>>) {
+/// `known`: the mounts when the backend started.
+fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
   let mut buffer = vec![0; READ_BUFFER_LEN];
   let mut next_read = Instant::now();
   let error = loop {
-    match ffi::wait_until_readable([&fds.inotify, &fds.stop]) {
-      Ok([_, true]) => return,
-      Ok(_) => {}
+    let mounted = match ffi::wait_until_ready(&fds.inotify, &fds.stop, fds.mounts.as_ref()) {
+      Ok([_, true, _]) => return,
+      Ok([_, _, mounted]) => mounted,
       Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
       Err(error) => break error,
+    };
+    // inotify says nothing of a volume that is mounted over a watched directory or one above:
+    // the mount points that came or went are told by their paths.
+    if mounted && let Some(mounts) = fds.mounts.as_ref().and_then(read_mounts) {
+      let raw = mount_records(&known, &mounts);
+      known = mounts;
+      if !raw.is_empty() {
+        sink.raw(raw);
+      }
+      continue;
     }
     // At most one read a millisecond, unless the last read filled over half of the buffer:
     // a flood of small writes would wake the reader for each.
@@ -240,6 +264,62 @@ fn forward(fds: &Fds, sink: &Sink<Vec<u8>>) {
     }
   };
   sink.failed(error);
+}
+
+/// The mounts of the namespace, each by its id with its mount point, in order. Mount ids and
+/// not only points: a volume mounted over another one at the same point is a change too.
+fn read_mounts(mut file: &File) -> Option<Vec<(u64, Vec<u8>)>> {
+  let mut text = Vec::new();
+  file.seek(SeekFrom::Start(0)).ok()?;
+  file.read_to_end(&mut text).ok()?;
+  let mut mounts: Vec<(u64, Vec<u8>)> = text
+    .split(|&byte| byte == b'\n')
+    .filter_map(|line| {
+      let mut fields = line.split(|&byte| byte == b' ');
+      let id = str::from_utf8(fields.next()?).ok()?.parse().ok()?;
+      Some((id, unescape(fields.nth(3)?)))
+    })
+    .collect();
+  mounts.sort_unstable();
+  Some(mounts)
+}
+
+/// A mount point with its space, tab, newline and backslash as the kernel writes them: `\040`.
+fn unescape(field: &[u8]) -> Vec<u8> {
+  let mut text = Vec::with_capacity(field.len());
+  let mut rest = field;
+  while let Some((&byte, tail)) = rest.split_first() {
+    let octal = tail
+      .first_chunk::<3>()
+      .filter(|digits| byte == b'\\' && digits.iter().all(|digit| (b'0'..=b'7').contains(digit)));
+    if let Some(digits) = octal {
+      text.push(digits.iter().fold(0_u8, |sum, digit| sum.wrapping_mul(8) + (digit - b'0')));
+      rest = &tail[3..];
+    } else {
+      text.push(byte);
+      rest = tail;
+    }
+  }
+  text
+}
+
+/// One record for each mount point that came or went, laid out as the kernel lays out an event.
+fn mount_records(old: &[(u64, Vec<u8>)], new: &[(u64, Vec<u8>)]) -> Vec<u8> {
+  let came = new.iter().filter(|mount| old.binary_search(mount).is_err());
+  let went = old.iter().filter(|mount| new.binary_search(mount).is_err());
+  let mut points: Vec<&[u8]> = came.chain(went).map(|(_, point)| point.as_slice()).collect();
+  points.sort_unstable();
+  points.dedup();
+  let mut raw = Vec::new();
+  for point in points {
+    let name_len = u32::try_from(point.len() + 1).unwrap_or(u32::MAX);
+    for field in [MOUNT_WD.to_ne_bytes(), [0; 4], [0; 4], name_len.to_ne_bytes()] {
+      raw.extend_from_slice(&field);
+    }
+    raw.extend_from_slice(point);
+    raw.push(0);
+  }
+  raw
 }
 
 struct Event<'a> {
@@ -297,11 +377,23 @@ mod ffi {
     unsafe { libc::inotify_rm_watch(inotify.as_raw_fd(), wd) };
   }
 
-  pub(super) fn wait_until_readable(files: [&File; 2]) -> io::Result<[bool; 2]> {
-    let mut polled =
-      files.map(|file| libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLIN, revents: 0 });
-    // SAFETY: `polled` holds two `pollfd`, and the call writes into these two only.
-    if unsafe { libc::poll(polled.as_mut_ptr(), 2, -1) } < 0 {
+  /// Whether `inotify` and `stop` are readable, and whether the mounts changed. A file of the
+  /// mounts always reads, and tells of a change by a priority event.
+  pub(super) fn wait_until_ready(
+    inotify: &File,
+    stop: &File,
+    mounts: Option<&File>,
+  ) -> io::Result<[bool; 3]> {
+    let wait = |fd: i32, events: i16| libc::pollfd { fd, events, revents: 0 };
+    // A negative descriptor is left out.
+    let mounts = mounts.map_or(-1, AsRawFd::as_raw_fd);
+    let mut polled = [
+      wait(inotify.as_raw_fd(), libc::POLLIN),
+      wait(stop.as_raw_fd(), libc::POLLIN),
+      wait(mounts, libc::POLLPRI),
+    ];
+    // SAFETY: `polled` holds three `pollfd`, and the call writes into these three only.
+    if unsafe { libc::poll(polled.as_mut_ptr(), 3, -1) } < 0 {
       return Err(io::Error::last_os_error());
     }
     Ok(polled.map(|file| file.revents != 0))
@@ -331,14 +423,14 @@ mod tests {
   fn read_error_is_reported_and_ends_the_reader() {
     let dir = tempfile::tempdir().unwrap();
     let (stop, _peer) = UnixStream::pair().unwrap();
-    let fds =
-      Fds { inotify: File::open(dir.path()).unwrap(), stop: File::from(OwnedFd::from(stop)) };
+    let inotify = File::open(dir.path()).unwrap();
+    let fds = Fds { inotify, stop: File::from(OwnedFd::from(stop)), mounts: None };
     let (sender, signals) = mpsc::channel();
     let sink = Sink::new(move |signal| {
       let _ = sender.send(signal);
     });
 
-    forward(&fds, &sink);
+    forward(&fds, Vec::new(), &sink);
 
     let Ok(Signal::Failed(error)) = signals.try_recv() else { panic!("no failure was reported") };
     assert_eq!(error.raw_os_error(), Some(libc::EISDIR));

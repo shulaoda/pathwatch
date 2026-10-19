@@ -102,6 +102,9 @@ pub enum Hint<'a> {
   Written { dir: DirKey, rel: &'a Path },
   /// Notifications were lost, and the backend cannot say where.
   Lost,
+  /// A volume was mounted or unmounted at `path`, a real path: another directory may stand
+  /// there now. The backend knows no key for it.
+  Mount { path: &'a Path },
 }
 
 /// The way from a thread of the backend into the engine. It never blocks.

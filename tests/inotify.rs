@@ -11,6 +11,7 @@ use std::{
     fs::{PermissionsExt, symlink},
   },
   path::{Path, PathBuf},
+  process::Command,
   sync::mpsc::{self, Receiver, TryRecvError},
   thread,
   time::{Duration, Instant},
@@ -30,6 +31,7 @@ enum Seen {
   Changed(DirKey, PathBuf),
   Written(DirKey, PathBuf),
   Lost,
+  Mount(PathBuf),
 }
 
 /// `""` is the directory of `dir` itself.
@@ -146,6 +148,7 @@ impl Harness {
         Hint::Changed { dir, rel } => Seen::Changed(dir, rel.to_owned()),
         Hint::Written { dir, rel } => Seen::Written(dir, rel.to_owned()),
         Hint::Lost => Seen::Lost,
+        Hint::Mount { path } => Seen::Mount(path.to_owned()),
       });
     });
     seen
@@ -539,10 +542,32 @@ fn missing_path_and_file_fail() {
   assert_eq!(h.watches(), 0);
 }
 
+/// A volume that is mounted over a watched directory, or unmounted, is told by its mount point:
+/// inotify says nothing of it. A user namespace with its own mounts can mount without root:
+///
+/// ```sh
+/// unshare -Urm cargo test -p pathwatch --test inotify -- --ignored mount
+/// ```
+#[test]
+#[ignore = "mounts a volume, see the comment"]
+fn a_mount_over_a_watched_directory_is_told() {
+  let mut h = Harness::new();
+  // The kernel writes a space in a mount point as `\040`.
+  fs::create_dir_all(h.path("a b/sub")).unwrap();
+  h.watch(1, "a b", Want::Contents);
+  h.watch(2, "a b/sub", Want::Contents);
+  let point = fs::canonicalize(h.path("a b")).unwrap();
+  let run = |command: &mut Command| assert!(command.status().unwrap().success(), "{command:?}");
+  run(Command::new("mount").args(["-t", "tmpfs", "tmpfs"]).arg(&point));
+  assert_eq!(h.hints_until(&Seen::Mount(point.clone())), [Seen::Mount(point.clone())]);
+  run(Command::new("umount").arg(&point));
+  h.hints_until(&Seen::Mount(point));
+}
+
 /// A user namespace can lower the limit without root:
 ///
 /// ```sh
-/// unshare -Ur sh -c 'echo 8 > /proc/sys/user/max_inotify_watches &&
+/// unshare -Urm sh -c 'echo 8 > /proc/sys/user/max_inotify_watches &&
 ///   cargo test -p pathwatch --test inotify -- --ignored'
 /// ```
 #[test]
@@ -591,6 +616,9 @@ fn masks_map_to_hints() {
   for mask in [libc::IN_MOVE_SELF, libc::IN_MOVE_SELF | libc::IN_ISDIR] {
     assert_eq!(h.translate(event(wd, mask, "")), [changed(key, "")], "{mask:#x}");
   }
+  // A mount point that the reader found: a record of its own, under no watch.
+  let mount = event(-2, 0, "/mnt/a b");
+  assert_eq!(h.translate(mount), [Seen::Mount(PathBuf::from("/mnt/a b"))]);
   assert_eq!(h.wd(key), Some(wd));
   for (index, mask) in [(1, libc::IN_DELETE_SELF), (2, libc::IN_UNMOUNT)] {
     // The kernel watch is still there: the second key gets it, after the first forgot it.

@@ -6,7 +6,7 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use super::{Engine, check::is_missing};
+use super::{Engine, Once, check::is_missing};
 use crate::{
   backend::{Backend, Committed, Coverage, DirKey, Want, is_watch_limit, same},
   config::EntryKind,
@@ -81,6 +81,19 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let answer = self.watch_dir(key, path, want);
     self.set_watch(key, answer, path);
     self.tree.queue_scan(key, Depth::Shallow);
+  }
+
+  /// An OS watch reports only what changes on this machine: on a disk that other machines change
+  /// too, the handler is told once for the disk.
+  fn tell_remote_disk(&mut self, key: DirKey, path: &Path) {
+    let Some(volume) = self.tree[key].dir().map(|dir| dir.id.volume) else { return };
+    if !self.once.insert(Once::AskedDisk(volume)) {
+      return;
+    }
+    if let Some(kind) = self.fs.remote_disk(path) {
+      let what = format!("a disk of {kind}: polling finds those changes (`with_polling`)");
+      self.report(ErrorKind::RemoteDisk, Some(path.to_path_buf()), Some(io::Error::other(what)));
+    }
   }
 
   /// After `unwatch` the directory may want names only: its watch for the contents is given back
@@ -233,13 +246,19 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     };
     dir.watch = new;
     self.tree.list_if_polled(key);
+    if matches!(new, Watch::Watched | Watch::WatchedTree) {
+      self.tell_remote_disk(key, path);
+    }
     if let Some(error) = to_report {
       let kind = match error.kind() {
         _ if is_watch_limit(&error) => ErrorKind::WatchLimit,
         io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
         _ => ErrorKind::Io,
       };
-      self.report(kind, Some(path.to_path_buf()), Some(error));
+      // A tree past the limit finds no room for one directory after the other.
+      if kind != ErrorKind::WatchLimit || self.once.insert(Once::ToldWatchLimit) {
+        self.report(kind, Some(path.to_path_buf()), Some(error));
+      }
     }
     if old == Watch::WatchedTree && new != Watch::WatchedTree {
       // The nodes below relied on this watch. A deep scan asks for a watch for each of them.

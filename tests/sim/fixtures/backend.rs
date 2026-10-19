@@ -222,6 +222,7 @@ impl Backend for SimBackend {
         return;
       }
       What::Overflow => return hint(Hint::Lost),
+      What::Mount => return hint(Hint::Mount { path: &raw.path }),
       What::Entry | What::Moved | What::Written => {}
     }
     let Some(keys) = self.keys.get(&raw.watch) else { return };
@@ -367,6 +368,15 @@ enum What {
   Lost,
   /// The OS lost notifications of every watch.
   Overflow,
+  /// A volume came or went at the path, which no watch tells (inotify).
+  Mount,
+}
+
+impl SimRaw {
+  /// A volume came or went at the real path `path`: the backend tells it by its path.
+  pub fn mount(path: &str) -> Self {
+    Self { watch: 0, path: path.into(), what: What::Mount }
+  }
 }
 
 /// The OS side of the watches. It is a part of the disk, not of the backend, because it must see

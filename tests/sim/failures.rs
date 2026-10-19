@@ -258,6 +258,39 @@ fn a_failed_commit() {
   caught_up(&mut d);
 }
 
+/// A tree past the watch limit finds no room for one new directory after the other: the
+/// handler is told once.
+#[test]
+fn the_watch_limit_is_reported_once() {
+  let mut d = driver(Mode::Inode);
+  d.fs.mkdir_all("/p/r").unwrap();
+  d.fs.set_watch_limit(Some(2));
+  d.watch(&["/p/r"]);
+  for dir in ["a", "b", "c"] {
+    d.fs.mkdir_all(format!("/p/r/{dir}")).unwrap();
+    d.fs.write(format!("/p/r/{dir}/file"), "1").unwrap();
+    Sim::settled(&mut d);
+  }
+  assert_eq!(Sim::errors(&d), [ErrorKind::WatchLimit]);
+  caught_up(&mut d);
+}
+
+/// On a disk that other machines change too, the OS reports only what changes here: the handler
+/// is told once for the disk, and not where the disk is polled anyway.
+#[test]
+fn a_disk_that_other_machines_change_is_told_once() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().mkdir_all("/net/a").unwrap();
+    d.fs().mkdir_all("/net/b").unwrap();
+    d.fs().set_remote(Some("nfs"));
+    d.watch(&["/net/a"]);
+    d.watch(&["/net/b"]);
+    let told: &[ErrorKind] = if on == "Poll" { &[] } else { &[ErrorKind::RemoteDisk] };
+    assert_eq!(d.errors(), told, "{on}");
+    d.caught_up();
+  });
+}
+
 /// A watch for a tree that the backend cannot give. Nothing below it may be left without a
 /// watch and without the poll. Where the backend answers for a whole tree, `commit` takes that
 /// answer back: the directories below relied on it, so each is asked for by itself, fails too,

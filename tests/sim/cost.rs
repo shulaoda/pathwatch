@@ -125,6 +125,7 @@ enum Kept {
   Changed(DirKey, PathBuf),
   Written(DirKey, PathBuf),
   Lost,
+  Mount(PathBuf),
 }
 
 impl Kept {
@@ -133,6 +134,7 @@ impl Kept {
       Hint::Changed { dir, rel } => Kept::Changed(dir, rel.to_path_buf()),
       Hint::Written { dir, rel } => Kept::Written(dir, rel.to_path_buf()),
       Hint::Lost => Kept::Lost,
+      Hint::Mount { path } => Kept::Mount(path.to_path_buf()),
     }
   }
 
@@ -141,6 +143,7 @@ impl Kept {
       Kept::Changed(dir, rel) => Hint::Changed { dir: *dir, rel },
       Kept::Written(dir, rel) => Hint::Written { dir: *dir, rel },
       Kept::Lost => Hint::Lost,
+      Kept::Mount(path) => Hint::Mount { path },
     }
   }
 }

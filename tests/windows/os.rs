@@ -156,6 +156,7 @@ impl Harness {
         Hint::Changed { dir, rel } => Seen::Changed { key: dir, rel: rel.to_owned() },
         Hint::Written { dir, rel } => Seen::Written { key: dir, rel: rel.to_owned() },
         Hint::Lost => Seen::Lost,
+        Hint::Mount { .. } => panic!("only inotify tells of a mount by its path"),
       });
     });
     seen

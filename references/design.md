@@ -32,7 +32,7 @@ watcher.close();
 | `close()` | Stops the backend and waits for the thread. After it the handler is not called again, and `watch` and `unwatch` return `Closed`. A check of the disk that runs ends at its next step, so the wait is one look at most. Dropping the watcher calls it. |
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
-| `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
+| `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `RemoteDisk`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
 | `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, none on macOS and 20 ms elsewhere (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and 50 ms elsewhere, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
@@ -194,10 +194,14 @@ There is a node for
 
 A node that is none of these is freed (`Tree::prune`).
 
-How it is stored (only `tree/mod.rs` knows it): all nodes live in one arena. A key is an index and
-a generation, so an old key never names a new node. A node has the list of its children, and
-one table for the whole tree finds a child by (parent, name). Small tables next to the arena
-hold what only a few nodes have: the link of a registered name (5.14), the content hash of a
+How it is stored (only `tree/mod.rs` knows it): all nodes live in one arena. A key is an index and a
+generation, so an old key never names a new node. The arena and the names are kept in blocks of
+64 KiB, and a full block never moves: they grow with no copy of what is there. (Grown as one block
+each, they were held twice for a moment at each growth, and macOS keeps the pages that are freed:
+the heap of a watcher of 50,000 files went up to 8.0 MiB for 4.3 MiB in use, and its footprint with
+it. In blocks: 4.8 MiB, and 14 MiB allocated in all instead of 39.) A node has the list of its
+children, and one table for the whole tree finds a child by (parent, name). Small tables next to the
+arena hold what only a few nodes have: the link of a registered name (5.14), the content hash of a
 young file (5.8), and the time of a hold (5.9).
 
 A tree that gets smaller gives its memory back (`Tree::give_back`). A node never moves,
@@ -207,17 +211,16 @@ and the table get smaller. Measured with a million nodes (94 bytes each, 91 MiB)
 them go, nothing stays; when the node that was made last stays, 71 MiB stay. A tree that goes
 and comes back pays for its memory again, as the first time (54 ns for a node, not 12).
 
-What a watcher holds, measured on macOS (the heap of the process, by `vmmap`): 0.1 MiB with
-nothing watched; 4.3 MiB for one watched directory with 50,000 files in 5,000 directories (86
-bytes for a file); 3.0 MiB for 20,000 files in 2,000 directories that are each watched by
-their own path (150 bytes for a file: the backend keeps the real path of each directory
-twice). While a `watch` call runs, the heap holds its paths once more, for the thread of the
-watcher, and the arena twice for a moment each time it grows. The lists of a flush keep their
-memory for the next flush only up to 16 KiB each (`emptied`): a longer one is given back when
-the flush ends. The usual work of a watcher that runs for days asks for no memory: a `watch`
-of paths that are watched already (in their clean form), an `unwatch` of a path and a poll
-allocate nothing, and a flush allocates for the paths of its events only
-(`tests/sim/allocations.rs` keeps the budgets).
+What a watcher holds, measured on macOS (the heap of the process, by `vmmap`): 0.1 MiB with nothing
+watched; 4.3 MiB for one watched directory with 50,000 files in 5,000 directories (86 bytes for a
+file); 3.0 MiB for 20,000 files in 2,000 directories that are each watched by their own path (150
+bytes for a file: the backend keeps the real path of each directory twice). While a `watch` call
+runs, the heap holds its paths once more, for the thread of the watcher. The lists of a flush keep
+their memory for the next flush only up to 16 KiB each (`emptied`): a longer one is given back when
+the flush ends. The usual work of a watcher that runs for days asks for no memory: a `watch` of
+paths that are watched already (in their clean form), an `unwatch` of a path and a poll allocate
+nothing, and a flush allocates for the paths of its events only (`tests/sim/allocations.rs` keeps
+the budgets).
 
 **`complete` is a rule.** A directory node is complete when its path is a watched path, or
 when its parent is complete, and in both cases the filter does not ignore it as a directory.
@@ -825,8 +828,9 @@ that the backend answered `NotWatched` for, and what failed. The timer runs only
 holds more than the root, a child of the root is not on disk (a drive that is not there yet), a
 registered name is a link (5.14), or a flush left work behind because the disk stopped
 answering, which the next poll takes up: with inotify, which watches the directories above too,
-the thread sleeps until a notification comes. With the poll backend every answer is
-`NotWatched`, so every node is polled, and the timer is the poll interval. **Polling is this
+and with FSEvents, whose guard does (7.2), the thread sleeps until a notification comes. With
+the poll backend every answer is `NotWatched`, so every node is polled, and the timer is the
+poll interval. **Polling is this
 timer with the poll backend.**
 
 **Asked again.** `NotWatched` is not for ever. A commit can start an OS watch for a tree that
@@ -927,7 +931,22 @@ have, and answers that depended on which directories existed. Rule 2 replaces it
 | anything else | no answer: the tree stays as it is, no `Delete` is told, the mark stays for the next flush; reported once; the node is polled |
 
 A failed `watch` is reported in the same way (`WatchLimit`, `PermissionDenied` or `Io`), but not
-when the directory is gone: the scan that follows finds it missing.
+when the directory is gone: the scan that follows finds it missing. `WatchLimit` is reported once
+for the life of the engine, not once for each directory: a tree past the limit finds no room for one
+new directory after the other, and each was one more error (`the_watch_limit_is_reported_once`).
+
+**A disk that other machines change too** (NFS, SMB, a folder of the host in a VM or a container):
+an OS watch reports only what changes on this machine, and no error of the OS says so. Measured: a
+folder of the Mac in a VM of Linux (virtiofs, FUSE) gave no inotify event for a write made on the
+Mac; NFS on macOS gave no FSEvents record within 15 s for a write made in the VM. So the first OS
+watch on each disk (by its device) asks the type of the file system (`Fs::remote_disk`, one
+`statfs`: 0.2 to 3 µs): on macOS a disk that is not `MNT_LOCAL`, on Linux NFS, SMB, CIFS, 9P and
+FUSE, by the number of the type and not its name (the same folder was `fuseblk`, and later
+`virtiofs`). The handler is told once for each such disk (`RemoteDisk`), and nothing more is polled:
+a big tree on a slow disk read every second can cost more than the changes are worth, which only the
+user can weigh (`with_polling`). A local disk through FUSE is told too (an error too many), and a
+disk that is polled anyway is not told (`a_disk_that_other_machines_change_is_told_once`). Windows
+asks nothing: a server of SMB reports the changes of other machines to the handle.
 
 ### 5.13 Time and the queue
 
@@ -1065,6 +1084,8 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   - `Written { dir, rel }`: the content of the file at `rel` was written. For a directory it
     means nothing.
   - `Lost`: notifications were lost, and the backend cannot say where. Check everything.
+  - `Mount { path }`: a volume was mounted or unmounted at the real path `path`, and the backend
+    knows no key for it (inotify, 7.1). The engine checks the node at that path, if it has one.
 - `Sink` is the way from a backend thread into the engine. It never blocks. It hands over a
   `Signal`: `raw` a raw notification, for `translate` on the watcher thread, and `failed` the
   word that the backend cannot go on. From then on the engine polls everything, and it drops
@@ -1144,6 +1165,18 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   next read. While events wait in the queue, the kernel merges one that repeats the last one,
   and the two threads wake up a thousand times a second at most (the probe below). The watcher
   thread adds and removes the kernel watches itself, so nothing needs a lock.
+- **A volume mounted or unmounted** over a watched directory, or over a directory above one, gives
+  no inotify event (measured: tmpfs over a watched directory, its parent and its grandparent; the
+  watches stay on the directories that the volume hides). The reader thread also waits on
+  `/proc/self/mountinfo`, where the kernel tells of each mount and unmount of the namespace by a
+  priority event (`POLLPRI`; measured: 19 to 27 ms after `mount`, none in idle time, none for a
+  mount in another namespace). Then it reads the table again and compares it with the last one by
+  mount id, as a volume mounted over another one at the same point is a change too, and each mount
+  point that came or went becomes a record of its own (`wd` -2) → `Hint::Mount` with the path. The
+  engine checks the node at that path, if it has one, and finds another directory there by its
+  identity (`a_mount_over_a_watched_directory_is_told`,
+  `a_volume_mounted_over_a_watched_directory`). The path is real, so a mount that a watched path
+  reaches through a link is not found this way. (macOS tells it in its own way, 7.2.)
 - `ENOSPC` → `Failed` with the watch limit error. Every other error → `Failed` with that error.
   `EMFILE` and `ENFILE` when the backend starts are the limit of inotify instances
   (`fs.inotify.max_user_instances`) or of open files: the watch limit error too.
@@ -1174,7 +1207,8 @@ default, two events for a new file):
   of the queue less often.
 - A directory that is shared with another machine (seen from a virtual machine, file system
   `fuseblk`): `inotify_add_watch` works, changes that are made inside the machine come, and
-  changes that the other machine makes do not come at all. Nothing tells the backend so.
+  changes that the other machine makes do not come at all. Nothing tells the backend so: the
+  engine asks the type of the file system (5.12).
 - The queue and its lock belong to the inotify instance. With the directories on two
   instances the overflow is gone or rare, with four it is gone, also when one thread reads
   all of them. This is not built: a user has 128 instances by default, an overflow needs more
@@ -1206,18 +1240,30 @@ Facts from probes on macOS (APFS):
   769 open files. And a stream with it takes 0.09 to 0.16 ms to make for each path (paths
   of 9 and of 11 names), without it 0.002 ms. (Other watchers that set it stop watching on
   that record, or report the watched directory as removed: Watchman, .NET, notify, watchdog.)
-- Not used any more (see "The check of the stream paths" below): the kernel tells about a
-  rename or a removal of a directory through a queue for vnode
-  events (`kqueue`, `EVFILT_VNODE` with `NOTE_RENAME`, `NOTE_DELETE`, `NOTE_REVOKE`), on a
-  descriptor of that very directory that was opened for events only (`O_EVTONLY`; it does
-  not keep a disk from being unmounted). Measured: the event is there when `rename` returns;
-  two renames with no pause give one event; none was missed in 4,000 runs of "rename away,
-  make a file below, rename back", of a rename that only changes the case, of a swap of two
-  directories in one call, and of a directory that is replaced; the same on APFS, HFS+,
-  exFAT and FAT32. Nothing comes on a descriptor of a directory below the renamed one, so
-  each directory on the way needs its own. To open and register one takes 10 µs.
+- Used by the guard (below): the kernel tells about a rename or a removal of a directory
+  through a queue for vnode events (`kqueue`, `EVFILT_VNODE` with `NOTE_RENAME`,
+  `NOTE_DELETE`, `NOTE_REVOKE`), on a descriptor of that very directory that was opened for
+  events only (`O_EVTONLY`; it does not keep a disk from being unmounted: `diskutil eject`
+  works, and the descriptor gets `NOTE_REVOKE`). Measured: the event is there when `rename`
+  returns; two renames with no pause give one event; none was missed in 4,000 runs of
+  "rename away, make a file below, rename back", of a rename that only changes the case, of a
+  swap of two directories in one call, and of a directory that is replaced; the same on APFS,
+  HFS+, exFAT and FAT32. Nothing comes on a descriptor of a directory below the renamed one, so
+  each directory on the way needs its own. To open and register one takes 10 µs, and the
+  kernel keeps 248 bytes for it (a `fileproc`, a `fileglob` and a `knote`; 10,000 of them
+  added 10,000 of each in `zprint`); the process itself keeps nothing more. A queue that waits
+  takes no time: 0.02 ms of CPU in 5 s with 10,000 directories. A dispatch source of type
+  `READ` on the descriptor of the queue calls its handler 0.6 ms after a rename, and again
+  while events wait: 200 that waited at once came in 4 calls of at most 64.
   `fcntl(F_GETPATH)` on such a descriptor gives the path of the directory as it is now, in
   0.3 µs, in the short spelling of a path on the data volume (`/Users/...`).
+- A volume mounted on a directory (a disk image): the descriptors of that directory and of one
+  below it get no event, and the one of its parent only `NOTE_WRITE`. A stream below the mount
+  point gets no record, and goes on by the text of its path, into the volume. A stream at or
+  above the mount point gets a record for it with `Mount` (`Unmount` when the volume goes),
+  and with no `ItemIsDir`. The kernel queue tells of each volume that comes or goes
+  (`EVFILT_FS` with `VQ_MOUNT | VQ_UNMOUNT`; also for a process that is not root, and only
+  the kinds asked for), and not where.
 - Flags are merged and stay set for many seconds. So flags are never read as "what happened".
 - Stopping a stream throws away what it has not delivered.
 - Records are lost without a word when one stream takes over from another while files are
@@ -1242,6 +1288,9 @@ Facts from probes on macOS (APFS):
   1 ms next to few files, 0.1 to 0.2 s next to 100,000, 0.3 to 0.9 s next to 360,000 (a
   `target/debug/deps` that was never cleaned). The same program is fast again from a copy in
   another directory.
+- `FSEventStreamStart` waits for an answer of fseventsd, with no time limit. While fseventsd
+  is busy, a start took 16 to 430 ms, and 20,000 `watch` calls of one file each took 13.8 s
+  in place of 0.47 s.
 - Limits: 512 started streams for a process, 4,096 paths for a stream.
 - A write to a file that stays open, and a write through `mmap`, is not reported before close.
 - Many stream paths lose nothing, but they are slow while other programs write a lot. Time
@@ -1258,7 +1307,9 @@ As built:
   real path with every key, in a table by path (`Dirs`). `watch(key, dir, Contents)`: if no
   stream reports the real path of `dir` yet, it goes into the stream of the next `commit`; the
   answer is `WatchedTree`. `watch(key, dir, Names)`: `WatchedTree` if a stream reports the
-  directory, else `NotWatched`. A stream never stands on `/`, `/Users` or a home directory
+  directory, else `Watched`: names come and go in a directory on the way only when one of them
+  is renamed or removed, and the guard of that one tells (below), as its own guard does for
+  the directory. A stream never stands on `/`, `/Users` or a home directory
   (`may_hold_a_stream`), where every program of the user writes: a cover there is answered
   `NotWatched` and polled, as a handle of Windows is never put on `C:\`, `C:\Users` or
   `C:\Users\<name>` (7.3). (Before, a watched path whose lowest existing directory was the
@@ -1281,14 +1332,18 @@ As built:
   its parent, which is kept until the next commit, and of its own name as the disk spells it
   (one `getattrlist` call). A link, and a name that differs by more than the case of ASCII
   letters, are left to the OS (`realpath`).
-- **Streams are only added.** `commit` starts streams for the new paths. Old streams keep
-  running, so nothing is ever in a gap. With 64 streams running (`MAX_STREAMS`), with too many
-  stream paths, or when a new path lies above a running one, `commit` starts new streams for
-  all covers in their place: so no stream path lies below another, and no record comes twice
-  for long. The covers are then placed on 56 paths, not 64: room for the paths of the next
-  few commits, so that a few new directories do not replace every stream again. If the
-  streams cannot start, `commit` names every key of the new paths as failed, with the watch
-  limit error, and the old streams keep running.
+- **Streams are only added.** `commit` starts streams for the new paths. Old streams keep running,
+  so nothing is ever in a gap. With 64 streams running (`MAX_STREAMS`), with too many stream paths,
+  or when a new path lies above a running one, `commit` places all covers again: so no stream path
+  lies below another, and no record comes twice for long. The covers are then placed on 56 paths,
+  not 64: room for the paths of the next few commits, so that a few new directories do not replace
+  every stream again. A running stream whose paths are all placed again, and still trusted, goes on
+  (the newest of two on one path): new streams start for the other paths only, and only the streams
+  that do not fit are replaced. With 64 streams running, only the 24 with the most covers at and
+  below their paths go on, so that the next commits have room. (Before 2026-10-19 every stream was
+  replaced: after one `watch` call for each of 20,000 files, the stops of the old streams made the
+  engine read 44,058 entries again, 11,990 now.) If the streams cannot start, `commit` names every
+  key of the new paths as failed, with the watch limit error, and the old streams keep running.
 - **Up to 8 streams for a commit** (`MAX_NEW_STREAMS`; more only where a stream would get more
   than 4,096 paths). The paths of a commit go to its streams in turn: so neighbours in the
   tree have different streams, and a flood over many watched directories is shared by all of
@@ -1302,22 +1357,30 @@ As built:
   (390 ms before, with one stream for all covers and a limit of 8). What stays: covers that
   share one stream path (more than 64 directories with one directory above them, or a watched
   tree) have one stream, and a flood below it can still end in a loss report.
-- **An old stream that stops.** A replaced stream runs on for 500 ms next to the new ones. When
-  it is stopped, the backend puts one loss report into the queue (`MustScanSubDirs` for `/`,
-  so `Lost`), and the engine reads everything again: a stream that stops takes with it what it
-  has not delivered, and the new one may not have told everything from its first moments (see
-  the probe). Streams that stop at the same time share one report, and the scans of loss
-  reports are paced (5.13). The stop is made by the first `commit` or `translate` after the
-  500 ms: the poll of the directories above the covers brings a `commit` every second, so an
-  old stream does not wait for the next change. At most 72 old streams run on
-  (`MAX_RETIRING_STREAMS`: as many as can run at a time, so the streams of one replacement
-  always keep their 500 ms). With more, the oldest are stopped at once, in the same way, so
-  that commits that come fast do not use up the 512 streams.
+- **An old stream that stops.** A replaced stream runs on for 500 ms next to the new ones. When it
+  is stopped, the backend reports each cover at and below its paths lost, and the engine reads them
+  again: a stream that stops takes with it what it has not delivered, and the new one may not have
+  told everything from its first moments (see the probe). A cover above its paths has a stream above
+  of its own, as trusted stream paths never lie one below another: that stream goes on, or stops
+  with a report of its own, or came with the replacement and started before the cover was read, as
+  for every new cover. (Before 2026-10-19 the report was for `/`, so `Lost`, and the engine read
+  everything.) Streams that stop at the same time share one report, and the scans of loss reports
+  are paced (5.13). A stream stops on the queue of the streams, and the report goes from there after
+  the stop, but the thread of the watcher does not wait for it: a callback can keep the queue for a
+  long time, and under a busy fseventsd the waits for 1,161 stops in one `watch` call for each of
+  20,000 files came to 21 to 27 s. The `Drop` of the backend waits on the queue, after these stops:
+  no report comes after it. The stop is made by the first `commit` or `translate` after the 500 ms:
+  the replacement sets a timer on the queue of the guard (`EVFILT_TIMER`), whose notice brings a
+  `translate` then, so an old stream does not wait for the next change, which would pay for the
+  reading of its covers. At most 72 old streams run on (`MAX_RETIRING_STREAMS`: as many as can run
+  at a time, so the streams of one replacement always keep their 500 ms). With more, the oldest are
+  stopped at once, in the same way, so that commits that come fast do not use up the 512 streams.
 - **Hints.** A record becomes one `Changed` for each key of each cover that holds its path;
   the rest of the path is `rel`. The covers are found by one table lookup for each directory
   above the path that can be a cover. A record under no cover is dropped: a stream path on a
   common directory also reports what lies next to the covers. A directory record without
-  `Created`, `Removed` or `Renamed` is dropped.
+  `Created`, `Removed` or `Renamed` is dropped. A record with `Mount` or `Unmount` is for a
+  directory, though it does not say so.
 - **Lost records.** A record with `MustScanSubDirs` for a path other than `/` → `Changed` with
   an empty `rel` for each key of every cover that holds the path, and of every cover below the
   path. If there is no such cover, no hint: no key can see that place. A record for `/`, and
@@ -1340,27 +1403,62 @@ As built:
   cover by the text of the cover. Both hold only while every name in them is the one that the
   disk has. Each way for a name to change has one place that finds it, and all of them answer
   in the same way: the cover is reported lost, and the engine asks for it again (which reads
-  its real path anew) and scans it deep. A directory above a stream path: the check of the
-  next commit. A directory inside a stream: the record of its rename. A change between
+  its real path anew) and scans it deep. A directory at or above a stream path: its guard. A
+  directory inside a stream: the record of its rename. A change between
   `watch` and the start of the stream: the check after the start. A link that leads
   somewhere else: the poll (5.14). The notes that follow are these four.
-- **The check of the stream paths.** At each commit, the real path of each stream path is
-  asked again (`realpath`, 8 µs; 64 paths at most, and the poll of the directories above
-  the covers brings a commit once a second). A path that is another one now, also only in
-  the case of its letters, or none, is trusted no more (it leaves the list of stream paths),
-  and every cover at or below it is reported lost: the engine watches each one again, which
-  resolves its real path anew and starts a stream at it, and scans it deep. The stream that
-  stood there is idle then, and the same commit stops it. So a rename or a removal of a
-  directory above a stream path is found within a second, as on Windows, and not at once.
-  (Before, each directory at and above a stream path was kept open for the vnode events of
-  the kernel, `kqueue` with `NOTE_RENAME` and `NOTE_DELETE`, which told at once and caught a
-  rename that was taken back within the second: 300 lines, a thread, and an open file for
-  each such directory with a limit of its own, for that second. Taken out; the README names
-  the hole.)
+- **The guard.** Each directory at and above a stream path, and each directory that a key asks
+  names of and no stream reports, is open for the vnode events of the kernel (`Guard`):
+  `O_EVTONLY | O_SEARCH`, and `EVFILT_VNODE` with `NOTE_RENAME`, `NOTE_DELETE` and
+  `NOTE_REVOKE`, under an id of its own (a descriptor number comes back for another directory).
+  One kernel queue serves the backend, and a dispatch source on the queue of the streams reads
+  it (`Notices`): no thread waits for it. It puts the ids that told in a list, and its signal
+  only wakes the engine: a full queue of the watcher drops the signal, never the list.
+  `translate` takes the list, and so does `commit`, which comes after the engine checked
+  everything for a dropped signal (before, the guards stayed on the old directories:
+  `a_notice_whose_signal_was_dropped_is_taken_by_the_commit`). For each id that told, a key that
+  asks names of a directory at or below the one that told gets a hint for its directory, each
+  stream path at or below is trusted no more (it leaves the list of stream paths), and every
+  cover at or below is reported lost, also when the path is back by then: the stream heard
+  nothing while its path was another one. The engine watches each cover again, which resolves
+  its real path anew and starts a stream at it, and scans it deep; the stream that stood there
+  is idle then, and the next commit stops it. The guard that told is closed, as another
+  directory may stand at its path now, and so is each guard below it: its directory left with
+  the one that told, and no notice comes on it. The next commit opens one where one is still
+  needed. (Kept open, the guards below held the old directories, and a rename of a new one at
+  their paths went unnoticed: `a_directory_above_a_cover_is_replaced`.)
+  - A volume mounted on a guarded directory, or above one, tells no guard, and no stream
+    below it. So the kernel queue also tells of each volume that comes or goes, and then
+    each guard whose open directory is not the one at its path now (device and inode: one
+    `stat` for each guard) counts as one that told (`a_volume_mounted_above_a_cover`). A
+    volume inside a stream is told by its record (below).
+  - At a commit when the stream paths or the directories asked for names changed, the guards
+    that the new streams need open before they start: a rename between the guard and the
+    start is told, and one before the guard is found by the check after the start. The
+    guards that nothing needs any more close at the end of the commit: the old stream paths
+    keep theirs until new streams stand, and for good if none could start.
+  - The guards of all watchers of the process take at most half of the open files that the
+    process may have (`getdtablesize`): 128 for a program started from a shell, which gets
+    256; Node asks for far more when it starts. A directory that gets no guard, for that or
+    another reason, gets no stream below it: the keys of the directories at and below it
+    are named as failed (the watch limit error, `ulimit -n`), and they are polled and asked
+    again. A directory that is not there is no error, but it gets no stream below it either:
+    the keys at and below it are reported lost, as it may be back by then, with no guard and
+    nothing to tell its next rename. The engine checks them and watches them again, and the
+    next commit opens the guard (`a_directory_away_when_its_guard_opens_is_checked_again`).
+  - So nothing is polled on the way to a watched path, and an idle watcher has no timer
+    (5.10). The project of the bench with 20,000 watched files has 40 stream paths and about
+    50 guards.
+  - Before 2026-10-15 the real path of each stream path was asked at each commit
+    (`realpath`), which a poll of the directories above the covers brought once a second:
+    1.6 ms a second for 40 stream paths, 23 to 28 s for 20,000 `watch` calls of one file each
+    (0.44 s now, side by side), and a rename taken back within the second, with changes below
+    meanwhile, went unnoticed.
+    (Before 2026-10-13 a guard ran next to that poll, with a thread of its own, for the
+    second it saved; it was taken out.)
 - **A stream that cannot start** fails every path of the commit, with the watch limit error:
   `commit` names the keys of their covers as failed, so that they are polled and asked
-  again, and the old streams stay. A directory that is gone is no error: its stream path is
-  reported lost right after the start, and the engine finds out what is there.
+  again, and the old streams stay.
 - **The check after the start.** The real path of a cover is asked at `watch`, and its stream
   starts at `commit`. A directory above that was renamed in between leaves the stream at a
   path where nothing is. So after the start, the real path of each stream path that is new
@@ -1385,20 +1483,18 @@ As built:
   its parent: `/System/Volumes/Data/Users` has a parent with no short way, and is `/Users`.
 - **A cover at another real path.** A key that is watched again and whose directory has
   another real path than before is reported lost, if its old path still has a stream that
-  is trusted: then a directory on the old path was renamed and the check of the next commit
-  has not come yet, or a link leads somewhere else. Without this, a key that
+  is trusted: then a directory on the old path was renamed and the notice of its guard was
+  not read yet, or a link leads somewhere else. Without this, a key that
   asks for more in that moment would take the new path with a scan of its own directory
   only. (A key below a stream path that is trusted no more was reported with it.)
-- **Covers below a renamed directory.** A record for a renamed directory inside a stream is
-  also a loss report for every cover below the path of the record. The engine finds such a
+- **Covers below a renamed directory.** A record for a renamed directory inside a stream, or
+  for a volume that came or went there (`a_volume_mounted_inside_a_stream`), is also a loss
+  report for every cover below the path of the record. The engine finds such a
   cover by itself when the renamed directory is a node of its tree. It is none when a link
   leads to the cover from somewhere else.
 
 What stays open:
 
-- A directory above a stream path that is renamed away and back between two commits, with
-  changes below it meanwhile: the stream heard nothing while its path was another one, and
-  the check finds the path in place (README, "Holes").
 - A link on the way to a watched path that points somewhere else now is found by the poll
   (5.14), within a second.
 - A stream path that is trusted no more keeps its stream until the streams are replaced,
@@ -1607,7 +1703,8 @@ Known holes of the engine:
   delete delay, replaced by another one of the same size and time on a file system that uses
   the inode number again (ext4); a second write of the same size inside one step of a file
   system that counts time in steps between 20 ms and 1 s.
-- A write through another hard link of a watched file. A mount over a watched directory.
+- Linux: a write through another hard link of a watched file, under a name in a directory that
+  is not watched.
 - FSEvents and Windows: after `rm -r` of the directories above a watched path, the engine
   learns that an upper directory is gone only at the next poll.
 - Where the OS watches are put depends on what was watched and unwatched before: a stream stays

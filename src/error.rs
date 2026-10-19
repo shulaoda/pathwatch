@@ -40,6 +40,7 @@ impl fmt::Display for Error {
       ErrorKind::InvalidPath => "the path cannot be watched",
       ErrorKind::WatchLimit => "the OS has no room for one more watch, polling instead",
       ErrorKind::PermissionDenied => "permission denied",
+      ErrorKind::RemoteDisk => "the OS does not report what other machines change here",
       ErrorKind::Io => "input or output error",
       ErrorKind::Closed => "the watcher is closed",
     })?;
@@ -90,10 +91,16 @@ pub enum ErrorKind {
   /// has a `:`, a control character or one of `< > " | ? *`. Only `watch` and `unwatch` return
   /// it.
   InvalidPath,
-  /// The OS has no room for one more watch. What could not be watched is polled instead.
+  /// The OS has no room for one more watch. What could not be watched is polled instead. A
+  /// watcher says it once.
   WatchLimit,
   /// A path cannot be read or watched for want of permission. For events it counts as missing.
   PermissionDenied,
+  /// The path is on a disk that other machines can change too: NFS, SMB, a folder of the host
+  /// in a virtual machine or a container. The OS reports only what changes on this machine, and
+  /// nothing more is polled: `Config::with_polling(true)` finds the rest. A watcher says it once
+  /// for each disk.
+  RemoteDisk,
   /// Any other error of the disk or of the watch API of the OS. Also the word that the watch
   /// API could not start, or stopped, and that every path is polled from now on.
   Io,

@@ -61,7 +61,7 @@ jobs:
       - if: runner.os == 'macOS'
         run: cargo test -p pathwatch --test fsevents -- --ignored failed_start
       - if: runner.os == 'Linux'
-        run: unshare -Ur sh -c 'echo 8 > /proc/sys/user/max_inotify_watches && cargo test -p pathwatch --test inotify -- --ignored'
+        run: unshare -Urm sh -c 'echo 8 > /proc/sys/user/max_inotify_watches && cargo test -p pathwatch --test inotify -- --ignored'
       # The big fuzz runs on seeds of the day, as a release build: new seeds every day, and the
       # engine once without the debug checks. A failure names its seed.
       - if: runner.os == 'Linux'

@@ -5,8 +5,8 @@
 use std::{path::Path, time::Duration};
 
 use crate::fixtures::{
-  Driver, Mode, NONE, RECURSIVE, SimBackend, caught_up, flush, known, on_a_small_stack, on_all,
-  on_modes, settled, sorted, taken, window, window_then_settled,
+  Driver, Mode, NONE, RECURSIVE, SimBackend, SimRaw, caught_up, flush, known, on_a_small_stack,
+  on_all, on_modes, settled, sorted, taken, window, window_then_settled,
 };
 use pathwatch::{ErrorKind, engine::Options};
 
@@ -387,5 +387,25 @@ fn a_polled_directory_gets_a_watch() {
   d.fs.write("/p/x/d/f.js", "333").unwrap();
   flush(&mut d);
   assert_eq!(taken(&mut d), ["U /p/x/d/f.js"]);
+  caught_up(&mut d);
+}
+
+/// A volume mounted over a watched directory: the OS says nothing, and the backend tells the
+/// mount point by its path. The engine checks the node there and finds another directory.
+#[test]
+fn a_volume_mounted_over_a_watched_directory() {
+  let mut d = driver(Mode::Inode);
+  d.fs.mkdir_all("/w/sub").unwrap();
+  d.fs.write("/w/sub/old.js", "1").unwrap();
+  d.watch(&["/w"]);
+  // The volume hides the directory and shows one of its own, with no notification.
+  d.fs.rename("/w/sub", "/hidden").unwrap();
+  d.fs.mkdir("/w/sub").unwrap();
+  d.fs.write("/w/sub/new.js", "1").unwrap();
+  d.fs.take_raw(usize::MAX);
+  assert_eq!(d.engine.deadline(), None);
+
+  d.signal(SimRaw::mount("/w/sub"));
+  assert_eq!(sorted(settled(&mut d)), ["C /w/sub/new.js", "D /w/sub/old.js"]);
   caught_up(&mut d);
 }

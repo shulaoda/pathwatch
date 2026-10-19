@@ -54,6 +54,7 @@ impl SimFs {
       listing_meta: false,
       ignore_case: false,
       mount: None,
+      remote: None,
       other_rule: FxHashSet::default(),
       offline: None,
       calls: Calls::default(),
@@ -325,6 +326,11 @@ impl SimFs {
     self.lock().mount = Some(name.into());
   }
 
+  /// Other machines change the disk too: `Some` names its kind.
+  pub fn set_remote(&self, kind: Option<&str>) {
+    self.lock().remote = kind.map(str::to_owned);
+  }
+
   /// The backend makes no more than this many OS watches.
   pub fn set_watch_limit(&self, limit: Option<usize>) {
     self.lock().kernel.limit = limit;
@@ -530,6 +536,10 @@ impl Fs for SimFs {
   fn now(&self) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_nanos(self.lock().clock)
   }
+
+  fn remote_disk(&self, _dir: &Path) -> Option<String> {
+    self.lock().remote.clone()
+  }
 }
 
 /// How often each call of [`Fs`] and of the backend was made.
@@ -589,6 +599,8 @@ pub(crate) struct State {
   ignore_case: bool,
   /// `SimFs::set_mount`.
   mount: Option<OsString>,
+  /// `SimFs::set_remote`.
+  remote: Option<String>,
   /// The directories that take names the other way than `ignore_case` says.
   other_rule: FxHashSet<u64>,
   /// Every read of the disk fails with this error.

@@ -5,6 +5,7 @@
 
 mod flags;
 mod names;
+mod slots;
 
 use std::{
   ffi::OsStr,
@@ -19,10 +20,11 @@ use std::{
 use hashbrown::HashTable;
 use rustc_hash::FxHashMap;
 
-use self::{flags::Flags, names::Names};
+use self::{flags::Flags, names::Names, slots::Slots};
 use crate::{
   backend::{DirKey, Hint, Want},
   fs::{DirId, Meta},
+  path::split_top,
 };
 
 /// In a link between nodes: there is no such node.
@@ -241,7 +243,7 @@ pub enum Added {
 #[derive(Debug)]
 pub struct Tree {
   /// The arena. Its last slot is never free: a free end is cut off ([`Tree::give_back`]).
-  slots: Vec<Slot>,
+  slots: Slots,
   /// The free slots. An index can be stale: its slot was cut off the end of the arena.
   free: Vec<u32>,
   /// The generation of a node in a new slot: above that of every slot that was cut off, so that an
@@ -294,7 +296,11 @@ impl Tree {
     let mut root = Node::new(0, NONE, names.add(OsStr::new("")));
     root.kind = Kind::Dir(Dir { watch: Watch::Polled, ..Dir::new(DirId::default(), false) });
     Self {
-      slots: vec![Slot::Live(root)],
+      slots: {
+        let mut slots = Slots::default();
+        slots.push(Slot::Live(root));
+        slots
+      },
       free: Vec::new(),
       first_generation: 0,
       names,
@@ -379,12 +385,6 @@ impl Tree {
       index
     } else {
       let index = u32::try_from(self.slots.len()).expect("the arena holds fewer than 2^32 nodes");
-      if self.slots.len() == self.slots.capacity() {
-        // The arena is the biggest block of the watcher: it grows by an eighth, not to twice its
-        // size,
-        // so that at most a ninth of it is unused.
-        self.slots.reserve_exact(self.slots.len() / 8 + 16);
-      }
       self.slots.push(Slot::Live(Node::new(self.first_generation, parent, name_at)));
       index
     };
@@ -549,10 +549,8 @@ impl Tree {
       self.first_generation = self.first_generation.max(generation);
       self.slots.pop();
     }
+    self.slots.shrink();
     let slots = self.slots.len();
-    if self.slots.capacity() > 2 * slots + 16 {
-      self.slots.shrink_to(slots + slots / 8 + 16);
-    }
     // More than half of the list is stale then.
     if self.free.len() > 2 * slots + 16 {
       self.free.retain(|&index| (index as usize) < slots);
@@ -667,7 +665,7 @@ impl Slot {
 }
 
 /// The node in a slot that a link or the table points to.
-fn linked(slots: &[Slot], index: u32) -> &Node {
+fn linked(slots: &Slots, index: u32) -> &Node {
   slots[index as usize].node().expect("a link points to a live node")
 }
 
@@ -676,7 +674,7 @@ fn name_of<'a>(names: &'a Names, node: &Node) -> &'a OsStr {
 }
 
 /// The hash under which the table files the live node in the slot `index`.
-fn hash_of(slots: &[Slot], names: &Names, index: u32) -> u64 {
+fn hash_of(slots: &Slots, names: &Names, index: u32) -> u64 {
   let node = linked(slots, index);
   child_hash(node.parent, name_of(names, node))
 }
@@ -775,6 +773,11 @@ impl Tree {
       Hint::Lost => {
         self.lost = true;
         true
+      }
+      // A node at the path checks it, and finds another directory there by its identity.
+      Hint::Mount { path } => {
+        let Some((top, rest)) = split_top(path) else { return false };
+        self.child(Self::ROOT, top).is_some_and(|top| self.mark_below(top, rest, false))
       }
     }
   }

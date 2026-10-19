@@ -12,8 +12,9 @@ use std::{
     fs::{PermissionsExt, symlink},
   },
   path::{Path, PathBuf},
+  process::Command,
   sync::{
-    Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
+    Arc, Condvar, Mutex, MutexGuard, Once, OnceLock, PoisonError,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, Receiver, TryRecvError},
   },
@@ -49,6 +50,7 @@ static TURN_IS_OVER: Condvar = Condvar::new();
 impl Turn {
   fn take(alone: bool) -> Self {
     assert_few_files_next_to_the_test_program();
+    allow_more_open_files();
     let mut turns = Self::turns();
     while turns.1 || (alone && turns.0 > 0) {
       turns = TURN_IS_OVER.wait(turns).unwrap_or_else(PoisonError::into_inner);
@@ -91,6 +93,34 @@ fn assert_few_files_next_to_the_test_program() {
      stream takes 0.1 s and more to start for every 100,000 of them. `cargo clean` removes \
      the old object files of the build directory."
   );
+}
+
+/// A shell gives a program 256 open files, and the guards of the tests that run side by side
+/// may take half of them.
+fn allow_more_open_files() {
+  #[repr(C)]
+  struct Limit {
+    now: u64,
+    most: u64,
+  }
+  unsafe extern "C" {
+    fn getrlimit(resource: i32, limit: *mut Limit) -> i32;
+    fn setrlimit(resource: i32, limit: *const Limit) -> i32;
+  }
+  const OPEN_FILES: i32 = 8;
+  /// `OPEN_MAX`: macOS gives every program this many when it asks.
+  const ENOUGH: u64 = 10_240;
+  static ASKED: Once = Once::new();
+  ASKED.call_once(|| {
+    let mut limit = Limit { now: 0, most: 0 };
+    // SAFETY: both calls get a pointer to a `struct rlimit` that lives until they return.
+    unsafe {
+      if getrlimit(OPEN_FILES, &raw mut limit) == 0 && limit.now < ENOUGH {
+        limit.now = ENOUGH.min(limit.most);
+        setrlimit(OPEN_FILES, &raw const limit);
+      }
+    }
+  });
 }
 
 const NO_PATHS: [&Path; 0] = [];
@@ -140,6 +170,8 @@ struct Harness {
   sentinels: u32,
   /// Every record that came in.
   records: Vec<(PathBuf, u32)>,
+  /// Every key that the backend reported lost by itself.
+  lost: Vec<DirKey>,
   /// Given back last, when the streams are stopped and the playground is removed.
   _turn: Turn,
 }
@@ -169,8 +201,8 @@ impl Harness {
     let backend = FsEventsBackend::new(sink).unwrap();
     let dir = tempfile::tempdir().unwrap();
     assert_ne!(dir.path(), fs::canonicalize(dir.path()).unwrap(), "no symlink on the way");
-    let (watched, records) = (Vec::new(), Vec::new());
-    Self { backend, signals, dir, watched, sentinels: 0, records, _turn: turn }
+    let (watched, records, lost) = (Vec::new(), Vec::new(), Vec::new());
+    Self { backend, signals, dir, watched, sentinels: 0, records, lost, _turn: turn }
   }
 
   /// `""` is the playground itself.
@@ -211,12 +243,14 @@ impl Harness {
 
   fn translate(&mut self, raw: Raw) -> Vec<Seen> {
     self.records.extend(raw.records().map(|(path, flags)| (path.to_owned(), flags)));
+    self.lost.extend_from_slice(raw.lost());
     let mut seen = Vec::new();
     self.backend.translate(raw, &mut |hint| {
       seen.push(match hint {
         Hint::Changed { dir, rel } => Seen::Changed(dir, rel.to_owned()),
         Hint::Written { .. } => panic!("FSEvents flags cannot prove a write"),
         Hint::Lost => Seen::Lost,
+        Hint::Mount { .. } => panic!("only inotify tells of a mount by its path"),
       });
     });
     seen
@@ -590,18 +624,20 @@ fn a_stream_with_no_cover_left_is_stopped() {
   h.hints_until(&[changed(two, "file")]);
 }
 
+/// A directory on the way that no stream reports is guarded: its rename is a hint for its key.
 #[test]
-fn ancestor_is_not_watched_unless_a_stream_reports_it() {
+fn ancestor_is_guarded_unless_a_stream_reports_it() {
   let mut h = Harness::new();
   fs::create_dir_all(h.path("cover/below")).unwrap();
   fs::create_dir(h.path("other")).unwrap();
 
   let alone = DirKey::new(9, 0);
   let coverage = h.backend.watch(alone, &h.path("other"), Want::Names);
-  assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
+  assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
   h.commit();
   assert_eq!(h.backend.stream_count(), 0);
   assert_eq!(h.backend.covers(), NO_PATHS);
+  assert!(h.backend.guarded().contains(&h.real("other").as_path()));
 
   let cover = h.cover(1, "cover");
   let below = h.watch(2, &h.path("cover/below"), Want::Names);
@@ -614,7 +650,9 @@ fn ancestor_is_not_watched_unless_a_stream_reports_it() {
   h.hints_until(&[changed(cover, "below/file"), changed(below, "file")]);
 
   let coverage = h.backend.watch(alone, &h.path("other"), Want::Names);
-  assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
+  assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
+  fs::rename(h.path("other"), h.path("moved")).unwrap();
+  h.hints_until(&[changed(alone, "")]);
 }
 
 #[test]
@@ -633,17 +671,17 @@ fn watch_is_live_when_commit_returns() {
 #[test]
 fn rebuild_opens_no_gap_for_an_old_cover() {
   let mut h = Harness::alone();
-  fs::create_dir(h.path("old")).unwrap();
-  let old = h.cover(1, "old");
-  let writer = spawn_writer(h.path("old"), usize::MAX, Duration::ZERO);
+  fs::create_dir_all(h.path("g/g/g/g/g/old")).unwrap();
+  let old = h.cover(1, "g/g/g/g/g/old");
+  let writer = spawn_writer(h.path("g/g/g/g/g/old"), usize::MAX, Duration::ZERO);
   let mut reported = Reported::default();
 
   let deadline = Instant::now() + TIMEOUT;
   let mut index = 100;
   for group in 0..5 {
-    // Four directories get a stream each, then the directory above them: every stream is
-    // replaced.
-    let above = format!("group-{group}");
+    // Four directories get a stream each, then the directory above them and above the stream
+    // path of the old cover: every stream is replaced, also the one that reports the old cover.
+    let above = vec!["g"; 5 - group].join("/");
     let below = (0..4).map(|dir| format!("{above}/{dir}"));
     for dir in below.chain([above.clone()]) {
       writer.fast_for(500);
@@ -653,7 +691,7 @@ fn rebuild_opens_no_gap_for_an_old_cover() {
       let streams = h.backend.stream_count();
       h.commit();
       if dir == above {
-        assert_eq!(h.backend.stream_count(), group + 2);
+        assert_eq!(h.backend.stream_count(), 1);
         // A replaced stream stays for the whole overlap time.
         assert!(h.backend.retiring_count() >= streams);
       }
@@ -693,15 +731,16 @@ fn cover_above_a_cover() {
   hints.extend(h.sync(up));
   assert!(!rels(&hints, low).contains("b"));
 
-  // A stopped stream takes with it what it has not delivered, so a loss report comes with
-  // its stop.
+  // A stopped stream takes with it what it has not delivered, so the covers at and below its
+  // path are reported lost when it stops. The one above came with the new stream, and was
+  // read after it started.
   let deadline = Instant::now() + TIMEOUT;
   while h.backend.retiring_count() > 0 {
     hints.extend(h.sync(up));
     assert!(Instant::now() < deadline, "{} streams never stop", h.backend.retiring_count());
   }
   hints.extend(h.sync(up));
-  assert!(hints.contains(&Seen::Lost), "{hints:?}");
+  assert_eq!(h.lost, [low]);
   File::create(h.path("up/low/d")).unwrap();
   h.hints_until(&[changed(low, "d"), changed(up, "low/d")]);
 
@@ -883,9 +922,8 @@ fn cover_renamed_in_letter_case_is_heard_after_the_next_watch() {
   h.hints_until(&[changed(key, "file")]);
 }
 
-/// The check of the next commit tells: a loss report for each cover below, and the path is
-/// trusted no more. Also for a rename that only changes the case of the letters, which the
-/// stream would never hear of.
+/// The guard tells: a loss report for each cover below, and the path is trusted no more. Also
+/// for a rename that only changes the case of the letters, which the stream would never hear of.
 #[test]
 fn a_directory_above_a_cover_is_renamed() {
   let mut h = Harness::new();
@@ -895,7 +933,6 @@ fn a_directory_above_a_cover_is_renamed() {
   let other = h.cover(2, "above/other");
 
   fs::rename(h.path("above"), h.path("away")).unwrap();
-  h.commit();
   h.hints_until(&[changed(key, ""), changed(other, "")]);
   assert_eq!(h.backend.streamed(), NO_PATHS);
 
@@ -911,7 +948,6 @@ fn a_directory_above_a_cover_is_renamed() {
     // The volume tells letter case apart: the rename is one away, as above.
     return;
   }
-  h.commit();
   h.hints_until(&[changed(key, "")]);
   assert_eq!(h.backend.streamed(), NO_PATHS);
   h.watch(1, &h.path("above/dir"), Want::Contents);
@@ -919,6 +955,227 @@ fn a_directory_above_a_cover_is_renamed() {
   h.commit();
   File::create(h.path("above/dir/other-file")).unwrap();
   h.hints_until(&[changed(key, "other-file")]);
+}
+
+/// The kernel tells about each rename above a stream path, however short the directory was
+/// away: what changed meanwhile is read again.
+#[test]
+fn a_directory_above_a_cover_is_away_and_back_at_once() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("above/dir")).unwrap();
+  let key = h.cover(1, "above/dir");
+  for round in 0..20 {
+    fs::rename(h.path("above"), h.path("away")).unwrap();
+    File::create(h.path("away/dir").join(format!("file-{round}"))).unwrap();
+    fs::rename(h.path("away"), h.path("above")).unwrap();
+    h.hints_until(&[changed(key, "")]);
+    h.watch(1, &h.path("above/dir"), Want::Contents);
+    h.commit();
+    h.sync(key);
+  }
+}
+
+/// A directory above a cover is renamed and made again: the guards below it held the directories
+/// that left with it. A rename of the new one in between is told.
+#[test]
+fn a_directory_above_a_cover_is_replaced() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("a/b/c")).unwrap();
+  let key = h.cover(1, "a/b/c");
+  fs::rename(h.path("a"), h.path("old")).unwrap();
+  fs::create_dir_all(h.path("a/b/c")).unwrap();
+  h.hints_until(&[changed(key, "")]);
+  h.watch(1, &h.path("a/b/c"), Want::Contents);
+  h.commit();
+  h.sync(key);
+  fs::rename(h.path("a/b"), h.path("a/x")).unwrap();
+  h.hints_until(&[changed(key, "")]);
+}
+
+/// A directory that is away when the commit opens its guard may be back by then, with no guard:
+/// its key is checked again, and the next commit opens the guard.
+#[test]
+fn a_directory_away_when_its_guard_opens_is_checked_again() {
+  let mut h = Harness::new();
+  fs::create_dir(h.path("n")).unwrap();
+  let key = DirKey::new(1, 0);
+  let coverage = h.backend.watch(key, &h.path("n"), Want::Names);
+  assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
+  fs::rename(h.path("n"), h.path("away")).unwrap();
+  h.commit();
+  fs::rename(h.path("away"), h.path("n")).unwrap();
+  h.hints_until(&[changed(key, "")]);
+  h.backend.watch(key, &h.path("n"), Want::Names);
+  h.commit();
+  assert!(h.backend.guarded().contains(&h.real("n").as_path()));
+}
+
+/// The watcher drops what comes while its queue is full, and then checks everything: its next
+/// commit takes a notice whose signal was dropped. Else the guards stay on the old directories.
+#[test]
+fn a_notice_whose_signal_was_dropped_is_taken_by_the_commit() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("a/b/c")).unwrap();
+  let key = h.cover(1, "a/b/c");
+  fs::rename(h.path("a"), h.path("old")).unwrap();
+  fs::create_dir_all(h.path("a/b/c")).unwrap();
+  // Drops what comes up to the notice, which has no record.
+  loop {
+    let (_, signal) = h.signals.recv_timeout(TIMEOUT).unwrap();
+    if matches!(signal, Signal::Raw(raw) if raw.records().next().is_none()) {
+      break;
+    }
+  }
+  h.commit();
+  h.watch(1, &h.path("a/b/c"), Want::Contents);
+  h.commit();
+  h.sync(key);
+  fs::rename(h.path("a/b"), h.path("a/x")).unwrap();
+  h.hints_until(&[changed(key, "")]);
+}
+
+/// A volume mounted on a directory above a cover: no guard and no stream tells it, but the kernel
+/// queue tells that a volume came, and the guards that stand on another directory than the one
+/// at their path now count as told. So when it goes.
+#[test]
+fn a_volume_mounted_above_a_cover() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("w/sub")).unwrap();
+  let image = disk_image(&h);
+  let key = h.cover(1, "w/sub");
+  let mounted = Mounted::new(&image, &h.real("w"));
+  h.hints_until(&[changed(key, "")]);
+  fs::create_dir(h.path("w/sub")).unwrap();
+  h.watch(1, &h.path("w/sub"), Want::Contents);
+  h.commit();
+  h.sync(key);
+  drop(mounted);
+  h.hints_until(&[changed(key, "")]);
+}
+
+/// A volume mounted inside a stream: its record does not say directory, and each cover below it
+/// is read again, as after a rename.
+#[test]
+fn a_volume_mounted_inside_a_stream() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("top/m/c")).unwrap();
+  let image = disk_image(&h);
+  let top = h.cover(1, "top");
+  let c = h.watch(2, &h.path("top/m/c"), Want::Contents);
+  h.commit();
+  let _mounted = Mounted::new(&image, &h.real("top/m"));
+  h.hints_until(&[changed(top, "m"), changed(c, "")]);
+}
+
+/// An empty disk image in the directory of the test.
+fn disk_image(h: &Harness) -> PathBuf {
+  let image = h.path("image.dmg");
+  hdiutil(Command::new("hdiutil").args(["create", "-size", "4m", "-fs", "HFS+"]).arg(&image));
+  image
+}
+
+fn hdiutil(command: &mut Command) {
+  let output = command.output().unwrap();
+  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// A disk image mounted on a directory while this lives.
+struct Mounted(PathBuf);
+
+impl Mounted {
+  fn new(image: &Path, dir: &Path) -> Self {
+    hdiutil(
+      Command::new("hdiutil").args(["attach", "-nobrowse", "-mountpoint"]).arg(dir).arg(image),
+    );
+    Self(dir.to_owned())
+  }
+}
+
+impl Drop for Mounted {
+  fn drop(&mut self) {
+    let _ = Command::new("hdiutil").args(["detach", "-force"]).arg(&self.0).output();
+  }
+}
+
+/// One open file for each directory at and above a stream path, which the paths share, and for
+/// each directory asked for names. Each goes with the last that needs it.
+#[test]
+fn the_guard_stands_at_and_above_each_stream_path() {
+  let mut h = Harness::new();
+  fs::create_dir_all(h.path("a/x")).unwrap();
+  fs::create_dir_all(h.path("a/y")).unwrap();
+  fs::create_dir(h.path("b")).unwrap();
+  let x = h.cover(1, "a/x");
+  h.cover(2, "a/y");
+  let playground = h.real("").ancestors().count();
+  assert_eq!(h.backend.guarded().len(), playground + 3);
+
+  let b = DirKey::new(3, 0);
+  h.backend.watch(b, &h.path("b"), Want::Names);
+  h.commit();
+  assert_eq!(h.backend.guarded().len(), playground + 4);
+
+  h.backend.unwatch(x);
+  h.backend.unwatch(b);
+  h.commit();
+  assert_eq!(h.backend.guarded().len(), playground + 2);
+  assert!(!h.backend.guarded().contains(&h.real("a/x").as_path()));
+}
+
+/// A directory that gets no guard, here because the process has no open file left, fails the
+/// keys at and below it, and no other key: the paths that are guarded keep their streams.
+#[test]
+fn a_directory_that_gets_no_guard_fails_its_keys_only() {
+  let mut h = Harness::alone();
+  fs::create_dir_all(h.path("a/x")).unwrap();
+  fs::create_dir_all(h.path("a/z")).unwrap();
+  fs::create_dir_all(h.path("b/y")).unwrap();
+  let x = h.cover(1, "a/x");
+  let z = h.watch(2, &h.path("a/z"), Want::Contents);
+  let y = h.watch(3, &h.path("b/y"), Want::Contents);
+  let mut hogs = Vec::new();
+  while let Ok(file) = File::open("/dev/null") {
+    hogs.push(file);
+  }
+  let committed = h.backend.commit();
+  drop(hogs);
+  let failed: HashSet<DirKey> = committed.failed.iter().map(|(key, _)| *key).collect();
+  assert_eq!(failed, HashSet::from([z, y]), "{committed:?}");
+  assert!(committed.failed.iter().all(|(_, error)| is_watch_limit(error)), "{committed:?}");
+  assert_eq!(h.backend.streamed(), [h.real("a/x")]);
+  File::create(h.path("a/x/file")).unwrap();
+  h.hints_until(&[changed(x, "file")]);
+
+  // With room again, the keys ask again and get their streams.
+  h.watch(2, &h.path("a/z"), Want::Contents);
+  h.watch(3, &h.path("b/y"), Want::Contents);
+  h.commit();
+  File::create(h.path("a/z/file")).unwrap();
+  File::create(h.path("b/y/file")).unwrap();
+  h.hints_until(&[changed(z, "file"), changed(y, "file")]);
+}
+
+/// The old streams of a replacement stop when their time is up, also when nothing else comes:
+/// no poll brings a commit.
+#[test]
+fn replaced_streams_stop_by_themselves() {
+  let mut h = Harness::new();
+  for dir in ["apart", "up/low"] {
+    fs::create_dir_all(h.path(dir)).unwrap();
+  }
+  h.cover(1, "apart");
+  let low = h.cover(2, "up/low");
+  h.cover(3, "up");
+  // The stream whose path stays goes on: only the one below the new path is replaced.
+  assert_eq!((h.backend.stream_count(), h.backend.retiring_count()), (2, 1));
+  assert!(!h.backend.guarded().contains(&h.real("up/low").as_path()));
+  // A stream that stops may take records with it: the covers at and below its path are read
+  // again.
+  let deadline = Instant::now() + TIMEOUT;
+  while h.lost.is_empty() {
+    assert!(h.next(deadline).is_some(), "no loss report");
+  }
+  assert_eq!((h.lost.as_slice(), h.backend.retiring_count()), ([low].as_slice(), 0));
 }
 
 /// A directory on the way that cannot be read, and a cover spelled through the data volume:
@@ -1257,10 +1514,10 @@ fn many_covers_share_stream_paths_on_common_directories() {
   }
   fs::create_dir(h.path("g0/apart")).unwrap();
 
-  // No stream reports a group directory yet.
+  // No stream reports a group directory yet: its guard does.
   let group = DirKey::new(1000, 0);
   let coverage = h.backend.watch(group, &h.path("g0"), Want::Names);
-  assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
+  assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
   assert_eq!(h.commit(), [group]);
   assert_eq!(h.backend.stream_count(), MAX_NEW_STREAMS);
   // The groups go up in path order until the paths fit: the last one keeps its own.
@@ -1275,7 +1532,7 @@ fn many_covers_share_stream_paths_on_common_directories() {
   // A stream reports the group directory now, and still none reports the playground.
   let group = h.watch(1000, &h.path("g0"), Want::Names);
   let coverage = h.backend.watch(DirKey::new(1001, 0), &h.path(""), Want::Names);
-  assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
+  assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
   assert_eq!(h.commit(), []);
   assert_eq!(h.backend.stream_count(), MAX_NEW_STREAMS);
 
@@ -1568,6 +1825,38 @@ impl RealEngine {
     }
     self.lstats.load(Ordering::Relaxed) - before
   }
+
+  /// Runs the engine until it looked at nothing for 3 s: records of what was made before the
+  /// start can come seconds late, after a pause.
+  fn settle(&mut self) -> usize {
+    let mut lstats = 0;
+    for _ in 0..10 {
+      match self.run(Duration::from_secs(3)) {
+        0 => break,
+        more => lstats += more,
+      }
+    }
+    lstats
+  }
+}
+
+/// Every directory above the watched files is guarded, and none is polled: an idle watcher has
+/// no timer and looks at nothing. (The playground is spelled without the link `/var`: a link on
+/// the way is polled.)
+#[test]
+fn an_idle_watcher_polls_nothing() {
+  let dir = tempfile::tempdir().unwrap();
+  let real = fs::canonicalize(dir.path()).unwrap();
+  let files: Vec<PathBuf> = (0..3).map(|index| real.join(format!("d{index}/f.js"))).collect();
+  for file in &files {
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(file, "").unwrap();
+  }
+  let mut engine = RealEngine::new();
+  engine.watch(files);
+  engine.settle();
+  assert_eq!(engine.out.errors.len(), 0, "{:?}", engine.out.errors);
+  assert_eq!(engine.engine.deadline(), None);
 }
 
 #[expect(clippy::print_stdout, reason = "the cost test is here to print what it measures")]
@@ -1581,10 +1870,12 @@ fn say(line: &str) {
 #[ignore = "a measurement of a few seconds: run it alone, in release mode"]
 fn the_cost_of_single_files() {
   let dir = tempfile::tempdir().unwrap();
+  // Without the link `/var` on the way, which the poll would look at each second.
+  let real = fs::canonicalize(dir.path()).unwrap();
   let mut paths = Vec::new();
   for group in 0..20 {
     for sub in 0..100 {
-      let sub = dir.path().join(format!("project/g{group:02}/d{sub:03}"));
+      let sub = real.join(format!("project/g{group:02}/d{sub:03}"));
       fs::create_dir_all(&sub).unwrap();
       for file in 0..10 {
         paths.push(sub.join(format!("m{file}.js")));
@@ -1594,8 +1885,6 @@ fn the_cost_of_single_files() {
   }
   // A new stream also delivers what happened shortly before its start.
   thread::sleep(Duration::from_secs(2));
-  // Polled: the directories above the project, and the project with its 20 groups.
-  let poll_budget = 50;
 
   let mut all = RealEngine::new();
   let started = Instant::now();
@@ -1604,9 +1893,10 @@ fn the_cost_of_single_files() {
   let setup_lstats = all.lstats.load(Ordering::Relaxed);
   say(&format!("one `watch` call for all files: {took:.1?}, {setup_lstats} lstat"));
   assert_eq!(all.out.errors.len(), 0, "{:?}", all.out.errors);
+  all.settle();
   let idle = all.run(Duration::from_secs(3)) / 3;
   say(&format!("  then idle: {idle} lstat a second"));
-  assert!(idle <= poll_budget, "{idle} lstat in an idle second");
+  assert_eq!(idle, 0, "nothing is polled");
   drop(all);
 
   let mut each = RealEngine::new();
@@ -1617,13 +1907,15 @@ fn the_cost_of_single_files() {
   let took = started.elapsed();
   say(&format!("one `watch` call for each file: {took:.1?}, {} errors", each.out.errors.len()));
   assert_eq!(each.out.errors.len(), 0, "{:?}", each.out.errors);
-  // The streams were replaced many times, and each stop makes the engine read everything.
-  let settling = each.run(Duration::from_secs(3));
-  say(&format!("  then the replaced streams stop: {settling} lstat in 3 s, and no event"));
+  // The streams were replaced many times, and each stop makes the engine read the covers of
+  // the stopped streams again.
+  let settling = each.settle();
+  say(&format!("  then the replaced streams stop: {settling} lstat, and no event"));
   assert_eq!(each.out.events.len(), 0, "{:?}", each.out.events);
+  assert!(settling < paths.len(), "{settling} lstat after the stops");
   let idle = each.run(Duration::from_secs(3)) / 3;
   say(&format!("  then idle: {idle} lstat a second"));
-  assert!(idle <= poll_budget, "{idle} lstat in an idle second");
+  assert_eq!(idle, 0, "nothing is polled");
 
   // One `lstat` for each written file, and no check of a directory on the way.
   let changed: Vec<&PathBuf> = paths.iter().step_by(10).collect();
@@ -1632,17 +1924,13 @@ fn the_cost_of_single_files() {
   }
   let burst = each.run(Duration::from_secs(3));
   let events = each.out.events.len();
-  say(&format!(
-    "a burst of {} files: {burst} lstat (with 3 polls), {events} events",
-    changed.len()
-  ));
+  say(&format!("a burst of {} files: {burst} lstat, {events} events", changed.len()));
   assert_eq!(events, changed.len());
-  assert!(burst <= changed.len() + 4 * poll_budget, "{burst} lstat for the burst");
+  assert_eq!(burst, changed.len(), "{burst} lstat for the burst");
   drop(each);
 
   // The backend alone: what one record costs with 2,000 covers.
   let mut h = Harness::new();
-  let real = fs::canonicalize(dir.path()).unwrap();
   let dirs: Vec<&Path> = paths.iter().step_by(10).map(|path| path.parent().unwrap()).collect();
   let started = Instant::now();
   for dir in &dirs {
@@ -1660,7 +1948,6 @@ fn the_cost_of_single_files() {
   let mut held = Raw::default();
   let mut apart = Raw::default();
   for path in &paths {
-    let path = real.join(path.strip_prefix(dir.path()).unwrap());
     held.push(path.as_os_str().as_bytes(), flag::CREATED | 0x1_0000);
     let next_to = path.parent().unwrap().parent().unwrap().join("dist/chunk.js");
     apart.push(next_to.as_os_str().as_bytes(), flag::CREATED | 0x1_0000);
