@@ -10,7 +10,8 @@ use pathwatch::{
 use crate::{disk::PATIENCE, everywhere, on_disk, skipped};
 
 /// Every write of a file is an `Update`: in place, appended, cut to nothing, and the same
-/// content written again.
+/// content written again. Not the last one on Windows: NTFS leaves the time of an empty file
+/// as it is when it is emptied again (measured), so nothing on the disk tells of that write.
 #[test]
 fn every_way_to_write_a_file_is_an_update() {
   everywhere(|w| {
@@ -25,7 +26,11 @@ fn every_way_to_write_a_file_is_an_update() {
     w.expect(&[(Update, "r/log.txt"), (Update, "f.txt")]);
     w.write("r/log.txt", "");
     w.write("f.txt", "");
-    w.expect(&[(Update, "r/log.txt"), (Update, "f.txt")]);
+    if cfg!(windows) {
+      w.expect(&[]);
+    } else {
+      w.expect(&[(Update, "r/log.txt"), (Update, "f.txt")]);
+    }
   });
 }
 
@@ -164,13 +169,13 @@ fn two_watchers_in_one_process_both_see_a_change() {
 }
 
 /// A watched file written through another hard link of it is an `Update`: the file is the
-/// same, whatever name the writer used. Not with inotify, which reports a write under the
-/// name the writer used (a hole of the README).
+/// same, whatever name the writer used. Not with inotify and ReadDirectoryChangesW, which
+/// report a write under the name the writer used (a hole of the README).
 #[test]
 fn a_write_through_another_hard_link_is_an_update() {
   on_disk(|w| {
-    if cfg!(target_os = "linux") && w.backend == "native" {
-      skipped("inotify reports a write under the name the writer used");
+    if cfg!(any(target_os = "linux", windows)) && w.backend == "native" {
+      skipped("inotify and ReadDirectoryChangesW report a write under the name the writer used");
       return;
     }
     w.write("r/a.txt", "1");

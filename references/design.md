@@ -541,6 +541,9 @@ the backend for its watch (`arm`, 5.10); queue a shallow scan. With `two_step_li
 not under the poll) the node is also marked for one more look at the next flush, as is a
 directory that is another one than before: a junction or a directory link is a plain directory
 until its second step, which gives no record, so a look between the steps sees a directory.
+The one more look is spent by whatever flush comes next, a poll or the hints of other paths:
+when that flush falls between the steps too, nothing looks again (measured with the steps 300
+ms apart, which no tool does; the story keeps them 50 ms apart, clear of the poll).
 
 `still_there(node, deep)`: `arm` the node, and with `deep` also queue a deep scan. `deep` is
 true for a `deep` mark, when the directory was held, when it is another directory than before,
@@ -1706,8 +1709,9 @@ Known holes of the engine:
   delete delay, replaced by another one of the same size and time on a file system that uses
   the inode number again (ext4); a second write of the same size inside one step of a file
   system that counts time in steps between 20 ms and 1 s.
-- Linux: a write through another hard link of a watched file, under a name in a directory that
-  is not watched.
+- Linux and Windows: a write through another hard link of a watched file, under a name in a
+  directory that is not watched (measured on NTFS: the record names the entry that was
+  written).
 - FSEvents and Windows: after `rm -r` of the directories above a watched path, the engine
   learns that an upper directory is gone only at the next poll.
 - Where the OS watches are put depends on what was watched and unwatched before: a stream stays

@@ -9,7 +9,7 @@ use pathwatch::{
   EventKind::{Create, Delete, Update},
 };
 
-use crate::{Settings, everywhere, everywhere_with};
+use crate::{Settings, everywhere, everywhere_with, skipped};
 
 /// A watched file and its directory, in one call or in two, in both orders: the file has one
 /// home, so a change gives one event, and the other files of the directory are the baseline.
@@ -206,6 +206,12 @@ fn changes_behind_a_link_on_the_way() {
     w.write("z/real/b/c.js", "1");
     w.mkdir("a");
     if !w.symlink("z/real", "a/link") {
+      return;
+    }
+    // The handle on the directory of the watched file is on the real directory: Windows
+    // refuses to rename the directory above it while the handle is open.
+    if cfg!(windows) && !w.polls() {
+      skipped("Windows refuses to rename a directory above an open handle");
       return;
     }
     w.watch(&["a/link/b/c.js"]);

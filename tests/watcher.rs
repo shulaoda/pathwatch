@@ -116,22 +116,27 @@ impl Watch {
   }
 }
 
-/// Windows: what `watch` makes of a path, seen through a filter that ignores everything, so
+/// Windows: what `watch` makes of a path, seen through a filter that ignores the paths, so
 /// that nothing is read. A share spelled with a separator too many is a share, not a path on the
 /// current drive; a drive with no root is joined to the current directory on that drive.
 #[cfg(windows)]
 #[test]
 fn the_paths_that_windows_takes() {
   let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+  let current = env::current_dir().unwrap();
+  let share = PathBuf::from(r"\\server\share\f");
   let config = Config::default().with_ignored({
-    let seen = Arc::clone(&seen);
+    let (seen, current, share) = (Arc::clone(&seen), current.clone(), share.clone());
+    // The filter is asked about the directories above a path first, and nothing below an
+    // ignored one: the paths themselves are ignored, so that nothing is read, and so is every
+    // entry of the current directory, which is watched when a drive with no root is cleaned
+    // to it, so that its listing reads nothing below.
     move |path: &Path, _| {
       seen.lock().unwrap().push(path.to_path_buf());
-      true
+      path == share || (path.starts_with(&current) && path != current)
     }
   });
   let watcher = Watcher::with_config(config, |_| {}).unwrap();
-  let current = env::current_dir().unwrap();
   let drive = current.components().next().unwrap().as_os_str().to_owned();
   let other_drive = if drive.eq_ignore_ascii_case("Q:") { "R:" } else { "Q:" };
 
@@ -152,11 +157,13 @@ fn the_paths_that_windows_takes() {
 
   let seen = seen.lock().unwrap();
   // The filter is asked as a file and as a directory, for each of the two calls.
-  let share = PathBuf::from(r"\\server\share\f");
   assert_eq!(seen.iter().filter(|path| **path == share).count(), 4, "{seen:?}");
   assert!(seen.contains(&current.join("name")), "{seen:?}");
   assert!(seen.contains(&current), "{seen:?}");
-  assert!(seen.iter().all(|path| path == &share || path.starts_with(&current)), "{seen:?}");
+  // Nothing else is asked about: the directories on the way, and the entries of the current
+  // directory.
+  let on_the_way = |path: &PathBuf| share.starts_with(path) || current.starts_with(path);
+  assert!(seen.iter().all(|path| on_the_way(path) || path.starts_with(&current)), "{seen:?}");
 }
 
 /// Windows: a watcher that a thread-local holds is dropped while the process exits, when the OS

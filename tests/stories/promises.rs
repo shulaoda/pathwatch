@@ -778,8 +778,11 @@ fn a_name_that_windows_reads_as_another_is_reported() {
 
 /// Windows: a junction is made in two steps, a plain directory first, and the second step
 /// (the reparse point) gives no record the backend asks for. A look between the steps sees a
-/// directory; the watcher looks once more and reports the link: a file inside a watched
-/// directory, and what is behind it at a watched path.
+/// directory; the watcher looks once more at the next flush, which the poll brings within a
+/// second, and reports the link: a file inside a watched directory, and what is behind it at a
+/// watched path. Between the steps the story only waits, longer than the quiet time, so that
+/// the first look falls between them, and not long, so that no poll does: a flush between the
+/// steps would be the one more look, and would see the directory (README, "Holes").
 #[cfg(windows)]
 #[test]
 fn a_junction_made_in_two_steps() {
@@ -793,6 +796,10 @@ fn a_junction_made_in_two_steps() {
     Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT},
     System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_REPARSE_POINT},
   };
+
+  /// Longer than the quiet time, so that the first look falls between the steps, and short
+  /// next to the second, which the poll brings.
+  const BETWEEN_THE_STEPS: Duration = Duration::from_millis(50);
 
   /// `IO_REPARSE_TAG_MOUNT_POINT`: the second step of `mklink /J` on the directory `link`.
   fn set_mount_point(link: &Path, target: &Path) {
@@ -849,7 +856,7 @@ fn a_junction_made_in_two_steps() {
 
     // Inside a watched directory: a directory is no event, and the link is a file.
     w.mkdir("w/j");
-    w.expect(&[]);
+    std::thread::sleep(BETWEEN_THE_STEPS);
     set_mount_point(&w.path("w/j"), &w.path("t"));
     w.expect(&[(Create, "w/j")]);
     w.write("t/a.txt", "22");
@@ -857,7 +864,7 @@ fn a_junction_made_in_two_steps() {
 
     // At a watched path: the link is followed.
     w.mkdir("b/cur");
-    w.expect(&[]);
+    std::thread::sleep(BETWEEN_THE_STEPS);
     set_mount_point(&w.path("b/cur"), &w.path("t"));
     w.expect(&[(Create, "b/cur/a.txt"), (Create, "b/cur/sub/b.txt")]);
     w.write("t/a.txt", "333");

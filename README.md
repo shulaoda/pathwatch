@@ -239,9 +239,9 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   in the case of its ASCII letters still gets its events. Below a watched directory a change
   made through another spelling of a name can be reported under a name the disk does not
   have, or not at all, and a rename that changes only the case leaves the old name known.
-- **Linux: a watched file written through another hard link of it**, under a name in a
-  directory that is not watched, gets no event: inotify reports a write under the name the
-  writer used. Polling finds it, and so does macOS.
+- **Linux and Windows: a watched file written through another hard link of it**, under a name
+  in a directory that is not watched, gets no event: inotify and ReadDirectoryChangesW report
+  a write under the name the writer used. Polling finds it, and so does macOS.
 - **A young file above 16 MiB, or one that cannot be read, under polling:** it gets one
   `Update` when it is 2 s old, also when nothing changed, and also when it was written just
   before `watch`.
@@ -267,7 +267,10 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 - **Windows: a junction or a directory link** is made in two steps, a plain directory first,
   and the second step gives no record. A watcher that looked between the steps sees a
   directory; it looks once more at the next flush, within the poll interval, and reports the
-  link then. Until then a watched path at or through the link gets no events.
+  link then. Until then a watched path at or through the link gets no events. When that next
+  flush falls between the steps as well (the tools make the two steps within a millisecond;
+  a flush comes 20 ms after a change at the soonest), the link is seen only when something
+  else brings a look at its directory.
 - **Windows: more than 64 directories** share handles. A watched path whose directory is then
   spelled in another way than the disk (more than the case of letters) gets no events, and
   neither does a change that a program makes through the short (8.3) name of a directory on
