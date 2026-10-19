@@ -68,7 +68,6 @@ pub mod flag {
 pub struct FsEventsBackend {
   covers: Covers,
   streams: Streams,
-  not_watched: FxHashMap<DirKey, PathBuf>,
   /// The keys asked for names of a directory that no stream reports, at its real path: its
   /// guard tells about it.
   named: FxHashMap<DirKey, PathBuf>,
@@ -93,7 +92,6 @@ impl FsEventsBackend {
         guard: Guard { notices, dirs: FxHashMap::default(), last_id: ffi::VOLUMES },
         guard_is_stale: false,
       },
-      not_watched: FxHashMap::default(),
       named: FxHashMap::default(),
       last_parent: None,
     })
@@ -113,10 +111,6 @@ impl FsEventsBackend {
 
   pub fn cover_of_key(&self) -> &FxHashMap<DirKey, PathBuf> {
     &self.covers.dir_of
-  }
-
-  pub fn not_watched(&self) -> &FxHashMap<DirKey, PathBuf> {
-    &self.not_watched
   }
 
   pub fn guarded(&self) -> Vec<&Path> {
@@ -184,7 +178,6 @@ impl Backend for FsEventsBackend {
       }
       if !may_hold_a_stream(&real) {
         self.unwatch(key);
-        self.not_watched.insert(key, real);
         return Coverage::NotWatched;
       }
       self.streams.pending.insert(real.clone(), ());
@@ -193,7 +186,6 @@ impl Backend for FsEventsBackend {
     if old.is_some_and(|old| *old != real && self.streams.paths.holds(old)) {
       self.streams.sink.raw(Raw { lost: vec![key], ..Raw::default() });
     }
-    self.not_watched.remove(&key);
     if self.named.remove(&key).is_some() {
       self.streams.guard_is_stale = true;
     }
@@ -202,7 +194,6 @@ impl Backend for FsEventsBackend {
   }
 
   fn unwatch(&mut self, key: DirKey) {
-    self.not_watched.remove(&key);
     if self.named.remove(&key).is_some() {
       self.streams.guard_is_stale = true;
     }
@@ -212,8 +203,8 @@ impl Backend for FsEventsBackend {
       && self.streams.pending.contains(&dir)
     {
       self.streams.pending.remove(&dir);
-      let below = self.covers.by_dir.below(&[&dir]);
-      let below: Vec<PathBuf> = below.into_iter().map(|(below, _)| below.to_owned()).collect();
+      let below: Vec<PathBuf> =
+        self.covers.by_dir.below(&[&dir]).map(|(below, _)| below.to_owned()).collect();
       for below in below {
         if !self.streams.paths.holds(&below) {
           self.streams.pending.insert(below, ());
@@ -268,8 +259,7 @@ impl Backend for FsEventsBackend {
       self.streams.sink.raw(moved);
     }
     let streamed = &self.streams.paths;
-    let now_streamed =
-      self.not_watched.iter().chain(&self.named).filter(|(_, dir)| streamed.holds(dir));
+    let now_streamed = self.named.iter().filter(|(_, dir)| streamed.holds(dir));
     committed.now_watched = now_streamed.map(|(&key, _)| key).collect();
     self.streams.fit_guard(&self.named);
     committed
@@ -280,7 +270,7 @@ impl Backend for FsEventsBackend {
     for key in raw.lost.iter().copied().chain(self.told()) {
       hint(Hint::Changed { dir: key, rel: Path::new("") });
     }
-    let covers = &self.covers.by_dir;
+    let covers = &self.covers;
     let mut lost_places = Vec::new();
     let mut moved_dirs = Vec::new();
     for (path, flags) in raw.records() {
@@ -304,19 +294,15 @@ impl Backend for FsEventsBackend {
       if is_dir && flags & flag::DIR_REPLACED != 0 {
         moved_dirs.push(path);
       }
-      for (keys, rel) in covers.holders(path) {
+      for (keys, rel) in covers.by_dir.holders(path) {
         for &key in keys {
           hint(Hint::Changed { dir: key, rel });
         }
       }
     }
-    let holders = lost_places.iter().flat_map(|path| covers.holders(path)).map(|(keys, _)| keys);
-    moved_dirs.extend_from_slice(&lost_places);
-    let below = covers.below(&moved_dirs);
-    for keys in holders.chain(below.into_iter().map(|(_, keys)| keys)) {
-      for &key in keys {
-        hint(Hint::Changed { dir: key, rel: Path::new("") });
-      }
+    let moved = covers.by_dir.below(&moved_dirs).flat_map(|(_, keys)| keys).copied();
+    for key in covers.keys_around(&lost_places).chain(moved) {
+      hint(Hint::Changed { dir: key, rel: Path::new("") });
     }
   }
 
@@ -338,10 +324,7 @@ impl FsEventsBackend {
     }
     let is_below = |dir: &Path| moved.iter().any(|moved| dir.starts_with(moved));
     let named = self.named.iter().filter(|(_, dir)| is_below(dir)).map(|(&key, _)| key);
-    let covers = &self.covers.by_dir;
-    let at = moved.iter().flat_map(|dir| covers.holders(dir)).map(|(keys, _)| keys);
-    let below = covers.below(&moved).into_iter().map(|(_, keys)| keys);
-    named.chain(at.chain(below).flatten().copied()).collect()
+    named.chain(self.covers.keys_around(&moved)).collect()
   }
 }
 
@@ -409,6 +392,14 @@ impl Covers {
     self.by_dir.remove(&dir);
     Some(dir)
   }
+
+  /// The keys of the covers that hold a directory of `dirs`, and of the covers below one: every
+  /// key that can see what is at or below them.
+  fn keys_around<'a>(&'a self, dirs: &'a [impl AsRef<Path>]) -> impl Iterator<Item = DirKey> + 'a {
+    let holding = dirs.iter().flat_map(|dir| self.by_dir.holders(dir.as_ref()));
+    let below = self.by_dir.below(dirs).map(|(_, keys)| keys);
+    holding.map(|(keys, _)| keys).chain(below).flatten().copied()
+  }
 }
 
 #[derive(Debug)]
@@ -459,7 +450,7 @@ impl Streams {
     let replace = !new.is_empty()
       && (self.running.len() >= MAX_STREAMS
         || self.paths.len() + new.len() > self.path_limit
-        || !self.paths.below(&new).is_empty());
+        || self.paths.below(&new).next().is_some());
     let (placed, keep) = if replace {
       // With room for the paths of the next few commits: a few new directories must not
       // replace every stream again.
@@ -533,7 +524,7 @@ impl Streams {
         for path in &running.paths {
           placed.remove(path.as_path());
         }
-        let covers_at = |path: &PathBuf| covers.by_dir.below(slice::from_ref(path)).len() + 1;
+        let covers_at = |path: &PathBuf| covers.by_dir.below(slice::from_ref(path)).count() + 1;
         kept.push((running.paths.iter().map(covers_at).sum::<usize>(), index));
       }
     }
@@ -573,13 +564,11 @@ impl Streams {
     self.guard_is_stale = false;
   }
 
+  /// The stream paths at and below `dirs` are trusted no more.
   fn distrust(&mut self, dirs: &[PathBuf]) {
-    if dirs.is_empty() {
-      return;
-    }
-    let dirs: FxHashSet<&Path> = dirs.iter().map(PathBuf::as_path).collect();
-    let below = |path: &&Path| path.ancestors().any(|above| dirs.contains(above));
-    let moved: Vec<PathBuf> = self.paths.keys().filter(below).map(Path::to_owned).collect();
+    let at = dirs.iter().filter(|dir| self.paths.contains(dir)).map(PathBuf::as_path);
+    let below = self.paths.below(dirs).map(|(path, ())| path);
+    let moved: Vec<PathBuf> = at.chain(below).map(Path::to_owned).collect();
     self.guard_is_stale |= !moved.is_empty();
     for path in moved {
       self.paths.remove(&path);
@@ -621,7 +610,8 @@ impl Streams {
   fn stop_idle(&mut self, covers: &Covers) {
     let needed = |path: &PathBuf| {
       self.paths.contains(path)
-        && (covers.by_dir.contains(path) || !covers.by_dir.below(slice::from_ref(path)).is_empty())
+        && (covers.by_dir.contains(path)
+          || covers.by_dir.below(slice::from_ref(path)).next().is_some())
     };
     let is_idle = |running: &Running| !running.paths.iter().any(needed);
     if !self.running.iter().any(is_idle) {
@@ -667,7 +657,7 @@ impl Streams {
     let paths = stopped.iter().flat_map(|old| &old.streams).flat_map(|old| old.paths.clone());
     let paths = top_most(paths.collect());
     let at = paths.iter().filter_map(|path| covers.by_dir.get(path));
-    let below = covers.by_dir.below(&paths).into_iter().map(|(_, keys)| keys);
+    let below = covers.by_dir.below(&paths).map(|(_, keys)| keys);
     let lost = at.chain(below).flatten().copied().collect();
     let sink = Arc::clone(&self.sink);
     self.queue.run(move || {
@@ -983,19 +973,20 @@ impl<T> Dirs<T> {
       })
   }
 
-  fn below(&self, paths: &[impl AsRef<Path>]) -> Vec<(&Path, &T)> {
-    let mut below = Vec::new();
-    for path in paths {
+  fn below<'a>(
+    &'a self,
+    paths: &'a [impl AsRef<Path>],
+  ) -> impl Iterator<Item = (&'a Path, &'a T)> + 'a {
+    paths.iter().flat_map(move |path| {
       let mut prefix = path.as_ref().components().as_path().as_os_str().to_owned();
       if !prefix.as_bytes().ends_with(b"/") {
         prefix.push("/");
       }
       let after = (Bound::Excluded(prefix.as_os_str()), Bound::Unbounded);
       let dirs = self.by_path.range::<OsStr, _>(after);
-      let dirs = dirs.take_while(|(dir, _)| dir.as_bytes().starts_with(prefix.as_bytes()));
-      below.extend(dirs.map(|(dir, value)| (Path::new(dir), value)));
-    }
-    below
+      let dirs = dirs.take_while(move |(dir, _)| dir.as_bytes().starts_with(prefix.as_bytes()));
+      dirs.map(|(dir, value)| (Path::new(dir), value))
+    })
   }
 }
 
@@ -1520,7 +1511,7 @@ mod ffi {
 mod tests {
   use std::path::{Path, PathBuf};
 
-  use super::{Dirs, is_too_high, may_hold_a_stream, place};
+  use super::{DATA_VOLUME, Dirs, is_too_high, may_hold_a_stream, place, short_way};
 
   fn paths(paths: &[&str]) -> Vec<PathBuf> {
     paths.iter().map(PathBuf::from).collect()
@@ -1584,6 +1575,15 @@ mod tests {
     }
   }
 
+  /// The directory itself is asked, not only its parent: `/Users` has a parent with no short way.
+  #[test]
+  fn the_short_way_of_a_directory_whose_parent_has_none() {
+    let long = Path::new(DATA_VOLUME).join("Users");
+    if long.is_dir() {
+      assert_eq!(short_way(long), Path::new("/Users"));
+    }
+  }
+
   #[test]
   fn where_a_stream_may_stand_for_a_cover() {
     for dir in ["/", "/Users", "/Users/me", "/System/Volumes/Data", "/System/Volumes/Data/Users/me"]
@@ -1628,8 +1628,7 @@ mod tests {
         assert_eq!(found, expected, "the covers that hold {}, step {step}", path.display());
         assert_eq!(covers.holds(path), !expected.is_empty());
 
-        let mut found: Vec<&Path> =
-          covers.below(&[path]).into_iter().map(|(_, dir)| *dir).collect();
+        let mut found: Vec<&Path> = covers.below(&[path]).map(|(_, dir)| *dir).collect();
         found.sort_unstable();
         let lies_below = |cover: &&&PathBuf| **cover != path && cover.starts_with(path);
         let expected: Vec<&Path> =

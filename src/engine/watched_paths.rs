@@ -127,15 +127,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// Whether the partial directory had to track every entry before the running `watch`: the
   /// tree can be behind while an older look waits for the disk.
   fn tracked_before(&self, key: DirKey) -> bool {
-    let (mut at, mut levels) = (key, 0);
-    while !(self.tree[at].is_path() && self.tree[at].added() == Added::No) {
-      if self.tree[at].is_unlisted() {
-        return false;
-      }
-      let Some(parent) = self.tree.parent(at) else { return false };
-      (at, levels) = (parent, levels + 1);
-    }
-    !self.is_ignored_on_the_way(key, levels)
+    self.levels_below_path(key, true).is_some_and(|levels| !self.is_ignored_on_the_way(key, levels))
   }
 }
 

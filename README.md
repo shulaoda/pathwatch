@@ -419,8 +419,8 @@ More:
 # What the engine costs for big cases. Run it before and after a change and compare.
 cargo test --release -p pathwatch --test sim cost:: -- --ignored --nocapture
 
-# Also prints how long `watch` takes for 20,000 watched files.
-cargo test -p pathwatch --test disk -- --nocapture
+# macOS: what 20,000 files watched one by one cost the FSEvents backend. It runs alone.
+cargo test --release -p pathwatch --test fsevents the_cost_of_single_files -- --ignored --nocapture
 
 # The FSEvents test that fills the stream limit of the process. It runs alone.
 cargo test -p pathwatch --test fsevents -- --ignored failed_start

@@ -12,7 +12,7 @@ use crate::{
   config::EntryKind,
   fs::Fs,
   path::split_top,
-  tree::{Kind, Tree, push_name},
+  tree::{Added, Kind, Tree, push_name},
 };
 
 impl<B: Backend, F: Fs> Engine<B, F> {
@@ -65,16 +65,28 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       Kind::Dir(_) => {}
       Kind::File(_) | Kind::Missing => return false,
     }
+    self
+      .levels_below_path(key, false)
+      .is_some_and(|levels| !self.is_ignored_on_the_way(key, levels))
+  }
+
+  /// How many nodes lie on the way up from the node to the nearest watched path at or above
+  /// it, that path left out (`before_call`: one that was a watched path before the running
+  /// `watch`). `None`: a node that is no entry of the directory above, or the root, comes
+  /// first, and nothing further up covers the node.
+  pub(super) fn levels_below_path(&self, key: DirKey, before_call: bool) -> Option<usize> {
     let (mut at, mut levels) = (key, 0);
-    while !self.tree[at].is_path() {
-      // No entry of the directory above: nothing further up covers it.
-      if self.tree[at].is_unlisted() {
-        return false;
+    loop {
+      let node = &self.tree[at];
+      if node.is_path() && (!before_call || node.added() == Added::No) {
+        return Some(levels);
       }
-      let Some(parent) = self.tree.parent(at) else { return false };
-      (at, levels) = (parent, levels + 1);
+      if node.is_unlisted() {
+        return None;
+      }
+      at = self.tree.parent(at)?;
+      levels += 1;
     }
-    !self.is_ignored_on_the_way(key, levels)
   }
 
   /// Whether the filter ignores the directory or one of the `levels - 1` above it, below the
