@@ -1329,9 +1329,8 @@ As built:
   directory below that depth, and at that depth one after the other while too many paths are
   left. For 20,000 covers in a deep tree that is 13 ms, for 100,000 it is 69 ms (38 ms and
   724 ms with a pass over all paths for every directory that was taken).
-- **The real path** of a directory that is asked for its contents is made of the real path of
-  its parent, which is kept until the next commit, and of its own name as the disk spells it
-  (one `getattrlist` call). A link, and a name that differs by more than the case of ASCII
+- **The real path** of a directory is made of the real path of its parent, which is kept until
+  the next commit, and of its own name as the disk spells it (one `getattrlist` call). A link, and a name that differs by more than the case of ASCII
   letters, are left to the OS (`realpath`).
 - **Streams are only added.** `commit` starts streams for the new paths. Old streams keep running,
   so nothing is ever in a gap. With 64 streams running (`MAX_STREAMS`), with too many stream paths,

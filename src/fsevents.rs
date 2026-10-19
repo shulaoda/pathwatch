@@ -127,9 +127,9 @@ impl FsEventsBackend {
     self.streams.pending.paths()
   }
 
-  fn real_path(&mut self, dir: &Path, want: Want) -> io::Result<PathBuf> {
-    let real = match (want, dir.parent(), dir.file_name()) {
-      (Want::Contents, Some(parent), Some(name)) => {
+  fn real_path(&mut self, dir: &Path) -> io::Result<PathBuf> {
+    let real = match (dir.parent(), dir.file_name()) {
+      (Some(parent), Some(name)) => {
         let last = match self.last_parent.take() {
           Some(last) if last.asked == parent => last,
           _ => RealParent { asked: parent.to_owned(), real: short_way(fs::canonicalize(parent)?) },
@@ -157,7 +157,7 @@ impl Backend for FsEventsBackend {
   type Raw = Raw;
 
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
-    let real = match self.real_path(dir, want) {
+    let real = match self.real_path(dir) {
       Ok(real) => real,
       Err(error) => {
         self.unwatch(key);
@@ -404,6 +404,8 @@ struct Streams {
   sink: Arc<Sink<Raw>>,
   queue: Queue,
   running: Vec<Running>,
+  /// The stream paths that are trusted. `distrust` takes a path out while its stream runs on,
+  /// so these are not always all the paths of `running`.
   paths: Dirs<()>,
   pending: Dirs<()>,
   path_limit: usize,
@@ -822,7 +824,7 @@ pub fn is_too_high(dir: &Path) -> bool {
 /// Whether a stream may stand on the directory that a cover asks for: not on `/`, `/Users`
 /// or a home directory, where every program of the user writes. The same three that no
 /// handle of Windows is put on (`windows::place::may_hold_a_handle`).
-pub fn may_hold_a_stream(dir: &Path) -> bool {
+fn may_hold_a_stream(dir: &Path) -> bool {
   let mut names = names_of(dir);
   match (names.next(), names.next(), names.next()) {
     (None, ..) => false,
@@ -928,17 +930,13 @@ impl<T> Dirs<T> {
 
   fn remove(&mut self, dir: &Path) {
     self.by_path.remove(dir.as_os_str());
-    self.reset_lengths_if_empty();
+    if self.by_path.is_empty() {
+      self.path_lengths = Range { start: usize::MAX, end: 0 };
+    }
   }
 
   fn drain(&mut self) -> impl Iterator<Item = PathBuf> {
     mem::take(self).by_path.into_keys().map(PathBuf::from)
-  }
-
-  fn reset_lengths_if_empty(&mut self) {
-    if self.by_path.is_empty() {
-      self.path_lengths = Range { start: usize::MAX, end: 0 };
-    }
   }
 
   fn keys(&self) -> impl Iterator<Item = &Path> {
