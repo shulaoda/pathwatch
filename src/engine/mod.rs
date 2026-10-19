@@ -147,14 +147,10 @@ pub struct Engine<B: Backend, F: Fs> {
   flush_time: SystemTime,
   /// `Fs::ticks` at the start of the flush.
   flush_ticks: Duration,
-  /// How long the backend took to make watches live.
-  commit_took: Duration,
   /// A watch was given back since the last commit: the backend may move its watches then.
   gave_back: bool,
   /// The nodes the flush changed: `finish` reads their events. A key can be stale.
   touched: Vec<DirKey>,
-  /// The directories that give their own watch back after the next commit.
-  covered: Vec<DirKey>,
   /// The directories that may want less after an `unwatch` or a drop: asked once at the end of
   /// the call, not once for each path.
   narrowing: Vec<DirKey>,
@@ -214,10 +210,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       now: None,
       flush_time: SystemTime::UNIX_EPOCH,
       flush_ticks: Duration::ZERO,
-      commit_took: Duration::ZERO,
       gave_back: false,
       touched: Vec::new(),
-      covered: Vec::new(),
       narrowing: Vec::new(),
       stop: None,
       listed: FxHashMap::default(),
@@ -388,7 +382,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.now = Some(now);
     self.flush_time = self.fs.now();
     self.flush_ticks = self.fs.ticks();
-    self.commit_took = Duration::ZERO;
     // The scans that loss reports ask for are paced: after one flush of them, the next wait
     // for a rest.
     let rest_is_over = self.rest_until.is_none_or(|until| until <= now);
@@ -411,8 +404,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.listed.clear();
     self.listed.shrink_to(KEPT / size_of::<ScanEntry>());
 
-    let took = self.fs.ticks().saturating_sub(self.flush_ticks);
-    let took = took.saturating_sub(self.commit_took).min(LONGEST_FLUSH);
+    let took = self.fs.ticks().saturating_sub(self.flush_ticks).min(LONGEST_FLUSH);
     if loss_scans_ran {
       self.rest_until = Some(now + took + (took * REST).min(LONGEST_LOSS_REST));
     }
@@ -486,8 +478,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.gave_back = false;
     let mut scans = mem::take(&mut self.scans);
     self.tree.take_scans(&mut scans);
-    // After `take_scans`: what these two queue waits for the next commit.
-    self.give_back_covered();
+    // After `take_scans`: what this queues waits for the next commit.
     self.ask_again(now_watched);
     for &(key, depth) in &scans {
       if self.stopped() {

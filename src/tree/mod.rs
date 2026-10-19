@@ -734,6 +734,13 @@ pub(crate) fn push_name(path: &mut PathBuf, name: &OsStr) {
   text.push(name);
 }
 
+/// The room to keep for a list that shrank: `None` while more than half of it is in use, or
+/// while it is small. Not for a hash table, which rounds its room up to a power of two: that
+/// one waits for a quarter, or an eighth, so that it does not rehash at every step.
+pub(crate) fn room_to_keep(len: usize, capacity: usize) -> Option<usize> {
+  (capacity > 2 * len + 16).then(|| len + len / 8 + 16)
+}
+
 /// Empties a list for its next use and keeps its memory, unless it is long: a `watch` of 20,000
 /// paths must not leave its lists behind for ever.
 pub(crate) fn emptied<T>(mut list: Vec<T>) -> Vec<T> {
@@ -972,8 +979,8 @@ impl Tree {
     polled.dedup();
     let is_polled = |node: &Node| matches!(node.kind, Kind::Dir(dir) if dir.is_polled());
     polled.retain(|&key| self.get(key).is_some_and(is_polled));
-    if polled.capacity() > 2 * polled.len() + 16 {
-      polled.shrink_to(polled.len() + polled.len() / 8 + 16);
+    if let Some(room) = room_to_keep(polled.len(), polled.capacity()) {
+      polled.shrink_to(room);
     }
     self.polled = polled;
   }

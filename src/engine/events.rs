@@ -8,7 +8,7 @@ use crate::{
   backend::{Backend, DirKey},
   event::{Event, EventKind},
   fs::Fs,
-  tree::{Added, Dir, Kind, Mark, Node, Watch, emptied},
+  tree::{Added, Dir, Kind, Mark, Node, Watch, emptied, room_to_keep},
 };
 
 impl<B: Backend, F: Fs> Engine<B, F> {
@@ -108,9 +108,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
     }
     // Many holds at once (a tree removed file by file) must not keep their room for ever.
-    let (len, capacity) = (self.hold_queue.len(), self.hold_queue.capacity());
-    if capacity > 64 && len * 4 < capacity {
-      self.hold_queue.shrink_to(len * 2);
+    if let Some(room) = room_to_keep(self.hold_queue.len(), self.hold_queue.capacity()) {
+      self.hold_queue.shrink_to(room);
     }
     any
   }

@@ -23,8 +23,9 @@ pub enum Mode {
   /// FSEvents. One stream for a real path and everything below it. A stream starts at `commit`,
   /// not at `watch`. A notification carries the real path, without any link in it; the backend
   /// maps it back. A moved directory gives one notification for the directory and none for what
-  /// is in it. It never says `Written`. `Names` is answered `NotWatched`, unless a live stream
-  /// reports the directory: then the key gets the records of that stream below its directory,
+  /// is in it. It never says `Written`. `Names` is answered `NotWatched` (the real backend
+  /// answers it with its guard; here the poll stands in), unless a live stream reports the
+  /// directory: then the key gets the records of that stream below its directory,
   /// and it stays on that stream when it asks for the contents later.
   ///
   /// A stream stands at the text of its path and hears nothing more when a directory at or

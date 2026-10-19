@@ -3,7 +3,7 @@
 
 use std::ops::{Index, IndexMut};
 
-use super::Slot;
+use super::{Slot, room_to_keep};
 
 /// Slots in a block: 64 KiB.
 const BLOCK: usize = 1024;
@@ -58,9 +58,9 @@ impl Slots {
   /// Gives back the room of the last block when less than half of it is in use.
   pub fn shrink(&mut self) {
     if let Some(block) = self.blocks.last_mut()
-      && block.capacity() > 2 * block.len() + 16
+      && let Some(room) = room_to_keep(block.len(), block.capacity())
     {
-      block.shrink_to(block.len() + block.len() / 8 + 16);
+      block.shrink_to(room);
     }
   }
 

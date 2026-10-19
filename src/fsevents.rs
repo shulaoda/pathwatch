@@ -258,9 +258,6 @@ impl Backend for FsEventsBackend {
     if !moved.records.is_empty() || !moved.lost.is_empty() {
       self.streams.sink.raw(moved);
     }
-    let streamed = &self.streams.paths;
-    let now_streamed = self.named.iter().filter(|(_, dir)| streamed.holds(dir));
-    committed.now_watched = now_streamed.map(|(&key, _)| key).collect();
     self.streams.fit_guard(&self.named);
     committed
   }

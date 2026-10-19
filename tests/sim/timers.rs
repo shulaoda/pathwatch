@@ -215,34 +215,6 @@ fn a_slow_poll_round_is_followed_by_a_pause_as_long() {
   caught_up(&mut d);
 }
 
-/// What the backend takes to make watches live is not paced: it is paid once, not at every
-/// look. Only the time of the looks at the disk counts.
-#[test]
-fn the_time_of_a_commit_is_not_paced() {
-  let mut d = Driver::sim(Mode::Prefix, Options::default());
-  d.fs.mkdir_all("/p/R").unwrap();
-  d.watch(&["/p/R"]);
-  let start = d.now;
-  let second = Duration::from_secs(1);
-
-  // The first call of a poll round is the commit of the backend.
-  let commits = d.fs.calls().commit;
-  d.fs.at_call(0, |fs| fs.advance(Duration::from_millis(1500)));
-  assert!(d.step());
-  assert_eq!((d.fs.traps_run(), d.fs.calls().commit), (1, commits + 1));
-  assert_eq!(d.engine.deadline(), Some(start + second * 2));
-
-  // The second call is a look at the disk.
-  let lstats = d.fs.calls().lstat;
-  d.fs.at_call(1, |fs| fs.advance(Duration::from_millis(1500)));
-  assert!(d.step());
-  assert_eq!(d.fs.traps_run(), 2);
-  assert!(d.fs.calls().lstat > lstats);
-  // The 1.5 s of the round, and a pause as long: longer than the interval of a second.
-  assert_eq!(d.engine.deadline(), Some(start + second * 2 + Duration::from_millis(3000)));
-  caught_up(&mut d);
-}
-
 /// After a scan of everything that took 30 ms, the next one for lost notifications waits
 /// until 300 ms after its start: its 30 ms, and a rest of nine times that. A plain hint does
 /// not wait for that.

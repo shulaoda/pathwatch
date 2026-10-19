@@ -83,51 +83,6 @@ fn unwatch_gives_a_watch_for_a_tree_back() {
   });
 }
 
-/// Where one watch covers a whole tree: single files are watched, three directories deep, and
-/// then the tree above them. The watch of the tree takes over: each directory below gives its
-/// own back, so it does not matter which of them was watched first. When the tree is taken
-/// back, each directory asks for its own again, and what is below is scanned deep once.
-#[test]
-fn a_tree_above_watched_files_takes_their_watches_over() {
-  for mode in RECURSIVE {
-    let mut d = Driver::sim(mode, Options::default());
-    let mut files = Vec::new();
-    let dirs = ["/p/t/a/src/x", "/p/t/a/src/y", "/p/t/b/src/x", "/p/t/b/src/y"];
-    for dir in dirs {
-      d.fs.mkdir_all(dir).unwrap();
-      for file in 0..5 {
-        files.push(format!("{dir}/file{file}.js"));
-        d.fs.write(files.last().unwrap(), "1").unwrap();
-      }
-    }
-    let of_the_files: Vec<_> = dirs.map(|dir| at(dir, Contents)).into();
-    d.watch(&files);
-    assert_eq!(os_watches(&d.fs), of_the_files, "{mode:?}");
-    d.watch(&["/p/t"]);
-    assert_eq!(settled(&mut d), NONE, "{mode:?}");
-    assert_eq!(os_watches(&d.fs), [at("/p/t", Contents)], "{mode:?}");
-    d.fs.write("/p/t/a/src/x/file1.js", "22").unwrap();
-    assert_eq!(settled(&mut d), ["U /p/t/a/src/x/file1.js"], "{mode:?}");
-
-    let before = d.fs.calls();
-    d.unwatch(&["/p/t"]);
-    assert_eq!(taken(&mut d), NONE, "{mode:?}");
-    let after = d.fs.calls();
-    // One look for each of the 8 directories and the 20 files below the tree.
-    assert_eq!(after.lstat - before.lstat, 28, "{mode:?}");
-    // The tree gives its watch back, and the backend is asked once for each of the 9
-    // directories: the top one then, and the others when the deep scan comes to them.
-    assert_eq!(after.unwatch - before.unwatch, 1, "{mode:?}");
-    assert_eq!(after.watch - before.watch, 9, "{mode:?}");
-    assert_eq!(os_watches(&d.fs), of_the_files, "{mode:?}");
-
-    d.fs.write("/p/t/b/src/y/file3.js", "22").unwrap();
-    d.fs.write("/p/t/b/src/y/new.js", "1").unwrap();
-    assert_eq!(settled(&mut d), ["U /p/t/b/src/y/file3.js"], "{mode:?}");
-    caught_up(&mut d);
-  }
-}
-
 /// A notification is on its way through the watch of a watched directory. Then the directory
 /// above gets a watch for its tree, and the watched directory is taken back: its own watch is
 /// given back, and the watch above covers it from now on. The notification is gone with the

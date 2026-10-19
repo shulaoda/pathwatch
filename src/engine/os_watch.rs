@@ -2,7 +2,7 @@
 //! live, and what is polled because no OS watch tells about it.
 
 use std::{
-  io, mem,
+  io,
   path::{Path, PathBuf},
 };
 
@@ -40,37 +40,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let linked = self.tree.link(key).is_some();
     let above = self.tree.parent(key).map(|parent| self.tree[parent].watch());
     !linked && matches!(above, Some(Watch::WatchedTree | Watch::FromAbove))
-  }
-
-  /// Whether the directory has a watch of its own that a watch above makes needless.
-  pub(super) fn has_a_watch_to_give_back(&self, key: DirKey) -> bool {
-    let has_its_own = self.tree[key].dir().is_some_and(|dir| dir.asked.is_some());
-    has_its_own && self.backend.is_some() && self.is_covered_from_above(key)
-  }
-
-  /// Gives the watch of each directory on `covered` back, after the commit: the watch above is
-  /// live, and the deep scan that follows finds what the old watch did not deliver.
-  pub(super) fn give_back_covered(&mut self) {
-    let mut covered = mem::take(&mut self.covered);
-    for key in covered.drain(..) {
-      // Nothing is on disk below a held node: its second look decides for this one too.
-      if self.tree.get(key).is_none() || self.tree.frozen(key) {
-        continue;
-      }
-      if self.has_a_watch_to_give_back(key) {
-        self.unwatch_dir(key);
-        if let Some(dir) = self.tree[key].dir_mut() {
-          dir.asked = None;
-        }
-        self.set_state(key, Watch::FromAbove);
-      } else {
-        // The watch above is gone again: ask for an own one, and the scan waits for the next
-        // commit.
-        let mut path = self.tree.path(key);
-        self.arm(key, &mut path, true);
-      }
-    }
-    self.covered = covered;
   }
 
   /// Asks the backend to watch the directory with `want`, and queues the scan.
@@ -147,20 +116,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// Makes the watches asked for since the last commit live. Gives the directories that an OS
   /// watch reports now (see `ask_again`). A key that got no watch is polled and asked again.
   pub(super) fn commit(&mut self) -> Vec<DirKey> {
-    let Some(backend) = &mut self.backend else {
-      self.covered.clear();
-      return Vec::new();
-    };
-    let started = self.fs.ticks();
+    let Some(backend) = &mut self.backend else { return Vec::new() };
     let Committed { now_watched, failed } = backend.commit();
-    // A commit can take long (an FSEvents stream: a quarter of a second); the pacing leaves it
-    // out.
-    self.commit_took += self.fs.ticks().saturating_sub(started);
     if failed.is_empty() {
       return now_watched;
     }
-    // A watch above a covered directory may not be live: it keeps its own and is asked again.
-    self.covered.clear();
     for (key, error) in failed {
       let asked = self.tree.get(key).and_then(Node::dir).is_some_and(|dir| dir.asked.is_some());
       if asked {

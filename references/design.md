@@ -833,18 +833,20 @@ the poll backend every answer is `NotWatched`, so every node is polled, and the 
 poll interval. **Polling is this
 timer with the poll backend.**
 
-**Asked again.** `NotWatched` is not for ever. A commit can start an OS watch for a tree that
-holds a polled directory (FSEvents: a stream path that went up to a common directory, or a
-watched path higher up). Then `commit` returns the keys of these directories, and the engine
+**Asked again.** `NotWatched` is not for ever. A commit can put an OS watch over a polled
+directory (Windows: a handle that comes to stand at or above a directory that asked for names;
+not FSEvents, whose guard answers such a directory, and whose streams never stand at or above
+a directory that got `NotWatched`). Then `commit` returns the keys of these directories, and the engine
 calls `watch` again for each of them (`ask_again`). One that is reported now gets a shallow
 scan after the next commit (watch, commit, then scan), and no poll looks at it any more.
 
-**Given back.** A directory can have a watch of its own and lie below a watch for a tree: its
-path was watched first, and a path above it later. When such a directory is scanned deep, its
-own watch is given back after the next commit, and it relies on the watch above (`still_there`,
-`give_back_covered`). So it does not matter which of the two paths was watched first. It
-happens only with a deep scan: a watch that goes takes with it what it has not delivered yet,
-and the scan after it finds what that watch did not tell.
+**A watch below a watch.** A directory can have a watch of its own and lie below a watch for
+a tree: its path was watched first, and a path above it later. It keeps its own watch until the
+directory goes or the tree above it is taken back: a record below it then makes one hint for
+each of the two keys, and the tree merges them into one mark. (Until 2026-10-19 the lower watch
+was given back after a deep scan, so that the OS watches did not depend on which path was
+watched first: 40 lines and two rules of their own, for one cover and one doubled hint a
+directory on FSEvents and Windows.)
 
 **A directory above a watch by path.** A watch by path (FSEvents) stands at the text of a
 path. When a directory above it is renamed, also only to another spelling of its name, the
@@ -1020,9 +1022,8 @@ and again: a poll, and the scans after a loss report. Each is paced by the time 
   floor that the user could not see, and 20,000 files polled every half second.)
 
 The time is the time of the whole flush that the poll or the scans ran in: the checks that
-hints asked for in the same flush count with it, and so do the reads of young files. What the
-backend takes to make watches live (`commit`) is left out: it is paid once, not at every look.
-And a flush counts for a minute at most (`LONGEST_FLUSH`): the clock runs on while the machine
+hints asked for in the same flush count with it, and so do the reads of young files and what
+the backend takes to make watches live. A flush counts for a minute at most (`LONGEST_FLUSH`): the clock runs on while the machine
 sleeps, and a flush that the sleep fell into would pause for hours.
 
 ### 5.14 Symbolic links
@@ -1058,7 +1059,7 @@ type has its own `new(sink: Sink<Self::Raw>)`.
 | `Raw` | A raw OS notification. Cheap to make: the backend thread only copies it into the sink. |
 | `watch(key, dir, want)` | Report changes in `dir` as hints that carry `key`. The answer is a `Coverage`. |
 | `unwatch(key)` | Forget `key`. No hint should carry it after this; a late one costs the engine one check. |
-| `commit()` | Make every watch asked for since the last call live. It returns two lists of keys (`Committed`). The keys whose watch could not be made live, each with the reason: the engine reports it, polls the directory, and asks again later; a key that is not named is live. And the keys that got `NotWatched` and whose directories an OS watch reports now: the engine calls `watch` again for each of them, with the `Want` of before, and does not poll one that is reported (5.10, "Asked again"). Only a backend that starts one OS watch for many directories (FSEvents) has work here, and only such a backend returns a key: its answer for a directory depends on the OS watches of other directories. Every other backend leaves the method out: then it does nothing and returns no key. |
+| `commit()` | Make every watch asked for since the last call live. It returns two lists of keys (`Committed`). The keys whose watch could not be made live, each with the reason: the engine reports it, polls the directory, and asks again later; a key that is not named is live. And the keys that got `NotWatched` and whose directories an OS watch reports now: the engine calls `watch` again for each of them, with the `Want` of before, and does not poll one that is reported (5.10, "Asked again"). Only a backend that puts one OS watch over many directories has work here, as its answer for a directory depends on the OS watches of other directories: FSEvents names the keys that got no stream or no guard, and the Windows backend the keys that a handle reports now. Every other backend leaves the method out: then it does nothing and returns no key. |
 | `translate(raw, hint)` | Turn one raw notification into hints. |
 | `raw_bytes(raw)` | How many bytes `raw` keeps on the heap (5.13). A backend that leaves it out says 0. |
 
@@ -1529,9 +1530,9 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   lie behind one (`System::is_link`, one look for each name on the way, once per settle), and
   the placement is made again with them known, before a handle moves.
 - **Answers.** A key that wants the contents and that a handle serves: `WatchedTree`. A key
-  that wants names only and that a handle serves: `Watched` (after `WatchedTree` the engine
-  would take back the watches of the directories below, and only a key that wants the
-  contents holds a handle). A `Names` request that no handle covers, and a directory that
+  that wants names only and that a handle serves: `Watched` (`WatchedTree` would make the
+  engine rely on it for the directories below, and only a key that wants the contents holds a
+  handle). A `Names` request that no handle covers, and a directory that
   could only be watched from one of those three directories: `NotWatched`; when a handle
   comes to stand at or above such a directory later, `commit` returns its key. A key that the
   commit can give no handle (no room and no allowed directory in common, or the open fails)

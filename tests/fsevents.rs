@@ -1515,7 +1515,7 @@ fn many_covers_share_stream_paths_on_common_directories() {
   let group = DirKey::new(1000, 0);
   let coverage = h.backend.watch(group, &h.path("g0"), Want::Names);
   assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
-  assert_eq!(h.commit(), [group]);
+  assert_eq!(h.commit(), []);
   assert_eq!(h.backend.stream_count(), MAX_NEW_STREAMS);
   // The groups go up in path order until the paths fit: the last one keeps its own.
   let mut expected: Vec<PathBuf> =
