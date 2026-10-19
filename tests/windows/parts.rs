@@ -1481,6 +1481,31 @@ mod translate {
     watch(&mut handles, 4, "/p/café", Want::Contents);
     watch(&mut handles, 5, "/p/CAFÉ", Want::Contents);
     assert_eq!(told(&mut handles, "café/x.js"), [changed(4, "x.js"), changed(5, "x.js")]);
+    // The fold is the one of each character: NTFS takes `οδοσ` for `ΟΔΟΣ` and not `οδος`
+    // (measured), which the lower case of the word as a whole would give.
+    watch(&mut handles, 6, "/p/ΟΔΟΣ", Want::Contents);
+    assert_eq!(told(&mut handles, "οδοσ/x.js"), [changed(6, "x.js")]);
+    assert_eq!(told(&mut handles, "οδος/x.js"), []);
+  }
+
+  /// NTFS names an entry by names with separators between them and nothing else. A record from
+  /// another disk, or a server, that names anything else names no entry below the directory and
+  /// is dropped: a `..` or a drive would reach another directory, and a key there.
+  #[test]
+  fn a_record_whose_name_is_no_name_below_the_directory_is_dropped() {
+    let mut handles = Handles::default();
+    let id = open(&mut handles, 0, "/p");
+    open(&mut handles, 1, "/q");
+    let bytes = records(&[
+      (ADDED, "../q/a.js"),
+      (ADDED, "C:/q/a.js"),
+      (ADDED, "/q/a.js"),
+      (ADDED, "a/../b.js"),
+      (MODIFIED, "f.txt:stream"),
+      (ADDED, "nul\0led.js"),
+      (ADDED, "kept.js"),
+    ]);
+    assert_eq!(hints(&mut handles, read(id, "/p", Ok(bytes))), [changed(0, "kept.js")]);
   }
 
   #[test]

@@ -1566,10 +1566,19 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   have them: they tell whether an entry is a directory.
 - **Hints.** A record goes to every key whose directory holds its path, the deepest first,
   with the names compared in lower case (rule 7): two watched paths that are two spellings of
-  one directory both get it, and so does each key above. A key above gets a hint it may not
+  one directory both get it, and so does each key above. The lower case is the one of each
+  character (`char::to_lowercase`), measured against NTFS, which takes `οδοσ` for `ΟΔΟΣ` and
+  not `οδος` (the final sigma that `str::to_lowercase` gives a word), nor `STRASSE` or
+  `STRAẞE` for `straße`, nor the Kelvin sign for `k`, nor `I` for `ı`; the fold takes `STRAẞE`
+  and the Kelvin sign for one with theirs, which costs one check too many and misses no
+  record. A key above gets a hint it may not
   need, which costs one walk; without it the path would be missed where the tree reaches it
   only from above: a second spelling of a name below, or the other letter case of the drive,
-  which is another top node of the tree. A record that no key holds is dropped. `MODIFIED` →
+  which is another top node of the tree. A record that no key holds is dropped, and so is one
+  whose name is no name of an entry below the directory: a `..`, a root, a drive, a NUL, or a
+  `:`, which starts a stream of a file (NTFS gives none of these; a write to a stream of a file
+  is a `MODIFIED` record for the file, measured; a disk that another system filled, or a
+  server, could give one, and a `..` or a drive would reach another directory). `MODIFIED` →
   `Written`; it is dropped when it names a directory (the longer records tell) or the
   directory of a key: Windows sends it whenever an entry in a directory changes, and that
   entry has a record of its own. Every other record → `Changed`. A read with no bytes, and a record with no name →

@@ -122,7 +122,9 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
     }
     path.clear();
     path.push(&*dir);
-    record.push_name(&mut path, &mut text);
+    if !record.push_name(&mut path, &mut text) {
+      continue;
+    }
     lower_case(&path, &mut lower, &mut text);
     // Windows says "modified" for a directory when an entry in it changes, and that entry has
     // a record of its own.
@@ -699,7 +701,13 @@ mod handles {
 }
 
 mod records {
-  use std::{ffi::OsString, mem::offset_of, os::windows::ffi::OsStringExt, path::PathBuf};
+  use std::{
+    borrow::Cow,
+    ffi::OsString,
+    mem::offset_of,
+    os::windows::ffi::OsStringExt,
+    path::{Component, Path, PathBuf},
+  };
 
   pub(super) use windows_sys::Win32::Storage::FileSystem::FILE_ACTION_MODIFIED;
   use windows_sys::Win32::Storage::FileSystem::{
@@ -779,16 +787,29 @@ mod records {
     }
 
     /// Puts the name below `path`, through `text`: a name is Unicode text unless it holds a
-    /// lone surrogate, and only such a one asks for memory.
-    pub fn push_name(&self, path: &mut PathBuf, text: &mut String) {
+    /// lone surrogate, and only such a one asks for memory. `false`, and nothing is put: the
+    /// name is no name of an entry below the directory. NTFS gives names with separators
+    /// between them and nothing else; a disk that another system filled, or a server, could
+    /// give a `..`, a root, a drive, a NUL, or a `:`, which starts a stream of a file.
+    pub fn push_name(&self, path: &mut PathBuf, text: &mut String) -> bool {
       text.clear();
-      for unit in char::decode_utf16(self.name()) {
-        match unit {
-          Ok(character) => text.push(character),
-          Err(_) => return path.push(OsString::from_wide(&self.name().collect::<Vec<u16>>())),
+      let decoded = char::decode_utf16(self.name())
+        .try_for_each(|unit| unit.map(|character| text.push(character)));
+      let name = match decoded {
+        Ok(()) => Cow::Borrowed(Path::new(text.as_str())),
+        Err(_) => Cow::Owned(OsString::from_wide(&self.name().collect::<Vec<u16>>()).into()),
+      };
+      let is_entry = |part| match part {
+        Component::Normal(name) => {
+          !name.as_encoded_bytes().iter().any(|&byte| byte == 0 || byte == b':')
         }
+        _ => false,
+      };
+      let is_below = name.components().all(is_entry);
+      if is_below {
+        path.push(&*name);
       }
-      path.push(&*text);
+      is_below
     }
   }
 
