@@ -688,12 +688,9 @@ fn rebuild_opens_no_gap_for_an_old_cover() {
       fs::create_dir_all(h.path(&dir)).unwrap();
       h.watch(index, &h.path(&dir), Want::Contents);
       index += 1;
-      let streams = h.backend.stream_count();
       h.commit();
       if dir == above {
         assert_eq!(h.backend.stream_count(), 1);
-        // A replaced stream stays for the whole overlap time.
-        assert!(h.backend.retiring_count() >= streams);
       }
       // The writer goes on for a while before the set of streams changes again.
       let goal = writer.made() + 80;
@@ -723,7 +720,8 @@ fn cover_above_a_cover() {
   assert_eq!(h.backend.stream_count(), 1);
   assert_eq!(h.backend.streamed(), [h.real("up")]);
 
-  // The replaced stream may still run and deliver the record too, so each hint can come twice.
+  // The replaced stream stops on the queue, and may deliver the record before: a hint can come
+  // twice.
   File::create(h.path("up/low/a")).unwrap();
   let mut hints = h.hints_until(&[changed(low, "a"), changed(up, "low/a")]);
   File::create(h.path("up/b")).unwrap();
@@ -735,25 +733,22 @@ fn cover_above_a_cover() {
   // path are reported lost when it stops. The one above came with the new stream, and was
   // read after it started.
   let deadline = Instant::now() + TIMEOUT;
-  while h.backend.retiring_count() > 0 {
+  while h.lost.is_empty() {
     hints.extend(h.sync(up));
-    assert!(Instant::now() < deadline, "{} streams never stop", h.backend.retiring_count());
+    assert!(Instant::now() < deadline, "no loss report");
   }
-  hints.extend(h.sync(up));
   assert_eq!(h.lost, [low]);
   File::create(h.path("up/low/d")).unwrap();
   h.hints_until(&[changed(low, "d"), changed(up, "low/d")]);
 
-  // With the last key gone, the streams that a replacement left running need no overlap: the
-  // next commit stops them, and nothing stays open.
+  // With the last key gone, nothing stays open.
   let top = h.watch(3, &h.path(""), Want::Contents);
   h.commit();
-  assert_eq!(h.backend.retiring_count(), 1);
   for key in [low, up, top] {
     h.backend.unwatch(key);
   }
   h.commit();
-  assert_eq!((h.backend.stream_count(), h.backend.retiring_count()), (0, 0));
+  assert_eq!(h.backend.stream_count(), 0);
 }
 
 #[test]
@@ -1152,10 +1147,9 @@ fn a_directory_that_gets_no_guard_fails_its_keys_only() {
   h.hints_until(&[changed(z, "file"), changed(y, "file")]);
 }
 
-/// The old streams of a replacement stop when their time is up, also when nothing else comes:
-/// no poll brings a commit.
+/// The stream below a new path is replaced and stops at once, with a loss report for its covers.
 #[test]
-fn replaced_streams_stop_by_themselves() {
+fn a_replaced_stream_stops_with_a_loss_report() {
   let mut h = Harness::new();
   for dir in ["apart", "up/low"] {
     fs::create_dir_all(h.path(dir)).unwrap();
@@ -1164,7 +1158,7 @@ fn replaced_streams_stop_by_themselves() {
   let low = h.cover(2, "up/low");
   h.cover(3, "up");
   // The stream whose path stays goes on: only the one below the new path is replaced.
-  assert_eq!((h.backend.stream_count(), h.backend.retiring_count()), (2, 1));
+  assert_eq!(h.backend.stream_count(), 2);
   assert!(!h.backend.guarded().contains(&h.real("up/low").as_path()));
   // A stream that stops may take records with it: the covers at and below its path are read
   // again.
@@ -1172,7 +1166,7 @@ fn replaced_streams_stop_by_themselves() {
   while h.lost.is_empty() {
     assert!(h.next(deadline).is_some(), "no loss report");
   }
-  assert_eq!((h.lost.as_slice(), h.backend.retiring_count()), ([low].as_slice(), 0));
+  assert_eq!(h.lost, [low]);
 }
 
 /// A directory on the way that cannot be read, and a cover spelled through the data volume:
@@ -1608,13 +1602,13 @@ fn drop_while_a_writer_is_active() {
       assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
     }
     assert!(backend.commit().failed.is_empty());
-    // Every second round also drops the streams that a rebuild has just replaced.
+    // Every second round drops the backend right after a rebuild: the stops of the replaced
+    // streams wait on the queue.
     if rebuild {
       let coverage = backend.watch(DirKey::new(covers, 0), dir.path(), Want::Contents);
       assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
       assert!(backend.commit().failed.is_empty());
     }
-    assert_eq!(backend.retiring_count(), if rebuild { MAX_NEW_STREAMS } else { 0 });
     assert!(matches!(signals.recv_timeout(TIMEOUT), Ok(Signal::Raw(_))), "no callback yet");
 
     drop(backend);
@@ -1715,7 +1709,6 @@ fn failed_start_is_reported_and_the_old_streams_stay() {
   let known: HashSet<DirKey> = h.backend.cover_of_key().keys().copied().collect();
   assert_eq!(known, keys.iter().copied().collect());
   assert_eq!(h.backend.stream_count(), MAX_STREAMS);
-  assert_eq!(h.backend.retiring_count(), 0);
   assert_eq!(h.backend.covers().len(), MAX_STREAMS);
   assert!(!h.backend.streamed().contains(&fs::canonicalize(&last).unwrap().as_path()));
   assert_eq!(h.backend.pending(), NO_PATHS);
@@ -1735,7 +1728,6 @@ fn failed_start_is_reported_and_the_old_streams_stay() {
   };
   // More covers than stream paths now: they share one path, the directory above them.
   assert_eq!(h.backend.stream_count(), 1);
-  assert_eq!(h.backend.retiring_count(), MAX_STREAMS);
   File::create(last.join("file")).unwrap();
   File::create(h.path("dir-0/again")).unwrap();
   h.hints_until(&[changed(new, "file"), changed(keys[0], "again")]);

@@ -1357,24 +1357,23 @@ As built:
   (390 ms before, with one stream for all covers and a limit of 8). What stays: covers that
   share one stream path (more than 64 directories with one directory above them, or a watched
   tree) have one stream, and a flood below it can still end in a loss report.
-- **An old stream that stops.** A replaced stream runs on for 500 ms next to the new ones. When it
-  is stopped, the backend reports each cover at and below its paths lost, and the engine reads them
-  again: a stream that stops takes with it what it has not delivered, and the new one may not have
-  told everything from its first moments (see the probe). A cover above its paths has a stream above
-  of its own, as trusted stream paths never lie one below another: that stream goes on, or stops
-  with a report of its own, or came with the replacement and started before the cover was read, as
-  for every new cover. (Before 2026-10-19 the report was for `/`, so `Lost`, and the engine read
-  everything.) Streams that stop at the same time share one report, and the scans of loss reports
-  are paced (5.13). A stream stops on the queue of the streams, and the report goes from there after
-  the stop, but the thread of the watcher does not wait for it: a callback can keep the queue for a
-  long time, and under a busy fseventsd the waits for 1,161 stops in one `watch` call for each of
-  20,000 files came to 21 to 27 s. The `Drop` of the backend waits on the queue, after these stops:
-  no report comes after it. The stop is made by the first `commit` or `translate` after the 500 ms:
-  the replacement sets a timer on the queue of the guard (`EVFILT_TIMER`), whose notice brings a
-  `translate` then, so an old stream does not wait for the next change, which would pay for the
-  reading of its covers. At most 72 old streams run on (`MAX_RETIRING_STREAMS`: as many as can run
-  at a time, so the streams of one replacement always keep their 500 ms). With more, the oldest are
-  stopped at once, in the same way, so that commits that come fast do not use up the 512 streams.
+- **An old stream that stops.** A replaced stream is stopped as soon as the new ones run, and the
+  backend reports each cover at and below its paths lost: the engine reads them again, as a stream
+  that stops takes with it what it has not delivered, and the new one may not have told everything
+  from its first moments (see the probe). What the old stream did not deliver is on the disk, and
+  the read after the stop finds it. A cover above its paths has a stream above of its own, as
+  trusted stream paths never lie one below another: that stream goes on, or stops with a report of
+  its own, or came with the replacement and started before the cover was read, as for every new
+  cover. (Before 2026-10-19 the report was for `/`, so `Lost`, and the engine read everything. Until
+  2026-10-19 a replaced stream also ran on for 500 ms next to the new ones, with a timer of the
+  guard's queue that brought the stop: the report alone was measured to lose nothing, and a probe
+  of 480 replacements, each under a burst of 300 files from 4 threads, lost nothing with the report
+  alone, and nothing with no report either.) Streams that stop at the same time share one report,
+  and the scans of loss reports are paced (5.13). A stream stops on the queue of the streams, and
+  the report goes from there after the stop, but the thread of the watcher does not wait for it: a
+  callback can keep the queue for a long time, and under a busy fseventsd the waits for 1,161 stops
+  in one `watch` call for each of 20,000 files came to 21 to 27 s. The `Drop` of the backend waits
+  on the queue, after these stops: no report comes after it.
 - **Hints.** A record becomes one `Changed` for each key of each cover that holds its path;
   the rest of the path is `rel`. The covers are found by one table lookup for each directory
   above the path that can be a cover. A record under no cover is dropped: a stream path on a

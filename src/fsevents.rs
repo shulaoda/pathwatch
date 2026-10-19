@@ -2,7 +2,7 @@
 //! the directories above them. The design is in `references/design.md` 7.2.
 
 use std::{
-  collections::{BTreeMap, VecDeque},
+  collections::BTreeMap,
   ffi::{OsStr, OsString},
   fs::{self, File, OpenOptions},
   io, mem,
@@ -17,7 +17,6 @@ use std::{
     Arc,
     atomic::{AtomicUsize, Ordering},
   },
-  time::{Duration, Instant},
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -32,8 +31,6 @@ pub const MAX_STREAMS: usize = 64;
 pub const MAX_NEW_STREAMS: usize = 8;
 pub const MAX_STREAM_PATHS: usize = 64;
 pub const MAX_PATHS_PER_STREAM: usize = 4096;
-const MAX_RETIRING_STREAMS: usize = MAX_STREAMS + MAX_NEW_STREAMS;
-const RETIRING_TIMEOUT: Duration = Duration::from_millis(500);
 const EXPECTED_PATH_BYTES: usize = 128;
 const DATA_VOLUME: &str = "/System/Volumes/Data";
 
@@ -152,7 +149,6 @@ impl Backend for FsEventsBackend {
   }
 
   fn commit(&mut self) -> Committed {
-    self.streams.stop_retired(&self.covers);
     // Notices whose wake-up was dropped with a full queue: the engine, which checks everything
     // then, hears of their keys here.
     let told = self.told();
@@ -161,9 +157,6 @@ impl Backend for FsEventsBackend {
     }
     self.streams.stop_idle(&self.covers);
     self.last_parent = None;
-    if self.covers.dir_of.is_empty() {
-      self.streams.stop_retired_now();
-    }
     let mut committed = Committed::default();
     if self.streams.pending.is_empty() && !self.streams.guard_is_stale {
       return committed;
@@ -199,7 +192,6 @@ impl Backend for FsEventsBackend {
   }
 
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
-    self.streams.stop_retired(&self.covers);
     for key in raw.lost.iter().copied().chain(self.told()) {
       hint(Hint::Changed { dir: key, rel: Path::new("") });
     }
@@ -290,10 +282,6 @@ impl FsEventsBackend {
 impl FsEventsBackend {
   pub fn stream_count(&self) -> usize {
     self.streams.running.len()
-  }
-
-  pub fn retiring_count(&self) -> usize {
-    self.streams.retiring.iter().map(|old| old.streams.len()).sum()
   }
 
   pub fn covers(&self) -> Vec<&Path> {
@@ -397,7 +385,6 @@ struct Streams {
   paths: Dirs<()>,
   pending: Dirs<()>,
   path_limit: usize,
-  retiring: VecDeque<Retiring>,
   guard: Guard,
   /// The stream paths or the named directories changed since the guard was last made to fit.
   guard_is_stale: bool,
@@ -421,12 +408,6 @@ struct Running {
   paths: Vec<PathBuf>,
 }
 
-#[derive(Debug)]
-struct Retiring {
-  streams: Vec<Running>,
-  deadline: Instant,
-}
-
 impl Streams {
   fn new(sink: Sink<Raw>) -> io::Result<Self> {
     let sink = Arc::new(sink);
@@ -439,7 +420,6 @@ impl Streams {
       paths: Dirs::default(),
       pending: Dirs::default(),
       path_limit: MAX_STREAM_PATHS,
-      retiring: VecDeque::new(),
       guard: Guard { notices, dirs: FxHashMap::default(), last_id: ffi::VOLUMES },
       guard_is_stale: false,
     })
@@ -487,19 +467,15 @@ impl Streams {
       Err(error) => return Started { fresh: Vec::new(), unguarded, failed: Some(error) },
     };
     let fresh = paths.iter().filter(|path| !self.paths.contains(path)).cloned().collect();
-    // The new streams run before the old ones retire: nothing is missed in between.
+    // The new streams run before the old ones stop: nothing is missed in between.
     if replace {
       let (kept, replaced): (Vec<_>, Vec<_>) =
         mem::take(&mut self.running).into_iter().zip(keep).partition(|(_, keep)| *keep);
       self.running = kept.into_iter().map(|(running, _)| running).collect();
       let replaced: Vec<Running> = replaced.into_iter().map(|(running, _)| running).collect();
       if !replaced.is_empty() {
-        let deadline = Instant::now() + RETIRING_TIMEOUT;
-        self.retiring.push_back(Retiring { streams: replaced, deadline });
-        // Nothing else may come to stop them: no poll runs while the guard tells.
-        self.guard.notices.wake_in(RETIRING_TIMEOUT);
+        self.stop(replaced, covers);
       }
-      self.stop_retired(covers);
       self.paths = Dirs::default();
       for path in self.running.iter().flat_map(|running| &running.paths) {
         self.paths.insert(path.clone(), ());
@@ -627,34 +603,11 @@ impl Streams {
     self.queue.run(move || drop(idle));
   }
 
-  /// No key is left: the streams that were replaced need no overlap, since their records
-  /// would reach no key.
-  fn stop_retired_now(&mut self) {
-    let stopped: Vec<Retiring> = self.retiring.drain(..).collect();
-    if !stopped.is_empty() {
-      self.queue.run(move || drop(stopped));
-    }
-  }
-
-  fn stop_retired(&mut self, covers: &Covers) {
-    let now = Instant::now();
-    let mut still_running: usize = self.retiring.iter().map(|old| old.streams.len()).sum();
-    let mut stopped = Vec::new();
-    while let Some(oldest) = self.retiring.front() {
-      if now < oldest.deadline && still_running <= MAX_RETIRING_STREAMS {
-        break;
-      }
-      still_running -= oldest.streams.len();
-      stopped.extend(self.retiring.pop_front());
-    }
-    if stopped.is_empty() {
-      return;
-    }
-    // A stream that stops takes what it has not delivered: the covers at and below its paths are
-    // read again. A cover above them has a stream of its own: trusted stream paths never lie one
-    // below another.
-    let paths = stopped.iter().flat_map(|old| &old.streams).flat_map(|old| old.paths.clone());
-    let paths = top_most(paths.collect());
+  /// Stops the replaced streams, with a loss report for the covers at and below their paths: a
+  /// stream that stops takes what it has not delivered. A cover above them has a stream of its
+  /// own: trusted stream paths never lie one below another.
+  fn stop(&mut self, stopped: Vec<Running>, covers: &Covers) {
+    let paths = top_most(stopped.iter().flat_map(|old| old.paths.clone()).collect());
     let at = paths.iter().filter_map(|path| covers.by_dir.get(path));
     let below = covers.by_dir.below(&paths).map(|(_, keys)| keys);
     let lost = at.chain(below).flatten().copied().collect();
@@ -671,7 +624,7 @@ impl Drop for Streams {
     // No notice is read once this returns, and the streams stop on their queue after the stops
     // that wait there: no report of theirs comes after this.
     self.guard.notices.cancel();
-    let streams = (mem::take(&mut self.running), mem::take(&mut self.retiring));
+    let streams = mem::take(&mut self.running);
     self.queue.sync(move || drop(streams));
   }
 }
@@ -997,7 +950,6 @@ mod ffi {
     path::PathBuf,
     ptr::{self, NonNull},
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
   };
 
   use super::{
@@ -1010,10 +962,8 @@ mod ffi {
   pub(super) const O_SEARCH: i32 = 0x4010_0000;
   pub(super) const ENFILE: i32 = 23;
   pub(super) const EMFILE: i32 = 24;
-  /// The notice of the timer, and the one of a volume that came or went: the ids of the guards
-  /// come after them.
-  pub(super) const TIMER: usize = 0;
-  pub(super) const VOLUMES: usize = 1;
+  /// The notice of a volume that came or went: the ids of the guards come after it.
+  pub(super) const VOLUMES: usize = 0;
 
   /// How many files the process may have open (`getdtablesize`).
   pub(super) fn open_file_limit() -> usize {
@@ -1022,8 +972,8 @@ mod ffi {
   }
 
   /// The kernel queue of the guard: a notice for each guarded directory that is renamed or
-  /// removed, or whose volume goes, for each volume that comes or goes, and the timer. It is
-  /// read on the dispatch queue of the streams, so it needs no thread of its own.
+  /// removed, or whose volume goes, and for each volume that comes or goes. It is read on the
+  /// dispatch queue of the streams, so it needs no thread of its own.
   #[derive(Debug)]
   pub(super) struct Notices {
     /// Open until `cancel` or `drop`: the `Reader` owns it, and only a cancel frees that.
@@ -1102,19 +1052,6 @@ mod ffi {
         data: 0,
         udata: ptr::without_provenance_mut(id),
       })
-    }
-
-    /// Asks for the notice `TIMER` once, after `delay`, in place of one asked before.
-    pub(super) fn wake_in(&self, delay: Duration) {
-      // A timer that cannot be set leaves the old streams to the next commit or notice.
-      let _ = self.add(KEvent {
-        ident: 0,
-        filter: EVFILT_TIMER,
-        flags: EV_ADD | EV_ONESHOT,
-        fflags: 0,
-        data: isize::try_from(delay.as_millis()).unwrap_or(isize::MAX),
-        udata: ptr::without_provenance_mut(TIMER),
-      });
     }
 
     fn add(&self, change: KEvent) -> io::Result<()> {
@@ -1357,10 +1294,8 @@ mod ffi {
   const SINCE_NOW: u64 = u64::MAX;
   const ENCODING_UTF8: u32 = 0x0800_0100;
   const EVFILT_VNODE: i16 = -4;
-  const EVFILT_TIMER: i16 = -7;
   const EVFILT_FS: i16 = -9;
   const EV_ADD: u16 = 0x1;
-  const EV_ONESHOT: u16 = 0x10;
   const EV_CLEAR: u16 = 0x20;
   const NOTE_DELETE: u32 = 0x1;
   const NOTE_RENAME: u32 = 0x20;
