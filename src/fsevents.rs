@@ -74,82 +74,20 @@ pub struct FsEventsBackend {
   last_parent: Option<RealParent>,
 }
 
+#[derive(Debug)]
+struct RealParent {
+  asked: PathBuf,
+  real: PathBuf,
+}
+
 impl FsEventsBackend {
   pub fn new(sink: Sink<Raw>) -> io::Result<Self> {
-    let sink = Arc::new(sink);
-    let queue = Queue::new()?;
-    let notices = Notices::new(&queue, &sink)?;
     Ok(Self {
       covers: Covers::default(),
-      streams: Streams {
-        sink,
-        queue,
-        running: Vec::new(),
-        paths: Dirs::default(),
-        pending: Dirs::default(),
-        path_limit: MAX_STREAM_PATHS,
-        retiring: VecDeque::new(),
-        guard: Guard { notices, dirs: FxHashMap::default(), last_id: ffi::VOLUMES },
-        guard_is_stale: false,
-      },
+      streams: Streams::new(sink)?,
       named: FxHashMap::default(),
       last_parent: None,
     })
-  }
-
-  pub fn stream_count(&self) -> usize {
-    self.streams.running.len()
-  }
-
-  pub fn retiring_count(&self) -> usize {
-    self.streams.retiring.iter().map(|old| old.streams.len()).sum()
-  }
-
-  pub fn covers(&self) -> Vec<&Path> {
-    self.covers.by_dir.paths()
-  }
-
-  pub fn cover_of_key(&self) -> &FxHashMap<DirKey, PathBuf> {
-    &self.covers.dir_of
-  }
-
-  pub fn guarded(&self) -> Vec<&Path> {
-    let mut dirs: Vec<&Path> = self.streams.guard.dirs.keys().map(PathBuf::as_path).collect();
-    dirs.sort_unstable();
-    dirs
-  }
-
-  pub fn streamed(&self) -> Vec<&Path> {
-    self.streams.paths.paths()
-  }
-
-  pub fn pending(&self) -> Vec<&Path> {
-    self.streams.pending.paths()
-  }
-
-  fn real_path(&mut self, dir: &Path) -> io::Result<PathBuf> {
-    let real = match (dir.parent(), dir.file_name()) {
-      (Some(parent), Some(name)) => {
-        let last = match self.last_parent.take() {
-          Some(last) if last.asked == parent => last,
-          _ => RealParent { asked: parent.to_owned(), real: short_way(fs::canonicalize(parent)?) },
-        };
-        let real_parent = &self.last_parent.insert(last).real;
-        // A link, or a name that differs by more than ASCII case, goes the slow way, by the OS.
-        match name_and_kind(dir)? {
-          (on_disk, kind) if kind != FileType::Symlink && on_disk.eq_ignore_ascii_case(name) => {
-            real_parent.join(on_disk)
-          }
-          _ => fs::canonicalize(dir)?,
-        }
-      }
-      _ => fs::canonicalize(dir)?,
-    };
-    let real = short_way(real);
-    if real.to_str().is_none() {
-      return Err(io::Error::new(io::ErrorKind::InvalidData, ERROR_PATH_NOT_UTF8));
-    }
-    Ok(real)
   }
 }
 
@@ -234,10 +172,8 @@ impl Backend for FsEventsBackend {
       self.streams.start_pending(&self.covers, &self.named);
     let mut gone = Vec::new();
     if !unguarded.is_empty() || failed.is_some() {
-      // The keys at and below a directory that got no guard, and the covers that got no
-      // stream, are taken back: the engine reports the error, polls them and asks again. A
-      // directory that was not there may be back by now, with no guard: its keys are checked
-      // again.
+      // The keys at and below a directory with no guard, and the covers with no stream, go back
+      // to the engine: an error is reported and polled, a directory that was away is checked.
       let why = |dir: &Path| unguarded.holders(dir).next().map(|(why, _)| why.as_ref());
       let streamed = &self.streams.paths;
       let named = self.named.iter().map(|(&key, dir)| (key, why(dir)));
@@ -311,6 +247,31 @@ impl Backend for FsEventsBackend {
 }
 
 impl FsEventsBackend {
+  fn real_path(&mut self, dir: &Path) -> io::Result<PathBuf> {
+    let real = match (dir.parent(), dir.file_name()) {
+      (Some(parent), Some(name)) => {
+        let last = match self.last_parent.take() {
+          Some(last) if last.asked == parent => last,
+          _ => RealParent { asked: parent.to_owned(), real: short_way(fs::canonicalize(parent)?) },
+        };
+        let real_parent = &self.last_parent.insert(last).real;
+        // A link, or a name that differs by more than ASCII case, goes the slow way, by the OS.
+        match name_and_kind(dir)? {
+          (on_disk, kind) if kind != FileType::Symlink && on_disk.eq_ignore_ascii_case(name) => {
+            real_parent.join(on_disk)
+          }
+          _ => fs::canonicalize(dir)?,
+        }
+      }
+      _ => fs::canonicalize(dir)?,
+    };
+    let real = short_way(real);
+    if real.to_str().is_none() {
+      return Err(io::Error::new(io::ErrorKind::InvalidData, ERROR_PATH_NOT_UTF8));
+    }
+    Ok(real)
+  }
+
   /// The keys at and below the directories whose guards told since the last look: each checks
   /// its directory, and each cover is read again, as its stream heard nothing while its path
   /// was another one, also when the path is back by now.
@@ -325,10 +286,37 @@ impl FsEventsBackend {
   }
 }
 
-#[derive(Debug)]
-struct RealParent {
-  asked: PathBuf,
-  real: PathBuf,
+/// What the tests look at.
+impl FsEventsBackend {
+  pub fn stream_count(&self) -> usize {
+    self.streams.running.len()
+  }
+
+  pub fn retiring_count(&self) -> usize {
+    self.streams.retiring.iter().map(|old| old.streams.len()).sum()
+  }
+
+  pub fn covers(&self) -> Vec<&Path> {
+    self.covers.by_dir.paths()
+  }
+
+  pub fn cover_of_key(&self) -> &FxHashMap<DirKey, PathBuf> {
+    &self.covers.dir_of
+  }
+
+  pub fn guarded(&self) -> Vec<&Path> {
+    let mut dirs: Vec<&Path> = self.streams.guard.dirs.keys().map(PathBuf::as_path).collect();
+    dirs.sort_unstable();
+    dirs
+  }
+
+  pub fn streamed(&self) -> Vec<&Path> {
+    self.streams.paths.paths()
+  }
+
+  pub fn pending(&self) -> Vec<&Path> {
+    self.streams.pending.paths()
+  }
 }
 
 #[derive(Debug, Default)]
@@ -415,7 +403,6 @@ struct Streams {
   guard_is_stale: bool,
 }
 
-/// What `start_pending` did.
 struct Started {
   /// The paths that got a stream and had none before.
   fresh: Vec<PathBuf>,
@@ -441,6 +428,23 @@ struct Retiring {
 }
 
 impl Streams {
+  fn new(sink: Sink<Raw>) -> io::Result<Self> {
+    let sink = Arc::new(sink);
+    let queue = Queue::new()?;
+    let notices = Notices::new(&queue, &sink)?;
+    Ok(Self {
+      sink,
+      queue,
+      running: Vec::new(),
+      paths: Dirs::default(),
+      pending: Dirs::default(),
+      path_limit: MAX_STREAM_PATHS,
+      retiring: VecDeque::new(),
+      guard: Guard { notices, dirs: FxHashMap::default(), last_id: ffi::VOLUMES },
+      guard_is_stale: false,
+    })
+  }
+
   /// Starts the streams for the pending paths, after the guard of the directories at and above
   /// them, and of the `named` ones: a directory renamed between the guard and the start is told
   /// too. A pending path below a directory that got no guard gets no stream.
@@ -537,12 +541,9 @@ impl Streams {
     keep
   }
 
-  /// The directories whose guards told since the last look: each was renamed, also only in the
-  /// case of its letters, or removed, or its volume went, or a volume came or went at or above
-  /// it. A stream at or below one stands at a path where another directory may be now, or was
-  /// meanwhile, and says nothing of it: such a path is trusted no more (`references/design.md`
-  /// 7.2). The guards that told are closed, and the next commit opens one again where one is
-  /// still needed.
+  /// The directories whose guards told since the last look: renamed, also only in letter case,
+  /// removed, or a volume came or went at or above them. Their guards close, and the stream
+  /// paths at and below them are trusted no more (`references/design.md` 7.2).
   fn moved(&mut self) -> Vec<PathBuf> {
     let told = self.guard.notices.take();
     let mut moved: Vec<PathBuf> = told.iter().filter_map(|&id| self.guard.take(id)).collect();
@@ -649,10 +650,9 @@ impl Streams {
     if stopped.is_empty() {
       return;
     }
-    // A stream that stops takes what it has not delivered at and below its paths: the covers
-    // there are read again. A cover above has a stream of its own above, as trusted stream paths
-    // never lie one below another: it goes on, stops with its own report, or started before the
-    // cover was read.
+    // A stream that stops takes what it has not delivered: the covers at and below its paths are
+    // read again. A cover above them has a stream of its own: trusted stream paths never lie one
+    // below another.
     let paths = stopped.iter().flat_map(|old| &old.streams).flat_map(|old| old.paths.clone());
     let paths = top_most(paths.collect());
     let at = paths.iter().filter_map(|path| covers.by_dir.get(path));
