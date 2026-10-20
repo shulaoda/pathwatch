@@ -132,7 +132,11 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
       continue;
     }
     handles.route(&path, &lower, &mut |key, rel| {
-      hint(if written { Hint::Written { dir: key, rel } } else { Hint::Changed { dir: key, rel } });
+      hint(if written {
+        Hint::Written { dir: key, rel, new: false }
+      } else {
+        Hint::Changed { dir: key, rel }
+      });
     });
   }
 }

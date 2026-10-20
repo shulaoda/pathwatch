@@ -90,7 +90,7 @@ fn clear_marks(tree: &mut Tree) {
 
 fn changed(dir: DirKey, rel: &str, written: bool) -> Hint<'_> {
   let rel = Path::new(rel);
-  if written { Hint::Written { dir, rel } } else { Hint::Changed { dir, rel } }
+  if written { Hint::Written { dir, rel, new: false } } else { Hint::Changed { dir, rel } }
 }
 
 #[test]
@@ -534,14 +534,13 @@ fn a_hint_for_the_directory_itself_is_a_loss_report() {
 }
 
 /// A write reported under another spelling of a registered name is a write to that name when
-/// every disk is loose and the backend means a write (`twins_share_writes`): the mark says
-/// "written", so a rewrite that leaves the fingerprint as it was is an `Update` for every
-/// spelling. A guess (a name that is not plain) keeps the look deciding.
+/// every disk is loose: the mark says "written", so a rewrite that leaves the fingerprint as it
+/// was is an `Update` for every spelling. A guess (a name that is not plain) keeps the look
+/// deciding.
 #[test]
 fn a_write_under_another_spelling_is_a_write_to_the_registered_name() {
   let mut f = fixture();
   f.tree.loose_spelling = true;
-  f.tree.twins_share_writes = true;
   assert!(f.tree.hint(changed(f.p, "F.JS", true)));
   assert_eq!(marks(&f.tree), ["/p|f.js|w"]);
   clear_marks(&mut f.tree);
@@ -559,10 +558,11 @@ fn a_write_under_another_spelling_is_a_write_to_the_registered_name() {
   assert!(f.tree.drop_path(accent));
   f.tree.prune(accent);
 
-  // A backend whose "written" is also said for a file that was moved in: the look decides.
-  f.tree.twins_share_writes = false;
-  assert!(f.tree.hint(changed(f.p, "F.JS", true)));
-  assert!(f.tree.hint(changed(f.p, "R/SUB/a.js", true)));
+  // inotify says "written" for a file that was moved in too: the twin is the same file after a
+  // rename that changes only the case, so its look decides.
+  let moved_in = |rel| Hint::Written { dir: f.p, rel: Path::new(rel), new: true };
+  assert!(f.tree.hint(moved_in("F.JS")));
+  assert!(f.tree.hint(moved_in("R/SUB/a.js")));
   assert_eq!(marks(&f.tree), ["/p/r/sub|a.js|d", "/p/r|SUB|d", "/p|f.js|d"]);
   clear_marks(&mut f.tree);
   f.tree.check_links().unwrap();
@@ -615,7 +615,7 @@ fn a_name_that_can_be_another_spelling() {
 
   assert!(f.tree.hint(changed(f.p, "F.JS", true)));
   assert!(f.tree.hint(changed(f.p, "R/sub", false)));
-  assert_eq!(marks(&f.tree), ["/p/r|sub|d", "/p|f.js|d"]);
+  assert_eq!(marks(&f.tree), ["/p/r|sub|d", "/p|f.js|w"]);
   assert_eq!(f.tree.to_scan, []);
   clear_marks(&mut f.tree);
 
@@ -649,7 +649,7 @@ fn a_name_that_can_be_another_spelling() {
   let accent = f.tree.child(f.r, OsStr::new("s\u{dc}b")).unwrap();
   assert!(f.tree.has_other_spelling(accent));
   f.tree.take_scans(&mut scans);
-  assert_eq!(scans, [(f.r, Depth::Names)]);
+  assert_eq!(scans, [(f.r, Depth::Names, false)]);
   on_disk(&mut f.tree, accent, true);
   assert!(f.tree.hint(changed(f.r, "s\u{dc}b", false)));
   assert!(f.tree.hint(changed(f.r, "\u{4e2d}.js", false)));
@@ -705,7 +705,7 @@ fn a_scan_is_queued_once_and_never_gets_shallower() {
   assert_eq!(f.tree.to_scan, [f.top]);
   let mut scans = Vec::new();
   f.tree.take_scans(&mut scans);
-  assert_eq!(scans, [(f.top, Depth::Deep)]);
+  assert_eq!(scans, [(f.top, Depth::Deep, false)]);
   assert!(!f.tree.has_work());
 }
 

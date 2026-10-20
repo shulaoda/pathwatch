@@ -275,15 +275,21 @@ every engine call):
    - otherwise: mark the child `c` and stop. If `X` has no such child yet, a node is made for
      it. The mark is `written` when the hint is `Written` and `c` is the last name. In every
      other case it is `deep`. So a hint from deep inside a place the tree does not know (a tree
-     that was moved in, an ignored directory) ends at the highest name that is not known.
+     that was moved in, an ignored directory) ends at the highest name that is not known. A
+     `Changed` hint for the very name of a young file that was not read (`Content::Pending`,
+     5.8) says `written` too: every write is a `Written`, so the record is a rename or a
+     removal, and the content can have changed under the other name (a watched file renamed
+     away, written and renamed back under a Windows handle). Under inotify also a `chmod` of
+     such a file, which costs one `Update`.
    - At each `X`, the other children that `c` can mean (below) are marked too, or walked into
-     when `c` is not the last name. A child that differs from `c` in the case of ASCII letters
-     only is the entry that was written, when every disk is loose and the backend says
-     "written" for a write and nothing else (`Tree::twins_share_writes`, from
-     `Options::loose_spelling` and `Backend::written_is_a_write`): its mark says `written` as
-     the hint does, so a rewrite that leaves the fingerprint as it was is an `Update` under
-     every watched spelling. inotify says "written" for a file that was created or moved in
-     too, so there, and for every other child (a guess), the look decides.
+     when `c` is not the last name. When every disk is loose (`Options::loose_spelling`), a
+     child that differs from `c` in the case of ASCII letters only is the entry that was
+     written: its mark says `written` as the hint does, so a rewrite that leaves the
+     fingerprint as it was is an `Update` under every watched spelling, also for a young file
+     that is not read (5.8). inotify says "written" for a file that was created or moved in
+     too (`Hint::Written` with `new`): such a twin is the same file after a rename that
+     changes only the case, so it is marked deep, as every other child (a guess) is, and its
+     look decides.
 
 Two marks for one node become one. `Lost` sets a flag: the next flush that the pacing allows
 (5.13) scans everything. A hint that left work moves the flush to one quiet time later (5.13).
@@ -552,11 +558,16 @@ The one more look is spent by whatever flush comes next, a poll or the hints of 
 when that flush falls between the steps too, nothing looks again (measured with the steps 300
 ms apart, which no tool does; the story keeps them 50 ms apart, clear of the poll).
 
-`still_there(node, deep)`: `arm` the node, and with `deep` also queue a deep scan. `deep` is
-true for a `deep` mark, when the directory was held, when it is another directory than before,
-and when a link on the way changed (5.14).
+`still_there(node, deep, away)`: `arm` the node, and with `deep` also queue a deep scan.
+`deep` is true for a `deep` mark, when the directory was held, when it is another directory
+than before, and when a link on the way changed (5.14).
 Nothing below the node is thrown away: the deep scan compares each file with the fingerprint
-that the tree has, so only what differs is reported.
+that the tree has, so only what differs is reported. `away` (`Dir::away`) says that the writes
+in the directory can have gone unheard: it was held, it is another directory, a link on the way
+changed, its watch lost records (a `lost` mark), or its name changed while only a watch above
+covers it (the records of its files came under the other name; a watch of its own follows the
+directory, as inotify does). A young file that was not read (`Content::Pending`, 5.8) counts as
+written in such a scan.
 
 `scan(node, depth)`: `check` every child of the node. A **complete** node also lists the
 directory: each entry that the tree has no node for yet gets one, and is checked with the type
@@ -692,11 +703,17 @@ Two guards:
    **Where every write gives a hint** (`Options::written_hints`: inotify and Windows, and not
    for a file that only the poll looks at), a young file is not read at all: guard 1 tells of
    a write that leaves the fingerprint as it is, so the hash would only repeat the hint. The
-   node keeps `Content::Pending` while it is young, and a look that a loss report asked for,
-   or that runs while one waits, counts a `Pending` file as written: the report may have
-   taken the hint. The first look that finds the file old drops it, after one last such
-   count. The read this saves is the one that waits for the virus scanner on Windows (5 to
-   12 ms after a write, measured 2026-10-20; 2 ms, and 14 ms for one in ten, on 2026-10-13):
+   node keeps `Content::Pending` while it is young, and a look counts a `Pending` file as
+   written when the hint can have gone by since its last look (`hint_may_be_lost`): a loss
+   report asked for the look, or one waits (the report may have taken the hint); the look is
+   one of the scan of a directory that was away (5.5, `Dir::away`), or such a scan is queued
+   above (the file's own look can come first in the flush); or the file was held (it was away
+   itself, or its hint went into the look that found it missing). A look that gets no answer
+   (`Found::Unknown`) passes what it knew of lost hints to the next one. The first look that
+   finds the file old drops it, after
+   one last such count. The read this saves is the one that waits for the virus
+   scanner on Windows (5 to 12 ms after a write, measured 2026-10-20; 2 ms, and 14 ms for one
+   in ten, on 2026-10-13):
    it was the floor of an edit told with no quiet time and the tail of a burst. (A number
    that NTFS keeps for each file, the place of its last record in the change journal, stood
    in for the hash there for a while: 0.04 ms instead of the read. It does not move for a

@@ -16,13 +16,6 @@ pub trait Backend: Send + 'static {
   /// stand is worked out again at the next [`commit`](Backend::commit).
   fn unwatch(&mut self, key: DirKey);
 
-  /// Whether `Written` names a write to the file and nothing else. `false`: the backend says it
-  /// also for a file that was created or moved in (inotify: `IN_CREATE`, `IN_MOVED_TO`), so the
-  /// engine trusts it for the hinted name only, and not for a watched twin of that name.
-  fn written_is_a_write(&self) -> bool {
-    true
-  }
-
   /// Makes the watches asked for since the last commit live. Says which keys got no watch,
   /// and which keys that were answered `NotWatched` before an OS watch reports now.
   fn commit(&mut self) -> Committed {
@@ -98,8 +91,12 @@ pub enum Hint<'a> {
   /// Something at `rel` below the directory `dir` changed. An empty `rel`: the directory
   /// itself, or its watch, and the engine scans everything below it.
   Changed { dir: DirKey, rel: &'a Path },
-  /// The file at `rel` below `dir` was written: an `Update`, also with an equal fingerprint.
-  Written { dir: DirKey, rel: &'a Path },
+  /// The file at `rel` below `dir` was written: an `Update`, also with an equal fingerprint,
+  /// under every spelling of the name where every disk is loose. `new`: the OS says so for a
+  /// file that was created or moved in too (inotify), which holds other content than the name
+  /// had before; a twin of such a name is left to its look, as a rename that changes only the
+  /// case is the same file.
+  Written { dir: DirKey, rel: &'a Path, new: bool },
   /// Notifications were lost, and the backend cannot say where.
   Lost,
   /// A volume was mounted or unmounted at `path`, a real path: another directory may stand

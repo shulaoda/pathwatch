@@ -373,3 +373,91 @@ fn a_file_that_only_the_poll_looks_at_is_read_where_writes_are_hinted() {
     caught_up(&mut d);
   }
 }
+
+/// Every disk is loose, and the write comes under the spelling of the disk, not the one of the
+/// watched path: the hint is for the one entry that both names are, so it says "written" for
+/// the watched name too. Nothing else could tell of the write: the file is young and not read,
+/// and the fingerprint stays as it was.
+#[test]
+fn a_write_under_the_spelling_of_the_disk_is_a_write_to_the_watched_name() {
+  for mode in [Mode::Inode, Mode::Handle] {
+    let mut d = Driver::sim(mode, Options { loose_spelling: true, ..hinted() });
+    d.fs.set_ignore_case(true);
+    d.fs.set_time_step(Duration::from_secs(1));
+    d.fs.mkdir("/p").unwrap();
+    d.fs.write("/p/a.js", "x=1;").unwrap();
+    d.watch(&["/p/A.JS"]);
+    d.fs.write("/p/A.JS", "x=2;").unwrap();
+    assert_eq!(window(&mut d), ["U /p/A.JS"], "{mode:?}");
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    assert_eq!(d.fs.calls().hash, 0, "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// A directory below the watch is renamed away, a young file in it is written under the other
+/// name, and it is renamed back, all inside one step of the clock. Where the OS watch is on the
+/// directory above (Windows), the write is reported under a name the tree does not know, so no
+/// hint reaches the file, and its fingerprint stays as it was. The deep scan of the directory
+/// that came back counts the young file as written.
+#[test]
+fn a_directory_away_and_back_counts_its_young_files_as_written() {
+  for mode in [Mode::Inode, Mode::Handle] {
+    let mut d = Driver::sim(mode, hinted());
+    d.fs.set_time_step(Duration::from_secs(1));
+    d.fs.mkdir_all("/p/sub").unwrap();
+    d.watch(&["/p"]);
+    d.fs.write("/p/sub/a.js", "x=1;").unwrap();
+    assert_eq!(window(&mut d), ["C /p/sub/a.js"], "{mode:?}");
+    d.fs.rename("/p/sub", "/p/other").unwrap();
+    d.fs.write("/p/other/a.js", "x=2;").unwrap();
+    d.fs.rename("/p/other", "/p/sub").unwrap();
+    assert_eq!(window(&mut d), ["U /p/sub/a.js"], "{mode:?}");
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    assert_eq!(d.fs.calls().hash, 0, "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// The hint of a write goes into a look that finds the file missing (the disk is away for a
+/// moment, or the file is), and the look that finds it back sees the fingerprint it had: the
+/// second look of a held file counts a young file that was not read as written.
+#[test]
+fn the_second_look_of_a_held_file_counts_it_as_written() {
+  for mode in [Mode::Inode, Mode::Handle] {
+    let mut d = Driver::sim(mode, hinted());
+    d.fs.set_time_step(Duration::from_secs(1));
+    d.fs.mkdir("/p").unwrap();
+    d.fs.write("/p/a.js", "x=1;").unwrap();
+    d.watch(&["/p/a.js"]);
+    d.fs.write("/p/a.js", "x=2;").unwrap();
+    d.fs.set_offline(Some(std::io::ErrorKind::NotFound));
+    assert_eq!(window(&mut d), NONE, "{mode:?}");
+    d.fs.set_offline(None);
+    assert_eq!(settled(&mut d), ["U /p/a.js"], "{mode:?}");
+    assert_eq!(d.fs.calls().hash, 0, "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// The same for a file: renamed away, written under the other name inside one step of the
+/// clock, and renamed back. The record of its own name is a rename, as every write is a
+/// "written" hint, so a young file that was not read counts as written.
+#[test]
+fn a_file_away_and_back_counts_as_written() {
+  for mode in [Mode::Inode, Mode::Handle] {
+    let mut d = Driver::sim(mode, hinted());
+    d.fs.set_time_step(Duration::from_secs(1));
+    d.fs.mkdir("/p").unwrap();
+    d.watch(&["/p"]);
+    d.fs.write("/p/a.js", "x=1;").unwrap();
+    assert_eq!(window(&mut d), ["C /p/a.js"], "{mode:?}");
+    d.fs.rename("/p/a.js", "/p/b.js").unwrap();
+    d.fs.write("/p/b.js", "x=2;").unwrap();
+    d.fs.rename("/p/b.js", "/p/a.js").unwrap();
+    assert_eq!(window(&mut d), ["U /p/a.js"], "{mode:?}");
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    assert_eq!(d.fs.calls().hash, 0, "{mode:?}");
+    caught_up(&mut d);
+  }
+}

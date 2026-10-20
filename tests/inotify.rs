@@ -146,7 +146,7 @@ impl Harness {
     self.backend.translate(raw, &mut |hint| {
       seen.push(match hint {
         Hint::Changed { dir, rel } => Seen::Changed(dir, rel.to_owned()),
-        Hint::Written { dir, rel } => Seen::Written(dir, rel.to_owned()),
+        Hint::Written { dir, rel, .. } => Seen::Written(dir, rel.to_owned()),
         Hint::Lost => Seen::Lost,
         Hint::Mount { path } => Seen::Mount(path.to_owned()),
       });

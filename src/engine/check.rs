@@ -116,10 +116,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     followed: bool,
   ) {
     let why = match self.tree.take_mark(key) {
+      // A loss report that asked for this node holds: its hints may be lost (5.8).
       Some(pending) => Mark {
         deep: why.deep || pending.deep,
         written: why.written || pending.written,
-        lost: why.lost && pending.lost,
+        lost: why.lost || pending.lost,
         since: why.since,
       },
       None => why,
@@ -190,7 +191,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   fn apply(&mut self, key: DirKey, path: &mut PathBuf, found: Found, had: Had, why: Mark) {
     match (found, had) {
       // No answer: the look is tried again, deep, since the tree below can be behind meanwhile.
-      (Found::Unknown, _) => self.tree.mark(key, Mark { deep: true, ..why }),
+      // What this look knew of lost hints (5.8) holds for the next one.
+      (Found::Unknown, _) => {
+        let lost = why.lost || self.loss.scanning || self.away_scan;
+        self.tree.mark(key, Mark { deep: true, lost, ..why });
+      }
 
       (Found::Missing, Had::Nothing) => {}
       (Found::Missing, Had::File | Had::Dir { .. }) => self.missing(key, why.since),
@@ -242,9 +247,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           // baseline.
           self.tree[key].set_baseline(true);
         }
-        // Scan deep when nothing tells what happened in it meanwhile.
+        // Scan deep when nothing tells what happened in it meanwhile. The writes in it can have
+        // gone unheard: it was away, or lies in a directory that was (`away_scan`), its watch
+        // lost records, or its name changed while only a watch above covers it (the records
+        // came under the other name).
         let moved = was_held || id != old || relinked;
-        self.still_there(key, path, why.deep || moved);
+        let from_above = self.tree[key].watch() == Watch::FromAbove;
+        let away = moved || why.lost || (why.deep && from_above) || self.away_scan;
+        self.still_there(key, path, why.deep || moved, away);
         let relist = self.tree[key].dir_mut().is_some_and(|dir| mem::take(&mut dir.relist));
         if relist && !(why.deep || moved) {
           self.tree.queue_scan(key, Depth::Shallow);
@@ -489,7 +499,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     why: Mark,
   ) {
     let written = why.written;
-    // A held node still has its file.
+    // A held node still has its file: this is its second look.
+    let was_held = self.tree[key].is_held();
     let old = match self.tree[key].kind {
       Kind::File(old) => Some((old, self.tree.content(key))),
       _ => None,
@@ -519,9 +530,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // Under the poll a young file with nothing to compare waits: the first look that finds it
     // old reports one `Update` for all. Where no poll comes, every look reports.
     let update_waits = young && hash.is_none() && self.only_polled(key);
-    // A loss report may have taken the hint of a write that left the fingerprint as it is: a
-    // file that was young at its last look counts as written.
-    let hints_lost = why.lost || self.loss.scanning || self.tree.lost || self.loss.waits;
 
     let changed = if let Some((old, content)) = old {
       written
@@ -532,7 +540,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           Some(Content::Unknown) => !update_waits,
           Some(Content::Pending) => {
             if trusts_hints {
-              hints_lost
+              self.hint_may_be_lost(key, why, was_held)
             } else {
               !update_waits
             }
@@ -554,7 +562,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if node.changed() || old.is_none() {
       self.touched.push(key);
     }
-    if node.is_held() {
+    if was_held {
       self.tree.unhold(key);
     }
     let content = if trusts_hints {
@@ -563,6 +571,31 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       young.then(|| hash.map_or(Content::Unknown, Content::Hash))
     };
     self.tree.set_content(key, content);
+  }
+
+  /// Whether the hint of a write that left the fingerprint as it is can have gone by since the
+  /// last look at the file, so that a young file that was not read counts as written (5.8): a
+  /// loss report asked for the look, or one waits; the look is one of the scan of a directory
+  /// that was away (`Dir::away`), or such a scan is queued above; or the file was held (it was
+  /// away itself, or its hint went into the look that found it missing).
+  fn hint_may_be_lost(&self, key: DirKey, why: Mark, was_held: bool) -> bool {
+    if why.lost
+      || was_held
+      || self.away_scan
+      || self.loss.scanning
+      || self.tree.lost
+      || self.loss.waits
+    {
+      return true;
+    }
+    let mut above = self.tree.parent(key);
+    while let Some(dir) = above {
+      if self.tree[dir].dir().is_some_and(|dir| dir.away) {
+        return true;
+      }
+      above = self.tree.parent(dir);
+    }
+    false
   }
 
   /// A hash of the content of a regular file, or of the target of a link. `None`: nothing to

@@ -83,11 +83,6 @@ impl SimBackend {
 }
 
 impl Backend for SimBackend {
-  /// inotify says "written" for a file that was created or moved in too.
-  fn written_is_a_write(&self) -> bool {
-    !matches!(self.mode, Mode::Inode)
-  }
-
   type Raw = SimRaw;
 
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
@@ -225,7 +220,7 @@ impl Backend for SimBackend {
       }
       What::Overflow => return hint(Hint::Lost),
       What::Mount => return hint(Hint::Mount { path: &raw.path }),
-      What::Entry | What::Moved | What::Written => {}
+      What::Entry | What::Moved | What::Written { .. } => {}
     }
     let Some(keys) = self.keys.get(&raw.watch) else { return };
     let prefix = self.prefixes.get(&raw.watch);
@@ -243,8 +238,8 @@ impl Backend for SimBackend {
         },
         None => &raw.path,
       };
-      if raw.what == What::Written {
-        hint(Hint::Written { dir: key, rel });
+      if let What::Written { new } = raw.what {
+        hint(Hint::Written { dir: key, rel, new });
       } else {
         hint(Hint::Changed { dir: key, rel });
       }
@@ -361,8 +356,9 @@ enum What {
   Entry,
   /// By prefix: a directory was renamed, or moved in or out. What is in it moved with it.
   Moved,
-  /// The OS says the content was written. For a directory this is noise.
-  Written,
+  /// The OS says the content was written. For a directory this is noise. `new`: inotify says
+  /// it for a file that was created or moved in too.
+  Written { new: bool },
   /// The watch is gone.
   Dead,
   /// The watch lost notifications. It still stands. The backend knows where the loss was: at
@@ -407,7 +403,7 @@ impl Kernel {
     // A new or moved-in file holds other content than the name had before, also when size and
     // time say nothing.
     let written = !is_dir && matches!(act, Act::Modify | Act::Create | Act::MoveTo);
-    let what = if written { What::Written } else { What::Entry };
+    let what = if written { What::Written { new: act != Act::Modify } } else { What::Entry };
     self.queue.push_back(SimRaw { watch: dir, path: name.into(), what });
   }
 
@@ -437,13 +433,14 @@ impl Kernel {
     // content (measured). A moved-in file keeps its own index, so it is never the file it
     // replaces.
     let written = !is_dir && matches!(act, Act::Modify | Act::Create);
-    let what = if written { What::Written } else { What::Entry };
+    let what = if written { What::Written { new: false } } else { What::Entry };
     self.queue.push_back(SimRaw { watch: handle, path: rel.to_path_buf(), what });
     if act != Act::Modify
       && !direct
       && let Some(dir) = rel.parent()
     {
-      self.queue.push_back(SimRaw { watch: handle, path: dir.to_path_buf(), what: What::Written });
+      let what = What::Written { new: false };
+      self.queue.push_back(SimRaw { watch: handle, path: dir.to_path_buf(), what });
     }
   }
 

@@ -162,6 +162,9 @@ pub struct Engine<B: Backend, F: Fs> {
   flush_time: SystemTime,
   /// `Fs::ticks` at the start of the flush.
   flush_ticks: Duration,
+  /// The running scan is of a directory that can have been away and back, or whose watch lost
+  /// records (`Dir::away`): a young file in it that was not read counts as written (5.8).
+  away_scan: bool,
   /// A watch was given back since the last commit: the backend may move its watches then.
   gave_back: bool,
   /// The nodes the flush changed: `finish` reads their events. A key can be stale.
@@ -182,7 +185,7 @@ pub struct Engine<B: Backend, F: Fs> {
   /// The marks of a flush, in the order of their checks.
   marks: Vec<(usize, DirKey, DirKey, Option<Instant>)>,
   /// The scans of one round.
-  scans: Vec<(DirKey, Depth)>,
+  scans: Vec<(DirKey, Depth, bool)>,
   /// The nodes of the directory that is scanned.
   names: Vec<ScanEntry>,
 
@@ -215,7 +218,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     options.poll_interval_alone = options.poll_interval_alone.map(|time| time.min(LONGEST_SETTING));
     let mut tree = Tree::new();
     tree.loose_spelling = options.loose_spelling;
-    tree.twins_share_writes = options.loose_spelling && backend.written_is_a_write();
     Self {
       backend: Some(backend),
       fs,
@@ -227,6 +229,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       hold_queue: BinaryHeap::new(),
       due_holds: Vec::new(),
       loss: Loss::default(),
+      away_scan: false,
       now: None,
       flush_time: SystemTime::UNIX_EPOCH,
       flush_ticks: Duration::ZERO,
@@ -502,7 +505,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.take_scans(&mut scans);
     // After `take_scans`: what this queues waits for the next commit.
     self.ask_again(now_watched);
-    for &(key, depth) in &scans {
+    for &(key, depth, away) in &scans {
       if self.stopped() {
         break;
       }
@@ -510,10 +513,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if let Some(queued) = &mut dir.scan {
         // Queued again in this round: its new watch is live only after the next commit.
         *queued = depth.max(*queued);
+        dir.away |= away;
         continue;
       }
+      self.away_scan = away;
       self.scan(key, depth, path, names);
     }
+    self.away_scan = false;
     self.scans = emptied(scans);
   }
 

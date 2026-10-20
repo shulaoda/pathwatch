@@ -132,7 +132,7 @@ impl Kept {
   fn of(hint: Hint<'_>) -> Self {
     match hint {
       Hint::Changed { dir, rel } => Kept::Changed(dir, rel.to_path_buf()),
-      Hint::Written { dir, rel } => Kept::Written(dir, rel.to_path_buf()),
+      Hint::Written { dir, rel, .. } => Kept::Written(dir, rel.to_path_buf()),
       Hint::Lost => Kept::Lost,
       Hint::Mount { path } => Kept::Mount(path.to_path_buf()),
     }
@@ -141,7 +141,7 @@ impl Kept {
   fn hint(&self) -> Hint<'_> {
     match self {
       Kept::Changed(dir, rel) => Hint::Changed { dir: *dir, rel },
-      Kept::Written(dir, rel) => Hint::Written { dir: *dir, rel },
+      Kept::Written(dir, rel) => Hint::Written { dir: *dir, rel, new: false },
       Kept::Lost => Hint::Lost,
       Kept::Mount(path) => Hint::Mount { path },
     }

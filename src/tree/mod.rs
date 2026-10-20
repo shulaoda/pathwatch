@@ -166,6 +166,7 @@ pub(crate) fn nanos(time: SystemTime) -> i64 {
 
 /// What the tree keeps for a directory that is on disk. All of it goes away with the directory.
 #[derive(Clone, Copy, Debug)]
+#[expect(clippy::struct_excessive_bools, reason = "each one is a state of the directory")]
 pub struct Dir {
   /// Tells this directory from another one at the same path.
   pub id: DirId,
@@ -179,6 +180,9 @@ pub struct Dir {
   pub has_error: bool,
   /// The node is queued for a scan.
   pub scan: Option<Depth>,
+  /// The queued scan is for a directory that can have been away and back, or whose watch lost
+  /// records: a young file in it that was not read counts as written (5.8).
+  pub away: bool,
   /// An entry that the listing named was not there when it was looked at: the next check lists
   /// the directory again, since it can have been away and back.
   pub relist: bool,
@@ -188,8 +192,8 @@ impl Dir {
   /// A directory that was just found. The backend was not asked yet.
   pub fn new(id: DirId, complete: bool) -> Self {
     let (asked, scan) = (None, None);
-    let (has_error, relist) = (false, false);
-    Self { id, complete, asked, watch: Watch::None, has_error, scan, relist }
+    let (has_error, relist, away) = (false, false, false);
+    Self { id, complete, asked, watch: Watch::None, has_error, scan, relist, away }
   }
 
   /// Whether the timer has to look at the directory: no OS watch tells about it, or it had an
@@ -279,10 +283,6 @@ pub struct Tree {
   pub lost: bool,
   /// Every disk takes two spellings of a name for one (`Options::loose_spelling`).
   pub loose_spelling: bool,
-  /// A `Written` hint is a write to the one entry that the name and its twins (the registered
-  /// names that differ in the case of ASCII letters only) all are: every disk is loose, and the
-  /// backend says "written" for a write and nothing else (`Backend::written_is_a_write`).
-  pub twins_share_writes: bool,
 }
 
 /// The nodes: finding them, adding and freeing them, their paths, and which are watched paths.
@@ -316,7 +316,6 @@ impl Tree {
       polled: vec![Self::ROOT],
       lost: false,
       loose_spelling: false,
-      twins_share_writes: false,
     }
   }
 
@@ -754,6 +753,19 @@ pub(crate) fn emptied<T>(mut list: Vec<T>) -> Vec<T> {
   if list.capacity() * size_of::<T>() > KEPT { Vec::new() } else { list }
 }
 
+/// What a hint says of the last name of its path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Said {
+  /// Something changed there.
+  Changed,
+  /// The file was written: an `Update`, also with an equal fingerprint.
+  Written,
+  /// A file was created or moved in, which inotify says "written" for too: other content than
+  /// the name had before, also with an equal fingerprint. A twin of the name is the same file
+  /// after a rename that changes only the case, so its look decides.
+  New,
+}
+
 /// "Check this name at the next flush."
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Mark {
@@ -781,8 +793,9 @@ impl Tree {
   /// Turns a hint into work for the next flush. `false`: no watched path can see the change.
   pub fn hint(&mut self, hint: Hint<'_>) -> bool {
     match hint {
-      Hint::Changed { dir, rel } => self.mark_below(dir, rel, false),
-      Hint::Written { dir, rel } => self.mark_below(dir, rel, true),
+      Hint::Changed { dir, rel } => self.mark_below(dir, rel, Said::Changed),
+      Hint::Written { dir, rel, new: false } => self.mark_below(dir, rel, Said::Written),
+      Hint::Written { dir, rel, new: true } => self.mark_below(dir, rel, Said::New),
       Hint::Lost => {
         self.lost = true;
         true
@@ -790,14 +803,14 @@ impl Tree {
       // A node at the path checks it, and finds another directory there by its identity.
       Hint::Mount { path } => {
         let Some((top, rest)) = split_top(path) else { return false };
-        self.child(Self::ROOT, top).is_some_and(|top| self.mark_below(top, rest, false))
+        self.child(Self::ROOT, top).is_some_and(|top| self.mark_below(top, rest, Said::Changed))
       }
     }
   }
 
   /// Marks the place to check for a change at `rel` below `dir`: the name itself, or the highest
   /// name on the way that the tree does not know as a directory. `false`: nothing to do.
-  pub fn mark_below(&mut self, dir: DirKey, rel: &Path, written: bool) -> bool {
+  pub fn mark_below(&mut self, dir: DirKey, rel: &Path, said: Said) -> bool {
     let Some(node) = self.get(dir) else { return false };
     if !node.is_dir() {
       return self.mark_from_above(dir);
@@ -810,12 +823,12 @@ impl Tree {
       }
       return has_parent;
     }
-    self.mark_path(dir.index(), rel.components().peekable(), written)
+    self.mark_path(dir.index(), rel.components().peekable(), said)
   }
 
   /// The walk of `mark_below`, by slots since it runs for every hint. A name of the hint means the
   /// child with that name and every child the OS can take for the same name (design.md 5.2).
-  fn mark_path(&mut self, mut at: u32, mut parts: Peekable<Components<'_>>, written: bool) -> bool {
+  fn mark_path(&mut self, mut at: u32, mut parts: Peekable<Components<'_>>, said: Said) -> bool {
     let mut found = false;
     while let Some(part) = parts.next() {
       let Component::Normal(name) = part else { return found };
@@ -830,7 +843,7 @@ impl Tree {
       let not_in_table = self.loose_spelling
         && (!self.not_plain.is_empty() || (is_complete && !below.is_some_and(Node::is_entry)));
       if has_other || (not_in_table && !is_plain(name)) {
-        found |= self.mark_others(at, name, child, &parts, written);
+        found |= self.mark_others(at, name, child, &parts, said);
       }
       if !is_seen {
         return found;
@@ -843,20 +856,26 @@ impl Tree {
         at = child;
         continue;
       }
-      let written = last && written;
       let child = match child {
         Some(child) => self.key(child),
         None => self.insert_child(self.key(at), name),
       };
+      // A record that names a young file that was not read (`Content::Pending`) is a rename or
+      // a removal, as every write is a `Written`: the content can have changed under the other
+      // name (5.8). Under inotify also a `chmod` of such a file, which costs one `Update`.
+      let written =
+        last && (said != Said::Changed || self.content(child) == Some(Content::Pending));
       self.mark(child, Mark { deep: !written, written, lost: false, since: None });
       return true;
     }
     found
   }
 
-  /// The walk of `mark_path` for the other children that `name` can mean. A twin of the name
-  /// (`twins_share_writes`) is the entry that was written: its mark says `written` as the hint
-  /// does. Every other child is a guess (a name that is not plain), and its look decides.
+  /// The walk of `mark_path` for the other children that `name` can mean. When every disk is
+  /// loose, a twin of the name (a registered name that differs in the case of ASCII letters
+  /// only) is the entry that was written: its mark says `written` as the hint does. Not for a
+  /// file that was created or moved in (`Said::New`): a rename that changes only the case is
+  /// the same file. Every other child is a guess (a name that is not plain). Their looks decide.
   #[cold]
   fn mark_others(
     &mut self,
@@ -864,13 +883,13 @@ impl Tree {
     name: &OsStr,
     exact: Option<u32>,
     rest: &Peekable<Components<'_>>,
-    written: bool,
+    said: Said,
   ) -> bool {
     let last = rest.clone().peek().is_none();
     let mut found = false;
     let parent = linked(&self.slots, at);
     let is_entry = exact.is_some_and(|exact| linked(&self.slots, exact).is_entry());
-    let one_entry = written && self.twins_share_writes;
+    let one_entry = said == Said::Written && self.loose_spelling;
     if self.loose_spelling && parent.is_complete() && !is_entry && !is_plain(name) {
       // A name that is not plain can be another spelling of each child that is not plain.
       self.queue_scan(self.key(at), Depth::Names);
@@ -880,7 +899,9 @@ impl Tree {
       let is_dir = node.is_dir();
       let written = one_entry && name_of(&self.names, node).eq_ignore_ascii_case(name);
       if !last && is_dir {
-        found |= self.mark_path(other, rest.clone(), written);
+        // Below a guess, the names are guesses too.
+        let said = if written { said } else { Said::Changed };
+        found |= self.mark_path(other, rest.clone(), said);
       } else {
         let written = written && last;
         self.mark(self.key(other), Mark { deep: !written, written, lost: false, since: None });
@@ -922,11 +943,14 @@ impl Tree {
     self.queue_scan(Self::ROOT, Depth::Deep);
   }
 
-  /// Takes the queue into `scans`: every queued node, with its depth.
-  pub fn take_scans(&mut self, scans: &mut Vec<(DirKey, Depth)>) {
+  /// Takes the queue into `scans`: every queued node, with its depth and whether it was away.
+  pub fn take_scans(&mut self, scans: &mut Vec<(DirKey, Depth, bool)>) {
     scans.clear();
     let mut queue = mem::take(&mut self.to_scan);
-    let scan = |key| Some((key, self.get_mut(key)?.dir_mut()?.scan.take()?));
+    let scan = |key| {
+      let dir = self.get_mut(key)?.dir_mut()?;
+      Some((key, dir.scan.take()?, mem::take(&mut dir.away)))
+    };
     scans.extend(queue.drain(..).filter_map(scan));
     self.to_scan = emptied(queue);
   }

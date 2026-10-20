@@ -204,12 +204,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.queue_scan(key, Depth::Shallow);
   }
 
-  /// A directory is still on disk at the node.
-  pub(super) fn still_there(&mut self, key: DirKey, path: &mut PathBuf, deep: bool) {
+  /// A directory is still on disk at the node. `away`: the writes in it can have gone unheard
+  /// (`Dir::away`).
+  pub(super) fn still_there(&mut self, key: DirKey, path: &mut PathBuf, deep: bool, away: bool) {
     // Also when not deep: the node may want more, or the watch above may be gone.
     self.arm(key, path, deep);
     if deep {
       self.tree.queue_scan(key, Depth::Deep);
+    }
+    if away && let Some(dir) = self.tree[key].dir_mut() {
+      dir.away = true;
     }
   }
 

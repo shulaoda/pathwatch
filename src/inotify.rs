@@ -131,11 +131,6 @@ impl InotifyBackend {
 }
 
 impl Backend for InotifyBackend {
-  /// `Written` is also said for a file that was created or moved in (`NEW_CONTENT`).
-  fn written_is_a_write(&self) -> bool {
-    false
-  }
-
   type Raw = Vec<u8>;
 
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
@@ -199,9 +194,10 @@ impl Backend for InotifyBackend {
         continue;
       }
       let is_written = !is_dir && event.mask & NEW_CONTENT != 0;
+      let new = event.mask & libc::IN_MODIFY == 0;
       let rel = Path::new(OsStr::from_bytes(event.name));
       let mut tell = |dir: DirKey| {
-        hint(if is_written { Hint::Written { dir, rel } } else { Hint::Changed { dir, rel } });
+        hint(if is_written { Hint::Written { dir, rel, new } } else { Hint::Changed { dir, rel } });
       };
       tell(keys.first);
       keys.more.iter().copied().for_each(tell);

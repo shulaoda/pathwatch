@@ -238,9 +238,11 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 - **Linux: a disk that takes two spellings of a name for one** (a folder shared from a Mac or
   from Windows, a FAT or SMB disk, a directory with the casefold flag) is taken for one that
   tells them apart, as the disks of Linux do. A watched path that differs from the disk only
-  in the case of its ASCII letters still gets its events. Below a watched directory a change
-  made through another spelling of a name can be reported under a name the disk does not
-  have, or not at all, and a rename that changes only the case leaves the old name known.
+  in the case of its ASCII letters still gets its events, except for a second write of the
+  same size inside one step of the time stamps of that disk, which inotify names as the disk
+  spells it. Below a watched directory a change made through another spelling of a name can
+  be reported under a name the disk does not have, or not at all, and a rename that changes
+  only the case leaves the old name known.
 - **Linux and Windows: a watched file written through another hard link of it**, under a name
   in a directory that is not watched, gets no event: inotify and ReadDirectoryChangesW report
   a write under the name the writer used. Polling finds it, and so does macOS.

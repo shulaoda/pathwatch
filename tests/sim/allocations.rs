@@ -103,7 +103,7 @@ impl Backend for Direct {
   fn unwatch(&mut self, _: DirKey) {}
 
   fn translate(&mut self, (dir, name): Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
-    hint(Hint::Written { dir, rel: Path::new(name) });
+    hint(Hint::Written { dir, rel: Path::new(name), new: false });
   }
 }
 
