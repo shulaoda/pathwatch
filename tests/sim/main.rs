@@ -6,6 +6,9 @@
 //! The paths are Unix paths, so nothing here runs on another host.
 
 #![cfg(unix)]
+// Android keeps its thread-locals by hand, and the lint takes every `const` initializer for a
+// plain one there: see the thread-local of `Watcher`.
+#![cfg_attr(target_os = "android", allow(clippy::missing_const_for_thread_local))]
 
 mod counting;
 mod fixtures;

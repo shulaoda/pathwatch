@@ -793,7 +793,9 @@ fn unwatch_stops_the_hints_of_that_key_only() {
   let real = h.watch(2, &h.real("dir"), Want::Contents);
   let other = h.watch(3, &h.path("other"), Want::Contents);
   h.commit();
+  // Each path got a stream of its own, and each delivers what came shortly before its start.
   h.sync(other);
+  h.sync(real);
 
   h.backend.unwatch(given);
   File::create(h.path("dir/a")).unwrap();

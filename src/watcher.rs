@@ -38,10 +38,11 @@ thread_local! {
   /// The number of the watcher whose thread this is; 0 on every other thread. A cell with no
   /// destructor: it can still be read while the thread-locals of the thread are destroyed,
   /// where `std::thread::current` panics (a watcher dropped as the process exits).
-  // Android keeps its thread-locals by hand, and the lint does not see the `const` there.
+  // Android keeps its thread-locals by hand, and the lint takes the `const` for a plain
+  // initializer there, but only where the std source is installed, which it reads.
   #[cfg_attr(
     target_os = "android",
-    expect(clippy::missing_const_for_thread_local, reason = "the initializer is `const`")
+    allow(clippy::missing_const_for_thread_local, reason = "the initializer is `const`")
   )]
   static WATCHER_THREAD: Cell<usize> = const { Cell::new(0) };
 }
