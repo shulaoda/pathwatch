@@ -564,10 +564,11 @@ than before, and when a link on the way changed (5.14).
 Nothing below the node is thrown away: the deep scan compares each file with the fingerprint
 that the tree has, so only what differs is reported. `away` (`Dir::away`) says that the writes
 in the directory can have gone unheard: it was held, it is another directory, a link on the way
-changed, its watch lost records (a `lost` mark), or its name changed while only a watch above
-covers it (the records of its files came under the other name; a watch of its own follows the
-directory, as inotify does). A young file that was not read (`Content::Pending`, 5.8) counts as
-written in such a scan.
+changed, its watch lost records (a `lost` mark), or a record named it (a hint with its time,
+not a `watch` call) while only a watch above covers it (its name changed: the records of its
+files came under the other name; a watch of its own follows the directory, as inotify does). A
+young file that was not read (`Content::Pending`, 5.8) counts as written in such a scan, also
+when nothing was written to it (README, "Holes").
 
 `scan(node, depth)`: `check` every child of the node. A **complete** node also lists the
 directory: each entry that the tree has no node for yet gets one, and is checked with the type

@@ -246,6 +246,12 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 - **Linux and Windows: a watched file written through another hard link of it**, under a name
   in a directory that is not watched, gets no event: inotify and ReadDirectoryChangesW report
   a write under the name the writer used. Polling finds it, and so does macOS.
+- **Windows: a young file in a directory that was moved away and back**, or removed and put
+  back within the delete delay, gets an `Update` also when nothing was written to it (young:
+  written in the last 20 ms, or 2 s on a disk that counts in seconds). A write while the
+  directory was away is reported under the other name, which the watcher cannot connect, so
+  it reports the files whose fingerprint could hide one. Linux and macOS are not touched: the
+  watch of inotify follows the directory, and macOS reads such a file.
 - **A young file above 16 MiB, or one that cannot be read, under polling:** it gets one
   `Update` when it is 2 s old, also when nothing changed, and also when it was written just
   before `watch`.

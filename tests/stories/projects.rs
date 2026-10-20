@@ -146,6 +146,9 @@ fn a_directory_is_moved_away_changed_and_moved_back() {
     w.write("r/sub/deep/changes.txt", "1");
     w.mkdir("outside");
     w.watch(&["r"]);
+    // The files are old by then: a young one in a directory that was away is reported as
+    // written (README, "Holes").
+    w.expect(&[]);
 
     w.rename("r/sub", "outside/sub");
     w.remove("outside/sub/goes.txt");

@@ -249,11 +249,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         }
         // Scan deep when nothing tells what happened in it meanwhile. The writes in it can have
         // gone unheard: it was away, or lies in a directory that was (`away_scan`), its watch
-        // lost records, or its name changed while only a watch above covers it (the records
-        // came under the other name).
+        // lost records, or a record named it (a hint, with its time; not a `watch` call) while
+        // only a watch above covers it, so the records of its files came under another name.
         let moved = was_held || id != old || relinked;
         let from_above = self.tree[key].watch() == Watch::FromAbove;
-        let away = moved || why.lost || (why.deep && from_above) || self.away_scan;
+        let named = why.deep && why.since.is_some() && from_above;
+        let away = moved || why.lost || named || self.away_scan;
         self.still_there(key, path, why.deep || moved, away);
         let relist = self.tree[key].dir_mut().is_some_and(|dir| mem::take(&mut dir.relist));
         if relist && !(why.deep || moved) {
