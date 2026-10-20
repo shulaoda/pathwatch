@@ -10,7 +10,7 @@ use super::{
 use crate::{
   backend::{Backend, DirKey},
   fs::{DirId, Entry, FileType, Fs},
-  tree::{Depth, Dir, Kind, Mark, Watch},
+  tree::{Depth, Dir, Kind, Mark, Watch, nanos},
 };
 
 /// One node to check in a scan, with what the listing said about it.
@@ -92,6 +92,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let heard =
       matches!(self.tree[key].watch(), Watch::Watched | Watch::WatchedTree | Watch::FromAbove);
     let lags = self.fs.listing_lags() && !heard;
+    let flush_time = nanos(self.flush_time);
     let tree = &mut self.tree;
     let mut listed = tree.loose_spelling.then_some(&mut self.listed);
     let result = self.fs.read_dir(path, &mut |name, entry| {
@@ -102,10 +103,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       match tree.child(key, name) {
         Some(node) => {
           if let Some(listed) = &mut listed {
-            listed.insert(node, entry.into());
+            listed.insert(node, Listed::of(entry, flush_time));
           }
         }
-        None => names.push((tree.insert_child(key, name), entry.into())),
+        None => names.push((tree.insert_child(key, name), Listed::of(entry, flush_time))),
       }
     });
     // A listing follows a link at the path: one that took the place of the directory since the

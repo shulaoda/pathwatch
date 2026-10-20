@@ -175,9 +175,9 @@ fn read(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   // A time before 1970, and a file in a cloud, are left to `lstat`: not measured. So is a
   // directory that a disk is mounted on, as the listing tells of the one below the disk.
   let told = match (kind, created, modified) {
-    (FileType::Dir, Some(created), _) if fields.u32()? == 0 => {
+    (FileType::Dir, Some(created), Some(modified)) if fields.u32()? == 0 => {
       let volume = i64::from(volume).cast_unsigned();
-      Entry::Dir { id: DirId { volume, inode: file_id, birth: nanos(created) } }
+      Entry::Dir { id: DirId { volume, inode: file_id, birth: nanos(created) }, modified }
     }
     (FileType::File, _, Some(modified)) if flags & SF_DATALESS == 0 => {
       Entry::File { modified, size: fields.u64()?, file_id }

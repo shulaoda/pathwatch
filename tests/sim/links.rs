@@ -116,6 +116,35 @@ fn a_link_made_in_two_steps() {
   }
 }
 
+/// The one more look is for a directory made in the last moments (the story above makes its
+/// directory right before `watch`): an old one is past its second step. The directories of a
+/// baseline are old, so the flush after `watch` asks the disk nothing about them.
+#[test]
+fn an_old_directory_is_not_looked_at_again() {
+  let options = Options { two_step_links: true, ..Options::default() };
+  for mode in Mode::ALL {
+    let mut d = Driver::sim(mode, options.clone());
+    for dir in 0..20 {
+      d.fs.mkdir_all(format!("/p/d{dir:02}/sub")).unwrap();
+      d.fs.write(format!("/p/d{dir:02}/sub/a.txt"), "1").unwrap();
+    }
+    // Older than the coarse youth.
+    d.advance(Duration::from_secs(3));
+    d.watch(&["/p"]);
+    assert_eq!(taken(&mut d), NONE, "{mode:?}");
+    let before = d.fs.calls();
+    // A change brings the next flush: the new file is looked at, and its directory where the
+    // OS names the directory of a change (Prefix, Handle); the 41 directories of the baseline
+    // are not (42 more `lstat` calls here before the rule).
+    d.fs.write("/p/new.txt", "1").unwrap();
+    assert_eq!(window(&mut d), ["C /p/new.txt"], "{mode:?}");
+    let looks = d.fs.calls().lstat - before.lstat;
+    let expected = if mode == Mode::Inode { 1 } else { 2 };
+    assert_eq!(looks, expected, "{mode:?}: lstat calls at the flush after the baseline");
+    caught_up(&mut d);
+  }
+}
+
 /// One directory under two spellings. Each watched path gets its events under its own
 /// spelling, with no help from the poll.
 #[test]

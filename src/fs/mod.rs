@@ -88,9 +88,11 @@ pub enum Entry {
     size: u64,
     file_id: u64,
   },
-  /// A directory that is no link, with its identity, so no `lstat` is asked.
+  /// A directory that is no link, with its identity and its modification time, so no `lstat`
+  /// is asked.
   Dir {
     id: DirId,
+    modified: SystemTime,
   },
 }
 
@@ -492,7 +494,7 @@ mod tests {
     StdFs.read_dir(top.path(), &mut |name, entry| seen.push((name.to_owned(), entry))).unwrap();
     seen.sort_by(|a, b| a.0.cmp(&b.0));
     let [
-      (_, Entry::Dir { id }),
+      (_, Entry::Dir { id, modified: dir_modified }),
       (_, Entry::File { modified, size, file_id }),
       (_, Entry::Kind(FileType::Symlink)),
     ] = seen[..]
@@ -501,7 +503,8 @@ mod tests {
     };
     let meta = StdFs.lstat(&top.path().join("file")).unwrap();
     assert_eq!((modified, size, file_id), (meta.modified, meta.size, meta.file_id));
-    assert_eq!(id, StdFs.lstat(&top.path().join("dir")).unwrap().dir_id);
+    let dir = StdFs.lstat(&top.path().join("dir")).unwrap();
+    assert_eq!((id, dir_modified), (dir.dir_id, dir.modified));
 
     // A pipe is no directory: the listing fails and does not wait for a writer.
     let pipe = top.path().join("pipe");

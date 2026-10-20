@@ -37,6 +37,8 @@ pub(super) enum Found {
     complete: bool,
     /// The link at the name changed, or came, or went.
     relinked: bool,
+    /// Made in the last moments (`young_dir`).
+    young: bool,
   },
   /// The disk did not answer, or the look has to wait. The tree stays as it is.
   Unknown,
@@ -51,27 +53,29 @@ pub(super) enum Listed {
   Named(Option<FileType>),
   /// Named, a regular file with all that a look reads.
   File(Fingerprint),
-  /// Named, a directory that is no link.
-  Dir(DirId),
+  /// Named, a directory that is no link, and whether it was made in the last moments
+  /// (`young_dir`).
+  Dir(DirId, bool),
   /// The whole directory was listed, and the entry was not in it.
   NotNamed,
 }
 
 impl Listed {
   pub(super) fn is_named(self) -> bool {
-    matches!(self, Self::Named(_) | Self::File(_) | Self::Dir(_))
+    matches!(self, Self::Named(_) | Self::File(_) | Self::Dir(..))
   }
 }
 
-impl From<Entry> for Listed {
-  fn from(entry: Entry) -> Self {
+impl Listed {
+  /// What the listing said, at a flush whose time is `flush_time` (nanoseconds since 1970).
+  pub(super) fn of(entry: Entry, flush_time: i64) -> Self {
     match entry {
       Entry::Name => Self::Named(None),
       Entry::Kind(kind) => Self::Named(Some(kind)),
       Entry::File { modified, size, file_id } => {
         Self::File(Fingerprint { modified: nanos(modified), size, id: file_id })
       }
-      Entry::Dir { id } => Self::Dir(id),
+      Entry::Dir { id, modified } => Self::Dir(id, young_dir(flush_time, nanos(modified))),
     }
   }
 }
@@ -201,20 +205,20 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         self.store_file(key, path, kind, file, why);
       }
 
-      (Found::Dir { id, complete, relinked }, Had::Nothing) => {
+      (Found::Dir { id, complete, relinked, young }, Had::Nothing) => {
         let baseline = self.is_baseline_dir(key, relinked);
         self.appear(key, path, id, complete, baseline);
-        self.look_again_at_a_new_dir(key);
+        self.look_again_at_a_new_dir(key, young);
       }
-      (Found::Dir { id, complete, relinked }, Had::File) => {
+      (Found::Dir { id, complete, relinked, young }, Had::File) => {
         let baseline = self.is_baseline_dir(key, relinked);
         // A change of kind is never an `Update`: the file is gone.
         self.forget_file(key);
         self.appear(key, path, id, complete, baseline);
-        self.look_again_at_a_new_dir(key);
+        self.look_again_at_a_new_dir(key, young);
       }
       (
-        Found::Dir { id, complete, relinked },
+        Found::Dir { id, complete, relinked, young },
         Had::Dir { id: old, complete: was_complete, unlisted: was_unlisted },
       ) => {
         let was_held = self.tree[key].is_held();
@@ -246,17 +250,21 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           self.tree.queue_scan(key, Depth::Shallow);
         }
         if id != old {
-          self.look_again_at_a_new_dir(key);
+          self.look_again_at_a_new_dir(key, young);
         }
       }
     }
   }
 
   /// On Windows a junction or a directory link is a plain directory first, and the second step
-  /// gives no record that the backend asks for: a directory that the tree did not know is
-  /// looked at once more at the next flush, so that a link is seen within the poll interval.
-  fn look_again_at_a_new_dir(&mut self, key: DirKey) {
-    if self.options.two_step_links {
+  /// gives no record that the backend asks for: a directory that the tree did not know, and
+  /// that was made in the last moments, is looked at once more at the next flush, so that a
+  /// link is seen within the poll interval. An old directory is past its second step: the
+  /// directories of a baseline are not looked at again (one `lstat` for each of them at the
+  /// first flush after `watch` before, 5,011 of them for 50,000 files in 5,000 directories,
+  /// 47 ms, measured).
+  fn look_again_at_a_new_dir(&mut self, key: DirKey, young: bool) {
+    if self.options.two_step_links && young {
       self.tree.mark(key, Mark::default());
     }
   }
@@ -298,7 +306,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let kind = match listed {
         Listed::Named(kind) => kind,
         Listed::File(_) => Some(FileType::File),
-        Listed::Dir(_) => Some(FileType::Dir),
+        Listed::Dir(..) => Some(FileType::Dir),
         Listed::NotAsked | Listed::NotNamed => None,
       };
       if kind.is_some_and(|kind| self.ignores(key, path, entry_kind(kind))) {
@@ -314,11 +322,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     {
       return Found::File(FileType::File, file);
     }
-    if let Listed::Dir(id) = listed
+    if let Listed::Dir(id, young) = listed
       && !registered
       && !unsure
     {
-      return Found::Dir { id, complete: true, relinked: false };
+      return Found::Dir { id, complete: true, relinked: false, young };
     }
     let mut meta = match self.fs.lstat(path) {
       Ok(meta) => meta,
@@ -374,7 +382,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let found = match kind {
       // A directory on the way to a watched path is not asked: `watch` asked about it.
       EntryKind::Dir if is_ancestor || visible => {
-        Found::Dir { id: meta.dir_id, complete: visible, relinked }
+        let young = young_dir(nanos(self.flush_time), nanos(meta.modified));
+        Found::Dir { id: meta.dir_id, complete: visible, relinked, young }
       }
       EntryKind::File if visible => Found::File(meta.kind, Fingerprint::of(&meta)),
       _ => return other.map_or(Found::Missing, Found::OtherSpelling),
@@ -426,7 +435,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   fn spelling_is_unsure(&self, key: DirKey, listed: Listed) -> bool {
     let node = &self.tree[key];
     let was_entry = match listed {
-      Listed::Named(_) | Listed::File(_) | Listed::Dir(_) => return false,
+      Listed::Named(_) | Listed::File(_) | Listed::Dir(..) => return false,
       Listed::NotNamed => false,
       // A name that the running call registered is spelled by its caller, whatever the tree
       // knew at the name.
@@ -645,6 +654,15 @@ fn is_link_loop(error: &io::Error) -> bool {
 
 fn nanos_of(time: Duration) -> i64 {
   i64::try_from(time.as_nanos()).unwrap_or(i64::MAX)
+}
+
+/// A directory made in the last moments: by its modification time, which its making sets,
+/// within the coarse youth of a file (5.8) of the time of the flush, which is longer than any
+/// flush waits and any listing takes. A time ahead of the clock counts as young. Only NTFS and
+/// ReFS have reparse points, and their clocks are fine, so no rounding of a coarse clock is
+/// allowed for.
+fn young_dir(flush_time: i64, modified: i64) -> bool {
+  flush_time.saturating_sub(modified) < nanos_of(YOUNG_COARSE)
 }
 
 fn hash_of(path: &Path) -> u64 {

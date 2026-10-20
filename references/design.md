@@ -541,6 +541,13 @@ the backend for its watch (`arm`, 5.10); queue a shallow scan. With `two_step_li
 not under the poll) the node is also marked for one more look at the next flush, as is a
 directory that is another one than before: a junction or a directory link is a plain directory
 until its second step, which gives no record, so a look between the steps sees a directory.
+Only a directory made in the last moments is marked: its modification time, which its making
+sets, within the coarse youth of 5.8 (2 s) of the time of the flush, or ahead of it. An older
+directory is past its second step, and the directories of a baseline are old: before this
+rule every one of them was looked at once more at the first flush after `watch`, 5,011
+`lstat` calls and 47 ms for 50,000 files in 5,000 directories, which made the first edit after
+`ready` 58 ms instead of 12 (measured 2026-10-20). The listing gives the time where it gives
+the identity (NTFS, APFS), so the rule costs no call.
 The one more look is spent by whatever flush comes next, a poll or the hints of other paths:
 when that flush falls between the steps too, nothing looks again (measured with the steps 300
 ms apart, which no tool does; the story keeps them 50 ms apart, clear of the poll).

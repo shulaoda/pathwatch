@@ -363,9 +363,10 @@ fn record(bytes: &[u8], volume: u64, name: &mut Vec<u16>) -> Option<(usize, Entr
       Entry::File { modified: time(u64_at(WRITTEN)?), size: u64_at(SIZE)?, file_id: index }
     }
     // The identity never changes, so the listing is never behind with it.
-    FileType::Dir if plain => {
-      Entry::Dir { id: DirId { volume, inode: index, birth: u64_at(CREATED)? } }
-    }
+    FileType::Dir if plain => Entry::Dir {
+      id: DirId { volume, inode: index, birth: u64_at(CREATED)? },
+      modified: time(u64_at(WRITTEN)?),
+    },
     kind => Entry::Kind(kind),
   };
   Some((next, told))
@@ -572,7 +573,7 @@ mod tests {
     // Not NTFS: the listing of std is used there.
     let Some(seen) = list() else { return };
     let [
-      (_, Entry::Dir { id }),
+      (_, Entry::Dir { id, modified: dir_modified }),
       (_, Entry::File { modified, size, file_id }),
       (_, Entry::Kind(FileType::Symlink)),
     ] = seen[..]
@@ -582,7 +583,8 @@ mod tests {
     let meta = stat(&top.path().join("file"), false).unwrap();
     assert_eq!((modified, size, file_id), (meta.modified, meta.size, meta.file_id));
     let dir = top.path().join("dir");
-    assert_eq!(id, stat(&dir, false).unwrap().dir_id);
+    let dir_meta = stat(&dir, false).unwrap();
+    assert_eq!((id, dir_modified), (dir_meta.dir_id, dir_meta.modified));
     assert_eq!(id, by_handle(&dir, false).unwrap().dir_id);
 
     // A handle on a file does not take the class: std lists then, and says what is no directory.

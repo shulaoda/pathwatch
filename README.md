@@ -268,11 +268,11 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   under the old name meanwhile.
 - **Windows: a junction or a directory link** is made in two steps, a plain directory first,
   and the second step gives no record. A watcher that looked between the steps sees a
-  directory; it looks once more at the next flush, within the poll interval, and reports the
-  link then. Until then a watched path at or through the link gets no events. When that next
-  flush falls between the steps as well (the tools make the two steps within a millisecond;
-  a flush comes 10 ms after a change at the soonest), the link is seen only when something
-  else brings a look at its directory.
+  directory; a directory made in the last two seconds is looked at once more at the next
+  flush, within the poll interval, and the link is reported then. Until then a watched path at
+  or through the link gets no events. When that next flush falls between the steps as well
+  (the tools make the two steps within a millisecond; a flush comes 10 ms after a change at
+  the soonest), the link is seen only when something else brings a look at its directory.
 - **Windows: more than 64 directories** share handles. A watched path whose directory is then
   spelled in another way than the disk (more than the case of letters) gets no events, and
   neither does a change that a program makes through the short (8.3) name of a directory on
