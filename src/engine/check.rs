@@ -5,7 +5,7 @@ use std::{
   hash::{Hash, Hasher},
   io, mem,
   path::{Path, PathBuf},
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use rustc_hash::FxHasher;
@@ -253,8 +253,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         // only a watch above covers it, so the records of its files came under another name.
         let moved = was_held || id != old || relinked;
         let from_above = self.tree[key].watch() == Watch::FromAbove;
-        let named = why.deep && why.since.is_some() && from_above;
+        let named = why.deep && from_above && why.since.is_some();
         let away = moved || why.lost || named || self.away_scan;
+        // Only named: a write while the directory was away hides behind the fingerprint of a
+        // file that was young when the record was made, and of no other.
+        if away
+          && !(moved || why.lost || self.away_scan)
+          && let Some(since) = why.since
+        {
+          self.forget_pending_old_at(key, since);
+        }
         self.still_there(key, path, why.deep || moved, away);
         let relist = self.tree[key].dir_mut().is_some_and(|dir| mem::take(&mut dir.relist));
         if relist && !(why.deep || moved) {
@@ -641,14 +649,31 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       return now.saturating_duration_since(since) < YOUNG_COARSE;
     }
     self.tree.set_ahead_since(key, None);
-    if age < nanos_of(YOUNG) {
-      return true;
-    }
-    if age >= nanos_of(YOUNG_COARSE) {
-      return false;
-    }
+    age < nanos_of(self.youth(key, modified))
+  }
+
+  /// How long the file is young for (5.8): the short time with a fine time stamp under an OS
+  /// watch, the long one with a whole second, or where only the poll looks at it.
+  fn youth(&self, key: DirKey, modified: i64) -> Duration {
     let whole_seconds = modified >= 0 && modified % nanos_of(Duration::from_secs(1)) == 0;
-    whole_seconds || self.only_polled(key)
+    if whole_seconds || self.only_polled(key) { YOUNG_COARSE } else { YOUNG }
+  }
+
+  /// Forgets the `Pending` content of the files below `dir` that were old at `since`, the time
+  /// of the record that named the directory: a write while it was away could hide behind the
+  /// fingerprint of a file that was young then, and of no other (5.8).
+  fn forget_pending_old_at(&mut self, dir: DirKey, since: Instant) {
+    let now = self.now.expect("a check runs inside a flush");
+    let passed = nanos_of(now.saturating_duration_since(since));
+    let flush_time = nanos(self.flush_time);
+    for key in self.tree.pending_below(dir) {
+      let Kind::File(file) = self.tree[key].kind else { continue };
+      // Below zero for a time in the future: young.
+      let age = flush_time.saturating_sub(file.modified).saturating_sub(passed);
+      if age >= nanos_of(self.youth(key, file.modified)) {
+        self.tree.set_content(key, None);
+      }
+    }
   }
 
   /// Whether only the poll looks at the entry: its directory is polled, or it is a link.

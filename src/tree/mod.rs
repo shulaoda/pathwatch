@@ -1171,6 +1171,23 @@ impl Tree {
     self.contents.get(&key).copied()
   }
 
+  /// The files below `dir` that were young at their last look and not read (`Content::Pending`).
+  pub fn pending_below(&self, dir: DirKey) -> Vec<DirKey> {
+    let below = |key: &DirKey| {
+      let mut above = self.parent(*key);
+      while let Some(at) = above {
+        if at == dir {
+          return true;
+        }
+        above = self.parent(at);
+      }
+      false
+    };
+    let pending =
+      self.contents.iter().filter(|(key, content)| **content == Content::Pending && below(key));
+    pending.map(|(key, _)| *key).collect()
+  }
+
   pub fn set_content(&mut self, key: DirKey, content: Option<Content>) {
     if let Some(content) = content {
       self.contents.insert(key, content);

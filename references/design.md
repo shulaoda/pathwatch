@@ -568,7 +568,9 @@ changed, its watch lost records (a `lost` mark), or a record named it (a hint wi
 not a `watch` call) while only a watch above covers it (its name changed: the records of its
 files came under the other name; a watch of its own follows the directory, as inotify does). A
 young file that was not read (`Content::Pending`, 5.8) counts as written in such a scan, also
-when nothing was written to it (README, "Holes").
+when nothing was written to it (README, "Holes"). Not one that was already old when the record
+named the directory: a write while it was away could not hide behind its fingerprint
+(`forget_pending_old_at`).
 
 `scan(node, depth)`: `check` every child of the node. A **complete** node also lists the
 directory: each entry that the tree has no node for yet gets one, and is checked with the type
