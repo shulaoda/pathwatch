@@ -304,3 +304,72 @@ fn a_young_file_goes_away_while_it_is_checked() {
   }
   run(|| Driver::poll(Options::default()), "Poll");
 }
+
+// ---- where every write gives a hint ----
+
+/// The settings of inotify and Windows: every write to a watched file is a "written" hint.
+fn hinted() -> Options {
+  Options { written_hints: true, ..Options::default() }
+}
+
+/// Where every write gives a "written" hint, a young file is not read: the hint tells of a
+/// second write of the same size inside one step of the clock.
+#[test]
+fn a_young_file_is_not_read_where_writes_are_hinted() {
+  for mode in [Mode::Inode, Mode::Handle] {
+    let mut d = Driver::sim(mode, hinted());
+    d.fs.set_time_step(Duration::from_millis(10));
+    d.fs.advance(OFF_THE_SECOND + Duration::from_millis(10));
+    d.fs.mkdir("/p").unwrap();
+    d.fs.write("/p/a.js", "x=1;").unwrap();
+    d.watch(&["/p/a.js"]);
+    assert_eq!(d.fs.calls().hash, 0, "{mode:?}");
+    // 4 ms later, in the same step: the same time, the same size, the same inode.
+    d.advance(Duration::from_millis(4));
+    d.fs.write("/p/a.js", "x=2;").unwrap();
+    assert_eq!(window(&mut d), ["U /p/a.js"], "{mode:?}");
+    d.fs.write("/p/a.js", "x=3;").unwrap();
+    assert_eq!(window(&mut d), ["U /p/a.js"], "{mode:?}");
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    assert_eq!(d.fs.calls().hash, 0, "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// A loss report may have taken the hint of such a write: the look it asks for counts a file
+/// that is young, or was young at its last look, as written. Once the file is found old, the
+/// fingerprint is trusted again. Nothing is read at any of these looks.
+#[test]
+fn a_loss_report_counts_as_a_write_while_the_file_is_young() {
+  for mode in [Mode::Inode, Mode::Handle] {
+    let mut d = Driver::sim(mode, hinted());
+    d.fs.advance(OFF_THE_SECOND);
+    d.fs.mkdir("/p").unwrap();
+    d.fs.write("/p/a.js", "x=1;").unwrap();
+    d.watch(&["/p/a.js"]);
+    // The scan at 10 ms: young. The scan at 20 ms: old, one last time. The scan at 30 ms: no.
+    for expected in [vec!["U /p/a.js"], vec!["U /p/a.js"], NONE.to_vec()] {
+      d.engine.overflow(d.now);
+      assert!(d.step());
+      assert_eq!(taken(&mut d), expected, "{mode:?}");
+    }
+    assert_eq!(d.fs.calls().hash, 0, "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// No OS watch covers the file: the hint cannot come, and the hash decides as before.
+#[test]
+fn a_file_that_only_the_poll_looks_at_is_read_where_writes_are_hinted() {
+  for mode in [Mode::Inode, Mode::Handle] {
+    let d = Driver::sim(mode, hinted());
+    d.fs.set_watch_limit(Some(0));
+    let mut d = d;
+    d.fs.advance(OFF_THE_SECOND);
+    d.fs.mkdir("/p").unwrap();
+    d.fs.write("/p/a.js", "x=1;").unwrap();
+    d.watch(&["/p/a.js"]);
+    assert_eq!(d.fs.calls().hash, 1, "{mode:?}");
+    caught_up(&mut d);
+  }
+}

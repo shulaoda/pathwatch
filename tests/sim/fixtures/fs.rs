@@ -866,7 +866,7 @@ impl State {
         let mut rel = PathBuf::from(name);
         let mut at = dir;
         loop {
-          self.kernel.by_handle(at, &rel, act, at == dir);
+          self.kernel.by_handle(at, &rel, act, is_dir, at == dir);
           if at == ROOT {
             break;
           }

@@ -152,6 +152,8 @@ impl Config {
       loose_spelling: cfg!(any(target_vendor = "apple", windows)),
       // The poll lists a directory again by itself.
       two_step_links: cfg!(windows) && !polling,
+      // inotify and ReadDirectoryChangesW report every write; FSEvents and the poll do not.
+      written_hints: cfg!(any(target_os = "linux", target_os = "android", windows)) && !polling,
     }
   }
 }

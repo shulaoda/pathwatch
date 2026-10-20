@@ -190,11 +190,13 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 
 - **A writer that keeps a file open.** macOS reports nothing until the file is closed; the
   same for a write through `mmap`. Linux reports no write through `mmap` at all, also after
-  the file is closed: inotify has no word for it. On Windows the directory lists the new size and time only
-  when the file is closed (measured on NTFS); whether the write is reported before that was
-  not checked. On Windows a write through a mapped view of a file that exists is not reported
-  at all, as on Linux, also after the file is closed, and neither is a write through a handle
-  that was opened by the index of the file (`OpenFileById`); polling finds the second.
+  the file is closed: inotify has no word for it. On Windows a save is two records, one at the
+  open that truncates the file and one at the close, and nothing for the writes between
+  (measured on NTFS): a save that takes longer than the quiet time from its open to its
+  close is told twice, the first time with what was written so far. On Windows a write
+  through a mapped view of a file that exists is not reported at all, as on Linux, also after
+  the file is closed, and neither is a write through a handle that was opened by the index of
+  the file (`OpenFileById`); polling finds the second.
 - **With polling, a file that was just written is opened and read** (up to 16 MiB, at every
   round for 2 s after the write), on every OS, and so is a young file wherever only the poll
   looks at it. On Windows a program that opens it meanwhile and shares it with nobody is

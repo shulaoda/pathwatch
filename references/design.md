@@ -590,7 +590,11 @@ queued already: a scan of the names alone skips what the listing names). The way
 name that the disk spelled in another way at its last look: the tree can be behind the disk
 when `watch` is called, a notification still on its way, and the baseline of what is below
 is decided by that answer. Then run one flush right away, without the quiet time, and return
-when it is done.
+when it is done. A `Written` hint that was on its way reports an `Update` for a file the
+baseline has just seen: a write the backend reports is one (5.8, guard 1), and nothing says
+whether the record came before the look. NTFS gives such a record for the content of a new
+file, so a file written a moment before `watch` under a handle can be told twice, `Create`
+and `Update` (the test `a_scan_that_waited_runs_inside_a_watch_of_a_file_below`, Handle).
 
 The whole batch is registered before the flush, and each node is checked once in a flush. So
 a batch costs one `watch` call for a directory and one `lstat` for a name (the test
@@ -678,11 +682,19 @@ Two guards:
      sure to come there, and a write that leaves the time stamp as it is can only come while
      the file is young.
 
-   On Windows the read of a file that was just written waits for the virus scanner (2 ms,
-   and 14 ms for one in ten, measured). (A number that NTFS keeps for each file, the place of
-   its last record in the change journal, stood in for the hash there for a while: 0.04 ms
-   instead of the read. It does not move for a second write through a handle that stays
-   open, which was a hole of its own, and it was one more thing to keep. Taken out.)
+   **Where every write gives a hint** (`Options::written_hints`: inotify and Windows, and not
+   for a file that only the poll looks at), a young file is not read at all: guard 1 tells of
+   a write that leaves the fingerprint as it is, so the hash would only repeat the hint. The
+   node keeps `Content::Pending` while it is young, and a look that a loss report asked for,
+   or that runs while one waits, counts a `Pending` file as written: the report may have
+   taken the hint. The first look that finds the file old drops it, after one last such
+   count. The read this saves is the one that waits for the virus scanner on Windows (5 to
+   12 ms after a write, measured 2026-10-20; 2 ms, and 14 ms for one in ten, on 2026-10-13):
+   it was the floor of an edit told with no quiet time and the tail of a burst. (A number
+   that NTFS keeps for each file, the place of its last record in the change journal, stood
+   in for the hash there for a while: 0.04 ms instead of the read. It does not move for a
+   second write through a handle that stays open, which was a hole of its own, and it was one
+   more thing to keep. Taken out.)
 
 | The modification time | Young for |
 |---|---|

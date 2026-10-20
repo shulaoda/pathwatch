@@ -1119,6 +1119,9 @@ pub enum Content {
   Hash(u64),
   /// No hash (the file is too big or unreadable): an equal fingerprint counts as a change.
   Unknown,
+  /// No hash was read, as every write gives a hint (`Options::written_hints`): an equal
+  /// fingerprint is a change when the hint says so, or when a loss report may have taken it.
+  Pending,
 }
 
 /// What only a few nodes have, kept beside the arena: links, contents and holds.

@@ -183,6 +183,14 @@ cargo build --release
 .\target\release\report.exe results\windows.json | Out-File -Encoding utf8 results\windows.md
 ```
 
+Run every round that is compared from the same place, and from the system drive: on one
+machine the driver started from a directory on a second drive made the writes of its noise
+and its edits six times slower (1,800 against 10,200 writes a second, the same binary, with
+the trees on the system drive either way; most likely the virus scanner, which looks at a
+program by where it is), and a run from there next to a run from `%TEMP%` showed a change in
+the watcher that was not there (2026-10-20). Copy `bench.exe`, `report.exe` and the
+`adapter-*.exe` of each version into a directory under `%TEMP%` and start them from there.
+
 In the OrbStack VM (Linux). The build directory and the Node packages must be in the VM, and
 the trees must be on a disk of the VM: inotify does not see changes that macOS makes in the
 shared folder.

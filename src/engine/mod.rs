@@ -58,6 +58,17 @@ const LONGEST_SETTING: Duration = Duration::from_hours(365 * 24);
 /// answer for the same path and kind: the node keeps it.
 pub type Ignored = Arc<dyn Fn(&Path, EntryKind) -> bool + Send + Sync>;
 
+/// The pacing of the scans that loss reports ask for (5.13).
+#[derive(Default)]
+struct Loss {
+  /// The scans wait until then: the rest after the last ones.
+  rest_until: Option<Instant>,
+  /// A loss report waits for the end of that rest.
+  waits: bool,
+  /// The running flush makes the scans of a loss report: a young file counts as written (5.8).
+  scanning: bool,
+}
+
 /// The settings of an [`Engine`]. `Options::default()` is for the tests (a quiet time of
 /// 10 ms); `Config` makes the ones of a watcher.
 #[derive(Clone)]
@@ -78,6 +89,10 @@ pub struct Options {
   /// record (Windows): a directory that the tree did not know is looked at once more at the
   /// next flush.
   pub two_step_links: bool,
+  /// Every write to a file that an OS watch covers gives a `Written` hint (inotify, Windows).
+  /// Then a young file is not read for a hash: the hint tells of a write that leaves the
+  /// fingerprint as it is, and while the file is young a loss report counts as one (5.8).
+  pub written_hints: bool,
 }
 
 impl Default for Options {
@@ -90,6 +105,7 @@ impl Default for Options {
       poll_interval_alone: None,
       loose_spelling: false,
       two_step_links: false,
+      written_hints: false,
     }
   }
 }
@@ -104,6 +120,7 @@ impl fmt::Debug for Options {
       .field("poll_interval_alone", &self.poll_interval_alone)
       .field("loose_spelling", &self.loose_spelling)
       .field("two_step_links", &self.two_step_links)
+      .field("written_hints", &self.written_hints)
       .finish()
   }
 }
@@ -135,10 +152,8 @@ pub struct Engine<B: Backend, F: Fs> {
   hold_queue: BinaryHeap<Reverse<(Instant, DirKey)>>,
   /// The held nodes whose second look is due in the running tick.
   due_holds: Vec<DirKey>,
-  /// The scans that loss reports ask for wait until then.
-  rest_until: Option<Instant>,
-  /// A loss report waits for the end of that rest.
-  loss_waits: bool,
+  /// The pacing of the scans that loss reports ask for.
+  loss: Loss,
 
   // The running flush.
   /// The time of the running flush. `None` before the first.
@@ -211,8 +226,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       poll_at: None,
       hold_queue: BinaryHeap::new(),
       due_holds: Vec::new(),
-      rest_until: None,
-      loss_waits: false,
+      loss: Loss::default(),
       now: None,
       flush_time: SystemTime::UNIX_EPOCH,
       flush_ticks: Duration::ZERO,
@@ -365,10 +379,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// The time at which a loss report that had to wait gets its scans: the end of the rest, and
   /// not before the quiet time, which its mark waits for like every hint.
   fn loss_wait(&self) -> Option<Instant> {
-    if !self.loss_waits {
+    if !self.loss.waits {
       return None;
     }
-    let rest_until = self.rest_until?;
+    let rest_until = self.loss.rest_until?;
     Some(self.flush_at.map_or(rest_until, |at| at.max(rest_until)))
   }
 
@@ -390,12 +404,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.flush_ticks = self.fs.ticks();
     // The scans that loss reports ask for are paced: after one flush of them, the next wait
     // for a rest.
-    let rest_is_over = self.rest_until.is_none_or(|until| until <= now);
+    let rest_is_over = self.loss.rest_until.is_none_or(|until| until <= now);
     let mut loss_scans_ran = rest_is_over && mem::take(&mut self.tree.lost);
     if loss_scans_ran {
       self.tree.scan_all();
     }
-    self.loss_waits = self.tree.lost;
+    self.loss.scanning = loss_scans_ran;
+    self.loss.waits = self.tree.lost;
 
     let mut path = mem::take(&mut self.path);
     loss_scans_ran |= self.check_marks(&mut path, rest_is_over, hints_due);
@@ -405,6 +420,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     while (!self.tree.to_scan.is_empty() || self.gave_back) && !self.stopped() {
       self.round(&mut path, &mut names);
     }
+    self.loss.scanning = false;
     (self.path, self.names) = (path, emptied(names));
     // A big listing is not kept for ever, as `emptied` does for a list.
     self.listed.clear();
@@ -412,7 +428,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
     let took = self.fs.ticks().saturating_sub(self.flush_ticks).min(LONGEST_FLUSH);
     if loss_scans_ran {
-      self.rest_until = Some(now + took + (took * REST).min(LONGEST_LOSS_REST));
+      self.loss.rest_until = Some(now + took + (took * REST).min(LONGEST_LOSS_REST));
     }
     took
   }
@@ -447,7 +463,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let waits = since.is_some() && !hints_due && above.binary_search(&key).is_err();
       if waits || (mark.lost && !rest_is_over) {
         self.tree.mark(key, mark);
-        self.loss_waits |= mark.lost;
+        self.loss.waits |= mark.lost;
         continue;
       }
       loss_checks_ran |= mark.lost;

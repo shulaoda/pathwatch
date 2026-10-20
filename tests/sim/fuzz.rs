@@ -195,6 +195,7 @@ struct Config {
   loose_spelling: bool,
   /// A new directory is looked at once more, as on Windows for a link made in two steps.
   two_step_links: bool,
+  written_hints: bool,
   /// The disk is such a disk, whatever the engine takes it for. Then some changes name an
   /// entry in upper case: the entry is the same, and the OS tells about a name that is gone
   /// in the spelling of the change. Some watched paths have a name in upper case too: a
@@ -246,6 +247,9 @@ impl Config {
       ignore_case: random.chance(25),
       mount: false,
       two_step_links: false,
+      // Only a backend that reports every write can be trusted for them.
+      written_hints: matches!(backend, Target::Sim(Mode::Inode | Mode::Handle))
+        && random.chance(50),
     };
     config.mount = random.chance(15);
     config.two_step_links = random.chance(25);
@@ -269,6 +273,7 @@ impl Config {
       poll_interval_alone: None,
       loose_spelling: self.loose_spelling,
       two_step_links: self.two_step_links,
+      written_hints: self.written_hints,
     }
   }
 }

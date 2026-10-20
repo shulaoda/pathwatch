@@ -193,12 +193,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       (Found::OtherSpelling(_), _) => self.gone(key),
 
       (Found::File(kind, file), Had::File | Had::Nothing) => {
-        self.store_file(key, path, kind, file, why.written);
+        self.store_file(key, path, kind, file, why);
       }
       (Found::File(kind, file), Had::Dir { .. }) => {
         // A change of kind is never an `Update`: the files below are gone.
         self.vanish(key);
-        self.store_file(key, path, kind, file, why.written);
+        self.store_file(key, path, kind, file, why);
       }
 
       (Found::Dir { id, complete, relinked }, Had::Nothing) => {
@@ -477,8 +477,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     path: &Path,
     kind: FileType,
     fingerprint: Fingerprint,
-    written: bool,
+    why: Mark,
   ) {
+    let written = why.written;
     // A held node still has its file.
     let old = match self.tree[key].kind {
       Kind::File(old) => Some((old, self.tree.content(key))),
@@ -486,10 +487,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     };
     let same = old.is_some_and(|(old, _)| old == fingerprint);
     let young = kind != FileType::Other && self.is_young(key, fingerprint.modified, same);
+    // Where every write gives a `written` hint, a young file is not read: the hint tells of a
+    // write that leaves the fingerprint as it is (5.8). Not where only the poll looks at it.
+    let trusts_hints = self.options.written_hints && !self.only_polled(key);
     // Compared when the fingerprint is the same, and one last time when the file is old.
     let kept = old.and_then(|(old, content)| content.filter(|_| old == fingerprint));
     let compare = matches!(kept, Some(Content::Hash(_)));
-    let hash = if young || compare {
+    let hash = if compare || (young && !trusts_hints) {
       match self.content_hash(key, path, kind, fingerprint.size) {
         Ok(hash) => hash,
         // Gone after the `lstat`: this check says nothing, and the next flush looks again.
@@ -506,6 +510,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // Under the poll a young file with nothing to compare waits: the first look that finds it
     // old reports one `Update` for all. Where no poll comes, every look reports.
     let update_waits = young && hash.is_none() && self.only_polled(key);
+    // A loss report may have taken the hint of a write that left the fingerprint as it is: a
+    // file that was young at its last look counts as written.
+    let hints_lost = why.lost || self.loss.scanning || self.tree.lost || self.loss.waits;
 
     let changed = if let Some((old, content)) = old {
       written
@@ -514,6 +521,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           None => false,
           Some(Content::Hash(old)) => hash != Some(old),
           Some(Content::Unknown) => !update_waits,
+          Some(Content::Pending) => {
+            if trusts_hints {
+              hints_lost
+            } else {
+              !update_waits
+            }
+          }
         }
     } else {
       // The handler may believe in a file the tree forgot earlier in this flush: nothing says it
@@ -534,7 +548,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if node.is_held() {
       self.tree.unhold(key);
     }
-    let content = young.then(|| hash.map_or(Content::Unknown, Content::Hash));
+    let content = if trusts_hints {
+      young.then_some(Content::Pending)
+    } else {
+      young.then(|| hash.map_or(Content::Unknown, Content::Hash))
+    };
     self.tree.set_content(key, content);
   }
 

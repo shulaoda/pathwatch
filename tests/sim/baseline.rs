@@ -561,7 +561,11 @@ fn a_scan_that_waited_runs_inside_a_watch_of_a_file_below() {
     assert_eq!(d.watch(&["/e"]), NONE, "{on}");
     d.fs().set_offline(None);
     assert_eq!(d.watch(&["/e/a"]), ["C /e/a", "C /e/z"], "{on}");
-    assert_eq!(d.settled(), NONE, "{on}");
+    // A handle above saw the two files written (NTFS gives a record for the content of a new
+    // file), and those records were still on their way when `watch` ran: a write that the
+    // backend reports is an `Update`, also for a file the baseline has just seen (5.8).
+    let late = if on == "Handle" { vec!["U /e/a", "U /e/z"] } else { NONE.to_vec() };
+    assert_eq!(d.settled(), late, "{on}");
     d.caught_up();
   });
 }
@@ -583,7 +587,10 @@ fn a_name_in_another_spelling_is_looked_at_again_before_a_new_path_below_it() {
     d.fs().mkdir("/b/C").unwrap();
     d.fs().write("/b/C/a", "1").unwrap();
     assert_eq!(d.watch(&["/b/C/a"]), ["C /b/C/a"], "{on}");
-    assert_eq!(d.settled(), ["D /b/c/f"], "{on}");
+    // The handle on `/b` saw the file written, and the record was still on its way when
+    // `watch` ran: a write that the backend reports is an `Update`, also after the baseline.
+    let late = if on == "Handle" { vec!["U /b/C/a", "D /b/c/f"] } else { vec!["D /b/c/f"] };
+    assert_eq!(d.settled(), late, "{on}");
     d.caught_up();
   });
 }

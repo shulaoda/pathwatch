@@ -34,8 +34,9 @@ pub enum Mode {
   /// the stream remembers the directories that were on its path when it started.
   Prefix,
   /// ReadDirectoryChangesW. One handle on a directory, for everything below it. The handle
-  /// belongs to the directory, not to its path. Writes are reported as `Written`; a change of an
-  /// entry also reports its directory as "modified". `Names` is answered `NotWatched`.
+  /// belongs to the directory, not to its path. Writes and new files are reported as
+  /// `Written`; a change of an entry also reports its directory as "modified". `Names` is
+  /// answered `NotWatched`.
   Handle,
 }
 
@@ -421,11 +422,22 @@ impl Kernel {
   }
 
   /// `direct`: the entry lies in the directory of the handle itself.
-  pub(crate) fn by_handle(&mut self, handle: u64, rel: &Path, act: Act, direct: bool) {
+  pub(crate) fn by_handle(
+    &mut self,
+    handle: u64,
+    rel: &Path,
+    act: Act,
+    is_dir: bool,
+    direct: bool,
+  ) {
     if !self.watched.contains_key(&handle) {
       return;
     }
-    let what = if act == Act::Modify { What::Written } else { What::Entry };
+    // A new file is written too: NTFS gives an ADDED record and then a MODIFIED one for its
+    // content (measured). A moved-in file keeps its own index, so it is never the file it
+    // replaces.
+    let written = !is_dir && matches!(act, Act::Modify | Act::Create);
+    let what = if written { What::Written } else { What::Entry };
     self.queue.push_back(SimRaw { watch: handle, path: rel.to_path_buf(), what });
     if act != Act::Modify
       && !direct

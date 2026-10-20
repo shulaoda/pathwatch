@@ -268,6 +268,9 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
 
 /// The mounts of the namespace, each by its id with its mount point, in order. Mount ids and
 /// not only points: a volume mounted over another one at the same point is a change too.
+// The file stays open for the poll of the mounts, and is read again from its start: a read by
+// path (`fs::read`) could open another file under the name.
+#[expect(clippy::verbose_file_reads, reason = "the open file is read again, not a path")]
 fn read_mounts(mut file: &File) -> Option<Vec<(u64, Vec<u8>)>> {
   let mut text = Vec::new();
   file.seek(SeekFrom::Start(0)).ok()?;
