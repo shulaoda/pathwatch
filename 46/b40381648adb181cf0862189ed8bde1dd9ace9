@@ -1,0 +1,21 @@
+README.md
+  s_50e134dde5413c::t_c2a04b2a96e9db 363-364
+src/watcher.rs
+  s_50e134dde5413c::t_11284177fbd524 91,119,292
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "46b40381648adb181cf0862189ed8bde1dd9ace9",
+  "prompts": {},
+  "sessions": {
+    "s_50e134dde5413c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9428fa2-2ccc-4d44-9a50-977a9fc02468",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
