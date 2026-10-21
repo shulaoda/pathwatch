@@ -1,0 +1,23 @@
+references/design.md
+  s_35ac4ca3286b91::t_612b2f3acdffe0 1654-1655
+src/windows.rs
+  s_35ac4ca3286b91::t_b1df8734857f21 188-189,207-212,214-215,218,225-229,231-232
+tests/windows/parts.rs
+  s_35ac4ca3286b91::t_dcf4467a0e4980 217-233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ff117ed3198cf4a21f5198df257068a87911865c",
+  "prompts": {},
+  "sessions": {
+    "s_35ac4ca3286b91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcde9c6a-7c6b-4913-9704-d8faae1db573",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
