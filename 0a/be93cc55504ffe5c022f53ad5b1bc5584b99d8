@@ -1,0 +1,27 @@
+src/engine/check.rs
+  s_2189c4100dc1ff::t_810cdf32150742 242,599
+src/engine/mod.rs
+  s_2189c4100dc1ff::t_d6fb6696f9dc1b 488
+src/engine/watched_paths.rs
+  s_2189c4100dc1ff::t_e50151b6143861 175,191,195,243
+src/inotify.rs
+  s_2189c4100dc1ff::t_b1ee77ae955e15 199,202
+src/tree/mod.rs
+  s_2189c4100dc1ff::t_31420b1dd17fb1 361-365,1223
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0abe93cc55504ffe5c022f53ad5b1bc5584b99d8",
+  "prompts": {},
+  "sessions": {
+    "s_2189c4100dc1ff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "87b36dfc-092a-47e0-84dd-f8402c1c0b6a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
