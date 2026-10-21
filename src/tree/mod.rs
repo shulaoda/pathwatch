@@ -571,10 +571,27 @@ impl Tree {
   }
 
   fn push_names(&self, index: u32, path: &mut PathBuf) {
-    let node = linked(&self.slots, index);
-    if node.parent != NONE {
-      self.push_names(node.parent, path);
-      push_name(path, name_of(&self.names, node));
+    // A list, not a recursion: a tree can be deeper than the stack takes. The nodes on the way up
+    // fill the array first; only a deeper path asks for memory.
+    let mut near = [NONE; 64];
+    let mut far = Vec::new();
+    let mut count = 0;
+    let mut at = index;
+    loop {
+      let node = linked(&self.slots, at);
+      if node.parent == NONE {
+        break;
+      }
+      match near.get_mut(count) {
+        Some(slot) => *slot = at,
+        None => far.push(at),
+      }
+      count += 1;
+      at = node.parent;
+    }
+    let near = &near[..count.min(near.len())];
+    for &at in far.iter().rev().chain(near.iter().rev()) {
+      push_name(path, name_of(&self.names, linked(&self.slots, at)));
     }
   }
 
