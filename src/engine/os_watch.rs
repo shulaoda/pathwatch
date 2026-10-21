@@ -221,8 +221,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
     }
     if old == Watch::WatchedTree && new != Watch::WatchedTree {
-      // The nodes below relied on this watch. A deep scan asks for a watch for each of them.
+      // The nodes below relied on this watch. A deep scan asks for a watch for each of them. It
+      // is away (5.5): the records that the old watch had not given yet are gone with it.
       self.tree.queue_scan(key, Depth::Deep);
+      if let Some(dir) = self.tree[key].dir_mut() {
+        dir.away = true;
+      }
     }
   }
 }

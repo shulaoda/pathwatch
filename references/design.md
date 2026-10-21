@@ -266,7 +266,10 @@ every engine call):
    on disk, and put a deep mark on its child that leads to `dir`. Done.
 3. An empty `rel` is the directory itself: a deep mark on its node. It is a loss report for
    that place (the watch is gone, the directory was moved, or notifications were lost), so the
-   mark says `lost`, until a hint that names the path joins it. Done.
+   mark says `lost`, until a hint that names the path joins it. The directory keeps that its
+   writes can have gone unheard (`Dir::away`, 5.5) also then: under inotify the parent reports
+   a removed directory with the end of its watch, and one made again at once can have the old
+   identity. Done.
 4. Walk down from the node through the names of `rel`. At node `X` with the next name `c`:
    - `X` is partial and it has no registered child `c`: the hint is dropped, or "another
      spelling" below applies. So a flood from a place that no watched path can see ends here
@@ -564,12 +567,13 @@ than before, and when a link on the way changed (5.14).
 Nothing below the node is thrown away: the deep scan compares each file with the fingerprint
 that the tree has, so only what differs is reported. `away` (`Dir::away`) says that the writes
 in the directory can have gone unheard: it was held, it is another directory, a link on the way
-changed, its watch lost records (a `lost` mark), or a record named it (a hint with its time,
-not a `watch` call) while only a watch above covers it (its name changed: the records of its
-files came under the other name; a watch of its own follows the directory, as inotify does). A
-young file that was not read (`Content::Pending`, 5.8) counts as written in such a scan, also
-when nothing was written to it (README, "Holes"). Not one that was already old when the record
-named the directory: a write while it was away could not hide behind its fingerprint
+changed, its watch lost records (a `lost` mark), the watch of the tree it had was given back
+(the records that watch had not given yet are gone with it), or a record named it (a hint with
+its time, not a `watch` call) while only a watch above covers it (its name changed: the records
+of its files came under the other name; a watch of its own follows the directory, as inotify
+does). A young file that was not read (`Content::Pending`, 5.8) counts as written in such a
+scan, also when nothing was written to it (README, "Holes"). Not one that was already old when
+the record named the directory: a write while it was away could not hide behind its fingerprint
 (`forget_pending_old_at`).
 
 `scan(node, depth)`: `check` every child of the node. A **complete** node also lists the

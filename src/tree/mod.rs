@@ -120,6 +120,15 @@ impl Node {
   /// Adds a mark to the node. Two marks for one node become one. `true`: it had none.
   fn add_mark(&mut self, mark: Mark) -> bool {
     let old = self.mark();
+    // The writes in a directory whose watch lost records can have gone unheard (5.8), also when
+    // another hint for it takes `lost` off the mark below: its next scan is away. Under inotify
+    // the parent reports a removed directory as its watch ends, and one made again at once can
+    // have the same identity.
+    if mark.lost
+      && let Some(dir) = self.dir_mut()
+    {
+      dir.away = true;
+    }
     self.set_mark(Some(old.map_or(mark, |old| Mark {
       deep: old.deep || mark.deep,
       written: old.written || mark.written,
@@ -180,7 +189,7 @@ pub struct Dir {
   pub has_error: bool,
   /// The node is queued for a scan.
   pub scan: Option<Depth>,
-  /// The queued scan is for a directory that can have been away and back, or whose watch lost
+  /// The next scan is for a directory that can have been away and back, or whose watch lost
   /// records: a young file in it that was not read counts as written (5.8).
   pub away: bool,
   /// An entry that the listing named was not there when it was looked at: the next check lists

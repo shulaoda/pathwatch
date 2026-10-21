@@ -461,3 +461,51 @@ fn a_file_away_and_back_counts_as_written() {
     caught_up(&mut d);
   }
 }
+
+/// A directory is removed and made again at once with its old identity (ext4 gives the inode
+/// numbers out again), and the record of its young file comes first: the look at the file finds
+/// the same fingerprint, and the new directory has no watch, so the next write in it gives no
+/// hint. The end of the old watch comes with the parent's records of the removal, and that hint
+/// does not take the loss off the directory: its scan counts the young file as written.
+#[test]
+fn a_directory_made_again_with_its_identity_counts_its_young_files_as_written() {
+  let mut d = Driver::sim(Mode::Inode, hinted());
+  d.fs.set_reuse_inode_numbers(true);
+  d.fs.set_time_step(Duration::from_secs(1));
+  d.fs.mkdir_all("/p/sub").unwrap();
+  d.watch(&["/p"]);
+  d.fs.write("/p/sub/a.js", "x=1;").unwrap();
+  assert_eq!(window(&mut d), ["C /p/sub/a.js"]);
+  d.fs.remove_all("/p/sub").unwrap();
+  d.fs.mkdir("/p/sub").unwrap();
+  d.fs.write("/p/sub/a.js", "x=2;").unwrap();
+  // The old watch tells of the removal of the file; the rest is read later.
+  assert_eq!(d.deliver(1), 1);
+  assert!(d.step());
+  assert_eq!(taken(&mut d), ["U /p/sub/a.js"]);
+  d.fs.write("/p/sub/a.js", "x=3;").unwrap();
+  assert_eq!(window(&mut d), ["U /p/sub/a.js"]);
+  assert_eq!(settled(&mut d), NONE);
+  assert_eq!(d.fs.calls().hash, 0);
+  caught_up(&mut d);
+}
+
+/// A young file is written again inside one step of the clock, and before its record is read,
+/// `unwatch` gives back the watch of the tree it lies in: the record goes with that watch. The
+/// directory above scans the tree deep for the watches it needs now, and counts the young file
+/// as written.
+#[test]
+fn a_tree_watch_given_back_counts_its_young_files_as_written() {
+  let mut d = Driver::sim(Mode::Handle, hinted());
+  d.fs.set_time_step(Duration::from_secs(1));
+  d.fs.mkdir("/p").unwrap();
+  d.fs.mkdir("/p/b").unwrap();
+  d.watch(&["/p", "/p/b/f.js"]);
+  d.fs.write("/p/b/f.js", "x=1;").unwrap();
+  assert_eq!(window(&mut d), ["C /p/b/f.js"]);
+  d.fs.write("/p/b/f.js", "x=2;").unwrap();
+  d.unwatch(&["/p"]);
+  assert_eq!(settled(&mut d), ["U /p/b/f.js"]);
+  assert_eq!(d.fs.calls().hash, 0);
+  caught_up(&mut d);
+}
