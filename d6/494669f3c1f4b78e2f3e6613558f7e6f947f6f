@@ -1,0 +1,19 @@
+src/inotify.rs
+  s_35ac4ca3286b91::t_9f1947311923c6 282-286,288-299
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d6494669f3c1f4b78e2f3e6613558f7e6f947f6f",
+  "prompts": {},
+  "sessions": {
+    "s_35ac4ca3286b91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcde9c6a-7c6b-4913-9704-d8faae1db573",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
