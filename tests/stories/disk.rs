@@ -4,7 +4,7 @@
 
 use std::{
   collections::{BTreeMap, BTreeSet},
-  env, fmt, fs,
+  env, fmt, fs, io,
   path::{Component, Path, PathBuf},
   sync::{
     Arc, OnceLock, Weak,
@@ -251,8 +251,24 @@ impl Disk {
     }
   }
 
+  /// Windows refuses to rename a directory while a listing of the watcher holds one below it
+  /// open, for a moment (README, "Holes"): the rename is tried again, for a second at most.
   pub fn rename(&self, from: &str, to: &str) {
-    fs::rename(self.path(from), self.path(to)).unwrap();
+    let (from, to) = (self.path(from), self.path(to));
+    let end = Instant::now() + Duration::from_secs(1);
+    loop {
+      match fs::rename(&from, &to) {
+        Ok(()) => return,
+        Err(error)
+          if cfg!(windows)
+            && error.kind() == io::ErrorKind::PermissionDenied
+            && Instant::now() < end =>
+        {
+          thread::sleep(Duration::from_millis(1));
+        }
+        Err(error) => panic!("{} to {}: {error}", from.display(), to.display()),
+      }
+    }
   }
 
   pub fn symlink(&self, target: &str, link: &str) -> bool {
