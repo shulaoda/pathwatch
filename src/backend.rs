@@ -1,7 +1,9 @@
 //! The `Backend` trait: what the engine asks of an OS watch API. The rules for a backend are in
 //! `references/design.md`, section 6.
 
-use std::{error, fmt, io, path::Path, sync::Arc, time::SystemTime};
+use std::{error, fmt, hash::Hash, io, path::Path, sync::Arc, time::SystemTime};
+
+use rustc_hash::FxHashMap;
 
 /// An OS watch API as the engine sees it. Every method runs on the watcher thread.
 pub trait Backend: Send + 'static {
@@ -177,6 +179,15 @@ pub(crate) fn same(error: &io::Error) -> io::Error {
     (Some(message), _) => watch_limit(message),
     (None, Some(code)) => io::Error::from_raw_os_error(code),
     (None, None) => io::Error::new(error.kind(), error.to_string()),
+  }
+}
+
+/// Gives the room of a table back once a quarter of it is in use, keeping twice what is left:
+/// many entries that went at once leave no room behind for good.
+pub(crate) fn give_room_back<K: Eq + Hash, V>(table: &mut FxHashMap<K, V>) {
+  let (len, capacity) = (table.len(), table.capacity());
+  if capacity > 64 && len * 4 < capacity {
+    table.shrink_to(len * 2);
   }
 }
 

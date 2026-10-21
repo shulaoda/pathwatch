@@ -22,7 +22,7 @@ use rustc_hash::FxHashMap;
 
 use self::{flags::Flags, names::Names, slots::Slots};
 use crate::{
-  backend::{DirKey, Hint, Want},
+  backend::{DirKey, Hint, Want, give_room_back},
   fs::{DirId, Meta},
   path::split_top,
 };
@@ -791,15 +791,6 @@ pub(crate) fn push_name(path: &mut PathBuf, name: &OsStr) {
 /// one waits for a quarter, or an eighth, so that it does not rehash at every step.
 pub(crate) fn room_to_keep(len: usize, capacity: usize) -> Option<usize> {
   (capacity > 2 * len + 16).then(|| len + len / 8 + 16)
-}
-
-/// Gives the room of a table of the tree back once a quarter of it is in use, keeping twice
-/// what is left: many entries that went at once leave no room behind for good.
-fn give_room_back<V>(table: &mut FxHashMap<DirKey, V>) {
-  let (len, capacity) = (table.len(), table.capacity());
-  if capacity > 64 && len * 4 < capacity {
-    table.shrink_to(len * 2);
-  }
 }
 
 /// Empties a list for its next use and keeps its memory, unless it is long: a `watch` of 20,000

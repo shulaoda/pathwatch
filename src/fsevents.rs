@@ -23,7 +23,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::ffi::{Notices, Queue, Stream};
 use crate::{
-  backend::{Backend, Committed, Coverage, DirKey, Hint, Sink, Want, same, watch_limit},
+  backend::{
+    Backend, Committed, Coverage, DirKey, Hint, Sink, Want, give_room_back, same, watch_limit,
+  },
   fs::{FileType, is_missing, name_and_kind},
 };
 
@@ -135,6 +137,7 @@ impl Backend for FsEventsBackend {
 
   fn unwatch(&mut self, key: DirKey) {
     if self.named.remove(&key).is_some() {
+      give_room_back(&mut self.named);
       self.streams.guard_is_stale = true;
     }
     // The stream that was to start here is not needed: a cover below it, which counted on
@@ -359,6 +362,7 @@ impl Covers {
   /// Forgets the cover of `key`. Gives its directory when no key is left at it.
   fn remove(&mut self, key: DirKey) -> Option<PathBuf> {
     let dir = self.dir_of.remove(&key)?;
+    give_room_back(&mut self.dir_of);
     let keys = self.by_dir.get_mut(&dir)?;
     keys.retain(|known| *known != key);
     if !keys.is_empty() {

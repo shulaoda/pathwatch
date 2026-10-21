@@ -21,7 +21,7 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want, watch_limit};
+use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want, give_room_back, watch_limit};
 
 const ENTRY_EVENTS: u32 =
   libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO;
@@ -135,10 +135,8 @@ impl InotifyBackend {
 
   /// The two tables are given back when most of their keys are gone.
   fn shrink(&mut self) {
-    if self.wd_by_key.len() < self.wd_by_key.capacity() / 4 {
-      self.wd_by_key.shrink_to_fit();
-      self.keys_by_wd.shrink_to_fit();
-    }
+    give_room_back(&mut self.wd_by_key);
+    give_room_back(&mut self.keys_by_wd);
   }
 }
 

@@ -292,7 +292,7 @@ mod handles {
   use rustc_hash::{FxHashMap, FxHashSet};
 
   use super::place::{may_hold_a_handle, place};
-  use crate::backend::{Coverage, DirKey, Want, same, watch_limit};
+  use crate::backend::{Coverage, DirKey, Want, give_room_back, same, watch_limit};
 
   pub const MAX_HANDLES: usize = 64;
 
@@ -672,10 +672,8 @@ mod handles {
 
     /// The two tables are given back when most of their keys are gone.
     fn shrink(&mut self) {
-      if self.keys.len() < self.keys.capacity() / 4 {
-        self.keys.shrink_to_fit();
-        self.at.shrink_to_fit();
-      }
+      give_room_back(&mut self.keys);
+      give_room_back(&mut self.at);
     }
   }
 
