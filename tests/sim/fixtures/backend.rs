@@ -5,6 +5,7 @@ use std::{
   ffi::OsStr,
   mem,
   path::{Path, PathBuf},
+  time::SystemTime,
 };
 
 use pathwatch::backend::{Backend, Committed, Coverage, DirKey, Hint, Want, watch_limit};
@@ -198,8 +199,13 @@ impl Backend for SimBackend {
     Committed { now_watched: now_streamed, failed: Vec::new() }
   }
 
+  fn ask_delivered(&mut self, after: SystemTime) {
+    self.fs.ask_delivered(after);
+  }
+
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     match raw.what {
+      What::Delivered { before } => return hint(Hint::Delivered { before }),
       What::Dead => {
         self.prefixes.remove(&raw.watch);
         for key in self.keys.remove(&raw.watch).unwrap_or_default() {
@@ -368,12 +374,23 @@ enum What {
   Overflow,
   /// A volume came or went at the path, which no watch tells (inotify).
   Mount,
+  /// The reader read the queue empty: every notification of a change before `before` came
+  /// before this one (`Backend::ask_delivered`).
+  Delivered { before: SystemTime },
 }
 
 impl SimRaw {
   /// A volume came or went at the real path `path`: the backend tells it by its path.
   pub fn mount(path: &str) -> Self {
     Self { watch: 0, path: path.into(), what: What::Mount }
+  }
+
+  pub(crate) fn delivered(before: SystemTime) -> Self {
+    Self { watch: 0, path: PathBuf::new(), what: What::Delivered { before } }
+  }
+
+  pub(crate) fn is_delivered(&self) -> bool {
+    matches!(self.what, What::Delivered { .. })
   }
 }
 
@@ -392,6 +409,9 @@ pub(crate) struct Kernel {
   next_stream: u64,
   pub(crate) limit: Option<usize>,
   pub(crate) queue: VecDeque<SimRaw>,
+  /// The time the engine asked about (`Backend::ask_delivered`). Once the clock passed it, a
+  /// notice says so at the end of the queue, where the reader puts it after all it read.
+  pub(crate) delivered_after: Option<SystemTime>,
 }
 
 impl Kernel {

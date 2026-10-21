@@ -276,6 +276,15 @@ impl SimFs {
   pub fn advance(&self, by: Duration) {
     let mut state = self.lock();
     state.clock += u64::try_from(by.as_nanos()).expect("a test does not run for 500 years");
+    state.tell_delivered();
+  }
+
+  /// The engine asks to hear once every notification of a change before `after` came: the
+  /// reader of the backend reads the queue empty at that time, and says so at its end.
+  pub fn ask_delivered(&self, after: SystemTime) {
+    let mut state = self.lock();
+    state.kernel.delivered_after = Some(after);
+    state.tell_delivered();
   }
 
   /// Sets how fine modification times are. With one second, two writes inside the same second
@@ -419,7 +428,9 @@ impl SimFs {
   pub fn lose_raw(&self, count: usize) -> usize {
     let mut state = self.lock();
     let kernel = &mut state.kernel;
-    let count = count.min(kernel.queue.len());
+    // The notice of the reader is no notification of the OS, and the loss is of notifications
+    // made before it: it stops there.
+    let count = kernel.queue.iter().take(count).take_while(|raw| !raw.is_delivered()).count();
     let lost: Vec<SimRaw> = kernel.queue.drain(..count).collect();
     for notice in lost_notices(kernel.mode, &lost).into_iter().rev() {
       kernel.queue.push_front(notice);
@@ -615,6 +626,16 @@ pub(crate) struct State {
 }
 
 impl State {
+  /// Puts the answer to the question of the engine at the end of the queue once the clock
+  /// passed its time.
+  fn tell_delivered(&mut self) {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_nanos(self.clock);
+    if self.kernel.delivered_after.is_some_and(|after| after <= now) {
+      self.kernel.delivered_after = None;
+      self.kernel.queue.push_back(SimRaw::delivered(now));
+    }
+  }
+
   fn stamp(&self) -> u64 {
     self.clock / self.step * self.step
   }

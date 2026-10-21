@@ -509,3 +509,74 @@ fn a_tree_watch_given_back_counts_its_young_files_as_written() {
   assert_eq!(d.fs.calls().hash, 0);
   caught_up(&mut d);
 }
+
+/// A young file is written again inside one step of the clock, the OS loses the record, and its
+/// loss report is read only after a look found the file old (here the look of a `watch` call;
+/// a reader that is behind, a watcher thread that is busy). A look that reports nothing keeps
+/// the doubt of the file, so the loss report still counts it as written (Inode seed 2074718981).
+#[test]
+fn a_loss_report_read_after_a_look_found_the_file_old_counts_it_as_written() {
+  for mode in [Mode::Inode, Mode::Handle] {
+    let mut d = Driver::sim(mode, hinted());
+    d.fs.set_time_step(Duration::from_secs(1));
+    d.fs.mkdir("/p").unwrap();
+    d.watch(&["/p"]);
+    d.fs.write("/p/a.js", "x=1;").unwrap();
+    assert_eq!(window(&mut d), ["C /p/a.js"], "{mode:?}");
+    d.fs.write("/p/a.js", "x=2;").unwrap();
+    assert!(d.fs.lose_raw(usize::MAX) > 0, "{mode:?}");
+    d.advance(Duration::from_secs(3));
+    d.watch(&["/p/a.js"]);
+    assert_eq!(taken(&mut d), NONE, "{mode:?}");
+    assert_eq!(settled(&mut d), ["U /p/a.js"], "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// A directory is renamed away and back while its file is young, and the file is written under
+/// the other name inside one step of the clock; the records are read only after the file got
+/// old. A record tells when it came, not when its change was made, so the doubt of the file stays
+/// until every record of the time it was young came, and the scan of the directory that was away
+/// counts it as written (Handle seed 2074719922).
+#[test]
+fn records_read_late_of_a_directory_away_and_back_count_its_young_file_as_written() {
+  for mode in [Mode::Inode, Mode::Handle] {
+    let mut d = Driver::sim(mode, hinted());
+    d.fs.set_time_step(Duration::from_secs(1));
+    d.fs.mkdir_all("/p/sub").unwrap();
+    d.watch(&["/p"]);
+    d.fs.write("/p/sub/a.js", "x=1;").unwrap();
+    assert_eq!(window(&mut d), ["C /p/sub/a.js"], "{mode:?}");
+    d.fs.rename("/p/sub", "/p/other").unwrap();
+    d.fs.write("/p/other/a.js", "x=2;").unwrap();
+    d.fs.rename("/p/other", "/p/sub").unwrap();
+    d.advance(Duration::from_secs(3));
+    assert_eq!(settled(&mut d), ["U /p/sub/a.js"], "{mode:?}");
+    caught_up(&mut d);
+  }
+}
+
+/// Once every record of the time a young file was young came (`Hint::Delivered`), its doubt
+/// ends: a loss report long after counts nothing as written, and neither does its directory
+/// renamed away and back. Before, the doubt stayed until a look reported the file, which gave an
+/// `Update` of every untouched file that was young at its last look.
+#[test]
+fn a_file_whose_records_all_came_is_not_counted_as_written_later() {
+  for mode in [Mode::Inode, Mode::Handle] {
+    let mut d = Driver::sim(mode, hinted());
+    d.fs.set_time_step(Duration::from_secs(1));
+    d.fs.mkdir_all("/p/sub").unwrap();
+    d.watch(&["/p"]);
+    d.fs.write("/p/sub/a.js", "x=1;").unwrap();
+    assert_eq!(window(&mut d), ["C /p/sub/a.js"], "{mode:?}");
+    d.advance(Duration::from_secs(3));
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    d.engine.overflow(d.now);
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    d.fs.rename("/p/sub", "/p/other").unwrap();
+    d.fs.rename("/p/other", "/p/sub").unwrap();
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    assert_eq!(d.fs.calls().hash, 0, "{mode:?}");
+    caught_up(&mut d);
+  }
+}

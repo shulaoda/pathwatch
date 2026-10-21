@@ -1,11 +1,12 @@
 //! One entry: `check` reads what is at a path and brings the node in line with it.
 
 use std::{
+  cmp::Reverse,
   ffi::OsString,
   hash::{Hash, Hasher},
   io, mem,
   path::{Path, PathBuf},
-  time::{Duration, Instant},
+  time::{Duration, SystemTime},
 };
 
 use rustc_hash::FxHasher;
@@ -253,14 +254,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         let from_above = self.tree[key].watch() == Watch::FromAbove;
         let named = why.deep && from_above && why.since.is_some();
         let away = moved || why.lost || named || self.away_scan;
-        // Only named: a write while the directory was away hides behind the fingerprint of a
-        // file that was young when the record was made, and of no other.
-        if away
-          && !(moved || why.lost || self.away_scan)
-          && let Some(since) = why.since
-        {
-          self.forget_pending_old_at(key, since);
-        }
         self.still_there(key, path, why.deep || moved, away);
         let relist = self.tree[key].dir_mut().is_some_and(|dir| mem::take(&mut dir.relist));
         if relist && !(why.deep || moved) {
@@ -574,11 +567,89 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.tree.unhold(key);
     }
     let content = if trusts_hints {
-      young.then_some(Content::Pending)
+      // Found old, a `Pending` file stays so until a look reports it, or until every record of
+      // the time it was young came (`forget_delivered`): the hint of a write while it was young
+      // can still be on its way, or the loss report that took it, behind the hints of this look.
+      let pending = matches!(kept, Some(Content::Pending)) && !changed;
+      (young || pending).then_some(Content::Pending)
     } else {
       young.then(|| hash.map_or(Content::Unknown, Content::Hash))
     };
     self.tree.set_content(key, content);
+    if young && content == Some(Content::Pending) {
+      self.await_delivery(key, fingerprint.modified);
+    }
+  }
+
+  /// When a file with this modification time gets old, in nanoseconds of the clock of the
+  /// watcher. A time far ahead of the clock gets old by the clock of the engine (`is_young`):
+  /// never by this one, and such a file keeps its `Pending` until a look reports it.
+  fn old_at(&self, key: DirKey, modified: i64) -> i64 {
+    let ahead = modified.saturating_sub(nanos(self.flush_time)) >= nanos_of(YOUNG_COARSE);
+    if ahead { i64::MAX } else { modified.saturating_add(nanos_of(self.youth(key, modified))) }
+  }
+
+  /// Keeps the `Pending` file to forget once it is old and every record of the time it was
+  /// young came, and asks the backend to tell when that is (5.8).
+  fn await_delivery(&mut self, key: DirKey, modified: i64) {
+    let old_at = self.old_at(key, modified);
+    self.pending.push(Reverse((old_at, key)));
+    // An entry stays until a delivery passes its time, also when the file was written again or
+    // is gone: such entries go once they are most of the queue, as the holds do.
+    if self.pending.len() > 2 * self.tree.content_count() + 64 {
+      let tree = &self.tree;
+      self.pending.retain(|&Reverse((_, key))| tree.content(key) == Some(Content::Pending));
+    }
+    self.ask_delivered();
+  }
+
+  /// Forgets the `Pending` content of the files that got old before `delivered`: every record of
+  /// the time they were young came, so no hint of a write that left the fingerprint as it is can
+  /// come any more (5.8). Not while work that earlier hints gave waits (a mark, a scan, a loss
+  /// report, a hold): it may count such a file as written. A file below a directory that was away
+  /// keeps it too: the scan of that directory counts it.
+  pub(super) fn forget_delivered(&mut self) {
+    let waits = self.tree.has_work() || self.tree.lost || self.loss.waits;
+    if waits || self.tree.hold_count() > 0 {
+      return;
+    }
+    let mut later = Vec::new();
+    while let Some(&Reverse((old_at, key))) = self.pending.peek()
+      && old_at <= self.delivered
+    {
+      self.pending.pop();
+      let Some(Kind::File(file)) = self.tree.get(key).map(|node| node.kind) else { continue };
+      let away =
+        self.tree.ancestors(key).any(|dir| self.tree[dir].dir().is_some_and(|dir| dir.away));
+      if self.tree.content(key) != Some(Content::Pending) || away {
+        continue;
+      }
+      // The time is worked out again: the file may be polled now, which makes it young for longer.
+      let old_at = self.old_at(key, file.modified);
+      if old_at <= self.delivered {
+        self.tree.set_content(key, None);
+      } else {
+        later.push(Reverse((old_at, key)));
+      }
+    }
+    self.pending.extend(later);
+    self.ask_delivered();
+  }
+
+  /// Asks the backend to tell when the earliest `Pending` file is old and every record before
+  /// came, unless a question that is not answered yet covers it. A time that came already waits
+  /// for the work of hints, not for the backend.
+  fn ask_delivered(&mut self) {
+    let Some(&Reverse((old_at, _))) = self.pending.peek() else { return };
+    let covered = self.asked > self.delivered && self.asked >= old_at;
+    if old_at <= self.delivered || old_at == i64::MAX || covered {
+      return;
+    }
+    self.asked = old_at;
+    let at = SystemTime::UNIX_EPOCH + Duration::from_nanos(u64::try_from(old_at).unwrap_or(0));
+    if let Some(backend) = &mut self.backend {
+      backend.ask_delivered(at);
+    }
   }
 
   /// Whether the hint of a write that left the fingerprint as it is can have gone by since the
@@ -649,23 +720,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   fn youth(&self, key: DirKey, modified: i64) -> Duration {
     let whole_seconds = modified >= 0 && modified % nanos_of(Duration::from_secs(1)) == 0;
     if whole_seconds || self.only_polled(key) { YOUNG_COARSE } else { YOUNG }
-  }
-
-  /// Forgets the `Pending` content of the files below `dir` that were old at `since`, the time
-  /// of the record that named the directory: a write while it was away could hide behind the
-  /// fingerprint of a file that was young then, and of no other (5.8).
-  fn forget_pending_old_at(&mut self, dir: DirKey, since: Instant) {
-    let now = self.now.expect("a check runs inside a flush");
-    let passed = nanos_of(now.saturating_duration_since(since));
-    let flush_time = nanos(self.flush_time);
-    for key in self.tree.pending_below(dir) {
-      let Kind::File(file) = self.tree[key].kind else { continue };
-      // Below zero for a time in the future: young.
-      let age = flush_time.saturating_sub(file.modified).saturating_sub(passed);
-      if age >= nanos_of(self.youth(key, file.modified)) {
-        self.tree.set_content(key, None);
-      }
-    }
   }
 
   /// Whether only the poll looks at the entry: its directory is polled, or it is a link.

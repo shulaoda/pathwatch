@@ -32,6 +32,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     self.touched = emptied(touched);
     out.errors.append(&mut self.errors);
+    // A delivery that came while hints had left work is taken up when it is done.
+    self.forget_delivered();
   }
 
   /// Nothing is at the node, and the tree has something: the first look holds it, the second look

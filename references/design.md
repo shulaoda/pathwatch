@@ -575,9 +575,12 @@ changed, its watch lost records (a `lost` mark), the watch of the tree it had wa
 its time, not a `watch` call) while only a watch above covers it (its name changed: the records
 of its files came under the other name; a watch of its own follows the directory, as inotify
 does). A young file that was not read (`Content::Pending`, 5.8) counts as written in such a
-scan, also when nothing was written to it (README, "Holes"). Not one that was already old when
-the record named the directory: a write while it was away could not hide behind its fingerprint
-(`forget_pending_old_at`).
+scan, also when nothing was written to it (README, "Holes"). Not one whose doubt ended: once
+every record of the time it was young came (`Hint::Delivered`, 5.8), no write can hide behind
+its fingerprint. (A rule forgot the doubt of a file that was old when the record named the
+directory came, `forget_pending_old_at`. It took the time a record came for the time of its
+change, and a record that came late made a file forget a write while it was away: Handle seed
+2074719922. Taken out.)
 
 `scan(node, depth)`: `check` every child of the node. A **complete** node also lists the
 directory: each entry that the tree has no node for yet gets one, and is checked with the type
@@ -719,9 +722,31 @@ Two guards:
    one of the scan of a directory that was away (5.5, `Dir::away`), or such a scan is queued
    above (the file's own look can come first in the flush); or the file was held (it was away
    itself, or its hint went into the look that found it missing). A look that gets no answer
-   (`Found::Unknown`) passes what it knew of lost hints to the next one. The first look that
-   finds the file old drops it, after
-   one last such count. The read this saves is the one that waits for the virus
+   (`Found::Unknown`) passes what it knew of lost hints to the next one.
+
+   **When the doubt ends.** A look that finds the file old and reports it ends it: the handler
+   reads the file after the event, and no later write can keep the fingerprint. A look that
+   finds it old and reports nothing does not: the hint of a write while it was young, or the
+   loss report that took it, can still be on its way behind the hints this look acted on (the
+   queue of the OS read after a `watch` call looked, a reader that is behind: Inode seed
+   2074718981). The doubt ends once every record of the time the file was young came. The
+   engine asks the backend about the time the earliest `Pending` file gets old
+   (`Backend::ask_delivered`); the backend reads the queue of the OS empty then and answers
+   with `Hint::Delivered`, behind every record it read (rule 13, 7.1, 7.3); and the engine
+   forgets the `Pending` of every file that was old by then (`forget_delivered`). Not while
+   work that earlier hints gave waits (a mark, a scan, a loss report, a hold), which may count
+   such a file as written, and not below a directory that was away, whose scan counts it. A
+   doubt lasts the youth and the time to the answer: a millisecond or so under inotify, up to
+   a tick of the clock (15.6 ms) under Windows. A file far ahead of the clock keeps it until a
+   look reports it, and so does every file of a backend that never answers: FSEvents and the
+   poll have no `written_hints`, and the default of the trait never answers. (Before, the
+   first look that found the file old ended the doubt, which missed the write of that seed;
+   and a file that no look found old kept its doubt for good, so a loss report or a directory
+   away and back long after gave it an `Update`: 1,000 untouched files, 1,000 `Update`s at a
+   loss report an hour later, `a_file_whose_records_all_came_is_not_counted_as_written_later`,
+   and the story `a_directory_is_moved_away_changed_and_moved_back` on Linux since 4e1026c.)
+
+   The read this saves is the one that waits for the virus
    scanner on Windows (5 to 12 ms after a write, measured 2026-10-20; 2 ms, and 14 ms for one
    in ten, on 2026-10-13):
    it was the floor of an edit told with no quiet time and the tail of a burst. (A number
@@ -1158,7 +1183,8 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   - `Mount { path }`: a volume was mounted or unmounted at the real path `path`, and the backend
     knows no key for it (inotify, 7.1). The engine checks the node at that path, if it has one.
   - `Delivered { before }`: every notification of a change made before `before`, by the clock
-    of the system, came before this hint: the answer to `ask_delivered`.
+    of the system, came before this hint: the answer to `ask_delivered`. It ends the doubt of
+    the young files that were old by then (5.8).
 - `Sink` is the way from a backend thread into the engine. It never blocks. It hands over a
   `Signal`: `raw` a raw notification, for `translate` on the watcher thread, and `failed` the
   word that the backend cannot go on. From then on the engine polls everything, and it drops

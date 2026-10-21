@@ -1194,6 +1194,8 @@ pub enum Content {
   Unknown,
   /// No hash was read, as every write gives a hint (`Options::written_hints`): an equal
   /// fingerprint is a change when the hint says so, or when a loss report may have taken it.
+  /// It stays until a look reports the file, or until every record of the time it was young
+  /// came (`Hint::Delivered`).
   Pending,
 }
 
@@ -1220,12 +1222,9 @@ impl Tree {
     self.contents.get(&key).copied()
   }
 
-  /// The files below `dir` that were young at their last look and not read (`Content::Pending`).
-  pub fn pending_below(&self, dir: DirKey) -> Vec<DirKey> {
-    let below = |key: &DirKey| self.ancestors(*key).any(|at| at == dir);
-    let pending =
-      self.contents.iter().filter(|(key, content)| **content == Content::Pending && below(key));
-    pending.map(|(key, _)| *key).collect()
+  /// How many files keep something to compare.
+  pub fn content_count(&self) -> usize {
+    self.contents.len()
   }
 
   pub fn set_content(&mut self, key: DirKey, content: Option<Content>) {

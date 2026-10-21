@@ -26,13 +26,13 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use self::{check::Listed, scan::ScanEntry};
 pub use crate::tree::Fingerprint;
 use crate::{
-  backend::{Backend, DirKey, Signal},
+  backend::{Backend, DirKey, Hint, Signal},
   config::EntryKind,
   error::{Error, ErrorKind},
   event::Event,
   fs::Fs,
   path::normalize,
-  tree::{Depth, KEPT, Mark, Node, Tree, emptied},
+  tree::{Depth, KEPT, Mark, Node, Tree, emptied, nanos},
 };
 
 /// While hints keep coming, a batch goes out four quiet times after its first hint, and this
@@ -153,6 +153,13 @@ pub struct Engine<B: Backend, F: Fs> {
   due_holds: Vec<DirKey>,
   /// The pacing of the scans that loss reports ask for.
   loss: Loss,
+  /// The young files that were not read (`Content::Pending`), by the time they get old, the
+  /// earliest on top. An entry can be stale.
+  pending: BinaryHeap<Reverse<(i64, DirKey)>>,
+  /// Every record of a change before this time came (`Hint::Delivered`), in nanoseconds.
+  delivered: i64,
+  /// The time the backend was last asked about (`Backend::ask_delivered`).
+  asked: i64,
 
   // The running flush.
   /// The time of the running flush. `None` before the first.
@@ -226,6 +233,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       hold_queue: BinaryHeap::new(),
       due_holds: Vec::new(),
       loss: Loss::default(),
+      pending: BinaryHeap::new(),
+      delivered: i64::MIN,
+      asked: i64::MIN,
       away_scan: false,
       now: None,
       flush_time: SystemTime::UNIX_EPOCH,
@@ -295,10 +305,19 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     match signal {
       Signal::Raw(raw) => {
         let tree = &mut self.tree;
+        let mut delivered = None;
         if let Some(backend) = &mut self.backend {
           tree.hint_time = Some(now);
-          backend.translate(raw, &mut |hint| left_work |= tree.hint(hint));
+          backend.translate(raw, &mut |hint| match hint {
+            Hint::Delivered { before } => delivered = Some(before),
+            hint => left_work |= tree.hint(hint),
+          });
           tree.hint_time = None;
+        }
+        // No young file that was old by then can hide a write any more (5.8).
+        if let Some(before) = delivered {
+          self.delivered = self.delivered.max(nanos(before));
+          self.forget_delivered();
         }
       }
       Signal::Failed(error) => {
@@ -318,6 +337,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// Signals were dropped before they reached the engine: everything has to be checked.
   pub fn overflow(&mut self, now: Instant) {
     self.tree.lost = true;
+    // The answer to the last question may be among them: the next one is asked again.
+    self.asked = i64::MIN;
     self.schedule(now);
   }
 
