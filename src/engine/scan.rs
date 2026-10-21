@@ -128,7 +128,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
             for (new, _) in names.drain(known..) {
               self.tree.prune(new);
             }
-            self.tree.mark(key, Mark::DEEP);
+            self.tree.mark(key, self.retry(Mark::default()));
             return Listing::Stop;
           }
           Err(error) => error,
@@ -145,14 +145,15 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if self.check_from_parent(key, path) {
         // The directory is there after all (away and back while it was read): the deep mark
         // keeps the work for the next flush, as when the disk gives no answer.
-        self.tree.mark(key, Mark::DEEP);
+        self.tree.mark(key, self.retry(Mark::default()));
       }
       return Listing::Stop;
     }
     if matches!(self.disk_error(key, path, error), Found::Unknown) {
-      // No answer: the parent checks it at the next flush, and the deep mark keeps the work.
+      // No answer: the parent checks it at the next flush, and the deep mark keeps the work,
+      // with what this scan knew of lost hints (5.8).
       if self.tree.parent(key).is_some() {
-        self.tree.mark(key, Mark::DEEP);
+        self.tree.mark(key, self.retry(Mark::default()));
       }
       return Listing::Stop;
     }

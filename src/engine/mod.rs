@@ -280,9 +280,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         None => self.report(ErrorKind::InvalidPath, Some(path), None),
       }
     }
-    let took = self.flush(now, true);
-    self.finish(out);
-    self.set_poll(now + took + self.options.poll_interval);
+    self.flush_now(now, out);
   }
 
   /// Takes back what `watch` did for every path, and reports nothing for them.
@@ -294,6 +292,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     self.narrow_all();
     // What still stands may need another watch now, or another look.
+    self.flush_now(now, out);
+  }
+
+  /// The flush of a `watch` or `unwatch` call: at once, without the quiet time, as its baseline
+  /// is decided by a tree that is in line with the hints.
+  fn flush_now(&mut self, now: Instant, out: &mut Output) {
     let took = self.flush(now, true);
     self.finish(out);
     self.set_poll(now + took + self.options.poll_interval);
@@ -322,7 +326,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
       Signal::Failed(error) => {
         left_work = self.backend.is_some();
-        self.backend_died(&error);
+        self.backend_died(error);
         // The poll that was set with the old interval may be far away.
         let next = now + self.options.poll_interval;
         self.poll_at = self.poll_at.map(|at| at.min(next));

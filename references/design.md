@@ -722,7 +722,9 @@ Two guards:
    one of the scan of a directory that was away (5.5, `Dir::away`), or such a scan is queued
    above (the file's own look can come first in the flush); or the file was held (it was away
    itself, or its hint went into the look that found it missing). A look that gets no answer
-   (`Found::Unknown`) passes what it knew of lost hints to the next one.
+   (`Found::Unknown`), and a listing that cannot be finished, pass what they knew of lost hints
+   to the look that is tried again (`Engine::retry`; before, a listing left a plain deep mark,
+   and its scan took a rewritten file for untouched: Inode seed 103232).
 
    **When the doubt ends.** A look that finds the file old and reports it ends it: the handler
    reads the file after the event, and no later write can keep the fingerprint. A look that

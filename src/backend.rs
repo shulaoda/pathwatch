@@ -169,6 +169,9 @@ pub fn is_watch_limit(error: &io::Error) -> bool {
   limit(error).is_some()
 }
 
+/// A copy of the error, for a backend that tells one error for many keys: an `io::Error` is not
+/// `Clone`.
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn same(error: &io::Error) -> io::Error {
   match (limit(error), error.raw_os_error()) {
     (Some(message), _) => watch_limit(message),

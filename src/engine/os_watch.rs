@@ -2,13 +2,14 @@
 //! live, and what is polled because no OS watch tells about it.
 
 use std::{
+  collections::BinaryHeap,
   io,
   path::{Path, PathBuf},
 };
 
 use super::{Engine, Once};
 use crate::{
-  backend::{Backend, Committed, Coverage, DirKey, Want, is_watch_limit, same},
+  backend::{Backend, Committed, Coverage, DirKey, Want, is_watch_limit},
   config::EntryKind,
   error::{ErrorKind, context},
   fs::{FileType, Fs, is_missing},
@@ -295,17 +296,20 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// The backend cannot go on: it is dropped, and every node is polled.
-  pub(super) fn backend_died(&mut self, error: &io::Error) {
+  pub(super) fn backend_died(&mut self, error: io::Error) {
     if self.backend.take().is_none() {
       return;
     }
-    let error = context("the OS watcher stopped, so every path is polled", same(error));
+    let error = context("the OS watcher stopped, so every path is polled", error);
     self.report(ErrorKind::Io, None, Some(error));
     // The poll is all there is now: the watcher works as one that only polls, at its interval
     // and with no delete delay. A hold that waits keeps its time.
     if let Some(fallback) = self.fallback.take() {
       self.options = fallback;
     }
+    // No backend answers a question about a delivery any more: the scans below look at every
+    // young file that was not read, and count it as written (5.8).
+    self.pending = BinaryHeap::new();
     self.tree.poll_all();
     // Its last notifications may be lost.
     self.tree.scan_all();

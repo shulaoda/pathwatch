@@ -189,12 +189,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// design.md 5.4.
   fn apply(&mut self, key: DirKey, path: &mut PathBuf, found: Found, had: Had, why: Mark) {
     match (found, had) {
-      // No answer: the look is tried again, deep, since the tree below can be behind meanwhile.
-      // What this look knew of lost hints (5.8) holds for the next one.
-      (Found::Unknown, _) => {
-        let lost = why.lost || self.loss.scanning || self.away_scan;
-        self.tree.mark(key, Mark { deep: true, lost, ..why });
-      }
+      // No answer: the look is tried again.
+      (Found::Unknown, _) => self.tree.mark(key, self.retry(why)),
 
       (Found::Missing, Had::Nothing) => {}
       (Found::Missing, Had::File | Had::Dir { .. }) => self.missing(key, why.since),
@@ -264,6 +260,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         }
       }
     }
+  }
+
+  /// The mark of a look that has to be tried again, deep, as the tree below can be behind
+  /// meanwhile. What this look knew of lost hints (5.8) holds for the next one: a loss report
+  /// asked for it, or it is part of the scans of one, or of the scan of a directory that was away.
+  pub(super) fn retry(&self, why: Mark) -> Mark {
+    Mark { deep: true, lost: why.lost || self.loss.scanning || self.away_scan, ..why }
   }
 
   /// On Windows a junction or a directory link is a plain directory first, and the second step

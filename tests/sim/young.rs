@@ -556,6 +556,44 @@ fn records_read_late_of_a_directory_away_and_back_count_its_young_file_as_writte
   }
 }
 
+/// A young file is written again inside one step of the clock, the OS loses the record, and the
+/// disk gives no answer at some moment of the flush that the loss report asks for: a look at an
+/// entry, or the listing of the directory of the file. The look that is tried again knows that
+/// hints may be lost, as the one that got no answer did, and counts the file as written. Before,
+/// a listing with no answer left a plain deep mark, and the scan after it took the file's
+/// fingerprint for the truth (Inode seed 103232).
+#[test]
+fn a_look_with_no_answer_in_the_scans_of_a_loss_report_keeps_the_doubt() {
+  for mode in [Mode::Inode, Mode::Handle] {
+    let prepare = || {
+      let mut d = Driver::sim(mode, hinted());
+      d.fs.set_time_step(Duration::from_secs(1));
+      d.fs.mkdir_all("/p/sub").unwrap();
+      d.watch(&["/p"]);
+      d.fs.write("/p/sub/a.js", "x=1;").unwrap();
+      assert_eq!(window(&mut d), ["C /p/sub/a.js"], "{mode:?}");
+      d.fs.write("/p/sub/a.js", "x=2;").unwrap();
+      assert!(d.fs.lose_raw(usize::MAX) > 0, "{mode:?}");
+      d
+    };
+    let mut d = prepare();
+    let before = d.fs.calls().total();
+    assert_eq!(window(&mut d), ["U /p/sub/a.js"], "{mode:?}");
+    let calls = d.fs.calls().total() - before;
+    caught_up(&mut d);
+
+    for moment in 0..calls {
+      let mut d = prepare();
+      d.fs.at_call(moment, |fs| fs.set_offline(Some(std::io::ErrorKind::TimedOut)));
+      let mut events = window(&mut d);
+      d.fs.set_offline(None);
+      events.append(&mut settled(&mut d));
+      assert_eq!(events, ["U /p/sub/a.js"], "{mode:?}, call {moment}");
+      caught_up(&mut d);
+    }
+  }
+}
+
 /// Once every record of the time a young file was young came (`Hint::Delivered`), its doubt
 /// ends: a loss report long after counts nothing as written, and neither does its directory
 /// renamed away and back. Before, the doubt stayed until a look reported the file, which gave an
