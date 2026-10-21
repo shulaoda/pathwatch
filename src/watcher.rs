@@ -373,7 +373,8 @@ enum Message<R> {
   /// A signal of the backend, and the bytes that it counts for in the queue.
   Signal(Signal<R>, usize),
   Command(Command),
-  /// Only wakes the thread up: a signal was dropped, and the overflow flag says the rest.
+  /// A signal was dropped, and the overflow flag says the rest. It wakes the thread up, and its
+  /// place in the queue is where the overflow is taken.
   Wake,
 }
 
@@ -662,7 +663,13 @@ fn run<B: Backend>(
           done
         }
         Message::Command(Command::Stop) => return,
-        Message::Wake => None,
+        // The drop that set the flag sent it: the overflow is taken where the drop was in the
+        // queue. A delivery behind it must not end the doubt of a young file (design.md 5.8)
+        // whose write the dropped signal can have been.
+        Message::Wake => {
+          take_overflow(&mut engine, queue);
+          None
+        }
       };
       deliver(&mut engine, &mut out, &mut handler, inside, stop);
       if let Some(done) = done {

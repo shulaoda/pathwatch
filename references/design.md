@@ -1046,8 +1046,12 @@ the tests.
 **The watcher thread** (`watcher.rs`) is one loop around a queue. A backend thread never
 blocks: at most 16 MiB of signals wait (`Backend::raw_bytes` says how big a raw notification
 is). A signal that would make it more is dropped and a flag is set, which the engine takes as
-lost notifications (`overflow`). The drop that sets the flag also sends one message that only
-wakes the thread, so the flag is read at once. Commands (`watch`, `unwatch`) are never dropped
+lost notifications (`overflow`). The drop that sets the flag also sends one message that wakes
+the thread, so the flag is read at once, and at the place of the drop in the queue: a delivery
+(rule 13) that comes behind it says nothing of the signal that was dropped, and taken at the end
+of the turn, before the overflow, it ended the doubt of a young file whose write that signal
+could have been (5.8, `a_delivery_behind_a_dropped_signal_does_not_end_the_doubt`). A dropped
+word that the backend died is taken there too. Commands (`watch`, `unwatch`) are never dropped
 and not counted. The loop takes at most 512 messages, then does what is due, so a flood cannot
 hold back a flush. A command from inside the handler goes a way of its own: the thread takes
 it when the handler has returned, before the next message of the queue, so what the handler

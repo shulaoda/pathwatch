@@ -12,7 +12,7 @@ use std::{
     mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
   },
   thread,
-  time::{Duration, Instant},
+  time::{Duration, Instant, SystemTime},
 };
 
 use pathwatch::{
@@ -220,7 +220,8 @@ fn with_handler(
 }
 
 /// Hints nothing: it watches everything, or nothing, so that the poll looks. A raw notification
-/// of one byte holds the watcher thread; every other one is counted.
+/// of one byte holds the watcher thread, and a 2 with the eight bytes of a time in nanoseconds
+/// (`delivery`) is a `Hint::Delivered`; every other one is counted.
 struct Silent {
   polled: bool,
   translated: Arc<AtomicUsize>,
@@ -237,10 +238,15 @@ impl Backend for Silent {
 
   fn unwatch(&mut self, _key: DirKey) {}
 
-  fn translate(&mut self, raw: Self::Raw, _hint: &mut dyn FnMut(Hint<'_>)) {
+  fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     if raw == [1] {
       self.entered.send(()).unwrap();
       self.gate.recv().unwrap();
+    } else if let [2, nanos @ ..] = raw.as_slice()
+      && let Ok(nanos) = <[u8; 8]>::try_from(nanos)
+    {
+      let before = SystemTime::UNIX_EPOCH + Duration::from_nanos(u64::from_ne_bytes(nanos));
+      hint(Hint::Delivered { before });
     } else {
       self.translated.fetch_add(1, Ordering::Relaxed);
     }
@@ -510,6 +516,9 @@ fn the_queue_is_bounded_by_bytes() {
 
   // The queue is filled to the last byte: a message with no bytes of its own fits as long as
   // any message does. So the word that the backend died is dropped too, and kept all the same.
+  // It is taken with the overflow, where the first drop was in the queue: nothing behind that
+  // reaches the backend, which is gone. Had the word fit, every empty message that fit would
+  // have been translated before it.
   hold(&|| {
     flood(20, MIB);
     flood(100_000, 0);
@@ -526,8 +535,7 @@ fn the_queue_is_bounded_by_bytes() {
   }
   // The backend held the other end of this channel.
   assert_eq!(enter.recv_timeout(PATIENCE), Err(RecvTimeoutError::Disconnected));
-  let total = translated.load(Ordering::Relaxed);
-  assert!(total > 100_030 && total < 200_030, "{total}: not every empty message fits");
+  assert_eq!(translated.load(Ordering::Relaxed), 100_030);
   drop(watcher);
 }
 
@@ -616,6 +624,64 @@ fn a_dropped_signal_wakes_the_thread() {
   sink.raw(vec![0; (16 << 20) + 1]);
   let batch = results.recv_timeout(PATIENCE).expect("the thread wakes up and scans");
   assert_eq!(batch.unwrap(), [Event { path, kind: EventKind::Create }]);
+}
+
+/// A delivery that comes behind a dropped signal is no delivery of that signal: the overflow is
+/// taken where the drop was in the queue. Taken at the end of the turn, the delivery ended the
+/// doubt of a young file that was not read (design.md 5.8), and the scan after the overflow did
+/// not count it as written, though the dropped signal can have been its write.
+#[test]
+fn a_delivery_behind_a_dropped_signal_does_not_end_the_doubt() {
+  let dir = tempfile::tempdir().unwrap();
+  let (entered, enter) = mpsc::channel();
+  let (open, gate) = mpsc::channel::<()>();
+  let (sender, results) = mpsc::channel();
+  let (sink_out, sink_in) = mpsc::channel::<Sink<Vec<u8>>>();
+  let backend = Silent { polled: false, translated: Arc::default(), entered, gate };
+  let watcher = Watcher::with_backend(
+    Options { written_hints: true, poll_interval: Duration::from_secs(3600), ..quick() },
+    move |result: Result<Vec<Event>, Error>| {
+      let _ = sender.send(result);
+    },
+    move |sink| {
+      sink_out.send(sink).unwrap();
+      Ok(backend)
+    },
+  )
+  .unwrap();
+  let sink = sink_in.recv().unwrap();
+
+  // Young at the look of `watch` however slow the machine: its time is a second ahead.
+  let path = dir.path().join("a.txt");
+  fs::write(&path, "1").unwrap();
+  let modified = SystemTime::now() + Duration::from_secs(1);
+  let set_time = || fs::File::options().write(true).open(&path).unwrap().set_modified(modified);
+  set_time().unwrap();
+  watcher.watch(&[dir.path()]).unwrap();
+  // Written again with the same fingerprint, and nothing hints at it: the hint was dropped.
+  fs::write(&path, "2").unwrap();
+  set_time().unwrap();
+  // Nothing will ever hint at this file either: only the scan after the overflow finds it.
+  let other = dir.path().join("b.txt");
+  fs::write(&other, "1").unwrap();
+
+  // In one turn of the thread: the dropped signal, then a delivery of every record until long
+  // after the file is old.
+  sink.raw(vec![1]);
+  enter.recv_timeout(PATIENCE).expect("the watcher thread took the notification");
+  sink.raw(vec![0; (16 << 20) + 1]);
+  let later = modified + Duration::from_secs(3600);
+  let nanos = later.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+  let mut delivery = vec![2];
+  delivery.extend_from_slice(&u64::try_from(nanos).unwrap().to_ne_bytes());
+  sink.raw(delivery);
+  open.send(()).unwrap();
+
+  let mut batch = results.recv_timeout(PATIENCE).expect("the scan after the overflow").unwrap();
+  batch.sort_by(|a, b| a.path.cmp(&b.path));
+  let expected =
+    [Event { path, kind: EventKind::Update }, Event { path: other, kind: EventKind::Create }];
+  assert_eq!(batch, expected);
 }
 
 /// A `watch` from inside the handler takes effect when the handler has returned, before the
