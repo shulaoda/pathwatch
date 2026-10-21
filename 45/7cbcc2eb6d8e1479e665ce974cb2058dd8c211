@@ -1,0 +1,35 @@
+references/design.md
+  s_2189c4100dc1ff::t_6d464c9653033a 1672-1673,1682,1696-1697
+src/engine/check.rs
+  s_2189c4100dc1ff::t_386d1226c742d7 18,521-522,542
+src/engine/os_watch.rs
+  s_2189c4100dc1ff::t_b0ed3f458944cf 9,14
+src/engine/scan.rs
+  s_2189c4100dc1ff::t_289515fd7c3081 8,12
+src/fs/mod.rs
+  s_2189c4100dc1ff::t_03603ba06a90d3 66,318-322,388,416,418-423,425
+src/fs/windows.rs
+  s_2189c4100dc1ff::t_697a413204ba0b 69,523,546
+src/fsevents.rs
+  s_2189c4100dc1ff::t_879738fa66662d 27,691
+tests/sim/fixtures/fs.rs
+  s_2189c4100dc1ff::t_30eb8821cec49c 790
+tests/sim/fixtures/mod.rs
+  s_2189c4100dc1ff::t_cfd44a104a15d6 6-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "457cbcc2eb6d8e1479e665ce974cb2058dd8c211",
+  "prompts": {},
+  "sessions": {
+    "s_2189c4100dc1ff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "87b36dfc-092a-47e0-84dd-f8402c1c0b6a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
