@@ -32,7 +32,7 @@ use crate::{
   event::Event,
   fs::Fs,
   path::normalize,
-  tree::{Depth, KEPT, Mark, Node, Tree, emptied, nanos},
+  tree::{Depth, KEPT, Mark, Marked, Node, Tree, emptied, nanos},
 };
 
 /// While hints keep coming, a batch goes out four quiet times after its first hint, and this
@@ -189,7 +189,7 @@ pub struct Engine<B: Backend, F: Fs> {
   /// Every path for the disk is built here.
   path: PathBuf,
   /// The marks of a flush, in the order of their checks (`Tree::take_marked`).
-  marks: Vec<(usize, usize, DirKey, DirKey, Option<Instant>)>,
+  marks: Vec<Marked>,
   /// The scans of one round.
   scans: Vec<(DirKey, Depth, bool)>,
   /// The nodes of the directory that is scanned.

@@ -813,6 +813,10 @@ pub enum Said {
   New,
 }
 
+/// A marked node as a flush takes it (`Tree::take_marked`): its level, the order of its key
+/// from the newest, its directory, the node, and the time of its hint.
+pub type Marked = (usize, usize, DirKey, DirKey, Option<Instant>);
+
 /// "Check this name at the next flush."
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Mark {
@@ -1004,14 +1008,13 @@ impl Tree {
     self.to_scan = emptied(queue);
   }
 
-  /// Takes the marked nodes into `marks`, from the top down and one directory after the other:
-  /// each with its level and the order of its key from the newest, its directory, and the time
-  /// of its hint. The marks stay on the nodes.
+  /// Takes the marked nodes into `marks`, from the top down and one directory after the other.
+  /// The marks stay on the nodes.
   ///
   /// A check takes the mark of its node and leaves the key in the list, and a node that is
   /// marked again is listed once more. So a key whose node has no mark is left out, and of the
   /// keys of one node only the newest is taken: its time is the time of the mark the node has.
-  pub fn take_marked(&mut self, marks: &mut Vec<(usize, usize, DirKey, DirKey, Option<Instant>)>) {
+  pub fn take_marked(&mut self, marks: &mut Vec<Marked>) {
     marks.clear();
     let mut marked = mem::take(&mut self.marked);
     for (newer, (key, since)) in marked.drain(..).rev().enumerate() {
