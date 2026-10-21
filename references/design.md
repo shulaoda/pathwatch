@@ -1048,25 +1048,27 @@ held node, a poll, or a loss report that waits for the end of a rest) and `tick`
 due). It reads the disk through the trait `Fs`: `StdFs` is the real disk, `SimFs` the one of
 the tests.
 
-**The watcher thread** (`watcher.rs`) is one loop around a queue. A backend thread never
-blocks: at most 16 MiB of signals wait (`Backend::raw_bytes` says how big a raw notification
-is). A signal that would make it more is dropped and a flag is set, which the engine takes as
-lost notifications (`overflow`). The drop that sets the flag also sends one message that wakes
-the thread, so the flag is read at once, and at the place of the drop in the queue: a delivery
-(rule 13) that comes behind it says nothing of the signal that was dropped, and taken at the end
-of the turn, before the overflow, it ended the doubt of a young file whose write that signal
-could have been (5.8, `a_delivery_behind_a_dropped_signal_does_not_end_the_doubt`). A dropped
-word that the backend died is taken there too. Commands (`watch`, `unwatch`) are never dropped
-and not counted. The loop takes at most 512 messages, then does what is due, so a flood cannot
-hold back a flush. A command from inside the handler goes a way of its own: the thread takes
-it when the handler has returned, before the next message of the queue, so what the handler
-asked for is in place before anything that came in meanwhile. On Windows the thread does not
-wait on the channel for a deadline: a timed wait of a channel ends at a tick of the clock, which
-comes every 15.6 ms unless a program asked for more (a wait of 20 ms took 31 ms, and one of
-1 ms 15.6 ms, measured), and that was the whole of the 11 ms between the quiet time and the
-reported edit. The thread waits on an event that every sender sets after its message and on a
-waitable timer of high resolution, which comes within half a millisecond (`watcher::inbox`);
-on the other systems the wait of the channel keeps the time.
+**The watcher thread** (`watcher.rs`) is one loop around a queue. A backend thread never blocks:
+at most 16 MiB of signals wait (`Backend::raw_bytes` says how big a raw notification is). A
+signal that would make it more is dropped and a flag is set, which the engine takes as lost
+notifications (`overflow`). The drop that sets the flag also sends one message that wakes the
+thread, so the flag is read at once, and at the place of the drop in the queue, and only there:
+a delivery (rule 13) that comes behind it says nothing of the signal that was dropped, and taken
+at the end of the turn, before the overflow, it ended the doubt of a young file whose write that
+signal could have been (5.8, `a_delivery_behind_a_dropped_signal_does_not_end_the_doubt`). A
+`watch` or `unwatch` before that place needs no word of the loss either: a young file that its
+flush finds old keeps its doubt (5.8). A dropped word that the backend died is taken there too.
+Commands (`watch`, `unwatch`) are never dropped and not counted. The loop takes at most 512
+messages, then does what is due, so a flood cannot hold back a flush. A command from inside the
+handler goes a way of its own: the thread takes it when the handler has returned, before the
+next message of the queue, so what the handler asked for is in place before anything that came
+in meanwhile. On Windows the thread does not wait on the channel for a deadline: a timed wait of
+a channel ends at a tick of the clock, which comes every 15.6 ms unless a program asked for more
+(a wait of 20 ms took 31 ms, and one of 1 ms 15.6 ms, measured), and that was the whole of the
+11 ms between the quiet time and the reported edit. The thread waits on an event that every
+sender sets after its message and on a waitable timer of high resolution, which comes within
+half a millisecond (`watcher::inbox`); on the other systems the wait of the channel keeps the
+time.
 
 **The debounce.** The disk is checked when no hint came for the quiet time: every hint that
 leaves work moves the flush to one quiet time after it. So a save in several steps is one

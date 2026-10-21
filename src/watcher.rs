@@ -651,21 +651,19 @@ fn run<B: Backend>(
           engine.signal(signal, Instant::now());
           None
         }
-        // The flush of the call decides a baseline: it knows of the signals dropped before it.
         Message::Command(Command::Watch(paths, done)) => {
-          take_overflow(&mut engine, queue);
           engine.watch(paths, Instant::now(), &mut out);
           done
         }
         Message::Command(Command::Unwatch(paths, done)) => {
-          take_overflow(&mut engine, queue);
           engine.unwatch(paths, Instant::now(), &mut out);
           done
         }
         Message::Command(Command::Stop) => return,
         // The drop that set the flag sent it: the overflow is taken where the drop was in the
-        // queue. A delivery behind it must not end the doubt of a young file (design.md 5.8)
-        // whose write the dropped signal can have been.
+        // queue, and only there. A delivery behind it must not end the doubt of a young file
+        // (design.md 5.8) whose write the dropped signal can have been. Each flag that is set
+        // sends one, so no drop goes untold.
         Message::Wake => {
           take_overflow(&mut engine, queue);
           None
@@ -683,7 +681,6 @@ fn run<B: Backend>(
     if stop.load(Ordering::Acquire) {
       return;
     }
-    take_overflow(&mut engine, queue);
     let now = Instant::now();
     if engine.deadline().is_some_and(|deadline| deadline <= now) {
       engine.tick(now, &mut out);
@@ -692,7 +689,7 @@ fn run<B: Backend>(
   }
 }
 
-/// Tells the engine of the signals that the queue dropped since the last call.
+/// Tells the engine of the signals that the queue dropped since the last `Wake`.
 fn take_overflow<B: Backend>(engine: &mut Engine<B, StdFs>, queue: &Queue) {
   if queue.overflow.swap(false, Ordering::AcqRel) {
     engine.overflow(Instant::now());
