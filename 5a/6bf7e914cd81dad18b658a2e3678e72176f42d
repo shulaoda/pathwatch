@@ -1,0 +1,23 @@
+references/design.md
+  s_b910dfc76e4e89::t_cc6b3c48f01973 1603-1604
+src/fsevents.rs
+  s_b910dfc76e4e89::t_4823eca45f9eff 101-110,279,371-379,621
+tests/fsevents.rs
+  s_b910dfc76e4e89::t_71993a4307850b 846-865
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5a6bf7e914cd81dad18b658a2e3678e72176f42d",
+  "prompts": {},
+  "sessions": {
+    "s_b910dfc76e4e89": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8a69738a-ae83-4a31-8a84-9d3e8722ff76",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
