@@ -649,11 +649,14 @@ fn run<B: Backend>(
           engine.signal(signal, Instant::now());
           None
         }
+        // The flush of the call decides a baseline: it knows of the signals dropped before it.
         Message::Command(Command::Watch(paths, done)) => {
+          take_overflow(&mut engine, queue);
           engine.watch(paths, Instant::now(), &mut out);
           done
         }
         Message::Command(Command::Unwatch(paths, done)) => {
+          take_overflow(&mut engine, queue);
           engine.unwatch(paths, Instant::now(), &mut out);
           done
         }
@@ -672,16 +675,21 @@ fn run<B: Backend>(
     if stop.load(Ordering::Acquire) {
       return;
     }
-    if queue.overflow.swap(false, Ordering::AcqRel) {
-      engine.overflow(Instant::now());
-      if let Some(error) = queue.failed.lock().unwrap_or_else(PoisonError::into_inner).take() {
-        engine.signal(Signal::Failed(error), Instant::now());
-      }
-    }
+    take_overflow(&mut engine, queue);
     let now = Instant::now();
     if engine.deadline().is_some_and(|deadline| deadline <= now) {
       engine.tick(now, &mut out);
       deliver(&mut engine, &mut out, &mut handler, inside, stop);
+    }
+  }
+}
+
+/// Tells the engine of the signals that the queue dropped since the last call.
+fn take_overflow<B: Backend>(engine: &mut Engine<B, StdFs>, queue: &Queue) {
+  if queue.overflow.swap(false, Ordering::AcqRel) {
+    engine.overflow(Instant::now());
+    if let Some(error) = queue.failed.lock().unwrap_or_else(PoisonError::into_inner).take() {
+      engine.signal(Signal::Failed(error), Instant::now());
     }
   }
 }
