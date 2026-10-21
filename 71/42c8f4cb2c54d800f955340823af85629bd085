@@ -1,0 +1,21 @@
+references/design.md
+  s_2189c4100dc1ff::t_127da6b8538d7f 382-394
+src/tree/mod.rs
+  s_2189c4100dc1ff::t_166b724f3eebf5 700-703,712,714,725-726,728,736-749,1451-1467
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7142c8f4cb2c54d800f955340823af85629bd085",
+  "prompts": {},
+  "sessions": {
+    "s_2189c4100dc1ff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "87b36dfc-092a-47e0-84dd-f8402c1c0b6a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
