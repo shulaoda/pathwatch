@@ -1568,7 +1568,9 @@ As built:
     256; Node asks for far more when it starts. A directory that gets no guard, for that or
     another reason, gets no stream below it: the keys of the directories at and below it
     are named as failed (the watch limit error, `ulimit -n`), and they are polled and asked
-    again. A directory that is not there is no error, but it gets no stream below it either:
+    again. The guards open from the top down, and none below a directory that got none: the
+    room that is left goes to whole ways down, so the last guards to fit fail the fewest
+    keys (`the_guards_that_fit_go_from_the_top_down`). A directory that is not there is no error, but it gets no stream below it either:
     the keys at and below it are reported lost, as it may be back by then, with no guard and
     nothing to tell its next rename. The engine checks them and watches them again, and the
     next commit opens the guard (`a_directory_away_when_its_guard_opens_is_checked_again`).

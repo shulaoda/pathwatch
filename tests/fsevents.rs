@@ -1170,6 +1170,35 @@ fn a_directory_that_gets_no_guard_fails_its_keys_only() {
   h.hints_until(&[changed(z, "file"), changed(y, "file")]);
 }
 
+/// With room for a few guards, they go from the top down: a key whose whole way down got guards
+/// keeps its stream, and only the keys below the first directory that got none fail.
+#[test]
+fn the_guards_that_fit_go_from_the_top_down() {
+  let mut h = Harness::alone();
+  fs::create_dir_all(h.path("a/x")).unwrap();
+  let x = h.watch(0, &h.path("a/x"), Want::Contents);
+  let mut below_b = HashSet::new();
+  for index in 1..=10 {
+    let dir = h.path(&format!("b/{index}"));
+    fs::create_dir_all(&dir).unwrap();
+    below_b.insert(h.watch(index, &dir, Want::Contents));
+  }
+  // Room for every directory on the way down to `a/x`, and for `b`.
+  let room = h.real("a/x").ancestors().count() + 1;
+  let mut hogs = Vec::new();
+  while let Ok(file) = File::open("/dev/null") {
+    hogs.push(file);
+  }
+  hogs.truncate(hogs.len().saturating_sub(room));
+  let committed = h.backend.commit();
+  drop(hogs);
+  let failed: HashSet<DirKey> = committed.failed.iter().map(|(key, _)| *key).collect();
+  assert_eq!(failed, below_b, "{committed:?}");
+  assert_eq!(h.backend.streamed(), [h.real("a/x")]);
+  File::create(h.path("a/x/file")).unwrap();
+  h.hints_until(&[changed(x, "file")]);
+}
+
 /// The stream below a new path is replaced and stops at once, with a loss report for its covers.
 #[test]
 fn a_replaced_stream_stops_with_a_loss_report() {

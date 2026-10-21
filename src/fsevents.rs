@@ -682,6 +682,10 @@ impl Guard {
   /// Opens a guard for each directory at and above `paths`, and for each of `named`, that has
   /// none. Gives the ones that got none, each with the reason, or with none when it was not
   /// there: it may be back by now, and nothing would tell its next rename.
+  ///
+  /// From the top down: what is below a directory that got none fails with it, and gets no
+  /// guard. So the room that is left goes to whole ways down, and a guard that runs out of room
+  /// at `/` does not fail every key.
   fn open<'a>(
     &mut self,
     paths: impl Iterator<Item = &'a Path>,
@@ -689,7 +693,7 @@ impl Guard {
   ) -> Dirs<Option<io::Error>> {
     let mut unguarded = Dirs::default();
     for dir in wanted(paths, named) {
-      if self.dirs.contains_key(dir) {
+      if self.dirs.contains_key(dir) || unguarded.holds(dir) {
         continue;
       }
       match self.open_one(dir) {
@@ -709,7 +713,7 @@ impl Guard {
     named: impl Iterator<Item = &'a Path>,
   ) {
     let wanted = wanted(paths, named);
-    self.dirs.retain(|dir, _| wanted.contains(dir.as_path()));
+    self.dirs.retain(|dir, _| wanted.binary_search(&dir.as_path()).is_ok());
   }
 
   fn open_one(&mut self, dir: &Path) -> io::Result<Guarded> {
@@ -749,11 +753,15 @@ impl Guard {
   }
 }
 
+/// The directories at and above `paths`, and `named`, sorted: each before the ones below it.
 fn wanted<'a>(
   paths: impl Iterator<Item = &'a Path>,
   named: impl Iterator<Item = &'a Path>,
-) -> FxHashSet<&'a Path> {
-  paths.flat_map(Path::ancestors).chain(named).collect()
+) -> Vec<&'a Path> {
+  let mut wanted: Vec<&Path> = paths.flat_map(Path::ancestors).chain(named).collect();
+  wanted.sort_unstable();
+  wanted.dedup();
+  wanted
 }
 
 /// `realpath` spells `/Users` as `/System/Volumes/Data/Users`, and FSEvents reports the short
