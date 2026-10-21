@@ -172,7 +172,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // What is at the path can still count as an entry of a watched directory above: only then it
     // stays.
     if self.tree[key].is_registered() && !self.stays_as_an_entry(key) {
-      self.uncover(key, false, false);
+      self.uncover(key, false);
     }
     // With no watched path below, the node is let go, and the nodes above that only led to it.
     let mut at = key;
@@ -188,12 +188,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Forgets what the tree has at the node and below it, down to each watched path, which stays.
-  /// `scan_comes`: a deep scan comes from a directory above that gave its watch back.
-  pub(super) fn uncover(&mut self, key: DirKey, tell_delete: bool, scan_comes: bool) {
+  pub(super) fn uncover(&mut self, key: DirKey, tell_delete: bool) {
     // A list, not a recursion: a tree can be deeper than the stack takes. The directories that
     // go vanish afterwards, each after the ones below it.
     let mut gone = Vec::new();
-    let mut next = Some((key, scan_comes));
+    let mut next = Some((key, false));
     let mut stack = Vec::new();
     while let Some((key, mut scan_comes)) = next.take().or_else(|| stack.pop()) {
       let node = &mut self.tree[key];
@@ -241,7 +240,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
     }
     if !stays {
-      self.uncover(key, false, false);
+      self.uncover(key, false);
     }
     self.tree.prune(key);
   }

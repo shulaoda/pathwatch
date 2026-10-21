@@ -64,9 +64,7 @@ impl Listed {
   pub(super) fn is_named(self) -> bool {
     matches!(self, Self::Named(_) | Self::File(_) | Self::Dir(..))
   }
-}
 
-impl Listed {
   /// What the listing said, at a flush whose time is `flush_time` (nanoseconds since 1970).
   pub(super) fn of(entry: Entry, flush_time: i64) -> Self {
     match entry {
@@ -241,7 +239,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         } else if !complete && unlisted && (was_complete || !was_unlisted) {
           // The directory above lists it under another name now: only what a watched path covers
           // stays. Also in a partial node, whose entries were covered through this name.
-          self.uncover(key, true, false);
+          self.uncover(key, true);
         } else if complete && relinked && self.tree[key].added() == Added::Registered {
           // The running `watch` follows this link for the first time: what is behind it is its
           // baseline.
@@ -598,14 +596,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     {
       return true;
     }
-    let mut above = self.tree.parent(key);
-    while let Some(dir) = above {
-      if self.tree[dir].dir().is_some_and(|dir| dir.away) {
-        return true;
-      }
-      above = self.tree.parent(dir);
-    }
-    false
+    self.tree.ancestors(key).any(|dir| self.tree[dir].dir().is_some_and(|dir| dir.away))
   }
 
   /// A hash of the content of a regular file, or of the target of a link. `None`: nothing to

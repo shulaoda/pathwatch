@@ -358,6 +358,11 @@ impl Tree {
     (parent != NONE).then(|| self.key(parent))
   }
 
+  /// The directories above the node, from its parent up to the top.
+  pub fn ancestors(&self, key: DirKey) -> impl Iterator<Item = DirKey> {
+    iter::successors(self.parent(key), |&at| self.parent(at))
+  }
+
   pub fn child(&self, parent: DirKey, name: &OsStr) -> Option<DirKey> {
     self.get(parent)?;
     self.find(parent.index(), name).map(|index| self.key(index))
@@ -1215,16 +1220,7 @@ impl Tree {
 
   /// The files below `dir` that were young at their last look and not read (`Content::Pending`).
   pub fn pending_below(&self, dir: DirKey) -> Vec<DirKey> {
-    let below = |key: &DirKey| {
-      let mut above = self.parent(*key);
-      while let Some(at) = above {
-        if at == dir {
-          return true;
-        }
-        above = self.parent(at);
-      }
-      false
-    };
+    let below = |key: &DirKey| self.ancestors(*key).any(|at| at == dir);
     let pending =
       self.contents.iter().filter(|(key, content)| **content == Content::Pending && below(key));
     pending.map(|(key, _)| *key).collect()

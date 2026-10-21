@@ -485,11 +485,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   fn above_due_holds(&self) -> Vec<DirKey> {
     let mut above = Vec::new();
     for &held in &self.due_holds {
-      let mut at = self.tree.parent(held);
-      while let Some(key) = at {
-        above.push(key);
-        at = self.tree.parent(key);
-      }
+      above.extend(self.tree.ancestors(held));
     }
     above.sort_unstable();
     above.dedup();

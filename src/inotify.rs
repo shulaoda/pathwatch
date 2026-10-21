@@ -196,11 +196,10 @@ impl Backend for InotifyBackend {
       let is_written = !is_dir && event.mask & NEW_CONTENT != 0;
       let new = event.mask & libc::IN_MODIFY == 0;
       let rel = Path::new(OsStr::from_bytes(event.name));
-      let mut tell = |dir: DirKey| {
+      let tell = |dir: DirKey| {
         hint(if is_written { Hint::Written { dir, rel, new } } else { Hint::Changed { dir, rel } });
       };
-      tell(keys.first);
-      keys.more.iter().copied().for_each(tell);
+      keys.iter().for_each(tell);
     }
     let is_cut_off = !rest.is_empty();
     if is_cut_off {
