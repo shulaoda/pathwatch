@@ -24,7 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use self::ffi::{Notices, Queue, Stream};
 use crate::{
   backend::{Backend, Committed, Coverage, DirKey, Hint, Sink, Want, same, watch_limit},
-  fs::{FileType, name_and_kind},
+  fs::{FileType, is_missing, name_and_kind},
 };
 
 pub const MAX_STREAMS: usize = 64;
@@ -688,7 +688,7 @@ impl Guard {
         Ok(guarded) => {
           self.dirs.insert(dir.to_owned(), guarded);
         }
-        Err(error) => unguarded.insert(dir.to_owned(), (!is_gone(&error)).then_some(error)),
+        Err(error) => unguarded.insert(dir.to_owned(), (!is_missing(&error)).then_some(error)),
       }
     }
     unguarded
@@ -746,10 +746,6 @@ fn wanted<'a>(
   named: impl Iterator<Item = &'a Path>,
 ) -> FxHashSet<&'a Path> {
   paths.flat_map(Path::ancestors).chain(named).collect()
-}
-
-fn is_gone(error: &io::Error) -> bool {
-  matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }
 
 /// `realpath` spells `/Users` as `/System/Volumes/Data/Users`, and FSEvents reports the short

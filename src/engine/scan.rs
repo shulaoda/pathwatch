@@ -5,11 +5,11 @@ use std::path::PathBuf;
 
 use super::{
   Engine,
-  check::{Found, Listed, is_missing},
+  check::{Found, Listed},
 };
 use crate::{
   backend::{Backend, DirKey},
-  fs::{DirId, Entry, FileType, Fs},
+  fs::{DirId, Entry, FileType, Fs, is_missing},
   tree::{Depth, Dir, Kind, Mark, Watch, nanos},
 };
 

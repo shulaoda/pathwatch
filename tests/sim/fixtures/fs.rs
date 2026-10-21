@@ -37,7 +37,6 @@ impl SimFs {
       name: OsString::new(),
       content: Content::Dir(BTreeMap::new()),
       modified: 0,
-      changed: 0,
       born: 0,
       denied: false,
     };
@@ -101,7 +100,6 @@ impl SimFs {
       };
       *bytes = content.as_ref().to_vec();
       inode.modified = now;
-      inode.changed = now;
       let (dir, name) = (inode.parent, inode.name.clone());
       state.notify(dir, &name, Act::Modify, false);
     } else {
@@ -198,7 +196,6 @@ impl SimFs {
     state.notify(from_dir, said(from.as_ref(), from_name), Act::MoveFrom, is_dir);
     state.entries_mut(to_dir).insert(to_name.to_owned(), id);
     state.touch(to_dir);
-    state.touch_entry(id);
     if let Some(inode) = state.inodes.get_mut(&id) {
       inode.parent = to_dir;
       to_name.clone_into(&mut inode.name);
@@ -214,7 +211,6 @@ impl SimFs {
     if let Some(inode) = state.inodes.get_mut(&id) {
       inode.denied = denied;
     }
-    state.touch_entry(id);
     Ok(())
   }
 
@@ -753,7 +749,6 @@ impl State {
     Meta {
       kind,
       modified: SystemTime::UNIX_EPOCH + Duration::from_nanos(inode.modified),
-      changed: SystemTime::UNIX_EPOCH + Duration::from_nanos(inode.changed),
       size: size as u64,
       file_id: inode.number,
       dir_id: DirId { volume: 1, inode: inode.number, birth },
@@ -781,7 +776,6 @@ impl State {
         name: name.to_owned(),
         content,
         modified: now,
-        changed: now,
         born: now,
         denied: false,
       },
@@ -793,21 +787,11 @@ impl State {
   }
 
   /// The content of the inode changed: for a directory, an entry came or went. That moves the
-  /// modification time and the change time.
+  /// modification time.
   fn touch(&mut self, id: u64) {
     let now = self.stamp();
     if let Some(inode) = self.inodes.get_mut(&id) {
       inode.modified = now;
-      inode.changed = now;
-    }
-  }
-
-  /// The entry itself changed, not what is in it: it has another name or other permissions.
-  /// That moves only the change time.
-  fn touch_entry(&mut self, id: u64) {
-    let now = self.stamp();
-    if let Some(inode) = self.inodes.get_mut(&id) {
-      inode.changed = now;
     }
   }
 
@@ -892,9 +876,6 @@ struct Inode {
   name: OsString,
   content: Content,
   modified: u64,
-  /// The change time. It moves with `modified`, and also when the entry itself is renamed or
-  /// gets other permissions.
-  changed: u64,
   born: u64,
   denied: bool,
 }

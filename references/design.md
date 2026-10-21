@@ -1669,8 +1669,8 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
 ## 8. Tests
 
 **The simulator** (`tests/sim`: the fixtures in `fixtures/`, the tests
-beside them; on Unix hosts). `SimFs` is a file system in memory with inodes, a clock, a change time for each
-entry, and a mode that ignores the case of letters. `SimBackend` plays an OS watch API on it in
+beside them; on Unix hosts). `SimFs` is a file system in memory with inodes, a clock, and a mode
+that ignores the case of letters. `SimBackend` plays an OS watch API on it in
 three modes: by inode (inotify), by path prefix with real paths (FSEvents), by handle for a tree
 (Windows). A stream of the second mode ends when a directory at or above its path is renamed or
 removed, and says so at once, where the real backend finds it out at its next commit (7.2). The test decides when each
@@ -1679,7 +1679,7 @@ lost. The disk can change in the middle of an engine call.
 The backend keeps a log of every `watch` and `unwatch` call, and the disk tells where an OS
 watch is now. Not played: `MOVE_SELF` of inotify, and the shared handles of Windows.
 
-**The two checks at every settle** (`src/caught_up.rs`). Each time a test lets everything
+**The two checks at every settle** (`fixtures/caught_up.rs`). Each time a test lets everything
 settle (every notification delivered, every delay over, and more than two polls), the fixtures
 check, by rules that they write down a second time:
 
@@ -1693,7 +1693,8 @@ checked after every engine call.
 
 The test files of the simulator:
 
-- `scenarios`: every row of section 3, in each mode and with the poll backend.
+- The rows of section 3 are the `contract` stories of `tests/stories`, which run here in each
+  mode and with the poll backend too.
 - `check_table`: one test for each row of 5.4. `baseline`, `young`, `delete_delay`: 5.7 to 5.9.
   `unwatch`: 5.7. `want`: 5.10, and where the OS watches are put. `filter`: 5.11.
   `spelling`: 5.2.

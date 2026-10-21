@@ -64,10 +64,9 @@ fn kind(attributes: u32, tag: u32) -> FileType {
   }
 }
 
-/// Windows has no change time: the modification time stands in, as with std.
 fn entry(kind: FileType, written: u64, size: u64, dir_id: DirId) -> Meta {
   let modified = time(written);
-  Meta { kind, modified, changed: modified, size, file_id: dir_id.inode, dir_id }
+  Meta { kind, modified, size, file_id: dir_id.inode, dir_id }
 }
 
 /// "Access denied" is also what Windows says for an entry that is being deleted and for a
@@ -521,12 +520,7 @@ mod tests {
     SHARE_ALL, by_handle, by_name, is_delete_pending, is_odd, literal, name_on_disk, read_dir,
     stat, told,
   };
-  use crate::fs::{Entry, FileType, Fs, Meta, StdFs};
-
-  fn same(a: &Meta, b: &Meta) -> bool {
-    (a.kind, a.modified, a.changed, a.size, a.file_id, a.dir_id)
-      == (b.kind, b.modified, b.changed, b.size, b.file_id, b.dir_id)
-  }
+  use crate::fs::{Entry, FileType, Fs, StdFs};
 
   fn junction(link: &Path, target: &Path) {
     let made = Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output();
@@ -549,7 +543,7 @@ mod tests {
     {
       let named = by_name(path).unwrap().unwrap();
       let opened = by_handle(path, false).unwrap();
-      assert!(same(&named, &opened), "{}: {named:?} and {opened:?}", path.display());
+      assert_eq!(named, opened, "{}", path.display());
       assert_eq!(named.kind, kind);
     }
     assert_eq!(stat(&link, true).unwrap().dir_id, stat(&dir, false).unwrap().dir_id);

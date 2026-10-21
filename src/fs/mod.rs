@@ -63,13 +63,10 @@ pub trait Fs {
 }
 
 /// What one `lstat` or `stat` tells about an entry.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Meta {
   pub kind: FileType,
   pub modified: SystemTime,
-  /// The change time: it moves with a rename or a chmod too. The modification time where the
-  /// platform gives none.
-  pub changed: SystemTime,
   pub size: u64,
   /// The inode on Unix, the file index on Windows.
   pub file_id: u64,
@@ -318,6 +315,11 @@ const O_NOFOLLOW: i32 = 0x0100;
 #[cfg(target_vendor = "apple")]
 const O_NONBLOCK: i32 = 0x0004;
 
+/// Whether an error of the disk says "nothing is at this path".
+pub(crate) fn is_missing(error: &io::Error) -> bool {
+  matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+}
+
 /// Whether the error says that the entry is being deleted (Windows): its name goes when the
 /// last handle on it is closed, unless the holder takes the deletion back.
 pub(crate) fn is_delete_pending(error: &io::Error) -> bool {
@@ -364,7 +366,6 @@ fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
     Err(_) if path == Path::new("/") => Ok(Meta {
       kind: FileType::Dir,
       modified: SystemTime::UNIX_EPOCH,
-      changed: SystemTime::UNIX_EPOCH,
       size: 0,
       file_id: 0,
       dir_id: DirId::default(),
@@ -384,30 +385,7 @@ fn meta(metadata: &Metadata, (file_id, dir_id): (u64, DirId)) -> Meta {
     FileType::Other
   };
   let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-  Meta {
-    kind,
-    modified,
-    changed: changed(metadata, modified),
-    size: metadata.len(),
-    file_id,
-    dir_id,
-  }
-}
-
-#[cfg(unix)]
-fn changed(metadata: &Metadata, _modified: SystemTime) -> SystemTime {
-  use std::os::unix::fs::MetadataExt;
-
-  // A time before 1970 counts as 1970.
-  let seconds = u64::try_from(metadata.ctime()).unwrap_or(0);
-  let nanos = u32::try_from(metadata.ctime_nsec()).unwrap_or(0);
-  SystemTime::UNIX_EPOCH + Duration::new(seconds, nanos)
-}
-
-/// Stable std gives no change time here.
-#[cfg(not(unix))]
-fn changed(_metadata: &Metadata, modified: SystemTime) -> SystemTime {
-  modified
+  Meta { kind, modified, size: metadata.len(), file_id, dir_id }
 }
 
 /// The file id and the directory identity.
@@ -435,56 +413,21 @@ fn nanos(time: SystemTime) -> u64 {
     .map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_vendor = "apple"))]
 mod tests {
-  use std::{fs, os::unix::fs::PermissionsExt, thread, time::Duration};
+  use std::{
+    fs,
+    io::{self, Write},
+    os::unix::fs::symlink,
+    process::Command,
+  };
 
-  use super::{Fs, StdFs};
-
-  /// A rename or a chmod moves the change time and not the modification time; a new entry
-  /// moves both.
-  #[test]
-  fn the_change_time_of_a_directory() {
-    // Longer than one step of the clock of the file system.
-    let wait = || thread::sleep(Duration::from_millis(50));
-    let top = tempfile::tempdir().unwrap();
-    let dir = top.path().join("dir");
-    fs::create_dir(&dir).unwrap();
-    let made = StdFs.lstat(&dir).unwrap();
-
-    wait();
-    let moved = top.path().join("moved");
-    fs::rename(&dir, &moved).unwrap();
-    let renamed = StdFs.lstat(&moved).unwrap();
-    assert_eq!(renamed.modified, made.modified);
-    assert!(renamed.changed > made.changed);
-
-    wait();
-    fs::set_permissions(&moved, fs::Permissions::from_mode(0o700)).unwrap();
-    let permitted = StdFs.lstat(&moved).unwrap();
-    assert_eq!(permitted.modified, made.modified);
-    assert!(permitted.changed > renamed.changed);
-
-    wait();
-    fs::write(moved.join("file"), "1").unwrap();
-    let filled = StdFs.lstat(&moved).unwrap();
-    assert!(filled.modified > made.modified);
-    assert!(filled.changed > permitted.changed);
-  }
+  use super::{Entry, FileType, Fs, StdFs};
 
   /// On APFS the listing tells of a file and of a directory what `lstat` tells, also while the
   /// file is open and written.
-  #[cfg(target_vendor = "apple")]
   #[test]
   fn the_listing_tells_what_lstat_tells() {
-    use std::{
-      io::{self, Write},
-      os::unix::fs::symlink,
-      process::Command,
-    };
-
-    use super::{Entry, FileType};
-
     let top = tempfile::tempdir().unwrap();
     fs::create_dir(top.path().join("dir")).unwrap();
     symlink("file", top.path().join("link")).unwrap();

@@ -15,7 +15,7 @@ use crate::{
   backend::{Backend, DirKey, Want},
   config::EntryKind,
   error::ErrorKind,
-  fs::{DirId, Entry, FileType, Fs, is_delete_pending},
+  fs::{DirId, Entry, FileType, Fs, is_delete_pending, is_missing},
   tree::{Added, Content, Depth, Fingerprint, Kind, Mark, Watch, nanos, push_name},
 };
 
@@ -518,7 +518,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let young = kind != FileType::Other && self.is_young(key, fingerprint.modified, same);
     // Where every write gives a `written` hint, a young file is not read: the hint tells of a
     // write that leaves the fingerprint as it is (5.8). Not where only the poll looks at it.
-    let trusts_hints = self.options.written_hints && !self.only_polled(key);
+    let only_polled = self.only_polled(key);
+    let trusts_hints = self.options.written_hints && !only_polled;
     // Compared when the fingerprint is the same, and one last time when the file is old.
     let kept = old.and_then(|(old, content)| content.filter(|_| old == fingerprint));
     let compare = matches!(kept, Some(Content::Hash(_)));
@@ -538,7 +539,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     };
     // Under the poll a young file with nothing to compare waits: the first look that finds it
     // old reports one `Update` for all. Where no poll comes, every look reports.
-    let update_waits = young && hash.is_none() && self.only_polled(key);
+    let update_waits = young && hash.is_none() && only_polled;
 
     let changed = if let Some((old, content)) = old {
       written
@@ -682,11 +683,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     !matches!(watch, Watch::Watched | Watch::WatchedTree | Watch::FromAbove)
       || self.tree.link(key).is_some()
   }
-}
-
-/// Whether an error of the disk says "nothing is at this path".
-pub(super) fn is_missing(error: &io::Error) -> bool {
-  matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }
 
 /// Whether the error is a link loop. Its kind (`FilesystemLoop`) is not stable yet, so the

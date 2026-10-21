@@ -3,8 +3,8 @@
 //!
 //! - [`SimFs`] is the disk. A test changes it with `write`, `mkdir`, `rename`, `remove` and so on,
 //!   and moves its clock by hand. Inode numbers are used again as on ext4, modification times
-//!   can be made coarse, links and permission errors exist. Every entry has a change time, and
-//!   the disk can ignore the case of letters ([`SimFs::set_ignore_case`]).
+//!   can be made coarse, links and permission errors exist, and the disk can ignore the case of
+//!   letters ([`SimFs::set_ignore_case`]).
 //! - [`SimBackend`] plays the OS watch API on top of it, in one of three [`Mode`]s. Whether a
 //!   change of the disk makes a raw notification is decided at the moment of the change, from the
 //!   watches that are live then. The notification goes into a queue inside the `SimFs`.

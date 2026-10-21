@@ -45,7 +45,6 @@ impl Fs for PlainDisk {
     Ok(Meta {
       kind: if is_file { FileType::File } else { FileType::Dir },
       modified: SystemTime::UNIX_EPOCH,
-      changed: SystemTime::UNIX_EPOCH,
       size: self.size.load(Ordering::Relaxed),
       file_id: 1,
       dir_id: DirId::default(),

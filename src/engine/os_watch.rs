@@ -6,12 +6,12 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use super::{Engine, Once, check::is_missing};
+use super::{Engine, Once};
 use crate::{
   backend::{Backend, Committed, Coverage, DirKey, Want, is_watch_limit, same},
   config::EntryKind,
   error::{ErrorKind, context},
-  fs::{FileType, Fs},
+  fs::{FileType, Fs, is_missing},
   tree::{Depth, Kind, Mark, Node, Tree, Watch, push_name},
 };
 
