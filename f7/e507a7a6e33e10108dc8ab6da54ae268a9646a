@@ -1,0 +1,23 @@
+Cargo.toml
+  s_2189c4100dc1ff::t_ce05b802f7d199 22-23
+src/engine/check.rs
+  s_2189c4100dc1ff::t_64c8b4db97f3f2 695,697,702
+src/fs/mod.rs
+  s_2189c4100dc1ff::t_24e9db3323f7f7 312-314,316,318
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f7e507a7a6e33e10108dc8ab6da54ae268a9646a",
+  "prompts": {},
+  "sessions": {
+    "s_2189c4100dc1ff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "87b36dfc-092a-47e0-84dd-f8402c1c0b6a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
