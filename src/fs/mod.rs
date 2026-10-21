@@ -309,12 +309,13 @@ fn open_regular(path: &Path) -> io::Result<Option<File>> {
 }
 
 /// `O_NOFOLLOW`: the open fails on a link. `O_NONBLOCK`: the open of a FIFO does not wait for a
-/// writer, and a read of a regular file is as always.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// writer, and a read of a regular file is as always. The numbers differ between systems
+/// (`0x0100` is `O_CREAT` on illumos).
+#[cfg(all(unix, not(target_vendor = "apple")))]
 use libc::{O_NOFOLLOW, O_NONBLOCK};
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(target_vendor = "apple")]
 const O_NOFOLLOW: i32 = 0x0100;
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(target_vendor = "apple")]
 const O_NONBLOCK: i32 = 0x0004;
 
 /// Whether the error says that the entry is being deleted (Windows): its name goes when the

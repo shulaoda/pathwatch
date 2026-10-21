@@ -692,20 +692,14 @@ pub(super) fn is_missing(error: &io::Error) -> bool {
 /// Whether the error is a link loop. Its kind (`FilesystemLoop`) is not stable yet, so the
 /// number of the OS is read where it is known; elsewhere a loop is an error like any other.
 fn is_link_loop(error: &io::Error) -> bool {
-  #[cfg(any(target_os = "linux", target_os = "android"))]
+  #[cfg(all(unix, not(target_vendor = "apple")))]
   const LINK_LOOP: Option<i32> = Some(libc::ELOOP);
-  #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+  #[cfg(target_vendor = "apple")]
   const LINK_LOOP: Option<i32> = Some(62);
   #[cfg(windows)]
   const LINK_LOOP: Option<i32> =
     Some(windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME.cast_signed());
-  #[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_vendor = "apple",
-    target_os = "freebsd",
-    windows
-  )))]
+  #[cfg(not(any(unix, windows)))]
   const LINK_LOOP: Option<i32> = None;
 
   LINK_LOOP.is_some_and(|code| error.raw_os_error() == Some(code))

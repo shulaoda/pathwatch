@@ -19,7 +19,8 @@ bitflags = { version = "2.13.2", default-features = false }
 hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
 rustc-hash = "2.1.2"
 
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+# Apple has the few numbers it needs written out (`fs`, `fsevents`).
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
 libc = "0.2.180"
 
 [target.'cfg(windows)'.dependencies]
