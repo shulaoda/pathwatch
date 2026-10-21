@@ -325,13 +325,23 @@ fn a_delivery_comes_after_the_events_of_every_change_before_its_time() {
   }
   assert!(before >= asked);
 
-  let asked = SystemTime::now() + Duration::from_millis(100);
-  h.backend.ask_delivered(asked);
-  thread::sleep(Duration::from_millis(30));
-  fs::write(h.path("late"), "1").unwrap();
-  let (seen, before) = h.until_delivered();
-  assert!(seen.contains(&written(key, "late")), "{seen:?}");
-  assert!(before >= asked);
+  // A busy machine can let the test write only after the time it asked about: then the write is
+  // no change before it, and the test asks again.
+  for attempt in 0.. {
+    assert!(attempt < 10, "no write came before the time it asked about");
+    let asked = SystemTime::now() + Duration::from_millis(100);
+    h.backend.ask_delivered(asked);
+    thread::sleep(Duration::from_millis(30));
+    let late = format!("late{attempt}");
+    fs::write(h.path(&late), "1").unwrap();
+    let in_time = SystemTime::now() < asked;
+    let (seen, before) = h.until_delivered();
+    assert!(before >= asked);
+    if in_time {
+      assert!(seen.contains(&written(key, &late)), "{seen:?}");
+      break;
+    }
+  }
 }
 
 #[test]

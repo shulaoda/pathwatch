@@ -301,13 +301,23 @@ fn a_delivery_comes_after_the_records_of_every_change_before_its_time() {
   }
   assert!(matches!(seen.last(), Some(&Seen::Delivered(before)) if before >= asked));
 
-  let asked = SystemTime::now() + Duration::from_millis(100);
-  harness.backend.ask_delivered(asked);
-  thread::sleep(Duration::from_millis(30));
-  fs::write(dirs[1].join("late.txt"), "1").unwrap();
-  let seen = harness.hints_until(delivered);
-  assert!(seen.iter().any(|hint| hint.names(keys[1], "late.txt")), "{seen:?}");
-  assert!(matches!(seen.last(), Some(&Seen::Delivered(before)) if before >= asked));
+  // A busy machine can let the test write only after the time it asked about (CI run
+  // 39691003007): then the write is no change before it, and the test asks again.
+  for attempt in 0.. {
+    assert!(attempt < 10, "no write came before the time it asked about");
+    let asked = SystemTime::now() + Duration::from_millis(100);
+    harness.backend.ask_delivered(asked);
+    thread::sleep(Duration::from_millis(30));
+    let late = format!("late{attempt}.txt");
+    fs::write(dirs[1].join(&late), "1").unwrap();
+    let in_time = SystemTime::now() < asked;
+    let seen = harness.hints_until(delivered);
+    assert!(matches!(seen.last(), Some(&Seen::Delivered(before)) if before >= asked));
+    if in_time {
+      assert!(seen.iter().any(|hint| hint.names(keys[1], &late)), "{seen:?}");
+      break;
+    }
+  }
 }
 
 #[test]
