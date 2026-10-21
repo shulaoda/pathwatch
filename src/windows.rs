@@ -706,10 +706,7 @@ mod handles {
 
 mod records {
   use std::{
-    borrow::Cow,
-    ffi::OsString,
     mem::offset_of,
-    os::windows::ffi::OsStringExt,
     path::{Component, Path, PathBuf},
   };
 
@@ -718,6 +715,8 @@ mod records {
     FILE_ATTRIBUTE_DIRECTORY, FILE_NOTIFY_EXTENDED_INFORMATION as Extended,
     FILE_NOTIFY_INFORMATION as Short,
   };
+
+  use crate::fs::wide_name;
 
   const NEXT_ENTRY_OFFSET: usize = offset_of!(Short, NextEntryOffset);
   const ACTION: usize = offset_of!(Short, Action);
@@ -782,7 +781,7 @@ mod records {
   }
 
   impl Record<'_> {
-    pub fn name(&self) -> impl Iterator<Item = u16> {
+    pub fn name(&self) -> impl Iterator<Item = u16> + Clone {
       self.name.as_chunks().0.iter().map(|&unit| u16::from_ne_bytes(unit))
     }
 
@@ -790,19 +789,14 @@ mod records {
       self.name.is_empty()
     }
 
-    /// Puts the name below `path`, through `text`: a name is Unicode text unless it holds a
-    /// lone surrogate, and only such a one asks for memory. `false`, and nothing is put: the
-    /// name is no name of an entry below the directory. NTFS gives names with separators
-    /// between them and nothing else; a disk that another system filled, or a server, could
-    /// give a `..`, a root, a drive, a NUL, or a `:`, which starts a stream of a file.
+    /// Puts the name below `path`, through `text` (`fs::wide_name`). `false`, and nothing is
+    /// put: the name is no name of an entry below the directory. NTFS gives names with
+    /// separators between them and nothing else; a disk that another system filled, or a
+    /// server, could give a `..`, a root, a drive, a NUL, or a `:`, which starts a stream of a
+    /// file.
     pub fn push_name(&self, path: &mut PathBuf, text: &mut String) -> bool {
-      text.clear();
-      let decoded = char::decode_utf16(self.name())
-        .try_for_each(|unit| unit.map(|character| text.push(character)));
-      let name = match decoded {
-        Ok(()) => Cow::Borrowed(Path::new(text.as_str())),
-        Err(_) => Cow::Owned(OsString::from_wide(&self.name().collect::<Vec<u16>>()).into()),
-      };
+      let name = wide_name(self.name(), text);
+      let name = Path::new(&*name);
       let is_entry = |part| match part {
         Component::Normal(name) => {
           !name.as_encoded_bytes().iter().any(|&byte| byte == 0 || byte == b':')
@@ -811,7 +805,7 @@ mod records {
       };
       let is_below = name.components().all(is_entry);
       if is_below {
-        path.push(&*name);
+        path.push(name);
       }
       is_below
     }

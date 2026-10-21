@@ -142,13 +142,11 @@ impl Fs for StdFs {
     }
     for entry in fs::read_dir(literal(dir)).map_err(told)? {
       let entry = entry.map_err(told)?;
-      #[cfg(windows)]
-      {
-        use std::os::windows::ffi::OsStrExt;
-        let name: Vec<u16> = entry.file_name().encode_wide().collect();
-        if windows::has_separator(&name) {
-          continue;
-        }
+      let name = entry.file_name();
+      // Windows: a name with a separator in it, which a disk that another system filled can
+      // hold, is left out: no path names such an entry. Both are one byte in the encoded form.
+      if cfg!(windows) && name.as_encoded_bytes().iter().any(|&byte| matches!(byte, b'\\' | b'/')) {
+        continue;
       }
       let kind = entry.file_type().ok().map(|file_type| {
         if file_type.is_dir() {
@@ -159,7 +157,7 @@ impl Fs for StdFs {
           FileType::File
         }
       });
-      each(&entry.file_name(), kind.map_or(Entry::Name, Entry::Kind));
+      each(&name, kind.map_or(Entry::Name, Entry::Kind));
     }
     Ok(())
   }
@@ -269,7 +267,7 @@ fn linux_remote_disk(dir: &Path) -> Option<String> {
 mod windows;
 
 #[cfg(windows)]
-pub(crate) use self::windows::{Unknown, kernel32, literal};
+pub(crate) use self::windows::{Unknown, kernel32, literal, wide_name};
 #[cfg(windows)]
 use self::windows::{name_on_disk, stat, told};
 
