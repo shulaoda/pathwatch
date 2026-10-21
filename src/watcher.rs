@@ -5,7 +5,6 @@ use std::{
   borrow::Cow,
   cell::Cell,
   env, fmt, io,
-  marker::PhantomData,
   path::{Path, PathBuf},
   sync::{
     Arc, Mutex, PoisonError,
@@ -17,7 +16,7 @@ use std::{
 };
 
 use crate::{
-  backend::{Backend, Coverage, DirKey, Hint, Signal, Sink, Want, is_watch_limit},
+  backend::{Backend, Signal, Sink, is_watch_limit},
   config::Config,
   engine::{Engine, Options, Output},
   error::{Error, ErrorKind, context},
@@ -347,7 +346,7 @@ impl Watcher {
               (ErrorKind::Io, context(what, error))
             };
             handler(Err(Error::new(kind, None, Some(error))));
-            let mut engine = Engine::new(NoBackend::<B::Raw>(PhantomData), StdFs, fallback);
+            let mut engine = Engine::new(PollBackend::<B::Raw>::for_queue(), StdFs, fallback);
             engine.stop_with(Arc::clone(&stop));
             run(engine, handler, &inbox, &from_inside, &queue, &stop);
           }
@@ -732,22 +731,6 @@ fn deliver<B: Backend>(
       return;
     }
   }
-}
-
-/// The backend of a watcher whose native backend did not start: it watches nothing, but has the
-/// raw type of the native one, which the queue was made for.
-struct NoBackend<R>(PhantomData<fn(R)>);
-
-impl<R: Send + 'static> Backend for NoBackend<R> {
-  type Raw = R;
-
-  fn watch(&mut self, _key: DirKey, _dir: &Path, _want: Want) -> Coverage {
-    Coverage::NotWatched
-  }
-
-  fn unwatch(&mut self, _key: DirKey) {}
-
-  fn translate(&mut self, _raw: R, _hint: &mut dyn FnMut(Hint<'_>)) {}
 }
 
 /// The form of `path` that the engine takes: absolute and clean. `None`: it cannot be used.

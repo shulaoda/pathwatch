@@ -475,7 +475,7 @@ fn a_watch_20000_files_in_one_batch() {
   let _serial = serial();
   // With the poll backend the kept memory is the memory of the engine alone. With the others
   // the simulated backend keeps its watches too.
-  watch_project("Poll", |fs| Run::new(fs, PollBackend, no_poll()));
+  watch_project("Poll", |fs| Run::new(fs, PollBackend::default(), no_poll()));
   for mode in MODES {
     watch_project(&format!("{mode:?}"), |fs| Run::sim(fs, mode, no_poll()));
   }
@@ -488,7 +488,7 @@ fn a_watch_20000_files_in_one_batch() {
     false
   });
   let options = Options { ignored: Some(ignored), ..no_poll() };
-  watch_project("Poll, with a filter", |fs| Run::new(fs, PollBackend, options.clone()));
+  watch_project("Poll, with a filter", |fs| Run::new(fs, PollBackend::default(), options.clone()));
   // `best` measures five times.
   say(&format!("   the filter is asked {} times", asked.load(Ordering::Relaxed) / 5));
 }
@@ -655,7 +655,7 @@ fn f_one_polling_round_at_20000_paths() {
   let _serial = serial();
   let fast = Options { poll_interval: Duration::from_millis(100), ..Options::default() };
   poll_rounds("f. one polling round at 20,000 paths (Poll)", |fs| {
-    Run::new(fs, PollBackend, fast.clone())
+    Run::new(fs, PollBackend::default(), fast.clone())
   });
   // With a backend of the OS the poll looks only at what no watch covers, and the timer does not
   // run when that is nothing.

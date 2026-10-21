@@ -1506,7 +1506,7 @@ fn play(config: &Config, ops: &[Op]) -> Result<(), Failure> {
         Run::new(config, fs, backend, Arc::clone(&shared)).play(ops);
       }
       Target::Poll => {
-        Run::new(config, fs, PollBackend, Arc::clone(&shared)).play(ops);
+        Run::new(config, fs, PollBackend::default(), Arc::clone(&shared)).play(ops);
       }
     }
   }));

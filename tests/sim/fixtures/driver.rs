@@ -64,7 +64,7 @@ impl Driver<SimBackend> {
 
 impl Driver<PollBackend> {
   pub fn poll(options: Options) -> Self {
-    Self::new(PollBackend, SimFs::new(), options)
+    Self::new(PollBackend::default(), SimFs::new(), options)
   }
 }
 
