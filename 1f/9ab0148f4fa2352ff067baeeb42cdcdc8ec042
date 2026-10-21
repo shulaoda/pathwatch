@@ -1,0 +1,29 @@
+src/backend.rs
+  s_b910dfc76e4e89::t_221411d97a4aa5 172-174
+src/engine/check.rs
+  s_b910dfc76e4e89::t_a9070cea63aca9 192-193,265-271
+src/engine/mod.rs
+  s_b910dfc76e4e89::t_869806b447fbc7 283,295-300,329
+src/engine/os_watch.rs
+  s_b910dfc76e4e89::t_4fc1e0b7b1430f 5,12,299,303,310-312
+src/engine/scan.rs
+  s_b910dfc76e4e89::t_a21854062e8396 131,148,153-154,156
+tests/sim/young.rs
+  s_b910dfc76e4e89::t_808e3038c72d7e 559-596
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1f9ab0148f4fa2352ff067baeeb42cdcdc8ec042",
+  "prompts": {},
+  "sessions": {
+    "s_b910dfc76e4e89": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8a69738a-ae83-4a31-8a84-9d3e8722ff76",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
