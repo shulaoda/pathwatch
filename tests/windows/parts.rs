@@ -1546,11 +1546,19 @@ mod translate {
       (ADDED, "C:/q/a.js"),
       (ADDED, "/q/a.js"),
       (ADDED, "a/../b.js"),
+      (ADDED, "./a.js"),
+      (ADDED, "a/./b.js"),
       (MODIFIED, "f.txt:stream"),
       (ADDED, "nul\0led.js"),
       (ADDED, "kept.js"),
     ]);
     assert_eq!(hints(&mut handles, read(id, "/p", Ok(bytes))), [changed(0, "kept.js")]);
+    // Separators that come twice, or at the end, separate all the same.
+    let bytes = encode(&[(ADDED, r"sub\\a.js"), (ADDED, "sub/b.js"), (ADDED, r"sub\")]);
+    assert_eq!(
+      hints(&mut handles, read(id, "/p", Ok(bytes))),
+      [changed(0, r"sub\a.js"), changed(0, r"sub\b.js"), changed(0, "sub")]
+    );
   }
 
   #[test]

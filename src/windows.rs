@@ -1,19 +1,14 @@
 //! The Windows backend: `ReadDirectoryChangesW` on at most 64 directory handles. See
 //! `references/design.md` 7.3.
 
-use std::{
-  io, mem,
-  path::{Path, PathBuf},
-  sync::Arc,
-  time::SystemTime,
-};
+use std::{io, mem, path::Path, sync::Arc, time::SystemTime};
 
-use self::{handles::lower_case, port::Port, records::FILE_ACTION_MODIFIED};
 pub use self::{
   handles::{Handles, MAX_HANDLES, System, Told, WatchId},
   place::{Place, place},
   records::{Malformed, Record, Records},
 };
+use self::{port::Port, records::FILE_ACTION_MODIFIED};
 use crate::backend::{Backend, Committed, Coverage, DirKey, Hint, Sink, Want};
 
 #[derive(Debug)]
@@ -115,8 +110,7 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
   }
   handles.delivered(watch);
   let records = if extended { Records::extended(&bytes) } else { Records::new(&bytes) };
-  // The path of a record and its lower-case spelling go into the same room each time.
-  let (mut path, mut lower, mut text) = (PathBuf::new(), PathBuf::new(), String::new());
+  let mut route = handles.route_below(&dir);
   // A record with no name is a loss for every key below the handle: once a read is enough.
   let mut told_lost = false;
   for record in records {
@@ -131,21 +125,15 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
       }
       continue;
     }
-    if written && record.is_dir == Some(true) {
+    if written && record.is_dir == Some(true) || !route.take(record.name()) {
       continue;
     }
-    path.clear();
-    path.push(&*dir);
-    if !record.push_name(&mut path, &mut text) {
-      continue;
-    }
-    lower_case(&path, &mut lower, &mut text);
     // Windows says "modified" for a directory when an entry in it changes, and that entry has
     // a record of its own.
-    if written && handles.holds_a_key(&lower) {
+    if written && route.is_at_a_key() {
       continue;
     }
-    handles.route(&path, &lower, &mut |key, rel| {
+    route.keys(&mut |key, rel| {
       hint(if written {
         Hint::Written { dir: key, rel, new: false }
       } else {
@@ -289,6 +277,8 @@ mod place {
 
 mod handles {
   use std::{
+    borrow::Cow,
+    ffi::OsStr,
     io, mem,
     path::{Component, Path, PathBuf},
   };
@@ -296,7 +286,10 @@ mod handles {
   use rustc_hash::{FxHashMap, FxHashSet};
 
   use super::place::{may_hold_a_handle, place};
-  use crate::backend::{Coverage, DirKey, Want, give_room_back, same, watch_limit};
+  use crate::{
+    backend::{Coverage, DirKey, Want, give_room_back, same, watch_limit},
+    fs::wide_name,
+  };
 
   pub const MAX_HANDLES: usize = 64;
 
@@ -453,24 +446,31 @@ mod handles {
       }
     }
 
-    /// Every key whose directory holds `path`, the deepest first; `lower` is the path in lower
-    /// case (`lower_case`). A key above one that was told gets a hint it may not need, which
-    /// costs one walk; left out, it would miss the path when the tree reaches it only from
-    /// above: through another spelling of a name, or from the other letter case of the drive,
-    /// which is another top node.
-    pub(super) fn route(&self, path: &Path, lower: &Path, found: &mut dyn FnMut(DirKey, &Path)) {
-      for (dir, lower_dir) in path.ancestors().zip(lower.ancestors()) {
-        let Some(keys) = self.at.get(lower_dir) else { continue };
-        let Ok(rel) = path.strip_prefix(dir) else { continue };
-        for &key in keys {
-          found(key, rel);
+    /// The way to the keys for the records of a read on the handle at `dir`.
+    pub(super) fn route_below(&self, dir: &Path) -> Route<'_> {
+      let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
+      let lower_dir = lowered(dir);
+      let mut path = dir.as_os_str().as_encoded_bytes().to_vec();
+      let mut lower = lower_dir.as_os_str().as_encoded_bytes().to_vec();
+      for text in [&mut path, &mut lower] {
+        if !text.last().is_some_and(is_separator) {
+          text.push(b'\\');
         }
       }
-    }
-
-    /// Whether a key stands at the path whose lower case is `lower`.
-    pub(super) fn holds_a_key(&self, lower: &Path) -> bool {
-      self.at.contains_key(lower)
+      // The directories on the way up, each with its spelling in lower case. The names below
+      // one start after the separators that follow it in `path`.
+      let above = dir.ancestors().zip(lower_dir.ancestors()).filter_map(|(up, lower_up)| {
+        let keys = self.at.get(lower_up)?;
+        let end = up.as_os_str().len();
+        Some((
+          keys.as_slice(),
+          end + path[end..].iter().take_while(|byte| is_separator(byte)).count(),
+        ))
+      });
+      let above = above.collect();
+      let base = (path.len(), lower.len());
+      let (ends, text, name) = (Vec::new(), String::new(), String::new());
+      Route { at: &self.at, above, path, lower, base, ends, text, name }
     }
 
     pub(super) fn below(&self, dir: &Path) -> Vec<DirKey> {
@@ -695,46 +695,135 @@ mod handles {
     dir.ancestors().take(names).find(|path| is_link(path)).map(Path::to_owned)
   }
 
-  /// `path` with its names in lower case, into `lower`: NTFS takes the two cases of a letter
-  /// for one name. `text` is room for one name on the way, so the call asks for no memory
-  /// once the two have grown. A name that is no Unicode text gets the ASCII letters folded.
-  pub(super) fn lower_case(path: &Path, lower: &mut PathBuf, text: &mut String) {
-    lower.clear();
+  /// `path` with its names in lower case (`lower_name`). The drive or the share stays as it is.
+  fn lowered(path: &Path) -> PathBuf {
+    let (mut lower, mut text) = (PathBuf::new(), String::new());
     for part in path.components() {
       match part {
-        Component::Normal(name) => match name.to_str() {
-          Some(name) => {
-            text.clear();
-            text.extend(name.chars().flat_map(char::to_lowercase));
-            lower.push(&*text);
-          }
-          None => lower.push(name.to_ascii_lowercase()),
-        },
+        Component::Normal(name) => lower.push(lower_name(name, &mut text)),
         other => lower.push(other.as_os_str()),
+      }
+    }
+    lower
+  }
+
+  /// A name in lower case, through `text`: NTFS takes the two cases of a letter for one name,
+  /// and folds each character by itself (`ΟΔΟΣ` is `οδοσ`, not `οδος`). A name that is no
+  /// Unicode text gets its ASCII letters folded.
+  fn lower_name<'a>(name: &'a OsStr, text: &'a mut String) -> Cow<'a, OsStr> {
+    let Some(name) = name.to_str() else { return Cow::Owned(name.to_ascii_lowercase()) };
+    text.clear();
+    text.extend(name.chars().flat_map(char::to_lowercase));
+    Cow::Borrowed(OsStr::new(text.as_str()))
+  }
+
+  /// The way of the records of one read to every key whose directory holds the path of the
+  /// record, the deepest first. What the records share is worked out once for the read: the
+  /// directory of the handle in lower case, and the keys at and above it. Each record then
+  /// costs a look for each of its own names, by its text: 0.53 µs a record in a flood of
+  /// 63,000, where a walk up the whole path of each in lower case took 2.1 µs (measured).
+  ///
+  /// A key above one that was told gets a hint it may not need; left out, it would miss the
+  /// path when the tree reaches it only from above: through another spelling of a name, or from
+  /// the other letter case of the drive, which is another top node.
+  pub(super) struct Route<'a> {
+    at: &'a FxHashMap<PathBuf, Vec<DirKey>>,
+    /// The keys at and above the directory, the deepest first, each with where the names of a
+    /// record below their directory start in `path`.
+    above: Vec<(&'a [DirKey], usize)>,
+    /// The directory, a separator, and the names of the record with one separator between
+    /// them, as encoded text (`OsStr::as_encoded_bytes`); `lower` the same in lower case.
+    path: Vec<u8>,
+    lower: Vec<u8>,
+    /// How long the directory and its separator are in `path` and in `lower`.
+    base: (usize, usize),
+    /// Where each name of the record ends in `path` and in `lower`.
+    ends: Vec<(usize, usize)>,
+    /// Room for a name on the way, and for its lower case.
+    text: String,
+    name: String,
+  }
+
+  impl Route<'_> {
+    /// Takes the name of a record, from its UTF-16 units. `false`: it is no name of an entry
+    /// below the directory. NTFS gives names with separators between them and nothing else; a
+    /// disk that another system filled, or a server, could give a root, a drive, a `.` or a
+    /// `..`, a NUL, or a `:`, which starts a stream of a file.
+    pub(super) fn take(&mut self, units: impl Iterator<Item = u16> + Clone) -> bool {
+      let Self { path, lower, base, ends, text, name, .. } = self;
+      let given = wide_name(units, text);
+      path.truncate(base.0);
+      lower.truncate(base.1);
+      ends.clear();
+      let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
+      let bytes = given.as_encoded_bytes();
+      if bytes.first().is_some_and(is_separator) {
+        return false;
+      }
+      for part in bytes.split(is_separator).filter(|part| !part.is_empty()) {
+        if matches!(part, b"." | b"..") || part.iter().any(|&byte| byte == 0 || byte == b':') {
+          return false;
+        }
+        if !ends.is_empty() {
+          path.push(b'\\');
+          lower.push(b'\\');
+        }
+        path.extend_from_slice(part);
+        // SAFETY: the bytes are a name of `given` between two separators, which are ASCII:
+        // encoded text may be cut there (`OsStr::from_encoded_bytes_unchecked`).
+        let part = unsafe { OsStr::from_encoded_bytes_unchecked(part) };
+        lower.extend_from_slice(lower_name(part, name).as_encoded_bytes());
+        ends.push((path.len(), lower.len()));
+      }
+      !ends.is_empty()
+    }
+
+    /// Whether a key stands at the path of the record.
+    pub(super) fn is_at_a_key(&self) -> bool {
+      self.at.contains_key(cut(&self.lower, 0, self.lower.len()))
+    }
+
+    /// Calls `found` with every key whose directory holds the path of the record, the deepest
+    /// first, and the path below that directory.
+    pub(super) fn keys(&self, found: &mut dyn FnMut(DirKey, &Path)) {
+      let len = self.path.len();
+      for &(end, lower_end) in self.ends.iter().rev() {
+        let Some(keys) = self.at.get(cut(&self.lower, 0, lower_end)) else { continue };
+        let rel = cut(&self.path, (end + 1).min(len), len);
+        for &key in keys {
+          found(key, rel);
+        }
+      }
+      for &(keys, below) in &self.above {
+        let rel = cut(&self.path, below, len);
+        for &key in keys {
+          found(key, rel);
+        }
       }
     }
   }
 
-  fn lowered(path: &Path) -> PathBuf {
-    let (mut lower, mut text) = (PathBuf::new(), String::new());
-    lower_case(path, &mut lower, &mut text);
-    lower
+  /// The path in `text[start..end]`. `text` is encoded text with separators between its
+  /// pieces (`Route::path`), and each end of the range is an end of it or lies next to a
+  /// separator.
+  fn cut(text: &[u8], start: usize, end: usize) -> &Path {
+    let next_to_ascii =
+      |at: usize| at == 0 || at == text.len() || text[at - 1].is_ascii() || text[at].is_ascii();
+    assert!(next_to_ascii(start) && next_to_ascii(end), "a cut inside a character");
+    // SAFETY: the pieces of `text` came from `OsStr::as_encoded_bytes` with ASCII bytes between
+    // them, and it is cut only next to an ASCII byte (`OsStr::from_encoded_bytes_unchecked`).
+    Path::new(unsafe { OsStr::from_encoded_bytes_unchecked(&text[start..end]) })
   }
 }
 
 mod records {
-  use std::{
-    mem::offset_of,
-    path::{Component, Path, PathBuf},
-  };
+  use std::mem::offset_of;
 
   pub(super) use windows_sys::Win32::Storage::FileSystem::FILE_ACTION_MODIFIED;
   use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_NOTIFY_EXTENDED_INFORMATION as Extended,
     FILE_NOTIFY_INFORMATION as Short,
   };
-
-  use crate::fs::wide_name;
 
   const NEXT_ENTRY_OFFSET: usize = offset_of!(Short, NextEntryOffset);
   const ACTION: usize = offset_of!(Short, Action);
@@ -805,27 +894,6 @@ mod records {
 
     pub fn is_unnamed(&self) -> bool {
       self.name.is_empty()
-    }
-
-    /// Puts the name below `path`, through `text` (`fs::wide_name`). `false`, and nothing is
-    /// put: the name is no name of an entry below the directory. NTFS gives names with
-    /// separators between them and nothing else; a disk that another system filled, or a
-    /// server, could give a `..`, a root, a drive, a NUL, or a `:`, which starts a stream of a
-    /// file.
-    pub fn push_name(&self, path: &mut PathBuf, text: &mut String) -> bool {
-      let name = wide_name(self.name(), text);
-      let name = Path::new(&*name);
-      let is_entry = |part| match part {
-        Component::Normal(name) => {
-          !name.as_encoded_bytes().iter().any(|&byte| byte == 0 || byte == b':')
-        }
-        _ => false,
-      };
-      let is_below = name.components().all(is_entry);
-      if is_below {
-        path.push(name);
-      }
-      is_below
     }
   }
 

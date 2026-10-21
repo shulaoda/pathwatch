@@ -1694,7 +1694,11 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   completed read are read on the watcher thread (`Records`, `translate`): the raw
   notification holds the bytes and shares the path of the handle, and the path of each
   record, with its lower-case spelling, is made into room that `translate` keeps from one
-  record to the next, so a flood of records asks for no memory. The reads ask for the longer
+  record to the next, so a flood of records asks for no memory. What the records of a read
+  share is worked out once (`Handles::route_below`): the path of the handle in lower case, and
+  the keys at and above it; each record then costs a look for each of its own names, by the
+  text (0.53 µs a record in a flood of 63,000, where a walk up the whole path of each in lower
+  case took 2.1 µs, 2026-10-22). The reads ask for the longer
   records (`ReadDirectoryChangesExW`, Windows 10 1709 and later) where Windows and the disk
   have them: they tell whether an entry is a directory.
 - **Hints.** A record goes to every key whose directory holds its path, the deepest first,
@@ -1708,8 +1712,8 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   need, which costs one walk; without it the path would be missed where the tree reaches it
   only from above: a second spelling of a name below, or the other letter case of the drive,
   which is another top node of the tree. A record that no key holds is dropped, and so is one
-  whose name is no name of an entry below the directory: a `..`, a root, a drive, a NUL, or a
-  `:`, which starts a stream of a file (NTFS gives none of these; a write to a stream of a file
+  whose name is no name of an entry below the directory: a `.` or a `..`, a root, a drive, a
+  NUL, or a `:`, which starts a stream of a file (NTFS gives none of these; a write to a stream of a file
   is a `MODIFIED` record for the file, measured; a disk that another system filled, or a
   server, could give one, and a `..` or a drive would reach another directory). `MODIFIED` →
   `Written`; it is dropped when it names a directory (the longer records tell) or the
