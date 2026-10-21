@@ -1013,19 +1013,36 @@ impl Tree {
     self.to_scan = emptied(queue);
   }
 
-  /// Takes the marked nodes into `marks`, each with its level, its directory and the time of its
-  /// hint, from the top down and one directory after the other. The marks stay on the nodes; a
-  /// stale key is left out.
-  pub fn take_marked(&mut self, marks: &mut Vec<(usize, DirKey, DirKey, Option<Instant>)>) {
+  /// Takes the marked nodes into `marks`, from the top down and one directory after the other:
+  /// each with its level and the order of its key from the newest, its directory, and the time
+  /// of its hint. The marks stay on the nodes.
+  ///
+  /// A check takes the mark of its node and leaves the key in the list, and a node that is
+  /// marked again is listed once more. So a key whose node has no mark is left out, and of the
+  /// keys of one node only the newest is taken: its time is the time of the mark the node has.
+  pub fn take_marked(&mut self, marks: &mut Vec<(usize, usize, DirKey, DirKey, Option<Instant>)>) {
     marks.clear();
     let mut marked = mem::take(&mut self.marked);
-    for (key, since) in marked.drain(..) {
-      if let Some(parent) = self.parent(key) {
-        marks.push((self.level(key), parent, key, since));
+    for (newer, (key, since)) in marked.drain(..).rev().enumerate() {
+      if let Some(parent) = self.parent(key)
+        && self[key].is_marked()
+      {
+        marks.push((self.level(key), newer, parent, key, since));
       }
     }
     self.marked = emptied(marked);
-    marks.sort_unstable_by_key(|&(level, parent, key, _)| (level, parent.index(), key.index()));
+    marks.sort_unstable_by_key(|&(level, newer, parent, key, _)| {
+      (level, parent.index(), key.index(), newer)
+    });
+    marks.dedup_by_key(|&mut (.., key, _)| key);
+  }
+
+  /// Drops the keys of the nodes that have no mark any more (a check or a scan took it, or the
+  /// node went): what is left is work.
+  pub fn tidy_marked(&mut self) {
+    let mut marked = mem::take(&mut self.marked);
+    marked.retain(|&(key, _)| self.get(key).is_some_and(Node::is_marked));
+    self.marked = marked;
   }
 
   pub fn has_work(&self) -> bool {

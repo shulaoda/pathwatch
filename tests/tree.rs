@@ -75,6 +75,13 @@ fn marks(tree: &Tree) -> Vec<String> {
   all
 }
 
+/// The marks of a flush (`Tree::take_marked`): level, directory, node and time of each.
+fn taken(tree: &mut Tree) -> Vec<(usize, DirKey, DirKey, Option<Instant>)> {
+  let mut marks = Vec::new();
+  tree.take_marked(&mut marks);
+  marks.into_iter().map(|(level, _, parent, key, since)| (level, parent, key, since)).collect()
+}
+
 /// The path as text, with `/` between the names on every OS.
 fn shown(path: &Path) -> String {
   path.display().to_string().replace('\\', "/")
@@ -499,9 +506,36 @@ fn a_mark_carries_the_time_of_its_hint() {
   let a = f.tree.child(f.r, OsStr::new("a.js")).unwrap();
   let c = f.tree.child(f.r, OsStr::new("c.js")).unwrap();
   assert_eq!(f.tree.marked, [(a, Some(at)), (c, None)]);
-  let mut marks = Vec::new();
-  f.tree.take_marked(&mut marks);
-  assert_eq!(marks, [(4, f.r, a, Some(at)), (4, f.r, c, None)]);
+  assert_eq!(taken(&mut f.tree), [(4, f.r, a, Some(at)), (4, f.r, c, None)]);
+}
+
+/// A node whose mark a scan took, then marked again, is listed twice: it is taken once, with the
+/// time of the mark it has. A flush drops the keys of the nodes that have no mark.
+#[test]
+fn a_node_marked_again_is_taken_once_with_its_new_time() {
+  let mut f = fixture();
+  let (old, new) = (Instant::now(), Instant::now() + Duration::from_secs(1));
+  let a = child(&mut f.tree, f.r, "a.js");
+  let c = child(&mut f.tree, f.r, "c.js");
+  f.tree.mark(a, Mark { since: Some(old), ..Mark::default() });
+  f.tree.mark(c, Mark::default());
+  f.tree.take_mark(a);
+  f.tree.take_mark(c);
+  f.tree.mark(a, Mark { since: Some(new), ..Mark::default() });
+  assert_eq!(f.tree.marked, [(a, Some(old)), (c, None), (a, Some(new))]);
+  f.tree.tidy_marked();
+  assert_eq!(f.tree.marked, [(a, Some(old)), (a, Some(new))]);
+  assert!(f.tree.has_work());
+  assert_eq!(taken(&mut f.tree), [(4, f.r, a, Some(new))]);
+
+  // Marked again without a time: the old time is not taken.
+  f.tree.take_mark(a);
+  f.tree.mark(a, Mark::default());
+  f.tree.marked.insert(0, (a, Some(old)));
+  assert_eq!(taken(&mut f.tree), [(4, f.r, a, None)]);
+  f.tree.take_mark(a);
+  f.tree.tidy_marked();
+  assert!(!f.tree.has_work());
 }
 
 /// Its mark says `lost` until a hint that names the path joins it.
@@ -784,10 +818,8 @@ fn the_marks_in_the_order_of_their_checks() {
   f.tree.prune(gone);
   f.tree.marked.push((gone, None));
 
-  let mut marks = Vec::new();
-  f.tree.take_marked(&mut marks);
   assert_eq!(
-    marks,
+    taken(&mut f.tree),
     [
       (2, f.top, f.p, None),
       (3, f.p, f.f, None),

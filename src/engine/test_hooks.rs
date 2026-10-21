@@ -204,6 +204,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if !self.touched.is_empty() {
       return Err("touched nodes are left over from a flush".to_owned());
     }
+    // A key whose node has no mark keeps the timer of the poll for nothing (`has_poll_work`).
+    if let Some(&(key, _)) =
+      self.tree.marked.iter().find(|&&(key, _)| !self.tree.get(key).is_some_and(Node::is_marked))
+    {
+      return Err(format!("{key:?} is on the list of marked nodes and has no mark"));
+    }
     Ok(())
   }
 }

@@ -188,8 +188,8 @@ pub struct Engine<B: Backend, F: Fs> {
   // Buffers, kept between flushes so that a flush asks for no memory (see `emptied`).
   /// Every path for the disk is built here.
   path: PathBuf,
-  /// The marks of a flush, in the order of their checks.
-  marks: Vec<(usize, DirKey, DirKey, Option<Instant>)>,
+  /// The marks of a flush, in the order of their checks (`Tree::take_marked`).
+  marks: Vec<(usize, usize, DirKey, DirKey, Option<Instant>)>,
   /// The scans of one round.
   scans: Vec<(DirKey, Depth, bool)>,
   /// The nodes of the directory that is scanned.
@@ -451,6 +451,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     while (!self.tree.to_scan.is_empty() || self.gave_back) && !self.stopped() {
       self.round(&mut path, &mut names);
     }
+    // The scans took the marks of the nodes they looked at: what is left on the list is work.
+    self.tree.tidy_marked();
     self.loss.scanning = false;
     (self.path, self.names) = (path, emptied(names));
     // A big listing is not kept for ever, as `emptied` does for a list.
@@ -476,7 +478,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let above = if hints_due { Vec::new() } else { self.above_due_holds() };
     // The path of one directory is built once for all of its marks.
     let mut path_of = None;
-    for &(_, parent, key, since) in &marks {
+    for &(_, _, parent, key, since) in &marks {
       if self.stopped() {
         break;
       }
