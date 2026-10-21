@@ -88,7 +88,7 @@ impl Watcher {
   ///
   /// # Errors
   ///
-  /// The watcher thread could not be started.
+  /// The watcher thread, or the queue into it, could not be made.
   pub fn new<H>(handler: H) -> Result<Self, Error>
   where
     H: FnMut(Result<Vec<Event>, Error>) + Send + 'static,
@@ -116,7 +116,7 @@ impl Watcher {
   ///
   /// # Errors
   ///
-  /// The watcher thread could not be started.
+  /// The watcher thread, or the queue into it, could not be made.
   pub fn with_config<H>(config: Config, handler: H) -> Result<Self, Error>
   where
     H: FnMut(Result<Vec<Event>, Error>) + Send + 'static,
@@ -289,7 +289,7 @@ impl Watcher {
   ///
   /// # Errors
   ///
-  /// The watcher thread could not be started.
+  /// The watcher thread, or the queue into it, could not be made.
   #[doc(hidden)]
   pub fn with_backend<B, H>(
     options: Options,
