@@ -113,7 +113,7 @@ impl Watcher {
   ///
   /// When the watch API of the OS cannot start, the watcher polls, as with
   /// [`Config::with_polling`], and tells the handler once: [`ErrorKind::WatchLimit`] for a limit
-  /// of the OS, [`ErrorKind::Io`] otherwise.
+  /// of the OS, [`ErrorKind::Io`] otherwise. The same when it stops later ([`ErrorKind::Io`]).
   ///
   /// # Errors
   ///
@@ -305,7 +305,7 @@ impl Watcher {
   }
 
   /// Starts the watcher thread. `make` makes the backend on that thread; when it fails, the handler
-  /// is told once and the watcher polls with `fallback`.
+  /// is told once and the watcher polls with `fallback`, and so it does when the backend dies.
   fn start<B, H>(
     options: Options,
     fallback: Options,
@@ -334,6 +334,7 @@ impl Watcher {
         match make(sink) {
           Ok(backend) => {
             let mut engine = Engine::new(backend, StdFs, options);
+            engine.fall_back_to(fallback);
             engine.stop_with(Arc::clone(&stop));
             run(engine, handler, &inbox, &from_inside, &queue, &stop);
           }

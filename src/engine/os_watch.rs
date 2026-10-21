@@ -301,9 +301,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     let error = context("the OS watcher stopped, so every path is polled", same(error));
     self.report(ErrorKind::Io, None, Some(error));
-    // The poll is all there is now: it runs as often as a watcher that only polls.
-    if let Some(alone) = self.options.poll_interval_alone {
-      self.options.poll_interval = alone;
+    // The poll is all there is now: the watcher works as one that only polls, at its interval
+    // and with no delete delay. A hold that waits keeps its time.
+    if let Some(fallback) = self.fallback.take() {
+      self.options = fallback;
     }
     self.tree.poll_all();
     // Its last notifications may be lost.

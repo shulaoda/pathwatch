@@ -225,19 +225,21 @@ fn the_reads_of_young_files_count_in_the_round() {
   assert_eq!(pause, Duration::from_millis(200 + 200), "{pause:?}");
 }
 
-/// The engine after its backend stopped: it polls as often as a watcher that only polls.
+/// The engine after its backend stopped: it works as a watcher that only polls, at the interval
+/// of the settings and with no delete delay.
 #[test]
-fn a_stopped_backend_is_polled_at_the_interval_of_the_settings() {
+fn a_stopped_backend_is_polled_as_a_watcher_that_only_polls() {
   let dir = tempfile::tempdir().unwrap();
   let hour = Duration::from_secs(3600);
   let options = Options {
     poll_interval: hour,
-    poll_interval_alone: Some(INTERVAL),
+    delete_delay: hour,
     loose_spelling: cfg!(any(target_vendor = "apple", windows)),
     ..Options::default()
   };
   let backend = PollBackend::new(Sink::new(|_| {})).unwrap();
-  let mut engine = Engine::new(backend, StdFs, options);
+  let mut engine = Engine::new(backend, StdFs, options.clone());
+  engine.fall_back_to(Options { poll_interval: INTERVAL, delete_delay: Duration::ZERO, ..options });
   let (start, mut out) = (Instant::now(), Output::default());
   engine.watch(vec![dir.path().to_owned()], start, &mut out);
   let first_poll = engine.deadline().expect("only the poll is due, in an hour");
@@ -262,6 +264,20 @@ fn a_stopped_backend_is_polled_at_the_interval_of_the_settings() {
   assert_eq!(
     (out.events[0].kind, &out.events[0].path),
     (EventKind::Create, &dir.path().join("a.txt"))
+  );
+
+  // The delete delay of an hour is gone with the backend: the poll that finds the file gone
+  // tells it.
+  out.events.clear();
+  fs::remove_file(dir.path().join("a.txt")).unwrap();
+  while out.events.is_empty() {
+    let now = engine.deadline().expect("the poll is always due");
+    assert!(now < start + Duration::from_secs(2), "no Delete came in two seconds");
+    engine.tick(now, &mut out);
+  }
+  assert_eq!(
+    (out.events[0].kind, &out.events[0].path),
+    (EventKind::Delete, &dir.path().join("a.txt"))
   );
 }
 

@@ -329,7 +329,7 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 | unwatch | `unwatch(paths)` | Offered differently: it takes back a `watch` of the same path. It cannot cut a part out of a watched directory; use the ignore filter. |
 | close | `close()`, or drop the watcher | Offered. |
 | ignored | `Config::with_ignored(f)` | Offered differently: one function, set when the watcher is made. No glob list, no change later. It decides about the paths you watch too: a path below an ignored directory, or ignored as a file and as a directory, is not watched. |
-| polling | `with_polling`, `with_poll_interval` | Offered. On top of that, a directory that the OS cannot watch is polled without an option, and so is everything when the watch API cannot start or stops: then at the poll interval of the settings. |
+| polling | `with_polling`, `with_poll_interval` | Offered. On top of that, a directory that the OS cannot watch is polled without an option, and so is everything when the watch API cannot start or stops: then as with `with_polling(true)`. |
 | debounce | `with_debounce` | Offered, and built in. Left out: waiting until a file stops growing (chokidar `awaitWriteFinish`). A slow writer gives more than one `Update`. |
 | atomic writes | `with_delete_delay(d)` | Offered differently: an atomic save (write a temporary file, rename it over) is always one `Update`, with no option. A file that is removed and back within the delete delay (10 ms on macOS and Windows, 50 ms on Linux; chokidar's `atomic` waits 100 ms) is one `Update` too. |
 | ignore initial | always on | Left out: what exists at `watch` time is never reported. Read the directory yourself if you need the list. |

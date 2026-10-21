@@ -861,7 +861,9 @@ next commit. The watch state of the node:
 - A node whose key `commit` names as failed becomes `Failed`, with the reason the backend
   gave; no other node does.
 - If the backend says that it cannot go on, the error is reported once, every node becomes
-  `Polled`, and everything is scanned.
+  `Polled`, and everything is scanned. From then on the settings are those of a watcher that
+  polls everything (`Engine::fall_back_to`): the poll interval of the settings and no delete
+  delay, as when the backend cannot start.
 
 **The poll.** The tree keeps a list of the directories that the timer looks at
 (`Tree::polled`), so a poll does not walk every node. A directory is put on it when the

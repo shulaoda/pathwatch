@@ -80,8 +80,6 @@ pub struct Options {
   pub delete_delay: Duration,
   /// The shortest time between two polls of what no OS watch covers.
   pub poll_interval: Duration,
-  /// The same once the backend has stopped and everything is polled. `None`: no other time.
-  pub poll_interval_alone: Option<Duration>,
   /// Every disk takes two spellings of a name for one (macOS, Windows). Without it, every
   /// directory tells them apart.
   pub loose_spelling: bool,
@@ -102,7 +100,6 @@ impl Default for Options {
       debounce: Duration::from_millis(10),
       delete_delay: Duration::from_millis(100),
       poll_interval: Duration::from_secs(1),
-      poll_interval_alone: None,
       loose_spelling: false,
       two_step_links: false,
       written_hints: false,
@@ -117,7 +114,6 @@ impl fmt::Debug for Options {
       .field("debounce", &self.debounce)
       .field("delete_delay", &self.delete_delay)
       .field("poll_interval", &self.poll_interval)
-      .field("poll_interval_alone", &self.poll_interval_alone)
       .field("loose_spelling", &self.loose_spelling)
       .field("two_step_links", &self.two_step_links)
       .field("written_hints", &self.written_hints)
@@ -139,6 +135,9 @@ pub struct Engine<B: Backend, F: Fs> {
   backend: Option<B>,
   fs: F,
   options: Options,
+  /// The settings once the backend has died: those of a watcher that polls everything
+  /// ([`Engine::fall_back_to`]). `None`: the settings stay.
+  fallback: Option<Options>,
   tree: Tree,
 
   // When the next work is due.
@@ -211,17 +210,15 @@ impl<B: Backend, F: Fs> fmt::Debug for Engine<B, F> {
 }
 
 impl<B: Backend, F: Fs> Engine<B, F> {
-  pub fn new(backend: B, fs: F, mut options: Options) -> Self {
-    for time in [&mut options.debounce, &mut options.delete_delay, &mut options.poll_interval] {
-      *time = (*time).min(LONGEST_SETTING);
-    }
-    options.poll_interval_alone = options.poll_interval_alone.map(|time| time.min(LONGEST_SETTING));
+  pub fn new(backend: B, fs: F, options: Options) -> Self {
+    let options = within_a_year(options);
     let mut tree = Tree::new();
     tree.loose_spelling = options.loose_spelling;
     Self {
       backend: Some(backend),
       fs,
       options,
+      fallback: None,
       tree,
       flush_at: None,
       flush_by: None,
@@ -252,6 +249,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// reads thousands of files.
   pub fn stop_with(&mut self, stop: Arc<AtomicBool>) {
     self.stop = Some(stop);
+  }
+
+  /// The settings once the backend has died and every node is polled: the watcher then works
+  /// as one that polls everything, as it does when the backend cannot start.
+  pub fn fall_back_to(&mut self, options: Options) {
+    self.fallback = Some(within_a_year(options));
   }
 
   fn stopped(&self) -> bool {
@@ -528,4 +531,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.errors.push(Error::new(kind, path, source));
     }
   }
+}
+
+/// No time of the settings is longer than `LONGEST_SETTING`.
+fn within_a_year(mut options: Options) -> Options {
+  for time in [&mut options.debounce, &mut options.delete_delay, &mut options.poll_interval] {
+    *time = (*time).min(LONGEST_SETTING);
+  }
+  options
 }
