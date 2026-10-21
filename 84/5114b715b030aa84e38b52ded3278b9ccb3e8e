@@ -1,0 +1,27 @@
+src/backend.rs
+  s_35ac4ca3286b91::t_36bc93b3a01b60 4-6,185-193
+src/fsevents.rs
+  s_35ac4ca3286b91::t_41eae3e4a5f074 26-28,140,365
+src/inotify.rs
+  s_35ac4ca3286b91::t_2b20f5654d3bb9 24,138-139
+src/tree/mod.rs
+  s_35ac4ca3286b91::t_34c9cb5e53b7de 25
+src/windows.rs
+  s_35ac4ca3286b91::t_66e48e63cdb01b 295,675-676
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "845114b715b030aa84e38b52ded3278b9ccb3e8e",
+  "prompts": {},
+  "sessions": {
+    "s_35ac4ca3286b91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcde9c6a-7c6b-4913-9704-d8faae1db573",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
