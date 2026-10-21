@@ -32,7 +32,7 @@ watcher.close();
 | `close()` | Stops the backend and waits for the thread. After it the handler is not called again, and `watch` and `unwatch` return `Closed`. A check of the disk that runs ends at its next step, so the wait is one look at most. Dropping the watcher calls it. |
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
-| `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `RemoteDisk`, `Io`, `Closed`. One error of a kind is handed over for a flush. Its text is these three in a row (see below). |
+| `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `RemoteDisk`, `Io`, `Closed`. One error of a kind is handed over for a flush, and one `RemoteDisk` for each disk (5.12). Its text is these three in a row (see below). |
 | `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, none on macOS, 10 ms on Windows and 20 ms on Linux (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and Windows and 50 ms on Linux, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
@@ -997,7 +997,9 @@ Mac; NFS on macOS gave no FSEvents record within 15 s for a write made in the VM
 watch on each disk (by its device) asks the type of the file system (`Fs::remote_disk`, one
 `statfs`: 0.2 to 3 µs): on macOS a disk that is not `MNT_LOCAL`, on Linux NFS, SMB, CIFS, 9P and
 FUSE, by the number of the type and not its name (the same folder was `fuseblk`, and later
-`virtiofs`). The handler is told once for each such disk (`RemoteDisk`), and nothing more is polled:
+`virtiofs`). The handler is told once for each such disk (`RemoteDisk`), also of two disks that one
+flush finds, as the rule of one error of a kind for a flush would drop the second for good
+(`each_disk_that_other_machines_change_is_told`), and nothing more is polled:
 a big tree on a slow disk read every second can cost more than the changes are worth, which only the
 user can weigh (`with_polling`). A local disk through FUSE is told too (an error too many), and a
 disk that is polled anyway is not told (`a_disk_that_other_machines_change_is_told_once`). Windows

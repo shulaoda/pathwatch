@@ -315,9 +315,9 @@ impl SimFs {
     self.lock().ignore_case = ignore_case;
   }
 
-  /// Another disk is mounted at `/name`: a directory that is made there takes names the other
-  /// way than `set_ignore_case` says, and so does every directory that is made in it. Set it
-  /// before the directory is made.
+  /// Another disk is mounted at `/name`, with a device of its own: a directory that is made
+  /// there takes names the other way than `set_ignore_case` says, and so does every directory
+  /// that is made in it. Set it before the directory is made.
   pub fn set_mount(&self, name: &str) {
     self.lock().mount = Some(name.into());
   }
@@ -746,12 +746,15 @@ impl State {
       Content::Link(target) => (FileType::Symlink, target.as_os_str().len()),
     };
     let birth = if self.birth_times { inode.born } else { 0 };
+    // The disk of `set_mount` is another device: a file is on the one of its directory.
+    let dir = if matches!(inode.content, Content::Dir(_)) { id } else { inode.parent };
+    let volume = if self.other_rule.contains(&dir) { 2 } else { 1 };
     Meta {
       kind,
       modified: SystemTime::UNIX_EPOCH + Duration::from_nanos(inode.modified),
       size: size as u64,
       file_id: inode.number,
-      dir_id: DirId { volume: 1, inode: inode.number, birth },
+      dir_id: DirId { volume, inode: inode.number, birth },
     }
   }
 

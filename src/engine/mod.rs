@@ -189,7 +189,7 @@ pub struct Engine<B: Backend, F: Fs> {
   /// The nodes of the directory that is scanned.
   names: Vec<ScanEntry>,
 
-  /// The errors for the next output, one of each kind.
+  /// The errors for the next output, one of each kind (`report`).
   errors: Vec<Error>,
   /// What happens once for the life of the engine.
   once: FxHashSet<Once>,
@@ -519,9 +519,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.scans = emptied(scans);
   }
 
-  /// Keeps one error of each kind for the next output.
+  /// Keeps one error of each kind for the next output, but every `RemoteDisk`: each is about
+  /// another disk, and each disk is told once (`tell_remote_disk`).
   fn report(&mut self, kind: ErrorKind, path: Option<PathBuf>, source: Option<io::Error>) {
-    if !self.errors.iter().any(|error| error.kind() == kind) {
+    let kept =
+      kind != ErrorKind::RemoteDisk && self.errors.iter().any(|error| error.kind() == kind);
+    if !kept {
       self.errors.push(Error::new(kind, path, source));
     }
   }

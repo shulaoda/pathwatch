@@ -84,7 +84,8 @@ watcher, so it should only pass the batch on.
 - An error means that something could not be watched or read. The watcher keeps running.
   `error.kind()` is one of `InvalidPath`, `WatchLimit`, `PermissionDenied`, `RemoteDisk`, `Io`,
   `Closed`.
-  The handler gets one error of a kind for a batch, with one path that shows the problem.
+  The handler gets one error of a kind for a batch, with one path that shows the problem;
+  `RemoteDisk` comes once for each disk.
 
 ## Options
 

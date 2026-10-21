@@ -291,6 +291,22 @@ fn a_disk_that_other_machines_change_is_told_once() {
   });
 }
 
+/// Two such disks that one call finds are both told: the handler gets one error of a kind for
+/// a batch, and of this kind one for each disk.
+#[test]
+fn each_disk_that_other_machines_change_is_told() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().set_mount("m");
+    d.fs().mkdir_all("/net/a").unwrap();
+    d.fs().mkdir_all("/m/b").unwrap();
+    d.fs().set_remote(Some("nfs"));
+    d.watch(&["/net/a", "/m/b"]);
+    let told: &[ErrorKind] = if on == "Poll" { &[] } else { &[ErrorKind::RemoteDisk; 2] };
+    assert_eq!(d.errors(), told, "{on}");
+    d.caught_up();
+  });
+}
+
 /// A watch for a tree that the backend cannot give. Nothing below it may be left without a
 /// watch and without the poll. Where the backend answers for a whole tree, `commit` takes that
 /// answer back: the directories below relied on it, so each is asked for by itself, fails too,
