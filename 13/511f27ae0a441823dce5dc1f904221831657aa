@@ -1,0 +1,21 @@
+src/engine/mod.rs
+  s_50e134dde5413c::t_11fb7bf998d9cc 35,192
+src/tree/mod.rs
+  s_50e134dde5413c::t_7d6827e3fd5c01 816-819,1011-1012,1017
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "13511f27ae0a441823dce5dc1f904221831657aa",
+  "prompts": {},
+  "sessions": {
+    "s_50e134dde5413c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9428fa2-2ccc-4d44-9a50-977a9fc02468",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
