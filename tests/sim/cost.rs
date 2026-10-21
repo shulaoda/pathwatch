@@ -532,6 +532,7 @@ fn c_hints_for_names_that_nobody_watches() {
       let mut engine = Engine::new(ByHand { trees, keys: Arc::clone(&keys) }, fs, no_poll());
       let now = Instant::now();
       engine.watch(files, now, &mut Output::default());
+      let deadline = engine.deadline();
 
       // 50 names that nobody watches in each of the 2,000 directories.
       let keys = lock(&keys);
@@ -555,7 +556,7 @@ fn c_hints_for_names_that_nobody_watches() {
       engine.signal(Signal::Raw(Arc::clone(&hints)), now);
       let total = start.elapsed();
       let allocations = allocations() - allocated;
-      assert_eq!(engine.deadline(), Some(now + no_poll().poll_interval), "no hint made work");
+      assert_eq!(engine.deadline(), deadline, "no hint made work");
       [Cost { total, simulation: Duration::ZERO, stopwatches: 0, allocations }]
     });
     cost.show_each(&format!("c. one of 100,000 hints for a name nobody watches ({shape})"), HINTS);
@@ -653,9 +654,18 @@ fn f_one_polling_round_at_20000_paths() {
   poll_rounds("f. one polling round at 20,000 paths (Poll)", |fs| {
     Run::new(fs, PollBackend, fast.clone())
   });
-  // With a backend of the OS the poll looks only at what no watch covers.
+  // With a backend of the OS the poll looks only at what no watch covers, and the timer does not
+  // run when that is nothing.
   for mode in MODES {
     let what = format!("f. one poll at 20,000 paths, next to OS watches ({mode:?})");
+    let fs = SimFs::new();
+    let files = project(&fs);
+    let mut run = Run::sim(fs, mode, Options::default());
+    run.watch(files);
+    if run.engine.deadline().is_none() {
+      say(&format!("{what}: none, no directory is polled"));
+      continue;
+    }
     poll_rounds(&what, |fs| Run::sim(fs, mode, Options::default()));
   }
 }
