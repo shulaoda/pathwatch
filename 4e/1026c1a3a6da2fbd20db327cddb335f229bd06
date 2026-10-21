@@ -1,0 +1,25 @@
+references/design.md
+  s_2189c4100dc1ff::t_ad3222d64ce119 269-272,570-576
+src/engine/os_watch.rs
+  s_2189c4100dc1ff::t_713384dc524cc4 224-225,227-229
+src/tree/mod.rs
+  s_2189c4100dc1ff::t_9e38ffcce36911 123-131,192
+tests/sim/young.rs
+  s_2189c4100dc1ff::t_87a13da3454114 464-511
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4e1026c1a3a6da2fbd20db327cddb335f229bd06",
+  "prompts": {},
+  "sessions": {
+    "s_2189c4100dc1ff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "87b36dfc-092a-47e0-84dd-f8402c1c0b6a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
