@@ -117,6 +117,8 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
   let records = if extended { Records::extended(&bytes) } else { Records::new(&bytes) };
   // The path of a record and its lower-case spelling go into the same room each time.
   let (mut path, mut lower, mut text) = (PathBuf::new(), PathBuf::new(), String::new());
+  // A record with no name is a loss for every key below the handle: once a read is enough.
+  let mut told_lost = false;
   for record in records {
     let Ok(record) = record else {
       hint(Hint::Lost);
@@ -124,7 +126,9 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
     };
     let written = record.action == FILE_ACTION_MODIFIED;
     if record.is_unnamed() {
-      handles.below(&dir).into_iter().for_each(|key| hint(lost(key)));
+      if !mem::replace(&mut told_lost, true) {
+        handles.below(&dir).into_iter().for_each(|key| hint(lost(key)));
+      }
       continue;
     }
     if written && record.is_dir == Some(true) {

@@ -969,8 +969,8 @@ mod ffi {
   };
 
   use super::{
-    ERROR_PATH_NOT_UTF8, ERROR_QUEUE_CREATE, ERROR_SOURCE_CREATE, ERROR_STREAM_CREATE,
-    ERROR_STREAM_START, EXPECTED_PATH_BYTES, Raw,
+    ERROR_QUEUE_CREATE, ERROR_SOURCE_CREATE, ERROR_STREAM_CREATE, ERROR_STREAM_START,
+    EXPECTED_PATH_BYTES, Raw,
   };
   use crate::backend::{Sink, watch_limit};
 
@@ -1186,8 +1186,8 @@ mod ffi {
       sink: &Arc<Sink<Raw>>,
       paths: impl Iterator<Item = &'a PathBuf>,
     ) -> io::Result<Self> {
-      let array = path_array(paths)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, ERROR_PATH_NOT_UTF8))?;
+      // The paths are UTF-8 (`real_path`): only an allocation that failed gives no array.
+      let array = path_array(paths).ok_or_else(|| io::Error::other(ERROR_STREAM_CREATE))?;
       let context = FSEventStreamContext {
         version: 0,
         info: Arc::as_ptr(sink).cast_mut().cast(),

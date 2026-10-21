@@ -21,7 +21,10 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want, give_room_back, watch_limit};
+use crate::{
+  backend::{Backend, Coverage, DirKey, Hint, Sink, Want, give_room_back, watch_limit},
+  fs::nanos,
+};
 
 const ENTRY_EVENTS: u32 =
   libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO;
@@ -229,7 +232,7 @@ impl Backend for InotifyBackend {
   }
 
   fn ask_delivered(&mut self, after: SystemTime) {
-    self.fds.asked.fetch_max(nanos_of(after).max(1), Ordering::Relaxed);
+    self.fds.asked.fetch_max(nanos(after).max(1), Ordering::Relaxed);
     let _ = (&self.fds.ask).write_all(&1_u64.to_ne_bytes());
   }
 }
@@ -251,7 +254,7 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
   let error = loop {
     // A question of the engine wakes the reader at its time.
     let asked = fds.asked.load(Ordering::Relaxed);
-    let until = (asked != 0).then(|| asked.saturating_sub(nanos_of(SystemTime::now())));
+    let until = (asked != 0).then(|| asked.saturating_sub(nanos(SystemTime::now())));
     let ready =
       ffi::wait_until_ready(&fds.inotify, &fds.stop, fds.mounts.as_ref(), &fds.ask, until);
     let mounted = match ready {
@@ -277,7 +280,7 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
       }
     }
     // Its time came: the queue is read empty, and a record says so. A later question stays.
-    if asked != 0 && nanos_of(SystemTime::now()) >= asked {
+    if asked != 0 && nanos(SystemTime::now()) >= asked {
       if let Err(error) = read_empty(&fds.inotify, &mut buffer, sink) {
         break error;
       }
@@ -307,7 +310,7 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
 /// every event of a change before that time is sent (design.md 7.1).
 fn read_empty(inotify: &File, buffer: &mut [u8], sink: &Sink<Vec<u8>>) -> io::Result<()> {
   loop {
-    let began = nanos_of(SystemTime::now());
+    let began = nanos(SystemTime::now());
     match (&*inotify).read(buffer) {
       Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
       Ok(len) => sink.raw(buffer[..len].to_vec()),
@@ -321,12 +324,6 @@ fn read_empty(inotify: &File, buffer: &mut [u8], sink: &Sink<Vec<u8>>) -> io::Re
       Err(error) => return Err(error),
     }
   }
-}
-
-/// Nanoseconds since the epoch. Zero before it.
-fn nanos_of(time: SystemTime) -> u64 {
-  let since = time.duration_since(SystemTime::UNIX_EPOCH);
-  since.map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))
 }
 
 /// The mounts of the namespace, each by its id with its mount point, in order. Mount ids and
