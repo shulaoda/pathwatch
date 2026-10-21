@@ -642,3 +642,28 @@ fn a_burst_of_young_files_gives_its_room_back() {
     caught_up(&mut d);
   }
 }
+
+/// A file that is written again before each look, so that every look finds it young (a log, a
+/// database), keeps one entry in the queue of the files that wait for a delivery. Before, each
+/// look added one that the next delivery passed on to the new time of the file, as many as there
+/// were: the queue grew by one entry a flush for as long as the writes went on.
+#[test]
+fn a_file_that_is_young_at_every_look_keeps_one_place_in_the_queue() {
+  const WRITES: usize = 2_000;
+  for mode in [Mode::Inode, Mode::Handle] {
+    let mut d = Driver::sim(mode, hinted());
+    d.fs.mkdir("/p").unwrap();
+    d.watch(&["/p"]);
+    d.fs.write("/p/log", "0").unwrap();
+    assert_eq!(window(&mut d), ["C /p/log"], "{mode:?}");
+    for write in 1..=WRITES {
+      d.fs.write("/p/log", write.to_string()).unwrap();
+      assert_eq!(window(&mut d), ["U /p/log"], "{mode:?}, write {write}");
+    }
+    let room = d.engine.young_room();
+    assert!(room < 100, "{mode:?}: room for {room} with one young file");
+    d.advance(Duration::from_secs(3));
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    caught_up(&mut d);
+  }
+}

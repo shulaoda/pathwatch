@@ -635,6 +635,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         later.push(Reverse((old_at, key)));
       }
     }
+    // A file that each look found young has an entry from each of them, and all of them come to
+    // its new time: one is enough, or the queue grows by one entry a flush while it is written.
+    later.sort_unstable();
+    later.dedup();
     self.pending.extend(later);
     // Thousands of new files at once must not keep their room for ever.
     if let Some(room) = room_to_keep(self.pending.len(), self.pending.capacity()) {
