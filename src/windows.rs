@@ -185,7 +185,8 @@ mod place {
     }
 
     let shared: Vec<usize> = tops.windows(2).map(|pair| common_parts(pair[0], pair[1])).collect();
-    let mut joined = vec![false; shared.len()];
+    // The tops that share a handle: each top names the first top of its group.
+    let mut group: Vec<usize> = (0..tops.len()).collect();
     let mut count = tops.len();
     let mut depths = shared.clone();
     depths.sort_unstable_by(|a, b| b.cmp(a));
@@ -203,40 +204,33 @@ mod place {
         }
         if shared[at..end].contains(&depth) && may_hold_a_handle(&first_parts(tops[at], depth)) {
           // A directory with a link between the common directory and itself cannot be served
-          // from there, and neither can the ones it was joined with deeper down.
-          let mut blocked: Vec<bool> =
-            tops[at..=end].iter().map(|top| leads_through(top, depth, is_link)).collect();
-          for pair in at..end {
-            if joined[pair] && blocked[pair - at] {
-              blocked[pair - at + 1] = true;
+          // from there; the others join, also across it. The tops of a group have no link
+          // below their common directory, so a link above it holds back all of them.
+          let mut first = None;
+          for top in at..=end {
+            if leads_through(tops[top], depth, is_link) {
+              continue;
             }
-          }
-          for pair in (at..end).rev() {
-            if joined[pair] && blocked[pair - at + 1] {
-              blocked[pair - at] = true;
-            }
-          }
-          for pair in at..end {
-            if !joined[pair] && !blocked[pair - at] && !blocked[pair - at + 1] {
-              joined[pair] = true;
+            let first = *first.get_or_insert(top);
+            if group[top] == top && top != first {
               count -= 1;
             }
+            group[top] = first;
           }
         }
         at = end;
       }
     }
 
+    // A group shares the common directory of its tops: of the first and the last of them.
+    let mut last: Vec<usize> = (0..tops.len()).collect();
+    for (top, &first) in group.iter().enumerate() {
+      last[first] = top;
+    }
     let mut places = Vec::with_capacity(count);
-    let mut first = 0;
-    while first < tops.len() {
-      let pairs = joined[first..].iter().take_while(|&&joined| joined).count();
-      let dir = match shared[first..first + pairs].iter().min() {
-        Some(&parts) => first_parts(tops[first], parts),
-        None => tops[first].to_owned(),
-      };
+    for (first, &top) in tops.iter().enumerate().filter(|&(top, _)| group[top] == top) {
+      let dir = first_parts(top, common_parts(top, tops[last[first]]));
       places.push(Place { dir, keys: Vec::new() });
-      first += pairs + 1;
     }
     // A place can lie below another one: the deepest at or above a directory serves it.
     places.sort_by(|a, b| a.dir.cmp(&b.dir));

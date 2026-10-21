@@ -214,6 +214,23 @@ mod place {
       placed_with_links(&wanted, 2, &["/p/a/b"]),
       [at("/p", &[2, 3]), at("/p/a/b", &[0, 1])]
     );
+    // The others join across a directory behind a link: one handle on `/p`, and no handle of
+    // the others below it.
+    let wanted = [
+      ("/p/a", Contents),
+      ("/p/b", Contents),
+      ("/p/link", Contents),
+      ("/p/y", Contents),
+      ("/p/z", Contents),
+    ];
+    assert_eq!(
+      placed_with_links(&wanted, 3, &["/p/link"]),
+      [at("/p", &[0, 1, 3, 4]), at("/p/link", &[2])]
+    );
+    assert_eq!(
+      placed_with_links(&wanted[1..], 2, &["/p/link"]),
+      [at("/p", &[0, 2, 3]), at("/p/link", &[1])]
+    );
     // Two links next to each other never share.
     let wanted = [
       ("/p/src/1", Contents),

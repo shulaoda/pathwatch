@@ -1651,7 +1651,8 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   `C:\Users` or `C:\Users\<name>`. A handle reports nothing behind a junction or a directory
   link below it, so a directory with a link on the way down from the common directory is not
   joined there (nor is any directory it was joined with deeper down): it keeps a handle of its
-  own, which can stand below the shared one, and the others share without it. A key goes to
+  own, which can stand below the shared one, and the others share without it, also the ones
+  on either side of it in path order. A key goes to
   the deepest handle at or above its directory. The links are found where a key would come to
   lie behind one (`System::is_link`, one look for each name on the way, once per settle), and
   the placement is made again with them known, before a handle moves.
