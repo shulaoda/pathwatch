@@ -142,6 +142,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           return fail("is held, and nothing brings its second look");
         }
       }
+      let frozen = self.tree.frozen(key);
+      let waits = self.mark_waits_above(key);
       match &node.kind {
         // 5. A node with nothing at its path is kept only for a watched path or a mark.
         Kind::Missing => {
@@ -173,6 +175,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           if dir.scan.is_some() && !self.tree.to_scan.contains(&key) {
             return fail("waits for a scan but is not on the list");
           }
+          // A scan that is not deep sets `away` below it only while a lost mark waits above: the
+          // deep scan of that mark takes it.
+          if dir.away && dir.scan.is_none() && !frozen && !waits {
+            return fail("was away, and no scan comes that knows it");
+          }
           if dir.is_polled() && !self.tree.polled.contains(&key) {
             return fail("no OS watch tells about it, and it is not on the list of the timer");
           }
@@ -180,8 +187,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
       // 6. A directory asked for names only holds no registered name without a directory, unless
       // it is frozen or a mark waits above it.
-      let frozen = self.tree.frozen(key);
-      let waits = self.mark_waits_above(key);
       let names_only = self.tree[parent].dir().is_some_and(|dir| dir.asked == Some(Want::Names));
       if names_only && node.is_registered() && !node.is_dir() && !frozen && !waits {
         return fail("is a registered name with no directory at it, and its directory tells names");
