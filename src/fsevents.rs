@@ -1083,8 +1083,15 @@ mod ffi {
     let count = unsafe { kevent(queue, ptr::null(), 0, events.as_mut_ptr(), room, &raw const now) };
     let Ok(count) = usize::try_from(count) else { return };
     if count > 0 {
-      let ids = events[..count].iter().map(|event| event.udata.addr());
-      reader.told.lock().unwrap_or_else(PoisonError::into_inner).extend(ids);
+      // Each id once: a directory renamed away and back again and again while the engine is
+      // busy tells again and again, and the list waits for the engine.
+      let mut told = reader.told.lock().unwrap_or_else(PoisonError::into_inner);
+      for id in events[..count].iter().map(|event| event.udata.addr()) {
+        if !told.contains(&id) {
+          told.push(id);
+        }
+      }
+      drop(told);
       // Only a wake-up: `translate` and `commit` take the ids.
       reader.sink.raw(Raw::default());
     }
