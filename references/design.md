@@ -1600,7 +1600,8 @@ As built:
   is trusted: then a directory on the old path was renamed and the notice of its guard was
   not read yet, or a link leads somewhere else. Without this, a key that
   asks for more in that moment would take the new path with a scan of its own directory
-  only. (A key below a stream path that is trusted no more was reported with it.)
+  only. (A key below a stream path that is trusted no more was reported with it.) Its old
+  cover goes as by `unwatch`: a stream that was to start for it alone does not.
 - **Covers below a renamed directory.** A record for a renamed directory inside a stream, or
   for a volume that came or went there (`a_volume_mounted_inside_a_stream`), is also a loss
   report for every cover below the path of the record. The engine finds such a

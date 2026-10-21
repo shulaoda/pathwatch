@@ -47,7 +47,6 @@ pub mod flag {
   pub const MUST_SCAN_SUB_DIRS: u32 = 0x1;
   pub const USER_DROPPED: u32 = 0x2;
   pub const KERNEL_DROPPED: u32 = 0x4;
-  pub const HISTORY_DONE: u32 = 0x10;
   pub const MOUNT: u32 = 0x40;
   pub const UNMOUNT: u32 = 0x80;
   pub const CREATED: u32 = 0x100;
@@ -99,6 +98,16 @@ impl Backend for FsEventsBackend {
         return Coverage::Failed(error);
       }
     };
+    if let Some(old) = self.covers.dir_of.get(&key)
+      && *old != real
+    {
+      // The key was at another real path, and nothing else said so. A stream that was to start
+      // for it there is not needed.
+      if self.streams.paths.holds(old) {
+        self.streams.sink.raw(Raw { lost: vec![key], ..Raw::default() });
+      }
+      self.unwatch(key);
+    }
     let has_stream = self.streams.paths.holds(&real) || self.streams.pending.holds(&real);
     if !has_stream {
       // A directory on the way: names come and go in it only when one of them is renamed or
@@ -116,10 +125,6 @@ impl Backend for FsEventsBackend {
         return Coverage::NotWatched;
       }
       self.streams.pending.insert(real.clone(), ());
-    }
-    let old = self.covers.dir_of.get(&key);
-    if old.is_some_and(|old| *old != real && self.streams.paths.holds(old)) {
-      self.streams.sink.raw(Raw { lost: vec![key], ..Raw::default() });
     }
     if self.named.remove(&key).is_some() {
       self.streams.guard_is_stale = true;
@@ -199,9 +204,6 @@ impl Backend for FsEventsBackend {
     let mut lost_places = Vec::new();
     let mut moved_dirs = Vec::new();
     for (path, flags) in raw.records() {
-      if flags & flag::HISTORY_DONE != 0 {
-        continue;
-      }
       if flags & flag::RECORDS_LOST != 0 {
         let names_a_place = flags & flag::MUST_SCAN_SUB_DIRS != 0 && path != Path::new("/");
         if names_a_place {
@@ -274,7 +276,7 @@ impl FsEventsBackend {
     }
     let is_below = |dir: &Path| moved.iter().any(|moved| dir.starts_with(moved));
     let named = self.named.iter().filter(|(_, dir)| is_below(dir)).map(|(&key, _)| key);
-    named.chain(self.covers.keys_around(&moved)).collect()
+    named.chain(self.covers.keys_at_or_below(&moved)).collect()
   }
 }
 
@@ -364,6 +366,15 @@ impl Covers {
     }
     self.by_dir.remove(&dir);
     Some(dir)
+  }
+
+  /// The keys of the covers at and below a directory of `dirs`.
+  fn keys_at_or_below<'a>(
+    &'a self,
+    dirs: &'a [impl AsRef<Path>],
+  ) -> impl Iterator<Item = DirKey> + 'a {
+    let at = dirs.iter().filter_map(|dir| self.by_dir.get(dir.as_ref()));
+    at.chain(self.by_dir.below(dirs).map(|(_, keys)| keys)).flatten().copied()
   }
 
   /// The keys of the covers that hold a directory of `dirs`, and of the covers below one: every
@@ -545,7 +556,6 @@ impl Streams {
     let at = dirs.iter().filter(|dir| self.paths.contains(dir)).map(PathBuf::as_path);
     let below = self.paths.below(dirs).map(|(path, ())| path);
     let moved: Vec<PathBuf> = at.chain(below).map(Path::to_owned).collect();
-    self.guard_is_stale |= !moved.is_empty();
     for path in moved {
       self.paths.remove(&path);
     }
@@ -608,9 +618,7 @@ impl Streams {
   /// own: trusted stream paths never lie one below another.
   fn stop(&self, stopped: Vec<Running>, covers: &Covers) {
     let paths = top_most(stopped.iter().flat_map(|old| old.paths.clone()).collect());
-    let at = paths.iter().filter_map(|path| covers.by_dir.get(path));
-    let below = covers.by_dir.below(&paths).map(|(_, keys)| keys);
-    let lost = at.chain(below).flatten().copied().collect();
+    let lost = covers.keys_at_or_below(&paths).collect();
     let sink = Arc::clone(&self.sink);
     self.queue.run(move || {
       drop(stopped);

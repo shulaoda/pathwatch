@@ -843,6 +843,26 @@ fn key_follows_its_path_to_another_directory() {
   assert!(!rels(&hints, key).contains("stale"));
 }
 
+/// The stream that was to start at its old path is not started.
+#[test]
+fn a_cover_that_moves_before_the_commit_takes_its_pending_stream_along() {
+  let mut h = Harness::new();
+  fs::create_dir(h.path("one")).unwrap();
+  fs::create_dir(h.path("two")).unwrap();
+  symlink(h.path("one"), h.path("link")).unwrap();
+  let key = h.watch(1, &h.path("link"), Want::Contents);
+  assert_eq!(h.backend.pending(), [h.real("one")]);
+
+  fs::remove_file(h.path("link")).unwrap();
+  symlink(h.path("two"), h.path("link")).unwrap();
+  h.watch(1, &h.path("link"), Want::Contents);
+  assert_eq!(h.backend.pending(), [h.real("two")]);
+  h.commit();
+  assert_eq!(h.backend.streamed(), [h.real("two")]);
+  File::create(h.path("two/file")).unwrap();
+  h.hints_until(&[changed(key, "file")]);
+}
+
 /// Only where the short path is the same directory and a real path of its own.
 #[test]
 fn the_short_way_out_of_the_data_volume() {
@@ -1433,7 +1453,6 @@ fn flags_decide_only_about_directories() {
     assert_eq!(h.translate(raw(&[(&h.real("name"), flags | flag::IS_DIR)])), [], "{flags:#x}");
     assert_eq!(h.translate(raw(&[(&h.real(""), flags | flag::IS_DIR)])), [], "{flags:#x}");
   }
-  assert_eq!(h.translate(raw(&[(&h.real(""), flag::HISTORY_DONE)])), []);
 
   // One callback call, several records.
   let hints = h.translate(raw(&[
