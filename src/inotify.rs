@@ -11,9 +11,12 @@ use std::{
     unix::ffi::OsStrExt,
   },
   path::Path,
-  sync::Arc,
+  sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+  },
   thread::{self, JoinHandle},
-  time::{Duration, Instant},
+  time::{Duration, Instant, SystemTime},
 };
 
 use rustc_hash::FxHashMap;
@@ -34,6 +37,9 @@ const MOUNTS: &str = "/proc/self/mountinfo";
 /// The record of a mount point that the reader makes: no watch has this number, and an
 /// overflow has -1.
 const MOUNT_WD: i32 = -2;
+/// The record the reader makes once it read the queue empty: every event of a change before the
+/// time in its name (nanoseconds since the epoch, in digits) came before it.
+const DELIVERED_WD: i32 = -3;
 
 const ERROR_WATCH_LIMIT: &str =
   "inotify has no watch left for this user (raise fs.inotify.max_user_watches)";
@@ -66,6 +72,11 @@ struct Fds {
   stop: File,
   /// `MOUNTS`, where it can be opened.
   mounts: Option<File>,
+  /// Wakes the reader for a question of the engine.
+  ask: File,
+  /// The time the engine asked about (`Backend::ask_delivered`), in nanoseconds since the epoch.
+  /// Zero: none.
+  asked: AtomicU64,
 }
 
 impl InotifyBackend {
@@ -75,9 +86,10 @@ impl InotifyBackend {
       _ => error,
     };
     let (inotify, stop) = (ffi::inotify().map_err(no_room)?, ffi::eventfd().map_err(no_room)?);
+    let ask = ffi::eventfd().map_err(no_room)?;
     let mounts = File::open(MOUNTS).ok();
     let known = mounts.as_ref().and_then(read_mounts).unwrap_or_default();
-    let fds = Arc::new(Fds { inotify, stop, mounts });
+    let fds = Arc::new(Fds { inotify, stop, mounts, ask, asked: AtomicU64::new(0) });
     let reader = thread::Builder::new().name("pathwatch-inotify".to_owned()).spawn({
       let fds = Arc::clone(&fds);
       move || forward(&fds, known, &sink)
@@ -168,6 +180,13 @@ impl Backend for InotifyBackend {
     let mut rest = raw.as_slice();
     while let Some((event, tail)) = split_event(rest) {
       rest = tail;
+      if event.wd == DELIVERED_WD {
+        let nanos = str::from_utf8(event.name).ok().and_then(|digits| digits.parse().ok());
+        if let Some(nanos) = nanos {
+          hint(Hint::Delivered { before: SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos) });
+        }
+        continue;
+      }
       if event.wd == MOUNT_WD {
         hint(Hint::Mount { path: Path::new(OsStr::from_bytes(event.name)) });
         continue;
@@ -210,6 +229,11 @@ impl Backend for InotifyBackend {
   fn raw_bytes(raw: &Self::Raw) -> usize {
     raw.len()
   }
+
+  fn ask_delivered(&mut self, after: SystemTime) {
+    self.fds.asked.fetch_max(nanos_of(after).max(1), Ordering::Relaxed);
+    let _ = (&self.fds.ask).write_all(&1_u64.to_ne_bytes());
+  }
 }
 
 impl Drop for InotifyBackend {
@@ -227,12 +251,30 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
   let mut buffer = vec![0; READ_BUFFER_LEN];
   let mut next_read = Instant::now();
   let error = loop {
-    let mounted = match ffi::wait_until_ready(&fds.inotify, &fds.stop, fds.mounts.as_ref()) {
-      Ok([_, true, _]) => return,
-      Ok([_, _, mounted]) => mounted,
+    // A question of the engine wakes the reader at its time.
+    let asked = fds.asked.load(Ordering::Relaxed);
+    let until = (asked != 0).then(|| asked.saturating_sub(nanos_of(SystemTime::now())));
+    let ready =
+      ffi::wait_until_ready(&fds.inotify, &fds.stop, fds.mounts.as_ref(), &fds.ask, until);
+    let mounted = match ready {
+      Ok([_, true, _, _]) => return,
+      Ok([_, _, mounted, asks]) => {
+        if asks {
+          let _ = (&fds.ask).read(&mut [0; 8]);
+        }
+        mounted
+      }
       Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
       Err(error) => break error,
     };
+    // Its time came: the queue is read empty, and a record says so. A later question stays.
+    if asked != 0 && nanos_of(SystemTime::now()) >= asked {
+      if let Err(error) = read_empty(&fds.inotify, &mut buffer, sink) {
+        break error;
+      }
+      let _ = fds.asked.compare_exchange(asked, 0, Ordering::Relaxed, Ordering::Relaxed);
+      continue;
+    }
     // inotify says nothing of a volume that is mounted over a watched directory or one above:
     // the mount points that came or went are told by their paths.
     if mounted && let Some(mounts) = fds.mounts.as_ref().and_then(read_mounts) {
@@ -259,6 +301,33 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
     }
   };
   sink.failed(error);
+}
+
+/// Reads until the queue is empty, then sends a record with the time the last read began: the
+/// kernel queues an event before the call that made the change returns, the loss report too, so
+/// every event of a change before that time is sent (design.md 7.1).
+fn read_empty(inotify: &File, buffer: &mut [u8], sink: &Sink<Vec<u8>>) -> io::Result<()> {
+  loop {
+    let began = nanos_of(SystemTime::now());
+    match (&*inotify).read(buffer) {
+      Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+      Ok(len) => sink.raw(buffer[..len].to_vec()),
+      Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+        let mut raw = Vec::new();
+        push_record(&mut raw, DELIVERED_WD, began.to_string().as_bytes());
+        sink.raw(raw);
+        return Ok(());
+      }
+      Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+      Err(error) => return Err(error),
+    }
+  }
+}
+
+/// Nanoseconds since the epoch. Zero before it.
+fn nanos_of(time: SystemTime) -> u64 {
+  let since = time.duration_since(SystemTime::UNIX_EPOCH);
+  since.map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))
 }
 
 /// The mounts of the namespace, each by its id with its mount point, in order. Mount ids and
@@ -310,14 +379,20 @@ fn mount_records(old: &[(u64, Vec<u8>)], new: &[(u64, Vec<u8>)]) -> Vec<u8> {
   points.dedup();
   let mut raw = Vec::new();
   for point in points {
-    let name_len = u32::try_from(point.len() + 1).unwrap_or(u32::MAX);
-    for field in [MOUNT_WD.to_ne_bytes(), [0; 4], [0; 4], name_len.to_ne_bytes()] {
-      raw.extend_from_slice(&field);
-    }
-    raw.extend_from_slice(point);
-    raw.push(0);
+    push_record(&mut raw, MOUNT_WD, point);
   }
   raw
+}
+
+/// A record of the reader, laid out as the kernel lays out an event: a number that no watch has,
+/// and a name.
+fn push_record(raw: &mut Vec<u8>, wd: i32, name: &[u8]) {
+  let name_len = u32::try_from(name.len() + 1).unwrap_or(u32::MAX);
+  for field in [wd.to_ne_bytes(), [0; 4], [0; 4], name_len.to_ne_bytes()] {
+    raw.extend_from_slice(&field);
+  }
+  raw.extend_from_slice(name);
+  raw.push(0);
 }
 
 struct Event<'a> {
@@ -375,13 +450,16 @@ mod ffi {
     unsafe { libc::inotify_rm_watch(inotify.as_raw_fd(), wd) };
   }
 
-  /// Whether `inotify` and `stop` are readable, and whether the mounts changed. A file of the
-  /// mounts always reads, and tells of a change by a priority event.
+  /// Whether `inotify` and `stop` are readable, whether the mounts changed, and whether `ask`
+  /// is readable. A file of the mounts always reads, and tells of a change by a priority event.
+  /// `nanos`: the longest wait (rounded up to a millisecond); `None` waits until one is ready.
   pub(super) fn wait_until_ready(
     inotify: &File,
     stop: &File,
     mounts: Option<&File>,
-  ) -> io::Result<[bool; 3]> {
+    ask: &File,
+    nanos: Option<u64>,
+  ) -> io::Result<[bool; 4]> {
     let wait = |fd: i32, events: i16| libc::pollfd { fd, events, revents: 0 };
     // A negative descriptor is left out.
     let mounts = mounts.map_or(-1, AsRawFd::as_raw_fd);
@@ -389,9 +467,12 @@ mod ffi {
       wait(inotify.as_raw_fd(), libc::POLLIN),
       wait(stop.as_raw_fd(), libc::POLLIN),
       wait(mounts, libc::POLLPRI),
+      wait(ask.as_raw_fd(), libc::POLLIN),
     ];
-    // SAFETY: `polled` holds three `pollfd`, and the call writes into these three only.
-    if unsafe { libc::poll(polled.as_mut_ptr(), 3, -1) } < 0 {
+    let millis = nanos.map(|nanos| nanos.div_ceil(1_000_000));
+    let timeout = millis.map_or(-1, |millis| i32::try_from(millis).unwrap_or(i32::MAX));
+    // SAFETY: `polled` holds four `pollfd`, and the call writes into these four only.
+    if unsafe { libc::poll(polled.as_mut_ptr(), 4, timeout) } < 0 {
       return Err(io::Error::last_os_error());
     }
     Ok(polled.map(|file| file.revents != 0))
@@ -411,10 +492,13 @@ mod tests {
   use std::{
     fs::File,
     os::{fd::OwnedFd, unix::net::UnixStream},
-    sync::mpsc::{self, TryRecvError},
+    sync::{
+      atomic::AtomicU64,
+      mpsc::{self, TryRecvError},
+    },
   };
 
-  use super::{Fds, forward};
+  use super::{Fds, ffi, forward};
   use crate::backend::{Signal, Sink};
 
   #[test]
@@ -422,7 +506,8 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let (stop, _peer) = UnixStream::pair().unwrap();
     let inotify = File::open(dir.path()).unwrap();
-    let fds = Fds { inotify, stop: File::from(OwnedFd::from(stop)), mounts: None };
+    let (stop, ask) = (File::from(OwnedFd::from(stop)), ffi::eventfd().unwrap());
+    let fds = Fds { inotify, stop, mounts: None, ask, asked: AtomicU64::new(0) };
     let (sender, signals) = mpsc::channel();
     let sink = Sink::new(move |signal| {
       let _ = sender.send(signal);

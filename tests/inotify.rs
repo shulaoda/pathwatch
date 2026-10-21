@@ -12,9 +12,13 @@ use std::{
   },
   path::{Path, PathBuf},
   process::Command,
-  sync::mpsc::{self, Receiver, TryRecvError},
+  sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicUsize, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
+  },
   thread,
-  time::{Duration, Instant},
+  time::{Duration, Instant, SystemTime},
 };
 
 use pathwatch::{
@@ -32,6 +36,7 @@ enum Seen {
   Written(DirKey, PathBuf),
   Lost,
   Mount(PathBuf),
+  Delivered(SystemTime),
 }
 
 /// `""` is the directory of `dir` itself.
@@ -66,9 +71,52 @@ fn event(wd: i32, mask: u32, name: &str) -> Vec<u8> {
   raw
 }
 
+/// While it is shut, the reader of the backend stops inside the sink.
+#[derive(Default)]
+struct Gate {
+  shut: Mutex<bool>,
+  moved: Condvar,
+  /// How many sends stop at the gate now.
+  waiting: AtomicUsize,
+}
+
+/// Opens the gate again when dropped, also when the test fails: a shut gate blocks the drop.
+struct Shut<'a>(&'a Gate);
+
+impl Gate {
+  fn shut(&self) -> Shut<'_> {
+    *self.shut.lock().unwrap() = true;
+    Shut(self)
+  }
+
+  fn pass(&self) {
+    let shut = self.shut.lock().unwrap();
+    self.waiting.fetch_add(1, Ordering::SeqCst);
+    drop(self.moved.wait_while(shut, |shut| *shut).unwrap());
+    self.waiting.fetch_sub(1, Ordering::SeqCst);
+  }
+
+  /// Returns once a send stops at the shut gate.
+  fn until_one_waits(&self) {
+    let deadline = Instant::now() + TIMEOUT;
+    while self.waiting.load(Ordering::SeqCst) == 0 {
+      assert!(Instant::now() < deadline, "nothing came to the gate");
+      thread::sleep(Duration::from_millis(1));
+    }
+  }
+}
+
+impl Drop for Shut<'_> {
+  fn drop(&mut self) {
+    *self.0.shut.lock().unwrap() = false;
+    self.0.moved.notify_all();
+  }
+}
+
 struct Harness {
   backend: InotifyBackend,
   signals: Receiver<Signal<Vec<u8>>>,
+  gate: Arc<Gate>,
   dir: TempDir,
   /// Watched by the harness itself, for `hints`.
   sentinel_dir: TempDir,
@@ -79,8 +127,13 @@ struct Harness {
 impl Harness {
   fn new() -> Self {
     let (sender, signals) = mpsc::channel();
-    let sink = Sink::new(move |signal| {
-      let _ = sender.send(signal);
+    let gate = Arc::new(Gate::default());
+    let sink = Sink::new({
+      let gate = Arc::clone(&gate);
+      move |signal| {
+        gate.pass();
+        let _ = sender.send(signal);
+      }
     });
     let mut backend = InotifyBackend::new(sink).unwrap();
     let sentinel_dir = tempfile::tempdir().unwrap();
@@ -90,7 +143,7 @@ impl Harness {
       Coverage::Watched
     ));
     let dir = tempfile::tempdir().unwrap();
-    Self { backend, signals, dir, sentinel_dir, sentinel_key, sentinels: 0 }
+    Self { backend, signals, gate, dir, sentinel_dir, sentinel_key, sentinels: 0 }
   }
 
   /// `""` is the playground itself.
@@ -149,6 +202,7 @@ impl Harness {
         Hint::Written { dir, rel, .. } => Seen::Written(dir, rel.to_owned()),
         Hint::Lost => Seen::Lost,
         Hint::Mount { path } => Seen::Mount(path.to_owned()),
+        Hint::Delivered { before } => Seen::Delivered(before),
       });
     });
     seen
@@ -167,6 +221,26 @@ impl Harness {
       }
     }
     seen
+  }
+
+  /// Receives and translates until the answer to `ask_delivered` shows up. Gives the hints in
+  /// front of it, and its time.
+  fn until_delivered(&mut self) -> (Vec<Seen>, SystemTime) {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut seen = Vec::new();
+    loop {
+      if let Some(at) = seen.iter().position(|hint| matches!(hint, Seen::Delivered(_))) {
+        let Seen::Delivered(before) = seen[at] else { unreachable!("found above") };
+        seen.truncate(at);
+        return (seen, before);
+      }
+      let left = deadline.saturating_duration_since(Instant::now());
+      match self.signals.recv_timeout(left) {
+        Ok(Signal::Raw(raw)) => seen.extend(self.translate(raw)),
+        Ok(Signal::Failed(error)) => panic!("the backend failed: {error}"),
+        Err(error) => panic!("no answer ({error}), only {seen:?}"),
+      }
+    }
   }
 
   /// Every hint for what the test did up to now, in order. inotify queues an event before the
@@ -223,6 +297,41 @@ fn watch_does_not_reach_below_its_directory() {
 
   fs::write(h.path("a"), "1").unwrap();
   assert_eq!(set(h.hints()), written_and_closed(key, "a"));
+}
+
+/// Asked about a time, the reader reads the queue empty then, and sends a record of it after
+/// every event it read: the events of every change before that time are in front of the answer
+/// (design.md 7.1), also the ones still in the queue of the kernel when the question came. A
+/// question about a time to come waits for it.
+#[test]
+fn a_delivery_comes_after_the_events_of_every_change_before_its_time() {
+  let mut h = Harness::new();
+  let key = h.watch(1, "", Want::Contents);
+  // The reader stops in the sink with the event of the first file: the others wait in the queue
+  // of the kernel when the question comes.
+  let gate = Arc::clone(&h.gate);
+  let shut = gate.shut();
+  fs::write(h.path("first"), "1").unwrap();
+  gate.until_one_waits();
+  for n in 0..200 {
+    fs::write(h.path(&format!("f{n}")), "1").unwrap();
+  }
+  let asked = SystemTime::now();
+  h.backend.ask_delivered(asked);
+  drop(shut);
+  let (seen, before) = h.until_delivered();
+  for n in 0..200 {
+    assert!(seen.contains(&written(key, &format!("f{n}"))), "f{n} came after the answer");
+  }
+  assert!(before >= asked);
+
+  let asked = SystemTime::now() + Duration::from_millis(100);
+  h.backend.ask_delivered(asked);
+  thread::sleep(Duration::from_millis(30));
+  fs::write(h.path("late"), "1").unwrap();
+  let (seen, before) = h.until_delivered();
+  assert!(seen.contains(&written(key, "late")), "{seen:?}");
+  assert!(before >= asked);
 }
 
 #[test]

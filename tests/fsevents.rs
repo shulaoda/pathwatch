@@ -251,6 +251,7 @@ impl Harness {
         Hint::Written { .. } => panic!("FSEvents flags cannot prove a write"),
         Hint::Lost => Seen::Lost,
         Hint::Mount { .. } => panic!("only inotify tells of a mount by its path"),
+        Hint::Delivered { .. } => panic!("FSEvents is never asked for a delivery"),
       });
     });
     seen

@@ -1,7 +1,7 @@
 //! The `Backend` trait: what the engine asks of an OS watch API. The rules for a backend are in
 //! `references/design.md`, section 6.
 
-use std::{error, fmt, io, path::Path, sync::Arc};
+use std::{error, fmt, io, path::Path, sync::Arc, time::SystemTime};
 
 /// An OS watch API as the engine sees it. Every method runs on the watcher thread.
 pub trait Backend: Send + 'static {
@@ -24,6 +24,12 @@ pub trait Backend: Send + 'static {
 
   /// Turns a raw notification into hints: one call of `hint` for each.
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>));
+
+  /// Asks for a [`Hint::Delivered`] with a time at or after `after`: the thread of the backend
+  /// reads the queue of the OS empty then, and sends it after what it read. A later question
+  /// takes the place of one that is not answered yet. The default never answers, and a young
+  /// file that was not read stays `Pending` until a look reports it (design.md 5.8).
+  fn ask_delivered(&mut self, _after: SystemTime) {}
 
   /// How many bytes `raw` counts for in the queue of the watcher.
   fn raw_bytes(_raw: &Self::Raw) -> usize {
@@ -102,6 +108,9 @@ pub enum Hint<'a> {
   /// A volume was mounted or unmounted at `path`, a real path: another directory may stand
   /// there now. The backend knows no key for it.
   Mount { path: &'a Path },
+  /// Every notification of a change made before `before`, by the clock of the system, came
+  /// before this hint: the answer to [`Backend::ask_delivered`].
+  Delivered { before: SystemTime },
 }
 
 /// The way from a thread of the backend into the engine. It never blocks.

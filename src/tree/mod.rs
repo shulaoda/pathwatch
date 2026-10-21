@@ -852,6 +852,8 @@ impl Tree {
         let Some((top, rest)) = split_top(path) else { return false };
         self.child(Self::ROOT, top).is_some_and(|top| self.mark_below(top, rest, Said::Changed))
       }
+      // No work for the tree: the engine takes it before.
+      Hint::Delivered { .. } => false,
     }
   }
 

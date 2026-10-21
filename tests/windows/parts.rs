@@ -1166,6 +1166,7 @@ mod translate {
         Hint::Written { dir, rel, .. } => Seen::Written(index(dir), rel.to_owned()),
         Hint::Lost => Seen::Lost,
         Hint::Mount { .. } => panic!("only inotify tells of a mount by its path"),
+        Hint::Delivered { .. } => panic!("no test of the parts asks for a delivery"),
       });
     });
     seen

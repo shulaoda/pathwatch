@@ -1130,6 +1130,7 @@ type has its own `new(sink: Sink<Self::Raw>)`.
 | `unwatch(key)` | Forget `key`. No hint should carry it after this; a late one costs the engine one check. |
 | `commit()` | Make every watch asked for since the last call live. It returns two lists of keys (`Committed`). The keys whose watch could not be made live, each with the reason: the engine reports it, polls the directory, and asks again later; a key that is not named is live. And the keys that got `NotWatched` and whose directories an OS watch reports now: the engine calls `watch` again for each of them, with the `Want` of before, and does not poll one that is reported (5.10, "Asked again"). Only a backend that puts one OS watch over many directories has work here, as its answer for a directory depends on the OS watches of other directories: FSEvents names the keys that got no stream or no guard, and the Windows backend the keys that a handle reports now. Every other backend leaves the method out: then it does nothing and returns no key. |
 | `translate(raw, hint)` | Turn one raw notification into hints. |
+| `ask_delivered(after)` | Answer with `Hint::Delivered` once every notification of a change before a time at or after `after` came (rule 13). A backend that leaves it out never answers. |
 | `raw_bytes(raw)` | How many bytes `raw` keeps on the heap (5.13). A backend that leaves it out says 0. |
 
 **The types.**
@@ -1156,6 +1157,8 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   - `Lost`: notifications were lost, and the backend cannot say where. Check everything.
   - `Mount { path }`: a volume was mounted or unmounted at the real path `path`, and the backend
     knows no key for it (inotify, 7.1). The engine checks the node at that path, if it has one.
+  - `Delivered { before }`: every notification of a change made before `before`, by the clock
+    of the system, came before this hint: the answer to `ask_delivered`.
 - `Sink` is the way from a backend thread into the engine. It never blocks. It hands over a
   `Signal`: `raw` a raw notification, for `translate` on the watcher thread, and `failed` the
   word that the backend cannot go on. From then on the engine polls everything, and it drops
@@ -1202,6 +1205,12 @@ type has its own `new(sink: Sink<Self::Raw>)`.
     `rel` or the `rel` of a place below; the watch stands. No place, or unreadable data: `Lost`.
 12. **The end.** A backend that cannot go on calls `Sink::failed` once. Dropping the backend
     stops and joins its threads, and the sink is not called after that.
+13. **A delivery.** Asked about a time (`ask_delivered`), the backend thread reads the queue of
+    the OS empty once that time came, and sends `Delivered` with the time the last read began,
+    behind everything it read. So every notification of a change before that time is in front
+    of it, and so is the loss report of one: this holds only for an OS that puts a
+    notification, and a loss report, into its queue before the call that made the change
+    returns (7.1). A later question takes the place of one that is not answered yet.
 
 ## 7. Backends
 
@@ -1247,6 +1256,15 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   identity (`a_mount_over_a_watched_directory_is_told`,
   `a_volume_mounted_over_a_watched_directory`). The path is real, so a mount that a watched path
   reaches through a link is not found this way. (macOS tells it in its own way, 7.2.)
+- **A delivery** (rule 13, `read_empty`). The reader also waits on an eventfd for a question of
+  the engine, and on the time it names. Then it reads the queue empty, past `READ_INTERVAL`,
+  and sends a record of its own behind what it read (`wd` -3, the time the last read began in
+  digits as its name) → `Hint::Delivered`. The kernel queues an event in the call that made the
+  change, before it returns (`fsnotify` from `vfs_write`, and from `__fput` for the close), and
+  a full queue gets one overflow event at its end (`fsnotify_insert_event`): measured on Linux
+  6.6, ext4 and tmpfs, 40,000 writes from the same and from another thread, the event of each
+  was in the queue when the write returned, and the overflow event came after the 16,384
+  events that the queue held (2026-10-22). A read of the empty queue costs 0.2 µs.
 - `ENOSPC` → `Failed` with the watch limit error. Every other error → `Failed` with that error.
   `EMFILE` and `ENFILE` when the backend starts are the limit of inotify instances
   (`fs.inotify.max_user_instances`) or of open files: the watch limit error too.
