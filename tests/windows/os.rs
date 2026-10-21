@@ -13,7 +13,7 @@ use std::{
     mpsc,
   },
   thread,
-  time::{Duration, Instant},
+  time::{Duration, Instant, SystemTime},
 };
 
 use pathwatch::{
@@ -29,13 +29,14 @@ enum Seen {
   Changed { key: DirKey, rel: PathBuf },
   Written { key: DirKey, rel: PathBuf },
   Lost,
+  Delivered(SystemTime),
 }
 
 impl Seen {
   fn key(&self) -> Option<DirKey> {
     match self {
       Self::Changed { key, .. } | Self::Written { key, .. } => Some(*key),
-      Self::Lost => None,
+      Self::Lost | Self::Delivered(_) => None,
     }
   }
 
@@ -59,6 +60,8 @@ impl Seen {
 struct Gate {
   shut: Mutex<bool>,
   moved: Condvar,
+  /// How many sends stop at the gate now.
+  waiting: AtomicUsize,
 }
 
 /// Opens the gate again when dropped, also when the test fails: a shut gate blocks the drop.
@@ -71,7 +74,19 @@ impl Gate {
   }
 
   fn pass(&self) {
-    drop(self.moved.wait_while(self.shut.lock().unwrap(), |shut| *shut).unwrap());
+    let shut = self.shut.lock().unwrap();
+    self.waiting.fetch_add(1, Ordering::SeqCst);
+    drop(self.moved.wait_while(shut, |shut| *shut).unwrap());
+    self.waiting.fetch_sub(1, Ordering::SeqCst);
+  }
+
+  /// Returns once a send stops at the shut gate.
+  fn until_one_waits(&self) {
+    let deadline = Instant::now() + TIMEOUT;
+    while self.waiting.load(Ordering::SeqCst) == 0 {
+      assert!(Instant::now() < deadline, "nothing came to the gate");
+      thread::sleep(Duration::from_millis(1));
+    }
   }
 }
 
@@ -160,7 +175,7 @@ impl Harness {
         Hint::Written { dir, rel, .. } => Seen::Written { key: dir, rel: rel.to_owned() },
         Hint::Lost => Seen::Lost,
         Hint::Mount { .. } => panic!("only inotify tells of a mount by its path"),
-        Hint::Delivered { .. } => panic!("no test asks for a delivery"),
+        Hint::Delivered { before } => Seen::Delivered(before),
       });
     });
     seen
@@ -251,6 +266,48 @@ fn a_flood_of_records_comes_in_batches() {
   let (reads, records) = (harness.reads, seen.len());
   // Without the rest the reads are as many as the records (measured: one record a read).
   assert!(reads * 2 <= records, "{reads} reads for {records} records");
+}
+
+/// Asked about a time, the worker reads every handle until nothing is left, the resting ones
+/// too, and then says so: the records of every change before that time are in front of the
+/// answer (design.md 7.3), also the ones the kernel still keeps when the question comes. A
+/// question about a time to come waits for it.
+#[test]
+fn a_delivery_comes_after_the_records_of_every_change_before_its_time() {
+  let temp = scratch();
+  let dirs = [make_dir(temp.path().join("a")), make_dir(temp.path().join("b"))];
+  let gate = Arc::new(Gate::default());
+  let mut harness = Harness::behind(&gate);
+  let keys = dirs.each_ref().map(|dir| harness.handle(dir));
+  let delivered = |hint: &Seen| matches!(hint, Seen::Delivered(_));
+
+  // The worker stops in the sink with the record of the first file: the others wait in the
+  // kernel, or in the port, when the question comes.
+  let shut = gate.shut();
+  fs::write(dirs[0].join("first.txt"), "1").unwrap();
+  gate.until_one_waits();
+  for n in 0..200 {
+    for dir in &dirs {
+      fs::write(dir.join(format!("f{n}.txt")), "1").unwrap();
+    }
+  }
+  let asked = SystemTime::now();
+  harness.backend.ask_delivered(asked);
+  drop(shut);
+  let seen = harness.hints_until(delivered);
+  for (key, n) in keys.iter().flat_map(|&key| (0..200).map(move |n| (key, n))) {
+    let name = format!("f{n}.txt");
+    assert!(seen.iter().any(|hint| hint.names(key, &name)), "{name} came after the answer");
+  }
+  assert!(matches!(seen.last(), Some(&Seen::Delivered(before)) if before >= asked));
+
+  let asked = SystemTime::now() + Duration::from_millis(100);
+  harness.backend.ask_delivered(asked);
+  thread::sleep(Duration::from_millis(30));
+  fs::write(dirs[1].join("late.txt"), "1").unwrap();
+  let seen = harness.hints_until(delivered);
+  assert!(seen.iter().any(|hint| hint.names(keys[1], "late.txt")), "{seen:?}");
+  assert!(matches!(seen.last(), Some(&Seen::Delivered(before)) if before >= asked));
 }
 
 #[test]
@@ -765,7 +822,7 @@ fn directories_above_the_limit_and_a_junction_come_to_rest() {
   }
   let is_a_loss_report = |hint: &Seen| match hint {
     Seen::Changed { rel, .. } => rel.as_os_str().is_empty(),
-    Seen::Written { .. } => false,
+    Seen::Written { .. } | Seen::Delivered(_) => false,
     Seen::Lost => true,
   };
   assert!(!seen.iter().any(is_a_loss_report), "{seen:?}");

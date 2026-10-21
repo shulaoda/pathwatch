@@ -1210,7 +1210,7 @@ type has its own `new(sink: Sink<Self::Raw>)`.
     behind everything it read. So every notification of a change before that time is in front
     of it, and so is the loss report of one: this holds only for an OS that puts a
     notification, and a loss report, into its queue before the call that made the change
-    returns (7.1). A later question takes the place of one that is not answered yet.
+    returns (7.1, 7.3). A later question takes the place of one that is not answered yet.
 
 ## 7. Backends
 
@@ -1680,6 +1680,19 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   handle is not delayed, as the read that waits for it comes back at once; a read that came
   back fuller is queued again at once, as the flood is heavy; a save of 20,000 records a
   second fills 2 KiB of the kernel's 64 KiB in the rest.
+- **A delivery** (rule 13, `read_empty`). Once the time of a question came, the worker queues
+  a read on every resting handle, takes packets until the port is empty (no handle rests
+  meanwhile), and sends `Raw::Delivered` with the time the last look at the port began →
+  `Hint::Delivered`. A queued read completes as soon as one record is in it, in the call that
+  made the change (`FsRtlNotifyFullReportChange` completes the pending requests, and on a
+  handle bound to a port the packet goes straight into the port), and a handle with no read
+  queued keeps its records for the next one: measured on Windows 11, NTFS, 60,000 writes from
+  the same thread, from another thread and with no read queued, the record of each was in
+  the port, or came with the next read, when the write returned (2026-10-22). The worker waits
+  for the time on the port and not by a sleep, which would leave the records of the time
+  between alone: the first try did, and an edit told with no quiet time took 4.6 ms in place
+  of 0.4. A share of another machine gets its records from the server, so an answer can come
+  before them.
 - Directories are compared by path text, and a handle reports nothing for what is behind a
   junction or a directory link below it. So each name between a handle and a key that it
   would serve is looked at (`leads_through_a_link`), and a key behind a link, below a

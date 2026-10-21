@@ -5,6 +5,7 @@ use std::{
   io, mem,
   path::{Path, PathBuf},
   sync::Arc,
+  time::SystemTime,
 };
 
 use self::{handles::lower_case, port::Port, records::FILE_ACTION_MODIFIED};
@@ -72,7 +73,12 @@ impl Backend for WindowsBackend {
     match raw {
       Raw::Read { result, .. } => result.as_ref().map_or(0, Vec::len),
       Raw::Lost(keys) => size_of_val(keys.as_slice()),
+      Raw::Delivered(_) => 0,
     }
+  }
+
+  fn ask_delivered(&mut self, after: SystemTime) {
+    self.port.ask_delivered(after);
   }
 }
 
@@ -86,6 +92,9 @@ pub enum Raw {
     result: io::Result<Vec<u8>>,
   },
   Lost(Vec<DirKey>),
+  /// Every record of a change before this time, by the clock of the system, came before: the
+  /// answer to `ask_delivered`.
+  Delivered(SystemTime),
 }
 
 pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
@@ -93,6 +102,7 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
   let (watch, dir, extended, result) = match raw {
     Raw::Read { watch, dir, extended, result } => (watch, dir, extended, result),
     Raw::Lost(keys) => return keys.into_iter().for_each(|key| hint(lost(key))),
+    Raw::Delivered(before) => return hint(Hint::Delivered { before }),
   };
   let bytes = match result {
     Ok(bytes) => bytes,
@@ -853,7 +863,7 @@ mod port {
     ptr, slice,
     sync::{Arc, OnceLock, mpsc},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
   };
 
   use rustc_hash::FxHashMap;
@@ -950,8 +960,12 @@ mod port {
       let worker = thread::Builder::new().name("pathwatch-windows".to_owned()).spawn({
         let iocp = Arc::clone(&iocp);
         move || {
-          let (watches, waiting) = (FxHashMap::default(), None);
-          Worker { iocp, commands: receiver, sink, watches, next_token: 0, waiting }.run();
+          let (watches, waiting, deliver_after) = (FxHashMap::default(), None, None);
+          let commands = receiver;
+          let next_token = 0;
+          let draining = false;
+          Worker { iocp, commands, sink, watches, next_token, waiting, deliver_after, draining }
+            .run();
         }
       })?;
       Ok(Self { iocp, commands, worker: Some(worker), closing: false })
@@ -960,6 +974,12 @@ mod port {
     fn send(&self, command: Command) -> io::Result<()> {
       self.commands.send(command).map_err(|_| stopped())?;
       self.iocp.wake()
+    }
+
+    /// Asks the worker for `Raw::Delivered` at or after `after`. A later question takes the
+    /// place of an earlier one.
+    pub(super) fn ask_delivered(&self, after: SystemTime) {
+      let _ = self.send(Command::Deliver { after });
     }
 
     /// Returns when every handle whose close was queued is closed: a directory above one of
@@ -1021,6 +1041,9 @@ mod port {
     Closed {
       reply: mpsc::SyncSender<()>,
     },
+    Deliver {
+      after: SystemTime,
+    },
     Stop,
   }
 
@@ -1034,13 +1057,33 @@ mod port {
     next_token: usize,
     /// The reply that waits for the closes.
     waiting: Option<mpsc::SyncSender<()>>,
+    /// The time the engine asked about (`Backend::ask_delivered`): then every handle is read
+    /// until nothing is left, and `Raw::Delivered` says so.
+    deliver_after: Option<SystemTime>,
+    /// The handles are read until nothing is left: none rests.
+    draining: bool,
   }
 
   impl Worker {
     fn run(mut self) {
       loop {
+        if self.deliver_after.is_some_and(|after| after <= SystemTime::now()) {
+          if !self.read_empty() {
+            break;
+          }
+          continue;
+        }
         let packet = match self.next_rest() {
-          None => self.iocp.wait(INFINITE),
+          // The time of a question is waited for on the port, not by a sleep, which would leave
+          // the records of the time between alone. Its wait counts in ticks of the clock (15.6
+          // ms): a late answer only keeps the doubt of a young file a little longer.
+          None => match self.deliver_after {
+            None => self.iocp.wait(INFINITE),
+            Some(after) => {
+              let wait = after.duration_since(SystemTime::now()).unwrap_or(Duration::ZERO);
+              self.iocp.wait(u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1))
+            }
+          },
           Some(at) => {
             let now = Instant::now();
             if at <= now {
@@ -1081,6 +1124,48 @@ mod port {
       self.watches.values().filter_map(|watch| watch.rest_until).min()
     }
 
+    /// Reads every handle until nothing is left, then sends the time the last look at the port
+    /// began: a queued read completes as soon as one record is in it, its packet is queued
+    /// before the call that made the change returns, and a resting handle keeps its records for
+    /// the next read, so every record of a change before that time is sent (design.md 7.3).
+    /// `false`: the worker stops.
+    fn read_empty(&mut self) -> bool {
+      self.draining = true;
+      let resting: Vec<usize> =
+        self.watches.iter().filter(|(_, w)| w.rest_until.is_some()).map(|(&t, _)| t).collect();
+      for token in resting {
+        let Some(watch) = self.watches.get_mut(&token) else { continue };
+        watch.rest_until = None;
+        if let Err(error) = watch.read() {
+          self.died(token, error);
+        }
+      }
+      let went_on = loop {
+        let began = SystemTime::now();
+        match self.iocp.wait(0) {
+          Packet::Timeout => {
+            self.sink.raw(Raw::Delivered(began));
+            if self.deliver_after.is_some_and(|after| after <= began) {
+              self.deliver_after = None;
+            }
+            break true;
+          }
+          Packet::Completed { token, result } => self.completed(token, result),
+          Packet::Wake => {
+            if !self.run_commands() {
+              break false;
+            }
+          }
+          Packet::Nothing(error) => {
+            self.sink.failed(error);
+            break false;
+          }
+        }
+      };
+      self.draining = false;
+      went_on
+    }
+
     /// Queues the next read of every handle whose rest is over.
     fn rearm(&mut self, now: Instant) {
       let over = |watch: &Watch| watch.rest_until.is_some_and(|at| at <= now);
@@ -1104,6 +1189,9 @@ mod port {
           Ok(Command::Closed { reply }) => {
             self.waiting = Some(reply);
             self.answer_closed();
+          }
+          Ok(Command::Deliver { after }) => {
+            self.deliver_after = Some(self.deliver_after.map_or(after, |at| at.max(after)));
           }
           Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return false,
           Err(mpsc::TryRecvError::Empty) => return true,
@@ -1196,7 +1284,7 @@ mod port {
         return;
       }
       // A read that came back nearly full, or with a loss (no bytes), is queued again at once.
-      if len == 0 || len >= BATCH_BYTES {
+      if len == 0 || len >= BATCH_BYTES || self.draining {
         if let Err(error) = watch.read() {
           self.died(token, error);
         }
