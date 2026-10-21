@@ -793,6 +793,15 @@ pub(crate) fn room_to_keep(len: usize, capacity: usize) -> Option<usize> {
   (capacity > 2 * len + 16).then(|| len + len / 8 + 16)
 }
 
+/// Gives the room of a table of the tree back once a quarter of it is in use, keeping twice
+/// what is left: many entries that went at once leave no room behind for good.
+fn give_room_back<V>(table: &mut FxHashMap<DirKey, V>) {
+  let (len, capacity) = (table.len(), table.capacity());
+  if capacity > 64 && len * 4 < capacity {
+    table.shrink_to(len * 2);
+  }
+}
+
 /// Empties a list for its next use and keeps its memory, unless it is long: a `watch` of 20,000
 /// paths must not leave its lists behind for ever.
 pub(crate) fn emptied<T>(mut list: Vec<T>) -> Vec<T> {
@@ -1230,10 +1239,16 @@ impl Tree {
   pub fn set_content(&mut self, key: DirKey, content: Option<Content>) {
     if let Some(content) = content {
       self.contents.insert(key, content);
-    } else if !self.contents.is_empty() {
-      // Most of the time no file is young, and a check has nothing to take away.
-      self.contents.remove(&key);
+    } else if !self.contents.is_empty() && self.contents.remove(&key).is_some() {
+      // Most of the time no file is young, and a check has nothing to take away. Thousands of
+      // new files at once must not keep their room for ever.
+      give_room_back(&mut self.contents);
     }
+  }
+
+  /// The room of the table of what is kept to compare.
+  pub fn content_room(&self) -> usize {
+    self.contents.capacity()
   }
 
   /// When the first look found the fingerprint the file has now, for a file whose modification
@@ -1264,10 +1279,7 @@ impl Tree {
       node.set_held(false);
       self.holds.remove(&key);
       // Many holds at once (a tree removed file by file) must not keep their room for ever.
-      let (len, capacity) = (self.holds.len(), self.holds.capacity());
-      if capacity > 64 && len * 4 < capacity {
-        self.holds.shrink_to(len * 2);
-      }
+      give_room_back(&mut self.holds);
     }
   }
 

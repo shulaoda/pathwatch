@@ -15,6 +15,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.polled.len()
   }
 
+  /// The room that the young files take: the table of what is kept to compare, and the queue of
+  /// the files that wait for a delivery.
+  pub fn young_room(&self) -> usize {
+    self.tree.content_room() + self.pending.capacity()
+  }
+
   /// Every file the handler believes to exist, a file whose `Delete` waits too.
   pub fn view(&self) -> BTreeSet<PathBuf> {
     let told = self.tree.nodes().filter(|(_, node)| node.told());

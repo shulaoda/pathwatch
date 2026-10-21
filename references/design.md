@@ -217,7 +217,12 @@ file); 3.0 MiB for 20,000 files in 2,000 directories that are each watched by th
 bytes for a file: the backend keeps the real path of each directory twice). While a `watch` call
 runs, the heap holds its paths once more, for the thread of the watcher. The lists of a flush keep
 their memory for the next flush only up to 16 KiB each (`emptied`): a longer one is given back when
-the flush ends. The usual work of a watcher that runs for days asks for no memory: a `watch` of
+the flush ends. The tables and queues of what only a few nodes have at a time, the young files
+and the holds, give their room back when most of it is free (`give_room_back`, `room_to_keep`).
+Before, the ones of the young files did not: a burst of 10,000 new files kept the room of 14,000
+entries in their table and of 16,000 in their queue for the life of the watcher, about 0.7 MB
+(`a_burst_of_young_files_gives_its_room_back`). The usual work of a watcher that runs for days
+asks for no memory: a `watch` of
 paths that are watched already (in their clean form), an `unwatch` of a path and a poll allocate
 nothing, and a flush allocates for the paths of its events only (`tests/sim/allocations.rs` keeps
 the budgets).

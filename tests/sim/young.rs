@@ -618,3 +618,27 @@ fn a_file_whose_records_all_came_is_not_counted_as_written_later() {
     caught_up(&mut d);
   }
 }
+
+/// A burst of young files gives its room back once their records all came: the table of what is
+/// kept to compare, and the queue of the files that wait for a delivery, do not stay as big as
+/// the burst for the life of the watcher.
+#[test]
+fn a_burst_of_young_files_gives_its_room_back() {
+  const FILES: usize = 10_000;
+  for mode in [Mode::Inode, Mode::Handle] {
+    let mut d = Driver::sim(mode, hinted());
+    d.fs.mkdir("/p").unwrap();
+    d.watch(&["/p"]);
+    for file in 0..FILES {
+      d.fs.write(format!("/p/{file}.js"), "x=1;").unwrap();
+    }
+    assert_eq!(window(&mut d).len(), FILES, "{mode:?}");
+    let room = d.engine.young_room();
+    assert!(room >= FILES, "{mode:?}: room for {room} with {FILES} young files");
+    d.advance(Duration::from_secs(3));
+    assert_eq!(settled(&mut d), NONE, "{mode:?}");
+    let room = d.engine.young_room();
+    assert!(room < FILES / 10, "{mode:?}: room for {room} with no young file");
+    caught_up(&mut d);
+  }
+}

@@ -17,7 +17,7 @@ use crate::{
   config::EntryKind,
   error::ErrorKind,
   fs::{DirId, Entry, FileType, Fs, is_delete_pending, is_missing},
-  tree::{Added, Content, Depth, Fingerprint, Kind, Mark, Watch, nanos, push_name},
+  tree::{Added, Content, Depth, Fingerprint, Kind, Mark, Watch, nanos, push_name, room_to_keep},
 };
 
 /// A file is young this long: two writes inside it can leave one modification time.
@@ -636,6 +636,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
     }
     self.pending.extend(later);
+    // Thousands of new files at once must not keep their room for ever.
+    if let Some(room) = room_to_keep(self.pending.len(), self.pending.capacity()) {
+      self.pending.shrink_to(room);
+    }
     self.ask_delivered();
   }
 
