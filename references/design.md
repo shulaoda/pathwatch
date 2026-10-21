@@ -1658,17 +1658,21 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   handle that no key uses any more (rule 6: the OS watch goes with its last key), and the
   engine commits after every flush that gave a watch back, also one that queued no scan. New
   handles are opened first, then old ones are closed. A key that got another
-  handle is not told: the new handle reported before the old one stopped, and the old one is
-  read until the kernel holds nothing more for it, then closed; the read that the close
-  cancels fails (`ERROR_OPERATION_ABORTED`), so it is not taken for lost records. The call
+  handle is not told: the new handle reported before the old one stopped, and the old one,
+  whose records wait in the kernel between two reads, gets one read queued after the close,
+  which takes them, then is closed. What comes later, the new handle reports, so a close
+  ends even in a flood. The read that the close cancels fails (`ERROR_OPERATION_ABORTED`), so
+  it is not taken for lost records; a loss in the kernel (`ERROR_NOTIFY_ENUM_DIR`) on that
+  read is one, as on any other. The call
   of the backend returns when the closes are done: a directory above a closed handle can be
   renamed then. If one open fails, nothing changes; a handle that only keys wanting names
   still use closes with the last of them. A `watch` for the very directory of a handle puts a
   new handle there (the old one may be on a directory that was renamed away), unless the key
   only waited for a handle, or got none at the last commit. A handle whose read fails is
-  given up and its keys are told; when the next handle on the directory dies too before it
-  delivered anything, the ask after that is answered `Failed` with the error of the read: the
-  directory is polled, and tried again at each poll. The tables of the keys are given back
+  given up and its keys are told; when the next handle of a key dies too before it delivered
+  anything, the ask after that is answered `Failed` with the error of the read: the directory
+  is polled, and tried again at each poll. The deaths are counted by key, as a shared handle
+  stands on a directory of no key. The tables of the keys are given back
   when most of their keys are gone, as the tables of inotify are (7.1).
 - Filter: `FILE_NAME | DIR_NAME | SIZE | LAST_WRITE`. 64 KiB buffer. The bytes of a
   completed read are read on the watcher thread (`Records`, `translate`): the raw

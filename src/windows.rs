@@ -317,6 +317,8 @@ mod handles {
   struct Handle {
     id: WatchId,
     dir: PathBuf,
+    /// It delivered records: its death is no death at once.
+    delivered: bool,
   }
 
   #[derive(Debug)]
@@ -332,7 +334,8 @@ mod handles {
     pub covered: Vec<DirKey>,
   }
 
-  /// What the last handle on a directory died of, and how many died there in a row.
+  /// What the last handle of a key died of, and how many of its handles died in a row before
+  /// they delivered anything.
   #[derive(Debug)]
   struct Death {
     count: u8,
@@ -348,8 +351,9 @@ mod handles {
     unsettled: bool,
     refused: FxHashSet<DirKey>,
     waiting: FxHashMap<DirKey, PathBuf>,
-    /// The directories whose handle died before it delivered anything.
-    dead: FxHashMap<PathBuf, Death>,
+    /// The keys whose last handle died before it delivered anything. Kept by key, not by the
+    /// directory of the handle: a shared handle stands on a directory of no key.
+    dead: FxHashMap<DirKey, Death>,
   }
 
   impl Handles {
@@ -379,10 +383,10 @@ mod handles {
         self.waiting.insert(key, dir.to_owned());
         return (Coverage::NotWatched, told);
       }
-      // The handles on this directory die as soon as they are opened (a server that refuses
-      // the request): the engine polls it, and asks again at each poll.
-      if self.dead.get(dir).is_some_and(|death| death.count >= 2)
-        && let Some(death) = self.dead.remove(dir)
+      // The handles of this key die as soon as they are opened (a server that refuses the
+      // request): the engine polls it, and asks again at each poll.
+      if self.dead.get(&key).is_some_and(|death| death.count >= 2)
+        && let Some(death) = self.dead.remove(&key)
       {
         return (Coverage::Failed(death.error), told);
       }
@@ -408,6 +412,7 @@ mod handles {
     pub fn unwatch(&mut self, key: DirKey, system: &mut dyn System) {
       self.waiting.remove(&key);
       self.refused.remove(&key);
+      self.dead.remove(&key);
       self.drop_key(key, system);
     }
 
@@ -423,12 +428,13 @@ mod handles {
     pub fn closed(&mut self, id: WatchId, error: &io::Error) -> Vec<DirKey> {
       let Some(at) = self.open.iter().position(|handle| handle.id == id) else { return Vec::new() };
       let handle = self.open.swap_remove(at);
-      let count = self.dead.get(&handle.dir).map_or(0, |death| death.count);
-      self.dead.insert(handle.dir, Death { count: count.saturating_add(1), error: same(error) });
       let served = self.keys.iter().filter(|(_, served)| served.handle == Some(id));
       let keys: Vec<DirKey> = served.map(|(&key, _)| key).collect();
       for &key in &keys {
         self.forget(key);
+        let before = if handle.delivered { None } else { self.dead.get(&key) };
+        let count = before.map_or(0, |death| death.count).saturating_add(1);
+        self.dead.insert(key, Death { count, error: same(error) });
       }
       keys
     }
@@ -437,10 +443,15 @@ mod handles {
       self.keys.get(&key).is_some_and(|served| served.handle.is_some())
     }
 
-    /// The handle delivered records: a death before it is forgotten.
+    /// The handle delivered records: the deaths of its keys before it are forgotten, at its
+    /// first read.
     pub(super) fn delivered(&mut self, id: WatchId) {
-      if let Some(handle) = self.open.iter().find(|handle| handle.id == id) {
-        self.dead.remove(&handle.dir);
+      let Some(handle) = self.open.iter_mut().find(|handle| handle.id == id) else { return };
+      if mem::replace(&mut handle.delivered, true) || self.dead.is_empty() {
+        return;
+      }
+      for (key, _) in self.keys.iter().filter(|(_, served)| served.handle == Some(id)) {
+        self.dead.remove(key);
       }
     }
 
@@ -567,7 +578,7 @@ mod handles {
           continue;
         }
         match self.next_id().and_then(|id| system.open(id, &place.dir).map(|()| id)) {
-          Ok(id) => new.push(Handle { id, dir: place.dir.clone() }),
+          Ok(id) => new.push(Handle { id, dir: place.dir.clone(), delivered: false }),
           Err(error) => {
             for handle in &new {
               system.close(handle.id);
@@ -617,6 +628,7 @@ mod handles {
       let id = self.next_id()?;
       system.open(id, &self.open[at].dir)?;
       let old = mem::replace(&mut self.open[at].id, id);
+      self.open[at].delivered = false;
       system.close(old);
       for served in self.keys.values_mut() {
         if served.handle == Some(old) {
@@ -1222,7 +1234,10 @@ mod port {
     fn close(&mut self, id: WatchId) {
       let found = self.watches.iter_mut().find(|(_, watch)| watch.id == id);
       let Some((&token, watch)) = found else { return };
-      watch.closing = true;
+      // A resting handle keeps its records in the kernel: the read after the close takes them.
+      let resting = watch.rest_until.take().is_some();
+      watch.closing =
+        if resting && watch.read().is_ok() { Closing::LastRead } else { Closing::Asked };
       if watch.pending {
         watch.cancel();
       } else {
@@ -1233,7 +1248,7 @@ mod port {
 
     /// The reply that waits for the closes gets it once no handle is closing.
     fn answer_closed(&mut self) {
-      if self.watches.values().any(|watch| watch.closing) {
+      if self.watches.values().any(|watch| watch.closing != Closing::No) {
         return;
       }
       if let Some(reply) = self.waiting.take() {
@@ -1244,13 +1259,24 @@ mod port {
     fn completed(&mut self, token: usize, result: io::Result<u32>) {
       let Some(watch) = self.watches.get_mut(&token) else { return };
       watch.pending = false;
-      if watch.closing {
+      let result = match result {
+        Ok(len) => Ok(watch.records(len)),
+        // The kernel had no room for the records: a loss, as a read with no bytes.
+        Err(error) if error.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR.cast_signed()) => {
+          Ok(Vec::new())
+        }
+        Err(error) => Err(error),
+      };
+      if watch.closing != Closing::No {
         // The kernel keeps the records of a handle between two reads and drops them with the
-        // handle: a read that came back whole may have left some there. One more read takes
-        // them, and the cancel ends the handle once nothing is left.
-        if let Ok(len) = result {
-          self.sink.raw(watch.raw(Ok(watch.records(len))));
-          if watch.read().is_ok() {
+        // handle: a read queued before the close may have left some there. One read queued
+        // after it takes them, and the cancel ends it at once when nothing is left. What comes
+        // later, the handle that took over reports: it was opened before the close. Reading
+        // on until nothing is left would not end in a flood.
+        if let Ok(records) = result {
+          self.sink.raw(watch.raw(Ok(records)));
+          let before = mem::replace(&mut watch.closing, Closing::LastRead);
+          if before == Closing::Asked && watch.read().is_ok() {
             watch.cancel();
             return;
           }
@@ -1260,10 +1286,7 @@ mod port {
         return;
       }
       let records = match result {
-        Ok(len) => watch.records(len),
-        Err(error) if error.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR.cast_signed()) => {
-          Vec::new()
-        }
+        Ok(records) => records,
         Err(error) => {
           // The read is over: the handle can take the next one.
           if watch.extended && not_supported(&error) {
@@ -1301,7 +1324,7 @@ mod port {
 
     fn stop(mut self) {
       for watch in self.watches.values_mut() {
-        watch.closing = true;
+        watch.closing = Closing::Asked;
         watch.cancel();
       }
       self.watches.retain(|_, watch| watch.pending);
@@ -1321,31 +1344,41 @@ mod port {
 
   struct Watch {
     id: WatchId,
-    dir: Option<File>,
+    dir: File,
     path: Arc<Path>,
     overlapped: Box<OVERLAPPED>,
     buffer: Box<[u64]>,
     pending: bool,
     empty_reads: u8,
     extended: bool,
-    /// The handle is given up: it is read until nothing is left, then closed.
-    closing: bool,
+    closing: Closing,
     /// No read is queued until then: the kernel gathers the records of a flood meanwhile.
     rest_until: Option<Instant>,
+  }
+
+  /// Whether the handle is given up: then it is read once more, and closed.
+  #[derive(Clone, Copy, PartialEq, Eq)]
+  enum Closing {
+    No,
+    /// The read that is queued, if any, was queued before the close.
+    Asked,
+    /// The read after the close is queued: once it is over, nothing is left that only this
+    /// handle reports.
+    LastRead,
   }
 
   impl Watch {
     fn new(id: WatchId, dir: File, path: Arc<Path>, extended: bool) -> Self {
       Self {
         id,
-        dir: Some(dir),
+        dir,
         path,
         overlapped: Box::default(),
         buffer: vec![0; BUFFER_WORDS].into_boxed_slice(),
         pending: false,
         empty_reads: 0,
         extended,
-        closing: false,
+        closing: Closing::No,
         rest_until: None,
       }
     }
@@ -1353,9 +1386,8 @@ mod port {
     /// Queues one read. When the call fails it started no request: no read is pending, no
     /// packet comes, and the blocks are free.
     fn read(&mut self) -> io::Result<()> {
-      let Some(dir) = &self.dir else { return Err(io::Error::other("the handle is closed")) };
       *self.overlapped = OVERLAPPED::default();
-      let (handle, buffer) = (dir.as_raw_handle(), self.buffer.as_mut_ptr().cast());
+      let (handle, buffer) = (self.dir.as_raw_handle(), self.buffer.as_mut_ptr().cast());
       let (subtree, overlapped) = (i32::from(true), &raw mut *self.overlapped);
       let extended = read_extended().filter(|_| self.extended);
       // SAFETY: the handle is open and no read is pending on it. `buffer` is `BUFFER_BYTES`
@@ -1393,11 +1425,9 @@ mod port {
     /// Cancels the pending read. It fails when the read is over already: then its packet is
     /// on its way, and the handle stays until it is taken.
     fn cancel(&mut self) {
-      if self.pending
-        && let Some(dir) = &self.dir
-      {
+      if self.pending {
         // SAFETY: the handle is open, and `overlapped` is the block of its pending read.
-        unsafe { CancelIoEx(dir.as_raw_handle(), &raw const *self.overlapped) };
+        unsafe { CancelIoEx(self.dir.as_raw_handle(), &raw const *self.overlapped) };
       }
     }
   }

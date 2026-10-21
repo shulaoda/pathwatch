@@ -559,6 +559,32 @@ mod handles {
     assert_eq!(fake.lost(), [101, 200]);
   }
 
+  /// A shared handle stands on a directory of no key: its deaths count for each of its keys.
+  /// When it died twice in a row before it delivered anything, the next ask of a key fails, and
+  /// the one after tries again.
+  #[test]
+  fn the_keys_of_a_shared_handle_that_dies_twice_fail() {
+    let mut fake = Fake::default();
+    let count = u32::try_from(MAX_HANDLES).unwrap();
+    let ask =
+      |fake: &mut Fake, index: u32| fake.watch(index, &format!("/p/{index}"), Want::Contents);
+    for index in 0..=count {
+      assert_eq!(ask(&mut fake, index), Answer::Tree);
+    }
+    for _ in 0..2 {
+      assert_eq!(fake.dirs(), dirs(["/p"]));
+      let shared = fake.id("/p");
+      assert_eq!(fake.died(shared), (0..=count).collect::<Vec<u32>>());
+      for index in 0..=count {
+        assert_eq!(ask(&mut fake, index), Answer::Tree);
+      }
+    }
+    let shared = fake.id("/p");
+    fake.died(shared);
+    assert_eq!(ask(&mut fake, 0), Answer::Failed);
+    assert_eq!(ask(&mut fake, 0), Answer::Tree);
+  }
+
   /// `unwatch` of the keys of a shared handle moves nothing: the handle goes with its last key,
   /// and where the handles stand is worked out once at the next commit, not for each key.
   #[test]
