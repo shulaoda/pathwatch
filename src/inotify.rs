@@ -279,12 +279,25 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
         sink.raw(raw);
       }
     }
-    // Its time came: the queue is read empty, and a record says so. A later question stays.
+    // Its time came: the queue is read empty, and a record with the time the read that found
+    // it empty began says so. The kernel queues an event before the call that made the change
+    // returns, the loss report too, so every event of a change before that time is sent
+    // (design.md 7.1). One read a turn: a flood can keep the queue from being empty for long,
+    // and the reader still sees a stop. A later question stays.
     if asked != 0 && nanos(SystemTime::now()) >= asked {
-      if let Err(error) = read_empty(&fds.inotify, &mut buffer, sink) {
-        break error;
+      let began = nanos(SystemTime::now());
+      match (&fds.inotify).read(&mut buffer) {
+        Ok(0) => break io::ErrorKind::UnexpectedEof.into(),
+        Ok(len) => sink.raw(buffer[..len].to_vec()),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+          let mut raw = Vec::new();
+          push_record(&mut raw, DELIVERED_WD, began.to_string().as_bytes());
+          sink.raw(raw);
+          let _ = fds.asked.compare_exchange(asked, 0, Ordering::Relaxed, Ordering::Relaxed);
+        }
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+        Err(error) => break error,
       }
-      let _ = fds.asked.compare_exchange(asked, 0, Ordering::Relaxed, Ordering::Relaxed);
       continue;
     }
     // At most one read a millisecond, unless the last read filled over half of the buffer:
@@ -303,27 +316,6 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
     }
   };
   sink.failed(error);
-}
-
-/// Reads until the queue is empty, then sends a record with the time the last read began: the
-/// kernel queues an event before the call that made the change returns, the loss report too, so
-/// every event of a change before that time is sent (design.md 7.1).
-fn read_empty(inotify: &File, buffer: &mut [u8], sink: &Sink<Vec<u8>>) -> io::Result<()> {
-  loop {
-    let began = nanos(SystemTime::now());
-    match (&*inotify).read(buffer) {
-      Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-      Ok(len) => sink.raw(buffer[..len].to_vec()),
-      Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-        let mut raw = Vec::new();
-        push_record(&mut raw, DELIVERED_WD, began.to_string().as_bytes());
-        sink.raw(raw);
-        return Ok(());
-      }
-      Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-      Err(error) => return Err(error),
-    }
-  }
 }
 
 /// The mounts of the namespace, each by its id with its mount point, in order. Mount ids and

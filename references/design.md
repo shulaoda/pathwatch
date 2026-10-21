@@ -1293,18 +1293,19 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   identity (`a_mount_over_a_watched_directory_is_told`,
   `a_volume_mounted_over_a_watched_directory`). The path is real, so a mount that a watched path
   reaches through a link is not found this way. (macOS tells it in its own way, 7.2.)
-- **A delivery** (rule 13, `read_empty`). The reader also waits on an eventfd for a question of
-  the engine, and on the time it names. Then it reads the queue empty, past `READ_INTERVAL`,
-  and sends a record of its own behind what it read (`wd` -3, the time the last read began in
-  digits as its name) → `Hint::Delivered`. The kernel queues an event in the call that made the
-  change, before it returns (`fsnotify` from `vfs_write`, and from `__fput` for the close), and
-  a full queue gets one overflow event at its end (`fsnotify_insert_event`): measured on Linux
-  6.6, ext4 and tmpfs, 40,000 writes from the same and from another thread, the event of each
-  was in the queue when the write returned, and the overflow event came after the 16,384
-  events that the queue held (2026-10-22). A read of the empty queue costs 0.2 µs. A change of
-  the mounts that the same wake-up brings is told first, in front of the answer: the wait that
-  sees it takes the word, which the kernel gives once (`mounts_poll`), and a reader that only
-  answered never told of the mount (`a_mount_in_the_wake_up_of_a_delivery_is_told`).
+- **A delivery** (rule 13, `forward`). The reader also waits on an eventfd for a question of the
+  engine, and on the time it names. Then it reads the queue empty, past `READ_INTERVAL` and one
+  read for each turn of its loop, so that a flood that keeps the queue from being empty does not
+  keep it from a stop, and sends a record of its own behind what it read (`wd` -3, the time the
+  last read began in digits as its name) → `Hint::Delivered`. The kernel queues an event in the
+  call that made the change, before it returns (`fsnotify` from `vfs_write`, and from `__fput`
+  for the close), and a full queue gets one overflow event at its end (`fsnotify_insert_event`):
+  measured on Linux 6.6, ext4 and tmpfs, 40,000 writes from the same and from another thread,
+  the event of each was in the queue when the write returned, and the overflow event came after
+  the 16,384 events that the queue held (2026-10-22). A read of the empty queue costs 0.2 µs. A
+  change of the mounts that the same wake-up brings is told first, in front of the answer: the
+  wait that sees it takes the word, which the kernel gives once (`mounts_poll`), and a reader
+  that only answered never told of the mount (`a_mount_in_the_wake_up_of_a_delivery_is_told`).
 - `ENOSPC` → `Failed` with the watch limit error. Every other error → `Failed` with that error.
   `EMFILE` and `ENFILE` when the backend starts are the limit of inotify instances
   (`fs.inotify.max_user_instances`) or of open files: the watch limit error too.
