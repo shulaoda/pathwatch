@@ -1301,7 +1301,10 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   a full queue gets one overflow event at its end (`fsnotify_insert_event`): measured on Linux
   6.6, ext4 and tmpfs, 40,000 writes from the same and from another thread, the event of each
   was in the queue when the write returned, and the overflow event came after the 16,384
-  events that the queue held (2026-10-22). A read of the empty queue costs 0.2 µs.
+  events that the queue held (2026-10-22). A read of the empty queue costs 0.2 µs. A change of
+  the mounts that the same wake-up brings is told first, in front of the answer: the wait that
+  sees it takes the word, which the kernel gives once (`mounts_poll`), and a reader that only
+  answered never told of the mount (`a_mount_in_the_wake_up_of_a_delivery_is_told`).
 - `ENOSPC` → `Failed` with the watch limit error. Every other error → `Failed` with that error.
   `EMFILE` and `ENFILE` when the backend starts are the limit of inotify instances
   (`fs.inotify.max_user_instances`) or of open files: the watch limit error too.

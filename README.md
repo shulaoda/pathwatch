@@ -440,9 +440,9 @@ cargo test --release -p pathwatch --test fsevents the_cost_of_single_files -- --
 cargo test -p pathwatch --test fsevents -- --ignored failed_start
 
 # The inotify tests of the watch limit and of a mount. They need a lowered limit and mounts of
-# their own.
+# their own, and run one after the other: they share the limit and see each other's mounts.
 unshare -Urm sh -c 'echo 8 > /proc/sys/user/max_inotify_watches &&
-  cargo test -p pathwatch --test inotify -- --ignored'
+  cargo test -p pathwatch --test inotify -- --ignored --test-threads=1'
 
 # Lints and the docs.
 cargo fmt --all -- --check

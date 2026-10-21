@@ -267,22 +267,23 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
       Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
       Err(error) => break error,
     };
-    // Its time came: the queue is read empty, and a record says so. A later question stays.
-    if asked != 0 && nanos_of(SystemTime::now()) >= asked {
-      if let Err(error) = read_empty(&fds.inotify, &mut buffer, sink) {
-        break error;
-      }
-      let _ = fds.asked.compare_exchange(asked, 0, Ordering::Relaxed, Ordering::Relaxed);
-      continue;
-    }
     // inotify says nothing of a volume that is mounted over a watched directory or one above:
-    // the mount points that came or went are told by their paths.
+    // the mount points that came or went are told by their paths. In every wake-up that says
+    // so, as the wait that sees a change of the mounts takes the word, which comes once; and
+    // before an answer below, which is about every change before its time.
     if mounted && let Some(mounts) = fds.mounts.as_ref().and_then(read_mounts) {
       let raw = mount_records(&known, &mounts);
       known = mounts;
       if !raw.is_empty() {
         sink.raw(raw);
       }
+    }
+    // Its time came: the queue is read empty, and a record says so. A later question stays.
+    if asked != 0 && nanos_of(SystemTime::now()) >= asked {
+      if let Err(error) = read_empty(&fds.inotify, &mut buffer, sink) {
+        break error;
+      }
+      let _ = fds.asked.compare_exchange(asked, 0, Ordering::Relaxed, Ordering::Relaxed);
       continue;
     }
     // At most one read a millisecond, unless the last read filled over half of the buffer:

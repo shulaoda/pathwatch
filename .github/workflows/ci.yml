@@ -61,11 +61,12 @@ jobs:
       - if: runner.os == 'macOS'
         run: cargo test -p pathwatch --test fsevents -- --ignored failed_start
       # Ubuntu 24.04 gives a user namespace no capabilities unless this is off, and the test
-      # wants one for a limit of its own.
+      # wants one for a limit of its own. One after the other: they share the limit, and each
+      # sees the mounts of the others.
       - if: runner.os == 'Linux'
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi
-          unshare -Urm sh -c 'echo 8 > /proc/sys/user/max_inotify_watches && cargo test -p pathwatch --test inotify -- --ignored'
+          unshare -Urm sh -c 'echo 8 > /proc/sys/user/max_inotify_watches && cargo test -p pathwatch --test inotify -- --ignored --test-threads=1'
       # The big fuzz runs on seeds of the day, as a release build: new seeds every day, and the
       # engine once without the debug checks. A failure names its seed.
       - if: runner.os == 'Linux'

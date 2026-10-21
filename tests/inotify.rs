@@ -652,10 +652,11 @@ fn missing_path_and_file_fail() {
 }
 
 /// A volume that is mounted over a watched directory, or unmounted, is told by its mount point:
-/// inotify says nothing of it. A user namespace with its own mounts can mount without root:
+/// inotify says nothing of it. A user namespace with its own mounts can mount without root, and
+/// the tests run one after the other, as each sees the mounts of the other:
 ///
 /// ```sh
-/// unshare -Urm cargo test -p pathwatch --test inotify -- --ignored mount
+/// unshare -Urm cargo test -p pathwatch --test inotify -- --ignored --test-threads=1 mount
 /// ```
 #[test]
 #[ignore = "mounts a volume, see the comment"]
@@ -669,6 +670,32 @@ fn a_mount_over_a_watched_directory_is_told() {
   let run = |command: &mut Command| assert!(command.status().unwrap().success(), "{command:?}");
   run(Command::new("mount").args(["-t", "tmpfs", "tmpfs"]).arg(&point));
   assert_eq!(h.hints_until(&Seen::Mount(point.clone())), [Seen::Mount(point.clone())]);
+  run(Command::new("umount").arg(&point));
+  h.hints_until(&Seen::Mount(point));
+}
+
+/// A volume comes, and the time of a question, while the reader is busy: it tells of the mount
+/// in the wake-up that brings both, before the answer. The wait that sees a change of the mounts
+/// takes the word, which the kernel gives once: a reader that answered first, and waited again,
+/// never told of the mount. In a user namespace, as the test above.
+#[test]
+#[ignore = "mounts a volume, see the comment above"]
+fn a_mount_in_the_wake_up_of_a_delivery_is_told() {
+  let mut h = Harness::new();
+  fs::create_dir(h.path("point")).unwrap();
+  h.watch(1, "", Want::Contents);
+  let point = fs::canonicalize(h.path("point")).unwrap();
+  let run = |command: &mut Command| assert!(command.status().unwrap().success(), "{command:?}");
+  // The reader stops in the sink with the event of the file.
+  let gate = Arc::clone(&h.gate);
+  let shut = gate.shut();
+  fs::write(h.path("first"), "1").unwrap();
+  gate.until_one_waits();
+  run(Command::new("mount").args(["-t", "tmpfs", "tmpfs"]).arg(&point));
+  h.backend.ask_delivered(SystemTime::now());
+  drop(shut);
+  let (seen, _) = h.until_delivered();
+  assert!(seen.contains(&Seen::Mount(point.clone())), "{seen:?}");
   run(Command::new("umount").arg(&point));
   h.hints_until(&Seen::Mount(point));
 }
