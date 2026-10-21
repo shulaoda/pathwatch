@@ -571,16 +571,17 @@ mod handles {
     for index in 0..=count {
       assert_eq!(ask(&mut fake, index), Answer::Tree);
     }
-    for _ in 0..2 {
-      assert_eq!(fake.dirs(), dirs(["/p"]));
-      let shared = fake.id("/p");
-      assert_eq!(fake.died(shared), (0..=count).collect::<Vec<u32>>());
-      for index in 0..=count {
-        assert_eq!(ask(&mut fake, index), Answer::Tree);
-      }
-    }
+    // The first death: each key is asked again, and the handle comes back.
+    assert_eq!(fake.dirs(), dirs(["/p"]));
     let shared = fake.id("/p");
-    fake.died(shared);
+    assert_eq!(fake.died(shared), (0..=count).collect::<Vec<u32>>());
+    for index in 0..=count {
+      assert_eq!(ask(&mut fake, index), Answer::Tree);
+    }
+    // The second, before the handle delivered anything.
+    assert_eq!(fake.dirs(), dirs(["/p"]));
+    let shared = fake.id("/p");
+    assert_eq!(fake.died(shared), (0..=count).collect::<Vec<u32>>());
     assert_eq!(ask(&mut fake, 0), Answer::Failed);
     assert_eq!(ask(&mut fake, 0), Answer::Tree);
   }
