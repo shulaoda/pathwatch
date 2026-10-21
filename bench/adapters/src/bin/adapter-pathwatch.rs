@@ -2,7 +2,7 @@
 //! `watch` for the paths.
 //!
 //! `--debounce-ms <n>` sets `Config::with_debounce`; without it the default is used (none on
-//! macOS, 20 ms elsewhere).
+//! macOS, 10 ms on Windows, 20 ms on Linux).
 
 use std::{env, sync::mpsc, time::Duration};
 

@@ -80,10 +80,10 @@ impl Config {
   }
 
   /// How long a `Delete` waits for the path to come back. Default: 10 ms on macOS and on
-  /// Windows, 50 ms on Linux. It does not apply when the watcher polls everything, as the quiet time does not,
-  /// and as in chokidar, notify and watchdog: a round that falls into a save that leaves the
-  /// path empty for a moment reports a `Delete` and a `Create` (vim on Linux, polled every
-  /// 100 ms: 4 of 100 saves).
+  /// Windows, 50 ms on Linux. It does not apply when the watcher polls everything, as the quiet
+  /// time does not, and as in chokidar, notify and watchdog: a round that falls into a save that
+  /// leaves the path empty for a moment reports a `Delete` and a `Create` (vim on Linux, polled
+  /// every 100 ms: 4 of 100 saves).
   ///
   /// A file that is removed and written again within this time is one `Update`, as the tools
   /// that replace a file that way expect (vim on Linux renames the file away and writes a new

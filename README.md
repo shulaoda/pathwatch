@@ -118,14 +118,14 @@ with another Unicode form of a name. The story with sockets (1) is Unix only.
 2. **Events are the difference to the disk.** The last event for a path tells its state: after
    `Create` or `Update` the file is there, after `Delete` it is not. When things are quiet, the
    files you were told about are the files on the disk.
-3. **`Update`.** `touch` is an `Update`; `chmod` is not. An atomic save (write a temporary
-   file, rename it over) is an `Update`, with no `Delete` and no `Create`. So is a file that is
-   removed and written again within the delete delay (10 ms on macOS and Windows, 50 ms on Linux; none
-   under polling). There can be more `Update`
-   events than writes. A file that is replaced again and again without a pause by a save that
-   leaves the name free for a moment (`ReplaceFileW`, the save of .NET's `File.Replace`) can
-   get a `Delete` and a `Create` when both looks of the delete delay fall into such moments
-   (measured on Windows with a delete delay of 100 ms: 62 of 10,000 saves).
+3. **`Update`.** `touch` is an `Update`; `chmod` is not. An atomic save (write a temporary file,
+   rename it over) is an `Update`, with no `Delete` and no `Create`. So is a file that is
+   removed and written again within the delete delay (10 ms on macOS and Windows, 50 ms on
+   Linux; none under polling). There can be more `Update` events than writes. A file that is
+   replaced again and again without a pause by a save that leaves the name free for a moment
+   (`ReplaceFileW`, the save of .NET's `File.Replace`) can get a `Delete` and a `Create` when
+   both looks of the delete delay fall into such moments (measured on Windows with a delete
+   delay of 100 ms: 62 of 10,000 saves).
 4. **What exists when `watch` returns is not reported.** Every change after that is. One
    exception: a file in a directory that an earlier `watch` could not list (no permission, or
    another program held it) is reported as `Create` by a later `watch` of a path at or below
@@ -299,24 +299,25 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 
 ## Timing
 
-- **Normally** an event comes within the quiet time (none on macOS, 10 ms on Windows, 20 ms on Linux) plus what the OS takes to tell
-  about a change (about 1 to 15 ms). For a watched path that is a link to a file, a write to
-  the file behind it is found by the poll of the links: within a second.
+- **Normally** an event comes within the quiet time (none on macOS, 10 ms on Windows, 20 ms on
+  Linux) plus what the OS takes to tell about a change (about 1 to 15 ms). For a watched path
+  that is a link to a file, a write to the file behind it is found by the poll of the links:
+  within a second.
 - **With polling** a change is found by the next round: within the poll interval (100 ms)
   plus the time of a round (20,000 files: about 50 ms on APFS), or within twice the round when
   the round is longer than the interval. The files written in the last two seconds are read
   in each round (on Windows a read right after a write waits for the virus scanner).
-- **Under a flood** of changes a batch goes out four quiet times (80 ms; on macOS each time
-  FSEvents tells) after the first change since the last batch, plus the time that the check of
-  the disk takes: a check with thousands of changed paths takes a second and more (measured:
-  30,000 files made by eight threads, the longest gap 2 s).
-- **A `Delete`** comes one delete delay (10 ms on macOS and Windows, 50 ms on Linux) after the OS said
-  that the path is gone, or one quiet time if that is longer, once the path was found empty
-  twice (under polling, at the round that finds it gone); under a flood it comes with the next batch. It comes at once
-  when a directory is found where the file was, or a file where the directory was, or when a
-  file below a watched directory is renamed to another spelling of its name (another letter
-  case, on macOS and Windows). An error of the disk that says nothing is never a `Delete`;
-  "permission denied" counts as missing.
+- **Under a flood** of changes a batch goes out four quiet times (80 ms on Linux, 40 ms on
+  Windows; on macOS each time FSEvents tells) after the first change since the last batch, plus
+  the time that the check of the disk takes: a check with thousands of changed paths takes a
+  second and more (measured: 30,000 files made by eight threads, the longest gap 2 s).
+- **A `Delete`** comes one delete delay (10 ms on macOS and Windows, 50 ms on Linux) after the
+  OS said that the path is gone, or one quiet time if that is longer, once the path was found
+  empty twice (under polling, at the round that finds it gone); under a flood it comes with the
+  next batch. It comes at once when a directory is found where the file was, or a file where the
+  directory was, or when a file below a watched directory is renamed to another spelling of its
+  name (another letter case, on macOS and Windows). An error of the disk that says nothing is
+  never a `Delete`; "permission denied" counts as missing.
 - **Lost notifications** (the OS dropped some, or more than 16 MiB of them waited for the
   watcher) are repaired by reading the disk again. These scans are paced: after one that took
   `t`, the next one waits `9 × t`, and half a second at most.
