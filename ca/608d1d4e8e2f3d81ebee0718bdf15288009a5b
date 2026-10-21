@@ -1,0 +1,23 @@
+references/design.md
+  s_b910dfc76e4e89::t_08ded9d25a63db 1661-1666,1672-1675
+src/windows.rs
+  s_b910dfc76e4e89::t_b753791505650f 320-321,337-338,354-356,386-389,415,435-437,446-447,449-454,581,631,1237-1240,1251,1262-1270,1272-1279,1289,1327,1347,1354,1359-1369,1374,1381,1390,1428,1430
+tests/windows/parts.rs
+  s_b910dfc76e4e89::t_a0bba3b55ff312 562-587
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ca608d1d4e8e2f3d81ebee0718bdf15288009a5b",
+  "prompts": {},
+  "sessions": {
+    "s_b910dfc76e4e89": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8a69738a-ae83-4a31-8a84-9d3e8722ff76",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
