@@ -1278,6 +1278,10 @@ impl Tree {
     self.holds.get(&key).copied()
   }
 
+  pub fn hold_count(&self) -> usize {
+    self.holds.len()
+  }
+
   pub fn holds(&self) -> impl Iterator<Item = (DirKey, Instant)> + '_ {
     self.holds.iter().map(|(key, until)| (*key, *until))
   }

@@ -68,6 +68,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.list_if_polled(key);
     self.tree.hold(key, until);
     self.hold_queue.push(Reverse((until, key)));
+    // A node that is back, or held again, leaves its entry until that time comes. With a long
+    // delete delay the stale entries are dropped once they are most of the queue.
+    if self.hold_queue.len() > 2 * self.tree.hold_count() + 64 {
+      let tree = &self.tree;
+      self.hold_queue.retain(|&Reverse((until, key))| tree.held_until(key) == Some(until));
+    }
   }
 
   /// What the tree has at the node is gone for good.
