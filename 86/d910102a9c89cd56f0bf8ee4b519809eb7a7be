@@ -1,0 +1,19 @@
+src/engine/test_hooks.rs
+  s_50e134dde5413c::t_c7b7bc5bfaec73 145-146,178-182
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "86d910102a9c89cd56f0bf8ee4b519809eb7a7be",
+  "prompts": {},
+  "sessions": {
+    "s_50e134dde5413c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9428fa2-2ccc-4d44-9a50-977a9fc02468",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
