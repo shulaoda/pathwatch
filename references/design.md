@@ -379,16 +379,19 @@ accent, Greek, kana, Hangul) is not known here, so two names that are not plain 
 be one name.
 
 A plain name is found through the table: its hash leaves out the case of ASCII letters
-(`child_hash`), so the children that differ only in that are filed under one hash. Such a
-hint costs one lookup more, however many children the directory has: 18 ns next to 20,000
-registered ones, where comparing with each child took 53 µs. The rest is for loose
-directories only. The registered names that are not plain are on a list for each directory
-(`Tree::not_plain`), and a hint with such a name marks all of them: one look for each. The
-other children of a complete directory are on no list, and there can be many. So when a hint
-names a name that is not plain, and the tree does
-not have it as an entry (`Node::is_entry`), the flush compares the names of the directory
-with one listing (`Depth::Names`): a node that the listing names is not looked at, and one
-that it does not name is. An edit of a file that the tree knows costs no listing.
+(`child_hash`), so the children that differ only in that are filed under one hash. Such a hint
+costs one lookup more, however many children the directory has: 18 ns next to 20,000 registered
+ones, where comparing with each child took 53 µs. Only the letters are folded: a name that
+differs in the same bit of another byte (`@` and `` ` ``, a byte of UTF-8) has another hash,
+since names that share one cost the square of their number to list (65,536 such names: 270 ms
+to insert, against 4 ms). The case variants of one name share it on purpose; only a disk that
+tells them apart can hold many. The rest is for loose directories only. The registered names
+that are not plain are on a list for each directory (`Tree::not_plain`), and a hint with such a
+name marks all of them: one look for each. The other children of a complete directory are on no
+list, and there can be many. So when a hint names a name that is not plain, and the tree does
+not have it as an entry (`Node::is_entry`), the flush compares the names of the directory with
+one listing (`Depth::Names`): a node that the listing names is not looked at, and one that it
+does not name is. An edit of a file that the tree knows costs no listing.
 
 **A look asks for the spelling when it is not sure** (`Engine::spelling_is_unsure`). In a
 partial directory a look asks nothing: a registered name is whatever `lstat` finds. A name

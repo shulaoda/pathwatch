@@ -697,19 +697,21 @@ fn hash_of(slots: &Slots, names: &Names, index: u32) -> u64 {
 /// is left out, so that names that differ only there share a hash and [`Tree::spellings`] finds
 /// them in one walk. No ready hasher does that without a copy of the name, so the bytes are
 /// mixed here, 16 at a time.
+///
+/// Only the letters are folded: names that differ in any other byte have other hashes, also
+/// when a directory holds very many of them (a listing of names that share a hash costs the
+/// square of their number).
 #[expect(clippy::cast_possible_truncation, reason = "the two halves of a product are taken")]
 fn child_hash(parent: u32, name: &OsStr) -> u64 {
-  // The bit that tells `a` from `A`, set in every byte; other bytes only share a hash more often.
-  const CASE: u64 = u64::from_ne_bytes([0x20; 8]);
   // Digits of pi: two numbers with no pattern.
   const SEEDS: [u64; 2] = [0x243f_6a88_85a3_08d3, 0x1319_8a2e_0370_7344];
   let mix = |a: u64, b: u64| {
     let product = u128::from(a) * u128::from(b);
     (product as u64) ^ ((product >> 64) as u64)
   };
-  let word = |bytes: &[u8]| u64::from_ne_bytes(*bytes.first_chunk().expect("eight bytes")) | CASE;
+  let word = |bytes: &[u8]| small(u64::from_ne_bytes(*bytes.first_chunk().expect("eight bytes")));
   let half =
-    |bytes: &[u8]| u64::from(u32::from_ne_bytes(*bytes.first_chunk().expect("four bytes"))) | CASE;
+    |bytes: &[u8]| small(u64::from(u32::from_ne_bytes(*bytes.first_chunk().expect("four bytes"))));
 
   let mut rest = name.as_encoded_bytes();
   let mut hash = SEEDS[0] ^ u64::from(parent) ^ ((rest.len() as u64) << 32);
@@ -720,15 +722,29 @@ fn child_hash(parent: u32, name: &OsStr) -> u64 {
   // What is left, 16 bytes at most, as two numbers. With fewer bytes the two overlap.
   let (first, last) = match *rest {
     [] => (0, 0),
-    [one] => (u64::from(one) | CASE, 0),
-    [one, two] => (u64::from(one) | CASE, u64::from(two) | CASE),
+    [one] => (small(u64::from(one)), 0),
+    [one, two] => (small(u64::from(one)), small(u64::from(two))),
     [one, two, three] => {
-      (u64::from(one) | CASE, u64::from(u16::from_ne_bytes([two, three])) | CASE)
+      (small(u64::from(one)), small(u64::from(u16::from_ne_bytes([two, three]))))
     }
     _ if rest.len() < 8 => (half(rest), half(&rest[rest.len() - 4..])),
     _ => (word(rest), word(&rest[rest.len() - 8..])),
   };
   mix(hash ^ first, SEEDS[1] ^ last)
+}
+
+/// The eight bytes with each ASCII capital made small, all at once; every other byte stays.
+fn small(bytes: u64) -> u64 {
+  const ONES: u64 = u64::from_ne_bytes([1; 8]);
+  const HIGH: u64 = ONES * 0x80;
+  // The low seven bits of each byte, plus a number that carries into the high bit of the byte
+  // from `A` on, and from the byte after `Z` on. No sum leaves its byte.
+  let low = bytes & !HIGH;
+  let from_a = low + ONES * (0x80 - u64::from(b'A'));
+  let after_z = low + ONES * (0x80 - u64::from(b'Z') - 1);
+  let capital = from_a & !after_z & !bytes & HIGH;
+  // The high bit of a capital, moved to the bit that tells `a` from `A`.
+  bytes | (capital >> 2)
 }
 
 /// The most bytes of a list that are kept between two uses.
@@ -1430,6 +1446,23 @@ mod tests {
     hashes.sort_unstable();
     hashes.dedup();
     assert_eq!(hashes.len(), 2 * (name.len() + 1));
+  }
+
+  /// Only letters are folded: names that differ in the same bit of another byte, which a
+  /// directory can hold in any number, have other hashes.
+  #[test]
+  fn only_the_case_of_letters_is_left_out_of_the_hash() {
+    let hash = |name: &str| child_hash(1, OsStr::new(name));
+    for byte in 0..0x80_u8 {
+      for len in [1, 2, 3, 5, 8, 13, 16, 17] {
+        let [one, two] = [byte, byte ^ 0x20].map(|byte| String::from(char::from(byte)).repeat(len));
+        let is_letter = byte.is_ascii_alphabetic();
+        assert_eq!(hash(&one) == hash(&two), is_letter, "byte {byte:#x}, {len} bytes");
+      }
+    }
+    // Bytes of other letters that differ in the same bit: `é` and `É`, `Р` and `Ѐ`.
+    assert_ne!(hash("café"), hash("cafÉ"));
+    assert_ne!(hash("Р"), hash("Ѐ"));
   }
 
   #[test]
