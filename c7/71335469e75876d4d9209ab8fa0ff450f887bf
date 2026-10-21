@@ -1,0 +1,25 @@
+src/engine/mod.rs
+  s_35ac4ca3286b91::t_4e48a1f814dea1 191-192,454-455,481
+src/engine/test_hooks.rs
+  s_35ac4ca3286b91::t_c62140849d46ea 207-212
+src/tree/mod.rs
+  s_35ac4ca3286b91::t_8cc1aaaabd037c 1016-1023,1026-1030,1034-1045
+tests/tree.rs
+  s_35ac4ca3286b91::t_f9d11e9b6bfd50 78-84,509-538,822
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c771335469e75876d4d9209ab8fa0ff450f887bf",
+  "prompts": {},
+  "sessions": {
+    "s_35ac4ca3286b91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dcde9c6a-7c6b-4913-9704-d8faae1db573",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
