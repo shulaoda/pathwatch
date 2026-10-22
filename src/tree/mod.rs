@@ -233,6 +233,18 @@ pub enum Watch {
   Failed,
 }
 
+impl Watch {
+  /// Whether an OS watch reports what changes in the directory: its own, or one for a tree above.
+  pub fn is_heard(self) -> bool {
+    matches!(self, Self::Watched | Self::WatchedTree | Self::FromAbove)
+  }
+
+  /// Whether an OS watch for a tree reports the directories below too.
+  pub fn covers_below(self) -> bool {
+    matches!(self, Self::WatchedTree | Self::FromAbove)
+  }
+}
+
 /// How far a scan goes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Depth {
@@ -464,7 +476,7 @@ impl Tree {
     let was_registered = node.is_registered();
     node.set_path(true);
     if !was_registered {
-      self.count_registered(key.index());
+      self.count_registered(key.index(), true);
     }
     true
   }
@@ -477,7 +489,7 @@ impl Tree {
     }
     node.set_path(false);
     if !node.is_registered() {
-      self.uncount_registered(key.index());
+      self.count_registered(key.index(), false);
     }
     true
   }
@@ -605,35 +617,25 @@ impl Tree {
     }
   }
 
-  /// The node in slot `child` is registered now, and so is every node above it that was not.
-  fn count_registered(&mut self, mut child: u32) {
+  /// The node in slot `child` is registered now, and so is every node above it that was not. Or,
+  /// with `registered` false, it is not registered any more, nor is a node above that only led
+  /// to it.
+  fn count_registered(&mut self, mut child: u32, registered: bool) {
     loop {
-      self.list_not_plain(child, true);
+      self.list_not_plain(child, registered);
       let parent = linked(&self.slots, child).parent;
       if parent == NONE {
         return;
       }
       let node = self.linked_mut(parent);
       let was_registered = node.is_registered();
-      node.registered_children += 1;
-      if was_registered {
-        return;
+      if registered {
+        node.registered_children += 1;
+      } else {
+        node.registered_children -= 1;
       }
-      child = parent;
-    }
-  }
-
-  /// The node in slot `child` is not registered any more, nor is a node above that only led to it.
-  fn uncount_registered(&mut self, mut child: u32) {
-    loop {
-      self.list_not_plain(child, false);
-      let parent = linked(&self.slots, child).parent;
-      if parent == NONE {
-        return;
-      }
-      let node = self.linked_mut(parent);
-      node.registered_children -= 1;
-      if node.is_registered() {
+      // The nodes above count the parent as before.
+      if node.is_registered() == was_registered {
         return;
       }
       child = parent;
@@ -1063,16 +1065,13 @@ impl Tree {
 
   /// The backend is gone: no directory has an OS watch any more, and the timer looks at all.
   pub fn poll_all(&mut self) {
-    self.polled.clear();
-    for (index, slot) in self.slots.iter_mut().enumerate() {
-      let Some(node) = slot.node_mut() else { continue };
-      let index = u32::try_from(index).expect("the arena holds fewer than 2^32 nodes");
-      if let Kind::Dir(dir) = &mut node.kind {
-        dir.watch = Watch::Polled;
-        dir.asked = None;
-        self.polled.push(DirKey::new(index, node.generation));
+    for slot in self.slots.iter_mut() {
+      if let Some(Node { kind: Kind::Dir(dir), .. }) = slot.node_mut() {
+        (dir.watch, dir.asked) = (Watch::Polled, None);
       }
     }
+    let dirs = self.nodes().filter(|(_, node)| matches!(node.kind, Kind::Dir(_)));
+    self.polled = dirs.map(|(key, _)| key).collect();
   }
 
   /// Puts the list of the timer in order: each polled directory once, and nothing else. A long

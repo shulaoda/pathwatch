@@ -193,7 +193,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
       // 7. A directory that relies on a watch above has one, unless it is frozen or a mark waits
       // above it.
-      let covered = matches!(self.tree[parent].watch(), Watch::WatchedTree | Watch::FromAbove);
+      let covered = self.tree[parent].watch().covers_below();
       if node.watch() == Watch::FromAbove && !covered && !frozen && !waits {
         return fail("relies on a watch above, and there is none");
       }

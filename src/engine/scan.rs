@@ -89,9 +89,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let known = names.len();
     // A listing that lags behind a write is trusted for a file only where an OS watch reports
     // the write.
-    let heard =
-      matches!(self.tree[key].watch(), Watch::Watched | Watch::WatchedTree | Watch::FromAbove);
-    let lags = self.fs.listing_lags() && !heard;
+    let lags = self.fs.listing_lags() && !self.tree[key].watch().is_heard();
     let flush_time = self.flush_time;
     let tree = &mut self.tree;
     let mut listed = tree.loose_spelling.then_some(&mut self.listed);

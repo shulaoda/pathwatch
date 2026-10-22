@@ -647,16 +647,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// that was away (`Dir::away`), or such a scan is queued above; or the file was held (it was
   /// away itself, or its hint went into the look that found it missing).
   fn hint_may_be_lost(&self, key: DirKey, why: Mark, was_held: bool) -> bool {
-    if why.lost
+    why.lost
       || was_held
       || self.away_scan
       || self.loss.scanning
       || self.tree.lost
       || self.loss.waits
-    {
-      return true;
-    }
-    self.below_away(key)
+      || self.below_away(key)
   }
 
   /// Whether a directory above the node can have been away and back (`Dir::away`): its scan is
@@ -723,9 +720,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Whether only the poll looks at the entry: its directory is polled, or it is a link.
   fn only_polled(&self, key: DirKey) -> bool {
-    let watch = self.tree.parent(key).map_or(Watch::None, |parent| self.tree[parent].watch());
-    !matches!(watch, Watch::Watched | Watch::WatchedTree | Watch::FromAbove)
-      || self.tree.link(key).is_some()
+    let heard = self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().is_heard());
+    !heard || self.tree.link(key).is_some()
   }
 }
 

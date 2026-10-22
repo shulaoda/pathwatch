@@ -38,9 +38,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Whether a watch for a tree above reports the directory: not through a link.
   fn is_covered_from_above(&self, key: DirKey) -> bool {
-    let linked = self.tree.link(key).is_some();
-    let above = self.tree.parent(key).map(|parent| self.tree[parent].watch());
-    !linked && matches!(above, Some(Watch::WatchedTree | Watch::FromAbove))
+    self.tree.link(key).is_none()
+      && self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().covers_below())
   }
 
   /// Asks the backend to watch the directory with `want`, and queues the scan.
