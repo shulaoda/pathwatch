@@ -34,16 +34,10 @@ pub enum EntryKind {
 impl Default for Config {
   fn default() -> Self {
     // FSEvents tells of a change about 10 ms after it, when the steps of a save are done: that
-    // is the quiet time already. On Windows the tools that replace a file leave the path
-    // missing for microseconds, and 10 ms of each was enough on an idle machine
-    // (`references/design.md` 5.9 and 5.13).
-    let (debounce, delete_delay) = if cfg!(target_os = "macos") {
-      (0, 10)
-    } else if cfg!(windows) {
-      (10, 10)
-    } else {
-      (20, 50)
-    };
+    // is the quiet time already. Elsewhere the saves of the IDEs write in place, rename, or
+    // leave the path missing for microseconds, and 10 ms of each was enough, also on a busy
+    // machine (`references/design.md` 5.9 and 5.13).
+    let (debounce, delete_delay) = if cfg!(target_os = "macos") { (0, 10) } else { (10, 10) };
     Self {
       ignored: None,
       debounce: Duration::from_millis(debounce),
@@ -67,13 +61,13 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
-  /// The quiet time: a batch goes out when no change was noticed for this long. Default: 20 ms
-  /// on Linux, long enough for the steps of one save (a temporary file, a rename) to be one
-  /// batch, also on a busy machine, and short enough not to be felt; 10 ms on Windows, where
-  /// the steps of a save are two records, at the open and at the close, and 10 ms held them
-  /// together on an idle machine. On macOS none: FSEvents tells of a change about 10 ms after
-  /// it, when a save is done, but a temporary file that lives longer (the swap file of vim) is
-  /// reported, a `Create` and a `Delete`.
+  /// The quiet time: a batch goes out when no change was noticed for this long. Default: 10 ms
+  /// on Linux and Windows, long enough for the steps of one save (a temporary file, a rename;
+  /// on Windows the records at the open and at the close) to be one batch, and short enough not
+  /// to be felt. On macOS none: FSEvents tells of a change about 10 ms after it, when a save is
+  /// done, but a temporary file that lives longer (the swap file of vim) is reported, a
+  /// `Create` and a `Delete`. vim and Neovim on Linux sync the new file before they close it:
+  /// a sync longer than the quiet time reports the save twice, and 20 ms holds it together.
   ///
   /// While changes keep coming, a batch still goes out four quiet times after the first of them,
   /// and 500 ms after it at most, unless the quiet time is longer. The most is a year.
@@ -83,15 +77,18 @@ impl Config {
     self
   }
 
-  /// How long a `Delete` waits for the path to come back. Default: 10 ms on macOS and on
-  /// Windows, 50 ms on Linux. It does not apply when the watcher polls everything, as the quiet
+  /// How long a `Delete` waits for the path to come back. Default: 10 ms. It does not apply
+  /// when the watcher polls everything, as the quiet
   /// time does not, and as in chokidar, notify and watchdog: a round that falls into a save that
   /// leaves the path empty for a moment reports a `Delete` and a `Create` (vim on Linux, polled
   /// every 100 ms: 4 of 100 saves).
   ///
   /// A file that is removed and written again within this time is one `Update`, as the tools
-  /// that replace a file that way expect (vim on Linux renames the file away and writes a new
-  /// one). A real delete is reported this long after the OS said that the path is gone, or
+  /// that replace a file that way expect (`git checkout` removes and writes it, a JetBrains IDE
+  /// renames it away and the new one in). vim and Neovim on Linux rename the file away and sync
+  /// their swap file before they write the new one, which on a busy machine leaves the path
+  /// empty for longer: 50 ms, with a quiet time of 20 ms, keeps nearly every such save one
+  /// `Update`. A real delete is reported this long after the OS said that the path is gone, or
   /// after the quiet time if that is longer. Zero: a `Delete` comes at the first look that finds
   /// the path gone, and such a file is a `Delete` and a `Create`. The most is a year.
   #[must_use]

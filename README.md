@@ -92,8 +92,8 @@ watcher, so it should only pass the batch on.
 | `Config` method | Default | Meaning |
 |---|---|---|
 | `with_ignored(f)` | nothing is ignored | `f(path, kind) -> bool`, where `kind` is `EntryKind::File` or `EntryKind::Dir`. A path for which it returns `true` is never reported, and an ignored directory is never read or watched. It must give the same answer for the same input, and should ignore everything below a directory that it ignores. It decides about the paths you watch too (promise 10). |
-| `with_debounce(d)` | none on macOS, 10 ms on Windows, 20 ms on Linux | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch goes out `4 × d` after the first change since the last batch, and 500 ms after it at most (never before `d`), plus the time that the check of the disk takes. Zero: no waiting. The most is a year, also for the poll interval. A `watch` or `unwatch` call ends the quiet time; a poll that runs meanwhile does not, but a change it finds by itself is reported. Under polling there is no quiet time: a change is found by the next round. |
-| `with_delete_delay(d)` | 10 ms on macOS and Windows, 50 ms on Linux; none under polling | How long a `Delete` waits for the path to come back. A file that is removed and written again within `d` is one `Update`; a real delete is reported `d` after the OS said that the path is gone, or after the quiet time if that is longer. Zero: no waiting, and such a file is a `Delete` and a `Create`. Under polling there is none, as there is no quiet time, and as in chokidar, notify and watchdog: a round that falls into a save that leaves the path empty for a moment reports a `Delete` and a `Create` (vim on Linux, polled every 100 ms: 4 of 100 saves). The most is a year. |
+| `with_debounce(d)` | none on macOS, 10 ms elsewhere | The quiet time: the disk is checked, and a batch goes out, when no change was noticed for `d`. While changes keep coming, a batch goes out `4 × d` after the first change since the last batch, and 500 ms after it at most (never before `d`), plus the time that the check of the disk takes. Zero: no waiting. The most is a year, also for the poll interval. A `watch` or `unwatch` call ends the quiet time; a poll that runs meanwhile does not, but a change it finds by itself is reported. Under polling there is no quiet time: a change is found by the next round. |
+| `with_delete_delay(d)` | 10 ms; none under polling | How long a `Delete` waits for the path to come back. A file that is removed and written again within `d` is one `Update`; a real delete is reported `d` after the OS said that the path is gone, or after the quiet time if that is longer. Zero: no waiting, and such a file is a `Delete` and a `Create`. Under polling there is none, as there is no quiet time, and as in chokidar, notify and watchdog: a round that falls into a save that leaves the path empty for a moment reports a `Delete` and a `Create` (vim on Linux, polled every 100 ms: 4 of 100 saves). The most is a year. |
 | `with_polling(bool)` | `false` | Read the disk on a timer and do not use the watch API of the OS. For network drives and other places where the OS reports no changes. |
 | `with_poll_interval(d)` | 100 ms | The pause between two rounds of polling, and at least as long as the round took: polling takes half of a core at most. The least is 1 ms. A round looks at every watched file once (20,000 files: about 50 ms on APFS). |
 
@@ -120,12 +120,11 @@ with another Unicode form of a name. The story with sockets (1) is Unix only.
    files you were told about are the files on the disk.
 3. **`Update`.** `touch` is an `Update`; `chmod` is not. An atomic save (write a temporary file,
    rename it over) is an `Update`, with no `Delete` and no `Create`. So is a file that is
-   removed and written again within the delete delay (10 ms on macOS and Windows, 50 ms on
-   Linux; none under polling). There can be more `Update` events than writes. A file that is
-   replaced again and again without a pause by a save that leaves the name free for a moment
-   (`ReplaceFileW`, the save of .NET's `File.Replace`) can get a `Delete` and a `Create` when
-   both looks of the delete delay fall into such moments (measured on Windows with a delete
-   delay of 100 ms: 62 of 10,000 saves).
+   removed and written again within the delete delay (10 ms; none under polling). There can be
+   more `Update` events than writes. A file that is replaced again and again without a pause by
+   a save that leaves the name free for a moment (`ReplaceFileW`, the save of .NET's
+   `File.Replace`) can get a `Delete` and a `Create` when both looks of the delete delay fall
+   into such moments (measured on Windows with a delete delay of 100 ms: 62 of 10,000 saves).
 4. **What exists when `watch` returns is not reported.** Every change after that is. One
    exception: a file in a directory that an earlier `watch` could not list (no permission, or
    another program held it) is reported as `Create` by a later `watch` of a path at or below
@@ -198,6 +197,14 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
   through a mapped view of a file that exists is not reported at all, as on Linux, also after
   the file is closed, and neither is a write through a handle that was opened by the index of
   the file (`OpenFileById`); polling finds the second.
+- **vim and Neovim on Linux.** They save by renaming the file away, syncing their swap file,
+  writing a new file and syncing it. On a busy machine the name can stay free longer than the
+  delete delay, and the sync last longer than the quiet time: such a save can be a `Delete`
+  and a `Create`, or two `Update`s (Linux in a VM, 60 saves a run: idle 1 and 4, busy 7 to 23
+  and 10 to 14). With `with_debounce(Duration::from_millis(20))` and
+  `with_delete_delay(Duration::from_millis(50))` none was wrong idle, and busy only the saves
+  whose name stayed free for more than 50 ms. The saves of VS Code, the JetBrains IDEs,
+  `sed -i` and `git checkout` were right in every run.
 - **With polling, a file that was just written is opened and read** (up to 16 MiB, at every
   round for 2 s after the write), on every OS, and so is a young file wherever only the poll
   looks at it. On Windows a program that opens it meanwhile and shares it with nobody is
@@ -299,19 +306,19 @@ What is not reported, or reported wrongly. All of these are known and not fixed.
 
 ## Timing
 
-- **Normally** an event comes within the quiet time (none on macOS, 10 ms on Windows, 20 ms on
-  Linux) plus what the OS takes to tell about a change (about 1 to 15 ms). For a watched path
+- **Normally** an event comes within the quiet time (none on macOS, 10 ms elsewhere) plus what
+  the OS takes to tell about a change (about 1 to 15 ms). For a watched path
   that is a link to a file, a write to the file behind it is found by the poll of the links:
   within a second.
 - **With polling** a change is found by the next round: within the poll interval (100 ms)
   plus the time of a round (20,000 files: about 50 ms on APFS), or within twice the round when
   the round is longer than the interval. The files written in the last two seconds are read
   in each round (on Windows a read right after a write waits for the virus scanner).
-- **Under a flood** of changes a batch goes out four quiet times (80 ms on Linux, 40 ms on
+- **Under a flood** of changes a batch goes out four quiet times (40 ms on Linux and
   Windows; on macOS each time FSEvents tells) after the first change since the last batch, plus
   the time that the check of the disk takes: a check with thousands of changed paths takes a
   second and more (measured: 30,000 files made by eight threads, the longest gap 2 s).
-- **A `Delete`** comes one delete delay (10 ms on macOS and Windows, 50 ms on Linux) after the
+- **A `Delete`** comes one delete delay (10 ms) after the
   OS said that the path is gone, or one quiet time if that is longer, once the path was found
   empty twice (under polling, at the round that finds it gone); under a flood it comes with the
   next batch. It comes at once when a directory is found where the file was, or a file where the

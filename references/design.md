@@ -33,7 +33,7 @@ watcher.close();
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
 | `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `RemoteDisk`, `Io`, `Closed`. One error of a kind is handed over for a flush, and one `RemoteDisk` for each disk (5.12). Its text is these three in a row (see below). |
-| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, none on macOS, 10 ms on Windows and 20 ms on Linux (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and Windows and 50 ms on Linux, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Config`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
+| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, none on macOS and 10 ms elsewhere (5.13); `with_delete_delay(d)`: the delete delay, 10 ms, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Config`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
 
@@ -166,7 +166,7 @@ The words, each for one idea:
 | coverage | what the backend answers | `Coverage::{Watched, WatchedTree, NotWatched, Failed}` |
 | polled | no OS watch covers the directory, so the timer scans it | `Watch::Polled` |
 | held | a look found nothing at the node; what the tree has there, and below, stays until the second look | `Node::is_held`, `Tree::hold` |
-| delete delay | the time from the hint to the second look: 10 ms on macOS and Windows, 50 ms on Linux, none under polling | `Options::delete_delay` |
+| delete delay | the time from the hint to the second look: 10 ms, none under polling | `Options::delete_delay` |
 | young | a file whose modification time is too close to the check to trust | `Content` |
 | quiet time | the debounce: how long no hint must come before the disk is checked | `Options::debounce` |
 | rest | the pause after work that no hint asked for by name: a poll, the scans after loss reports | `REST`, `rest_until` |
@@ -830,17 +830,23 @@ is not told at once.
 - A file that is not told yet is not held: when it is gone, it is forgotten.
 - If a node above a held node is found missing too, the upper one decides for both.
 - With a delay of zero (`with_delete_delay`) nothing is held: a `Delete` comes at the first look.
-- **The default** is 50 ms on Linux: vim renames
-  the file away and writes a new one, and on a busy machine the path was missing for long
-  enough that no delay made 4 of 20 saves a `Delete` and a `Create`, and 30 ms 2 of 60; with
-  50 ms, none of 60 was. On Windows it is 10 ms: the tools that remove a file and write it
-  again (a delete and a new file, a delete and a rename, a rename away and a new file, vim,
-  `git checkout` of 100 files) leave the path missing for microseconds, and with 10 ms none of
-  505 saves a round was a `Delete`, idle or under a load of 16 busy threads on 20 cores and a
-  writer of files next to the tree (2026-10-20, with each quiet time of 5.13). On macOS FSEvents tells about 10 ms after the change, when a save is
-  done (5.13): the delay is 10 ms there, a guard that costs little, and the only wait, as
-  there is no quiet time (with a quiet time of 10 ms or 20 ms and no delay, none of VS Code,
-  vim, `sed -i`, `git checkout` and a JetBrains-like save was wrong, idle or busy). When the watcher polls everything there is none, as there is no quiet time
+- **The default** is 10 ms. The saves of the IDEs write in place (VS Code), rename a new file
+  over (`sed -i`, an atomic save) or rename the file away and the new one in (a JetBrains IDE),
+  and `git checkout` removes and writes: the path is missing for microseconds at most. On Linux
+  (a VM, 2026-10-22: 20 saves of each and 20 checkouts of 50 files a run, idle and with every
+  core busy) none of them was wrong with 10 ms; on Windows none of 505 saves a round was a
+  `Delete`, idle or under a load of 16 busy threads on 20 cores and a writer of files next to
+  the tree (2026-10-20, with each quiet time of 5.13). vim and Neovim on Linux are the
+  exception, and not the case the default is for: they rename the file away and sync their swap
+  file before they write the new one, so the path is missing for 4 ms (median) when idle, and on
+  a busy machine for more than 10 ms in 31% of the saves, 20 ms in 18%, 50 ms in 6%. Such a save
+  is a `Delete` and a `Create` when the path stays missing longer than both the delete delay and
+  the quiet time: with 10 ms, 1 of 60 saves idle and 7 to 23 of 60 busy; with 50 ms and a quiet
+  time of 20 ms, none idle and 0 to 7 busy (README, "Holes"). On macOS FSEvents tells about
+  10 ms after the change, when a save is done (5.13): the delay is 10 ms there, a guard that costs
+  little, and the only wait, as there is no quiet time (with a quiet time of 10 ms or 20 ms and
+  no delay, none of VS Code, vim, `sed -i`, `git checkout` and a JetBrains-like save was wrong,
+  idle or busy). When the watcher polls everything there is none, as there is no quiet time
   (`Config::into_options`), and as in chokidar (`atomic` is off under `usePolling`), notify's
   `PollWatcher`, watchdog's `PollingObserver` and watchpack: a round that falls into a save
   that leaves the path empty reports a `Delete`, and the next round a `Create` (vim on Linux,
@@ -1085,11 +1091,15 @@ four quiet times; on macOS FSEvents leaves gaps of about 10 ms, and the edit wai
 either way. A burst of 2,000 edits went out in 3 batches on macOS instead of 1, and all were
 there as soon (2026-10-15). @parcel/watcher counts its 500 ms from the last batch instead: the
 first change after half a second of quiet goes out at once, alone, and a check of the disk at
-that moment can catch a save half done (5.9). The default quiet time is 20 ms on Linux: long enough for the steps of one save (a temporary file, a rename) to be one batch,
-also on a busy machine, and short enough not to be felt; watchman and webpack wait the same.
-Measured on Linux with the saves of 5.9 on a busy machine: with 5 ms, 4 of 60 saves and 2
-files of 1,000 that `git checkout` wrote were reported twice, the first time half written;
-with 10 ms, none. On Windows a save is two records, one at the open that truncates the file
+that moment can catch a save half done (5.9). The default quiet time is 10 ms on Linux: long enough for the steps of one save (a temporary file, a rename) to be one batch,
+also on a busy machine, and short enough not to be felt. Measured on Linux with the saves of
+5.9 on a busy machine: with 5 ms, 4 of 60 saves and 2 files of 1,000 that `git checkout`
+wrote were reported twice, the first time half written; with 10 ms, none (2026-10-15), and
+again none in the runs of 2026-10-22, idle and busy, where an edit was told after 11 ms
+instead of 21 ms with 20 ms. vim and Neovim sync the new file before they close it: a sync
+longer than the quiet time (common on a busy machine) reports such a save twice, the second
+time after the close; with 10 ms 4 of 60 saves idle and 10 to 14 of 60 busy, with 20 ms none
+of 300. On Windows a save is two records, one at the open that truncates the file
 and one at the close, and nothing for the writes between (measured): the quiet time can only
 hold those two together, and a flush that falls between them reports the file twice, as the
 record of the close is a `Written` hint (5.8). Measured with the saves of 5.9, 15 of each way,
