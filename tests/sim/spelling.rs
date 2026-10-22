@@ -463,23 +463,27 @@ fn two_watched_spellings_with_a_letter_outside_ascii() {
 
 /// The rule for a watched path needs no word about the disk. An engine that takes the disk
 /// for a strict one (Linux) still finds a watched file in another spelling, on a disk that
-/// ignores case (a folder that is shared with macOS or Windows).
+/// ignores case (a folder that is shared with macOS or Windows). Also when the name has a
+/// letter outside ASCII: the table finds the names that differ in the case of the others.
 #[test]
 fn a_watched_path_in_another_spelling_with_an_engine_that_does_not_know_the_disk() {
-  on_all(&Options::default(), |d, on| {
-    d.fs().set_ignore_case(true);
-    d.fs().mkdir_all("/p/src").unwrap();
-    d.fs().write("/p/src/app.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/src/App.js"]), NONE, "{on}");
+  for (on_disk, watched) in [("app.js", "App.js"), ("caf\u{e9}.js", "Caf\u{e9}.js")] {
+    on_all(&Options::default(), |d, on| {
+      let (file, event) = (format!("/p/src/{on_disk}"), |kind| format!("{kind} /p/src/{watched}"));
+      d.fs().set_ignore_case(true);
+      d.fs().mkdir_all("/p/src").unwrap();
+      d.fs().write(&file, "1").unwrap();
+      assert_eq!(d.watch(&[format!("/p/src/{watched}").as_str()]), NONE, "{on}");
 
-    d.fs().write("/p/src/app.js", "22").unwrap();
-    assert_eq!(d.window(), ["U /p/src/App.js"], "{on}");
-    d.fs().remove("/p/src/app.js").unwrap();
-    assert_eq!(d.settled(), ["D /p/src/App.js"], "{on}");
-    d.fs().write("/p/src/app.js", "333").unwrap();
-    assert_eq!(d.settled(), ["C /p/src/App.js"], "{on}");
-    d.caught_up();
-  });
+      d.fs().write(&file, "22").unwrap();
+      assert_eq!(d.window(), [event("U")], "{on}");
+      d.fs().remove(&file).unwrap();
+      assert_eq!(d.settled(), [event("D")], "{on}");
+      d.fs().write(&file, "333").unwrap();
+      assert_eq!(d.settled(), [event("C")], "{on}");
+      d.caught_up();
+    });
+  }
 }
 
 /// A watched directory is renamed, and only the case of its letters changes, on a disk that

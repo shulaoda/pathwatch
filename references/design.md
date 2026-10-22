@@ -385,7 +385,10 @@ accent, Greek, kana, Hangul) is not known here, so two names that are not plain 
 be one name.
 
 A plain name is found through the table: its hash leaves out the case of ASCII letters
-(`child_hash`), so the children that differ only in that are filed under one hash. Such a hint
+(`child_hash`), so the children that differ only in that are filed under one hash. So is any
+name where every directory tells two spellings apart, as only the case of ASCII letters is
+followed there. (Before, a name that was not plain found nothing there: on a loose disk that
+Linux shares, a watched `Café.js` missed the writes to `café.js`.) Such a hint
 costs one lookup more, however many children the directory has: 18 ns next to 20,000 registered
 ones, where comparing with each child took 53 µs. Only the letters are folded: a name that
 differs in the same bit of another byte (`@` and `` ` ``, a byte of UTF-8) has another hash,

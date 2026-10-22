@@ -1125,22 +1125,22 @@ impl Tree {
   /// child that can be the same name, and in a complete node any child that differs only in the
   /// case of ASCII letters. Why: design.md 5.2.
   fn others_meant(&self, at: u32, name: &OsStr, exact: Option<u32>) -> Vec<u32> {
+    // Where every disk is loose, a name that is not plain can be any registered name that is
+    // not plain either; a listing shows the other children (`mark_others`).
+    if self.loose_spelling && !is_plain(name) {
+      let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
+      return listed.iter().copied().filter(|&child| Some(child) != exact).collect();
+    }
+    // The table files the names that differ only in the case of ASCII letters under one hash.
     let any_child = linked(&self.slots, at).is_complete();
     let is_meant = |&child: &u32| {
       let node = linked(&self.slots, child);
       Some(child) != exact
         && node.parent == at
         && (any_child || node.is_registered())
-        && can_be_one_name(name_of(&self.names, node), name)
+        && name_of(&self.names, node).eq_ignore_ascii_case(name)
     };
-    if is_plain(name) {
-      self.index.iter_hash(child_hash(at, name)).copied().filter(is_meant).collect()
-    } else if self.loose_spelling {
-      let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
-      listed.iter().copied().filter(|&child| Some(child) != exact).collect()
-    } else {
-      Vec::new()
-    }
+    self.index.iter_hash(child_hash(at, name)).copied().filter(is_meant).collect()
   }
 
   /// Whether the name of the node `key` is plain: the table finds every other spelling of it.
