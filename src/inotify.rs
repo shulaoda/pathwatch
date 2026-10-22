@@ -121,21 +121,6 @@ impl InotifyBackend {
     self.keys_by_wd.len()
   }
 
-  fn unbind(&mut self, key: DirKey) {
-    let Some(wd) = self.wd_by_key.remove(&key) else { return };
-    let Entry::Occupied(mut keys) = self.keys_by_wd.entry(wd) else { return };
-    let Keys { first, more } = keys.get_mut();
-    if *first != key {
-      more.retain(|&other| other != key);
-    } else if let Some(next) = more.pop() {
-      *first = next;
-    } else {
-      keys.remove();
-      ffi::remove_watch(&self.fds.inotify, wd);
-    }
-    self.shrink();
-  }
-
   /// The two tables are given back when most of their keys are gone.
   fn shrink(&mut self) {
     give_room_back(&mut self.wd_by_key);
@@ -155,18 +140,14 @@ impl Backend for InotifyBackend {
       Ok(wd) if self.wd_by_key.get(&key) == Some(&wd) => Coverage::Watched,
       // A kernel watch belongs to the inode: a second add for it gives the old `wd`.
       Ok(wd) => {
-        self.unbind(key);
+        self.unwatch(key);
         self.wd_by_key.insert(key, wd);
-        match self.keys_by_wd.entry(wd) {
-          Entry::Occupied(mut keys) => keys.get_mut().more.push(key),
-          Entry::Vacant(free) => {
-            free.insert(Keys { first: key, more: Vec::new() });
-          }
-        }
+        let first = Keys { first: key, more: Vec::new() };
+        self.keys_by_wd.entry(wd).and_modify(|keys| keys.more.push(key)).or_insert(first);
         Coverage::Watched
       }
       Err(error) => {
-        self.unbind(key);
+        self.unwatch(key);
         let is_limit = error.raw_os_error() == Some(libc::ENOSPC);
         Coverage::Failed(if is_limit { watch_limit(ERROR_WATCH_LIMIT) } else { error })
       }
@@ -174,7 +155,18 @@ impl Backend for InotifyBackend {
   }
 
   fn unwatch(&mut self, key: DirKey) {
-    self.unbind(key);
+    let Some(wd) = self.wd_by_key.remove(&key) else { return };
+    let Entry::Occupied(mut keys) = self.keys_by_wd.entry(wd) else { return };
+    let Keys { first, more } = keys.get_mut();
+    if *first != key {
+      more.retain(|&other| other != key);
+    } else if let Some(next) = more.pop() {
+      *first = next;
+    } else {
+      keys.remove();
+      ffi::remove_watch(&self.fds.inotify, wd);
+    }
+    self.shrink();
   }
 
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
@@ -240,10 +232,8 @@ impl Backend for InotifyBackend {
 impl Drop for InotifyBackend {
   fn drop(&mut self) {
     let Some(reader) = self.reader.take() else { return };
-    let told_to_stop = (&self.fds.stop).write_all(&1_u64.to_ne_bytes()).is_ok();
-    if told_to_stop {
-      let _ = reader.join();
-    }
+    let _ = (&self.fds.stop).write_all(&1_u64.to_ne_bytes());
+    let _ = reader.join();
   }
 }
 
@@ -255,8 +245,7 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
     // A question of the engine wakes the reader at its time.
     let asked = fds.asked.load(Ordering::Relaxed);
     let until = (asked != 0).then(|| asked.saturating_sub(nanos(SystemTime::now())));
-    let ready =
-      ffi::wait_until_ready(&fds.inotify, &fds.stop, fds.mounts.as_ref(), &fds.ask, until);
+    let ready = ffi::wait_until_ready(fds, until);
     let mounted = match ready {
       Ok([_, true, _, _]) => return,
       Ok([_, _, mounted, asks]) => {
@@ -284,33 +273,26 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
     // returns, the loss report too, so every event of a change before that time is sent
     // (design.md 7.1). One read a turn: a flood can keep the queue from being empty for long,
     // and the reader still sees a stop. A later question stays.
-    if asked != 0
-      && let began = nanos(SystemTime::now())
-      && began >= asked
-    {
-      match (&fds.inotify).read(&mut buffer) {
-        Ok(0) => break io::ErrorKind::UnexpectedEof.into(),
-        Ok(len) => sink.raw(buffer[..len].to_vec()),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-          let mut raw = Vec::new();
-          push_record(&mut raw, DELIVERED_WD, began.to_string().as_bytes());
-          sink.raw(raw);
-          let _ = fds.asked.compare_exchange(asked, 0, Ordering::Relaxed, Ordering::Relaxed);
-        }
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-        Err(error) => break error,
-      }
-      continue;
-    }
+    let began = if asked == 0 { 0 } else { nanos(SystemTime::now()) };
+    let answers = asked != 0 && began >= asked;
     // At most one read a millisecond, unless the last read filled over half of the buffer:
     // a flood of small writes would wake the reader for each.
-    thread::sleep(next_read.saturating_duration_since(Instant::now()));
+    if !answers {
+      thread::sleep(next_read.saturating_duration_since(Instant::now()));
+    }
     match (&fds.inotify).read(&mut buffer) {
       Ok(0) => break io::ErrorKind::UnexpectedEof.into(),
+      Ok(len) if answers => sink.raw(buffer[..len].to_vec()),
       Ok(len) => {
         sink.raw(buffer[..len].to_vec());
         let is_behind = len > READ_BUFFER_LEN / 2;
         next_read = Instant::now() + if is_behind { Duration::ZERO } else { READ_INTERVAL };
+      }
+      Err(error) if answers && error.kind() == io::ErrorKind::WouldBlock => {
+        let mut raw = Vec::new();
+        push_record(&mut raw, DELIVERED_WD, began.to_string().as_bytes());
+        sink.raw(raw);
+        let _ = fds.asked.compare_exchange(asked, 0, Ordering::Relaxed, Ordering::Relaxed);
       }
       Err(error)
         if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
@@ -443,21 +425,15 @@ mod ffi {
   /// Whether `inotify` and `stop` are readable, whether the mounts changed, and whether `ask`
   /// is readable. A file of the mounts always reads, and tells of a change by a priority event.
   /// `nanos`: the longest wait (rounded up to a millisecond); `None` waits until one is ready.
-  pub(super) fn wait_until_ready(
-    inotify: &File,
-    stop: &File,
-    mounts: Option<&File>,
-    ask: &File,
-    nanos: Option<u64>,
-  ) -> io::Result<[bool; 4]> {
+  pub(super) fn wait_until_ready(fds: &super::Fds, nanos: Option<u64>) -> io::Result<[bool; 4]> {
     let wait = |fd: i32, events: i16| libc::pollfd { fd, events, revents: 0 };
     // A negative descriptor is left out.
-    let mounts = mounts.map_or(-1, AsRawFd::as_raw_fd);
+    let mounts = fds.mounts.as_ref().map_or(-1, AsRawFd::as_raw_fd);
     let mut polled = [
-      wait(inotify.as_raw_fd(), libc::POLLIN),
-      wait(stop.as_raw_fd(), libc::POLLIN),
+      wait(fds.inotify.as_raw_fd(), libc::POLLIN),
+      wait(fds.stop.as_raw_fd(), libc::POLLIN),
       wait(mounts, libc::POLLPRI),
-      wait(ask.as_raw_fd(), libc::POLLIN),
+      wait(fds.ask.as_raw_fd(), libc::POLLIN),
     ];
     let millis = nanos.map(|nanos| nanos.div_ceil(1_000_000));
     let timeout = millis.map_or(-1, |millis| i32::try_from(millis).unwrap_or(i32::MAX));

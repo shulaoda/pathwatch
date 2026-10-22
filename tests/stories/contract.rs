@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use pathwatch::EventKind::{Create, Delete, Update};
 
-use crate::{Settings, everywhere, everywhere_with, on_disk, on_disk_with};
+use crate::{Settings, World, everywhere, everywhere_with, on_disk, on_disk_with};
 
 #[test]
 fn s1_a_write_in_place() {

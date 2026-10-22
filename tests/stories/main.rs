@@ -47,8 +47,6 @@ pub use crate::disk::{Disk, Inside};
 pub trait World {
   /// The absolute path of `rel` in this world.
   fn path(&self, rel: &str) -> PathBuf;
-  /// `native` or `polling` on the real disk; the name of the simulated backend otherwise.
-  fn name(&self) -> &'static str;
   /// Whether the world polls the disk in place of an OS watch.
   fn polls(&self) -> bool;
   /// Whether the disk takes two spellings of a name for one (the case of letters).

@@ -33,11 +33,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.options.ignored.is_none() {
       return false;
     }
-    let Some((top, rest)) = split_top(path) else { return false };
-    let above = iter::once(top).chain(rest.iter()).take(rest.iter().count());
+    let Some((top, rest)) = path.parent().and_then(split_top) else { return false };
     let mut dir = PathBuf::with_capacity(path.as_os_str().len());
     let mut at = Some(Tree::ROOT);
-    for name in above {
+    for name in iter::once(top).chain(rest.iter()) {
       push_name(&mut dir, name);
       at = at.and_then(|at| self.tree.child(at, name));
       let ignored = match at {

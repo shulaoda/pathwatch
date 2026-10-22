@@ -303,7 +303,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.pending = BinaryHeap::new();
     self.tree.poll_all();
     // Its last notifications may be lost.
-    self.tree.scan_all();
+    self.tree.queue_scan(Tree::ROOT, Depth::Deep);
   }
 
   /// The directory at or above the node that only a poll of its parent checks.

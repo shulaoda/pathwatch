@@ -203,7 +203,7 @@ mod place {
           // below their common directory, so a link above it holds back all of them.
           let mut first = None;
           for top in at..=end {
-            if link_between(&common, tops[top], &mut *is_link).is_some() {
+            if link_between(&common, tops[top], &mut *is_link) {
               continue;
             }
             let first = *first.get_or_insert(top);
@@ -258,14 +258,10 @@ mod place {
     path.components().take(count).collect()
   }
 
-  /// The deepest link on the way from `top` down to `dir`, `dir` itself included.
-  pub(super) fn link_between<'a>(
-    top: &Path,
-    dir: &'a Path,
-    mut is_link: impl FnMut(&Path) -> bool,
-  ) -> Option<&'a Path> {
+  /// Whether a link lies on the way from `top` down to `dir`, `dir` itself included.
+  pub(super) fn link_between(top: &Path, dir: &Path, is_link: impl FnMut(&Path) -> bool) -> bool {
     let names = dir.strip_prefix(top).map_or(0, |below| below.components().count());
-    dir.ancestors().take(names).find(|path| is_link(path))
+    dir.ancestors().take(names).any(is_link)
   }
 
   pub(super) fn may_hold_a_handle(dir: &Path) -> bool {
@@ -331,11 +327,11 @@ mod handles {
     pub covered: Vec<DirKey>,
   }
 
-  /// What the last handle of a key died of, and how many of its handles died in a row before
-  /// they delivered anything.
+  /// What the last handle of a key died of, and whether it died before it delivered anything
+  /// while the death before it was still on record.
   #[derive(Debug)]
   struct Death {
-    count: u8,
+    again: bool,
     error: io::Error,
   }
 
@@ -364,16 +360,28 @@ mod handles {
       let mut told = Told::default();
       let waited = self.waiting.remove(&key).is_some();
       let refused = self.refused.remove(&key);
-      let want = self.keys.get(&key).map_or(want, |served| served.want.max(want));
 
       // The deepest handle at or above the directory: one can stand below another, behind a
       // link.
       let above = self.open.iter().enumerate().filter(|(_, handle)| dir.starts_with(&handle.dir));
       if let Some((at, _)) = above.max_by_key(|(_, handle)| handle.dir.as_os_str().len()) {
-        let coverage = self.share(at, key, dir, want, !(waited || refused), system);
-        if matches!(coverage, Coverage::NotWatched | Coverage::Failed(_)) {
+        if link_between(&self.open[at].dir, dir, |path| system.is_link(path)) {
           self.drop_key(key, system);
+          return (Coverage::NotWatched, told);
         }
+        // A `watch` for the very directory of the handle puts a new handle there: the old one
+        // may be on a directory that was renamed away. A key that only waited, or got no handle
+        // at the last commit, takes the one that the commit just opened.
+        if !(waited || refused)
+          && self.open[at].dir == dir
+          && let Err(error) = self.reopen(at, system)
+        {
+          self.drop_key(key, system);
+          return (Coverage::Failed(error), told);
+        }
+        self.remember(key, dir, want, Some(self.open[at].id));
+        let coverage =
+          if want == Want::Contents { Coverage::WatchedTree } else { Coverage::Watched };
         return (coverage, told);
       }
       if want == Want::Names || !may_hold_a_handle(dir) {
@@ -382,7 +390,7 @@ mod handles {
       }
       // The handles of this key die as soon as they are opened (a server that refuses the
       // request): the engine polls it, and asks again at each poll.
-      if self.dead.get(&key).is_some_and(|death| death.count >= 2)
+      if self.dead.get(&key).is_some_and(|death| death.again)
         && let Some(death) = self.dead.remove(&key)
       {
         return (Coverage::Failed(death.error), told);
@@ -429,9 +437,8 @@ mod handles {
       let keys: Vec<DirKey> = served.map(|(&key, _)| key).collect();
       for &key in &keys {
         self.forget(key);
-        let before = if handle.delivered { None } else { self.dead.get(&key) };
-        let count = before.map_or(0, |death| death.count).saturating_add(1);
-        self.dead.insert(key, Death { count, error: same(error) });
+        let again = !handle.delivered && self.dead.contains_key(&key);
+        self.dead.insert(key, Death { again, error: same(error) });
       }
       keys
     }
@@ -458,11 +465,8 @@ mod handles {
       let lower_dir = lowered(dir);
       let mut path = dir.as_os_str().as_encoded_bytes().to_vec();
       let mut lower = lower_dir.as_os_str().as_encoded_bytes().to_vec();
-      for text in [&mut path, &mut lower] {
-        if !text.last().is_some_and(is_separator) {
-          text.push(b'\\');
-        }
-      }
+      path.push(b'\\');
+      lower.push(b'\\');
       // The directories on the way up, each with its spelling in lower case. The names below
       // one start after the separators that follow it in `path`.
       let above = dir.ancestors().zip(lower_dir.ancestors()).filter_map(|(up, lower_up)| {
@@ -483,32 +487,6 @@ mod handles {
       let dir = lowered(dir);
       let below = self.at.iter().filter(|(lower, _)| lower.starts_with(&dir));
       below.flat_map(|(_, keys)| keys).copied().collect()
-    }
-
-    /// `fresh`: the request is no second ask of a key that waited for a handle, or got none.
-    fn share(
-      &mut self,
-      at: usize,
-      key: DirKey,
-      dir: &Path,
-      want: Want,
-      fresh: bool,
-      system: &mut dyn System,
-    ) -> Coverage {
-      if link_between(&self.open[at].dir, dir, |path| system.is_link(path)).is_some() {
-        return Coverage::NotWatched;
-      }
-      // A `watch` for the very directory of the handle puts a new handle there: the old one may
-      // be on a directory that was renamed away. A key that only waited, or got no handle at
-      // the last commit, takes the one that the commit just opened.
-      if fresh
-        && self.open[at].dir == dir
-        && let Err(error) = self.reopen(at, system)
-      {
-        return Coverage::Failed(error);
-      }
-      self.remember(key, dir, want, Some(self.open[at].id));
-      if want == Want::Contents { Coverage::WatchedTree } else { Coverage::Watched }
     }
 
     /// The key is forgotten. A handle that it alone used closes now (rule 6: the OS watch goes
@@ -547,12 +525,11 @@ mod handles {
       // made again with them known, until no new one turns up: a directory behind a link then
       // has a handle of its own. A key that still lies behind a link (below a directory that
       // has a handle anyway) is not served.
-      let mut links: Vec<PathBuf> = Vec::new();
       let mut looked: FxHashMap<PathBuf, bool> = FxHashMap::default();
       let (places, behind_a_link) = loop {
-        let places = place(&wanted, MAX_HANDLES, &mut |path| links.iter().any(|link| link == path));
+        let known = looked.values().filter(|&&is| is).count();
+        let places = place(&wanted, MAX_HANDLES, &mut |path| looked.get(path) == Some(&true));
         let mut behind = Vec::new();
-        let mut found_more = false;
         for place in &places {
           let id = self.open.iter().find(|handle| handle.dir == place.dir).map(|handle| handle.id);
           for &key in &place.keys {
@@ -562,16 +539,12 @@ mod handles {
             }
             let is_link =
               |path: &Path| *looked.entry(path.to_owned()).or_insert_with(|| system.is_link(path));
-            if let Some(link) = link_between(&place.dir, &served.dir, is_link) {
+            if link_between(&place.dir, &served.dir, is_link) {
               behind.push(key);
-              if !links.iter().any(|known| known == link) {
-                links.push(link.to_owned());
-                found_more = true;
-              }
             }
           }
         }
-        if !found_more {
+        if looked.values().filter(|&&is| is).count() == known {
           break (places, behind);
         }
       };
@@ -581,13 +554,13 @@ mod handles {
         if self.open.iter().any(|handle| handle.dir == place.dir) {
           continue;
         }
-        match self.next_id().and_then(|id| system.open(id, &place.dir).map(|()| id)) {
-          Ok(id) => new.push(Handle { id, dir: place.dir.clone(), delivered: false }),
+        let id = self.next_id();
+        match system.open(id, &place.dir) {
+          Ok(()) => new.push(Handle { id, dir: place.dir.clone(), delivered: false }),
           Err(error) => {
             for handle in &new {
               system.close(handle.id);
             }
-            self.close_unused(system);
             return Err(error);
           }
         }
@@ -605,7 +578,7 @@ mod handles {
         let covered = waiting.filter(|(_, dir)| {
           let is_link =
             |path: &Path| *looked.entry(path.to_owned()).or_insert_with(|| system.is_link(path));
-          link_between(&handle.dir, dir.as_path(), is_link).is_none()
+          !link_between(&handle.dir, dir.as_path(), is_link)
         });
         told.covered.extend(covered.map(|(&key, _)| key));
       }
@@ -630,7 +603,7 @@ mod handles {
     }
 
     fn reopen(&mut self, at: usize, system: &mut dyn System) -> io::Result<()> {
-      let id = self.next_id()?;
+      let id = self.next_id();
       system.open(id, &self.open[at].dir)?;
       let old = mem::replace(&mut self.open[at].id, id);
       self.open[at].delivered = false;
@@ -643,23 +616,9 @@ mod handles {
       Ok(())
     }
 
-    fn close_unused(&mut self, system: &mut dyn System) {
-      let used: FxHashSet<WatchId> =
-        self.keys.values().filter_map(|served| served.handle).collect();
-      self.open.retain(|handle| {
-        let is_used = used.contains(&handle.id);
-        if !is_used {
-          system.close(handle.id);
-        }
-        is_used
-      });
-    }
-
-    fn next_id(&mut self) -> io::Result<WatchId> {
-      let id = WatchId(self.next_id);
-      let next = self.next_id.checked_add(1);
-      self.next_id = next.ok_or_else(|| watch_limit("every id of a directory handle is used"))?;
-      Ok(id)
+    fn next_id(&mut self) -> WatchId {
+      self.next_id += 1;
+      WatchId(self.next_id - 1)
     }
 
     fn remember(&mut self, key: DirKey, dir: &Path, want: Want, handle: Option<WatchId>) {
@@ -934,7 +893,7 @@ mod port {
   use windows_sys::Win32::{
     Foundation::{
       ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_NOTIFY_ENUM_DIR,
-      HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+      FARPROC, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
     },
     Storage::FileSystem::{
       FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
@@ -953,7 +912,7 @@ mod port {
   use super::{Raw, System, WatchId};
   use crate::{
     backend::Sink,
-    fs::{FileType, Fs, SHARE_ALL, StdFs, Unknown, kernel32},
+    fs::{FileType, Fs, SHARE_ALL, StdFs, kernel32},
   };
 
   // No creation time: a tool that only sets it would give a `Written` hint.
@@ -980,9 +939,10 @@ mod port {
   fn read_extended() -> Option<ReadExtended> {
     static CALL: OnceLock<Option<ReadExtended>> = OnceLock::new();
     *CALL.get_or_init(|| {
-      let found = kernel32(c"ReadDirectoryChangesExW");
       // SAFETY: the function with this name has this signature.
-      found.map(|call| unsafe { mem::transmute::<Unknown, ReadExtended>(call) })
+      unsafe {
+        mem::transmute::<FARPROC, Option<ReadExtended>>(kernel32(c"ReadDirectoryChangesExW"))
+      }
     })
   }
 
@@ -1026,9 +986,7 @@ mod port {
           let (watches, waiting, deliver_after) = (FxHashMap::default(), None, None);
           let commands = receiver;
           let next_token = 0;
-          let draining = false;
-          Worker { iocp, commands, sink, watches, next_token, waiting, deliver_after, draining }
-            .run();
+          Worker { iocp, commands, sink, watches, next_token, waiting, deliver_after }.run();
         }
       })?;
       Ok(Self { iocp, commands, worker: Some(worker), closing: false })
@@ -1120,8 +1078,6 @@ mod port {
     /// The time the engine asked about (`Backend::ask_delivered`): then every handle is read
     /// until nothing is left, and `Raw::Delivered` says so.
     deliver_after: Option<SystemTime>,
-    /// The handles are read until nothing is left: none rests.
-    draining: bool,
   }
 
   impl Worker {
@@ -1168,7 +1124,7 @@ mod port {
               break;
             }
           }
-          Packet::Completed { token, result } => self.completed(token, result),
+          Packet::Completed { token, result } => self.completed(token, result, false),
           Packet::Timeout => {}
           Packet::Nothing(error) => {
             self.sink.failed(error);
@@ -1190,9 +1146,8 @@ mod port {
     /// the next read, so every record of a change before that time is sent (design.md 7.3).
     /// `false`: the worker stops.
     fn read_empty(&mut self) -> bool {
-      self.draining = true;
       self.rearm(None);
-      let went_on = loop {
+      loop {
         let began = SystemTime::now();
         match self.iocp.wait(0) {
           Packet::Timeout => {
@@ -1200,22 +1155,20 @@ mod port {
             if self.deliver_after.is_some_and(|after| after <= began) {
               self.deliver_after = None;
             }
-            break true;
+            return true;
           }
-          Packet::Completed { token, result } => self.completed(token, result),
+          Packet::Completed { token, result } => self.completed(token, result, true),
           Packet::Wake => {
             if !self.run_commands() {
-              break false;
+              return false;
             }
           }
           Packet::Nothing(error) => {
             self.sink.failed(error);
-            break false;
+            return false;
           }
         }
-      };
-      self.draining = false;
-      went_on
+      }
     }
 
     /// Queues the next read of every handle whose rest is over at `now`, or of every resting one.
@@ -1283,7 +1236,6 @@ mod port {
       } else {
         self.watches.remove(&token);
       }
-      self.answer_closed();
     }
 
     /// The reply that waits for the closes gets it once no handle is closing.
@@ -1296,7 +1248,8 @@ mod port {
       }
     }
 
-    fn completed(&mut self, token: usize, result: io::Result<u32>) {
+    /// `draining`: the handles are read until nothing is left, so none rests.
+    fn completed(&mut self, token: usize, result: io::Result<u32>, draining: bool) {
       let Some(watch) = self.watches.get_mut(&token) else { return };
       watch.pending = false;
       let result = match result {
@@ -1347,7 +1300,7 @@ mod port {
         return;
       }
       // A read that came back nearly full, or with a loss (no bytes), is queued again at once.
-      if len == 0 || len >= BATCH_BYTES || self.draining {
+      if len == 0 || len >= BATCH_BYTES || draining {
         if let Err(error) = watch.read() {
           self.died(token, error);
         }

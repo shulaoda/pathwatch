@@ -462,34 +462,16 @@ impl Tree {
     path
   }
 
-  /// How many nodes are above the node. Zero for a key that names no node.
-  pub fn level(&self, key: DirKey) -> usize {
-    self.above(key).count()
-  }
-
-  /// Makes the node a watched path. `false`: it is one already.
-  pub fn make_path(&mut self, key: DirKey) -> bool {
+  /// Makes the node a watched path, or takes that back. `false`: it was so already.
+  pub fn set_path(&mut self, key: DirKey, is_path: bool) -> bool {
     let node = &mut self[key];
-    if node.is_path() {
+    if node.is_path() == is_path {
       return false;
     }
     let was_registered = node.is_registered();
-    node.set_path(true);
-    if !was_registered {
-      self.count_registered(key.index(), true);
-    }
-    true
-  }
-
-  /// The node is no watched path any more. `false`: it was none.
-  pub fn drop_path(&mut self, key: DirKey) -> bool {
-    let node = &mut self[key];
-    if !node.is_path() {
-      return false;
-    }
-    node.set_path(false);
-    if !node.is_registered() {
-      self.count_registered(key.index(), false);
+    node.set_path(is_path);
+    if node.is_registered() != was_registered {
+      self.count_registered(key.index(), is_path);
     }
     true
   }
@@ -501,9 +483,6 @@ impl Tree {
     let node = &self[key];
     if node.is_complete() {
       return Some(Want::Contents);
-    }
-    if node.registered_children == 0 {
-      return Some(Want::Names);
     }
     let mut unknown = false;
     for child in self.children(key) {
@@ -900,9 +879,11 @@ impl Tree {
       let is_seen = below.is_some_and(Node::is_registered) || is_complete;
       // The table finds the other spellings of a plain name only; the registered ones that are not
       // plain are on a list, and a listing shows the rest.
-      let not_in_table = self.loose_spelling
-        && (!self.not_plain.is_empty() || (is_complete && !below.is_some_and(Node::is_entry)));
-      if has_other || (not_in_table && !is_plain(name)) {
+      let is_new = is_complete && !below.is_some_and(Node::is_entry);
+      if self.loose_spelling && is_new && !is_plain(name) {
+        self.queue_scan(self.key(at), Depth::Names);
+      }
+      if has_other || (self.loose_spelling && !self.not_plain.is_empty() && !is_plain(name)) {
         found |= self.mark_others(at, name, child, &parts, said);
       }
       if !is_seen {
@@ -947,13 +928,7 @@ impl Tree {
   ) -> bool {
     let last = rest.clone().peek().is_none();
     let mut found = false;
-    let parent = linked(&self.slots, at);
-    let is_entry = exact.is_some_and(|exact| linked(&self.slots, exact).is_entry());
     let one_entry = said == Said::Written && self.loose_spelling;
-    if self.loose_spelling && parent.is_complete() && !is_entry && !is_plain(name) {
-      // A name that is not plain can be another spelling of each child that is not plain.
-      self.queue_scan(self.key(at), Depth::Names);
-    }
     for other in self.others_meant(at, name, exact) {
       let node = linked(&self.slots, other);
       let is_dir = node.is_dir();
@@ -998,11 +973,6 @@ impl Tree {
     }
   }
 
-  /// Queues a scan of everything.
-  pub fn scan_all(&mut self) {
-    self.queue_scan(Self::ROOT, Depth::Deep);
-  }
-
   /// Takes the queue into `scans`: every queued node, with its depth and whether it was away.
   pub fn take_scans(&mut self, scans: &mut Vec<(DirKey, Depth, bool)>) {
     scans.clear();
@@ -1028,7 +998,7 @@ impl Tree {
       if let Some(parent) = self.parent(key)
         && self[key].is_marked()
       {
-        marks.push((self.level(key), newer, parent, key, since));
+        marks.push((self.above(key).count(), newer, parent, key, since));
       }
     }
     self.marked = emptied(marked);
@@ -1051,9 +1021,9 @@ impl Tree {
   }
 
   /// Puts the directory on the list of the timer if it has to be polled now. Also while held.
-  /// A directory is listed more than once (the answer of the backend, the end of its scan), and
-  /// a stale key stays until a tidy: the list is tidied when it outgrows the arena twice over,
-  /// so a `watch` and `unwatch` of ever new paths cannot grow it without bound.
+  /// A directory is listed more than once (its watch state is set, a look in it failed), and a
+  /// stale key stays until a tidy: the list is tidied when it outgrows the arena twice over, so
+  /// a `watch` and `unwatch` of ever new paths cannot grow it without bound.
   pub fn list_if_polled(&mut self, key: DirKey) {
     if matches!(self[key].kind, Kind::Dir(dir) if dir.is_polled()) {
       self.polled.push(key);
@@ -1125,7 +1095,7 @@ impl Tree {
   /// case of ASCII letters. Why: design.md 5.2.
   fn others_meant(&self, at: u32, name: &OsStr, exact: Option<u32>) -> Vec<u32> {
     // Where every disk is loose, a name that is not plain can be any registered name that is
-    // not plain either; a listing shows the other children (`mark_others`).
+    // not plain either; a listing shows the other children (`mark_path`).
     if self.loose_spelling && !is_plain(name) {
       let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
       return listed.iter().copied().filter(|&child| Some(child) != exact).collect();
@@ -1166,7 +1136,8 @@ impl Tree {
     marked.map(|twin| self.key(twin)).collect()
   }
 
-  /// The other nodes of the directory that the table finds as the same name as the node `key`.
+  /// The other nodes of the directory whose names differ from the name of `key` only in the case
+  /// of ASCII letters: the table files them under one hash.
   fn twins(&self, key: DirKey) -> impl Iterator<Item = u32> + '_ {
     let node = &self[key];
     let name = name_of(&self.names, node);
@@ -1174,15 +1145,9 @@ impl Tree {
       let other_node = linked(&self.slots, other);
       other != key.index()
         && other_node.parent == node.parent
-        && can_be_one_name(name_of(&self.names, other_node), name)
+        && name_of(&self.names, other_node).eq_ignore_ascii_case(name)
     })
   }
-}
-
-/// Whether `a` and `b` can be one name on a loose disk: equal but for the case of ASCII letters,
-/// or neither is plain.
-fn can_be_one_name(a: &OsStr, b: &OsStr) -> bool {
-  a.eq_ignore_ascii_case(b) || (!is_plain(a) && !is_plain(b))
 }
 
 /// Whether every other spelling of `name` is known: only ASCII and Han ideographs, which have no
@@ -1295,10 +1260,6 @@ impl Tree {
     self.holds.len()
   }
 
-  pub fn holds(&self) -> impl Iterator<Item = (DirKey, Instant)> + '_ {
-    self.holds.iter().map(|(key, until)| (*key, *until))
-  }
-
   /// Whether a node above is held: then nothing is done here before its second look.
   pub fn frozen(&self, key: DirKey) -> bool {
     !self.holds.is_empty() && self.above(key).any(|at| linked(&self.slots, at).is_held())
@@ -1382,7 +1343,7 @@ mod tests {
     time::{Duration, UNIX_EPOCH},
   };
 
-  use super::{KEPT, Tree, can_be_one_name, child_hash, emptied, nanos};
+  use super::{KEPT, Tree, child_hash, emptied, is_plain, nanos};
   use crate::backend::DirKey;
 
   /// After a pack, every node that stays has its name and is found by it.
@@ -1489,26 +1450,10 @@ mod tests {
   }
 
   #[test]
-  fn two_names_that_can_be_one_name() {
-    let same = |a: &str, b: &str| can_be_one_name(OsStr::new(a), OsStr::new(b));
-    assert!(same("App.js", "App.js"));
-    assert!(same("App.js", "aPP.JS"));
-    assert!(!same("App.js", "App.jsx"));
-    assert!(!same("App.js", "Abb.js"));
-    assert!(!same("a-b", "a_b"));
-    // Other letters: the rules of the disk are not known, so any two such names can be one.
-    // `e` with an accent as one character and as two, and in upper case.
-    assert!(same("caf\u{e9}.js", "cafe\u{301}.js"));
-    assert!(same("caf\u{e9}.js", "CAF\u{c9}.JS"));
-    assert!(same("\u{e9}", "\u{444}"));
-    // One of the two is plain: the bytes decide. An ideograph is plain, a compatibility
-    // ideograph is not.
-    assert!(!same("cafe.js", "caf\u{e9}.js"));
-    assert!(!same("caf\u{e9}.js", "cafe.js"));
-    assert!(same("\u{4e2d}\u{6587}.js", "\u{4e2d}\u{6587}.JS"));
-    assert!(!same("\u{4e2d}.js", "\u{6587}.js"));
-    assert!(!same("\u{4e2d}.js", "\u{e9}.js"));
-    assert!(same("\u{f967}.js", "\u{e9}.js"));
+  fn names_that_are_plain() {
+    assert!(is_plain(OsStr::new("App.js")) && is_plain(OsStr::new("\u{4e2d}\u{6587}.js")));
+    // An ideograph is plain, a compatibility ideograph is not.
+    assert!(!is_plain(OsStr::new("caf\u{e9}.js")) && !is_plain(OsStr::new("\u{f967}.js")));
   }
 
   /// A time that does not fit becomes the nearest one that does.

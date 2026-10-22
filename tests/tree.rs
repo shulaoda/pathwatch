@@ -55,7 +55,7 @@ fn fixture() -> Fixture {
     on_disk(&mut tree, key, true);
   }
   for key in [r, f, x] {
-    assert!(tree.make_path(key));
+    assert!(tree.set_path(key, true));
   }
   tree.check_links().unwrap();
   Fixture { tree, top, p, r, sub, gone, deep, f }
@@ -107,7 +107,6 @@ fn paths_are_built_from_the_names() {
   assert_eq!(tree.path(top), Path::new("/"));
   assert_eq!(tree.path(sub), Path::new("/p/r/sub"));
   assert_eq!(tree.path(deep), Path::new("/p/gone/deep"));
-  assert_eq!(tree.level(deep), 4);
 
   // A buffer is used again, whatever it held.
   let mut path = PathBuf::from("/something/else");
@@ -236,19 +235,19 @@ fn what_is_registered() {
   }
   assert!(!tree[sub].is_registered());
 
-  assert!(!tree.make_path(r));
+  assert!(!tree.set_path(r, true));
   let below = child(&mut tree, sub, "x.js");
-  assert!(tree.make_path(below));
+  assert!(tree.set_path(below, true));
   assert!(tree[r].is_path() && tree[r].is_ancestor());
   assert!(tree[sub].is_ancestor() && !tree[sub].is_path());
   tree.check_links().unwrap();
 
   // A node above another watched path stays registered.
-  assert!(tree.drop_path(r));
-  assert!(!tree.drop_path(r));
+  assert!(tree.set_path(r, false));
+  assert!(!tree.set_path(r, false));
   assert!(!tree[r].is_path() && tree[r].is_registered());
   tree.check_links().unwrap();
-  assert!(tree.drop_path(below));
+  assert!(tree.set_path(below, false));
   for key in [below, sub, r] {
     assert!(!tree[key].is_registered());
   }
@@ -256,7 +255,7 @@ fn what_is_registered() {
   assert!(tree[p].is_ancestor());
   tree.check_links().unwrap();
   let x = tree.child(deep, OsStr::new("x.js")).unwrap();
-  assert!(tree.drop_path(f) && tree.drop_path(x));
+  assert!(tree.set_path(f, false) && tree.set_path(x, false));
   for key in [f, x, deep, gone, p, top, Tree::ROOT] {
     assert!(!tree[key].is_registered());
   }
@@ -340,7 +339,7 @@ fn a_held_node() {
   let until = Instant::now() + Duration::from_millis(100);
   tree.hold(r, until);
   assert!(tree[r].is_held() && tree.held_until(r) == Some(until));
-  assert_eq!(tree.holds().collect::<Vec<_>>(), [(r, until)]);
+  assert_eq!(tree.hold_count(), 1);
   assert!(matches!(tree[r].kind, Kind::Dir(_)));
   assert!(!tree[r].is_dir() && tree[r].dir().is_none() && !tree[r].is_complete());
   assert_eq!(tree[r].watch(), Watch::None);
@@ -374,7 +373,7 @@ fn a_held_node() {
   tree[file].kind = Kind::Missing;
   tree.unhold(file);
   tree.prune(file);
-  assert!(tree.get(file).is_none() && tree.holds().next().is_none());
+  assert!(tree.get(file).is_none() && tree.hold_count() == 0);
   tree.check_links().unwrap();
 }
 
@@ -585,11 +584,11 @@ fn a_write_under_another_spelling_is_a_write_to_the_registered_name() {
   clear_marks(&mut f.tree);
   // A name that is not plain can be every registered name that is not plain: a guess.
   let accent = child(&mut f.tree, f.p, "caf\u{e9}.js");
-  assert!(f.tree.make_path(accent));
+  assert!(f.tree.set_path(accent, true));
   assert!(f.tree.hint(changed(f.p, "CAF\u{c9}.js", true)));
   assert_eq!(marks(&f.tree), ["/p|caf\u{e9}.js|d"]);
   clear_marks(&mut f.tree);
-  assert!(f.tree.drop_path(accent));
+  assert!(f.tree.set_path(accent, false));
   f.tree.prune(accent);
 
   // inotify says "written" for a file that was moved in too: the twin is the same file after a
@@ -612,11 +611,11 @@ fn a_name_that_can_be_another_spelling() {
   assert_eq!(f.tree.child(f.p, OsStr::new("F.JS")), None);
   clear_marks(&mut f.tree);
   let upper = child(&mut f.tree, f.p, "F.JS");
-  assert!(f.tree.make_path(upper));
+  assert!(f.tree.set_path(upper, true));
   assert!(f.tree.hint(changed(f.p, "f.js", true)));
   assert_eq!(marks(&f.tree), ["/p|F.JS|d", "/p|f.js|w"]);
   clear_marks(&mut f.tree);
-  assert!(f.tree.drop_path(upper));
+  assert!(f.tree.set_path(upper, false));
   f.tree.prune(upper);
   // The walk goes on below a registered directory in another spelling.
   assert!(f.tree.hint(changed(f.p, "R/sub/a.js", true)));
@@ -624,7 +623,7 @@ fn a_name_that_can_be_another_spelling() {
   clear_marks(&mut f.tree);
   // On a strict disk, an accent is no other spelling of anything.
   let accent = child(&mut f.tree, f.p, "\u{e9}.js");
-  assert!(f.tree.make_path(accent));
+  assert!(f.tree.set_path(accent, true));
   assert!(!f.tree.hint(changed(f.p, "\u{c9}.js", true)));
   assert!(!f.tree.has_work());
 
@@ -635,7 +634,7 @@ fn a_name_that_can_be_another_spelling() {
   assert!(!f.tree.hint(changed(f.p, "\u{4e2d}", false)));
   assert_eq!(marks(&f.tree), ["/p|\u{e9}.js|d"]);
   clear_marks(&mut f.tree);
-  assert!(f.tree.drop_path(accent));
+  assert!(f.tree.set_path(accent, false));
   f.tree.prune(accent);
   f.tree.check_links().unwrap();
 
@@ -716,7 +715,7 @@ fn an_old_key_does_not_reach_the_node_that_reuses_its_slot() {
   assert_eq!(f.tree.child(old, OsStr::new("a.js")), None);
   assert_eq!(f.tree.children(old).count(), 0);
   assert_eq!(f.tree.path(old), Path::new(""));
-  assert_eq!(f.tree.level(old), 0);
+  assert_eq!(f.tree.ancestors(old).count(), 0);
   f.tree.prune(old);
   assert_eq!(f.tree.path(new), Path::new("/p/r/other"));
 
@@ -751,7 +750,7 @@ fn lost_notifications_scan_everything() {
   f.tree.hint(Hint::Lost);
   // The engine says when: the scans after loss reports are paced.
   assert!(f.tree.lost && !f.tree.has_work());
-  f.tree.scan_all();
+  f.tree.queue_scan(Tree::ROOT, Depth::Deep);
   assert_eq!(f.tree[Tree::ROOT].dir().unwrap().scan, Some(Depth::Deep));
   assert_eq!(f.tree.to_scan, [Tree::ROOT]);
   assert_eq!(f.tree.parent(f.top), Some(Tree::ROOT));

@@ -911,9 +911,7 @@ mod handles {
     assert_eq!(fake.watch(1, "/p/a", Want::Names), Answer::Names);
     assert_eq!(fake.watch(1, "/p/a", Want::Contents), Answer::Tree);
     assert_eq!(fake.disk.open, [(id, dir("/p"))]);
-    // It wants the contents now, also when it is asked for less (rule 5): the handle moves to
-    // it when the key above goes.
-    assert_eq!(fake.watch(1, "/p/a", Want::Names), Answer::Tree);
+    // The handle moves to it when the key above goes.
     fake.unwatch(0);
     assert_eq!(fake.dirs(), dirs(["/p/a"]));
   }

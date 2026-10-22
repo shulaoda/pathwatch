@@ -88,7 +88,7 @@ impl Backend for SimBackend {
 
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
     self.fs.enter(|calls| calls.watch += 1);
-    self.fs.lock().log_watch(WatchCall { key, dir: dir.to_path_buf(), want: Some(want) });
+    self.fs.lock().watch_calls.push(WatchCall { key, dir: dir.to_path_buf(), want: Some(want) });
     if let Some(had) = self.wants.insert(key, want) {
       assert!(want >= had, "rule 5: the want of {key:?} went down from {had:?} to {want:?}");
     }
@@ -200,7 +200,9 @@ impl Backend for SimBackend {
   }
 
   fn ask_delivered(&mut self, after: SystemTime) {
-    self.fs.ask_delivered(after);
+    let mut state = self.fs.lock();
+    state.kernel.delivered_after = Some(after);
+    state.tell_delivered();
   }
 
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
@@ -230,9 +232,6 @@ impl Backend for SimBackend {
     }
     let Some(keys) = self.keys.get(&raw.watch) else { return };
     let prefix = self.prefixes.get(&raw.watch);
-    if prefix.is_some_and(|prefix| !raw.path.starts_with(prefix)) {
-      return hint(Hint::Lost);
-    }
     for &key in keys {
       // A key that uses a stream above its directory gets what is at or below its directory.
       let rel = match self.below.get(&key).or(prefix) {
@@ -437,15 +436,7 @@ impl Kernel {
     }
   }
 
-  /// `direct`: the entry lies in the directory of the handle itself.
-  pub(crate) fn by_handle(
-    &mut self,
-    handle: u64,
-    rel: &Path,
-    act: Act,
-    is_dir: bool,
-    direct: bool,
-  ) {
+  pub(crate) fn by_handle(&mut self, handle: u64, rel: &Path, act: Act, is_dir: bool) {
     if !self.watched.contains_key(&handle) {
       return;
     }
@@ -456,8 +447,8 @@ impl Kernel {
     let what = if written { What::Written { new: false } } else { What::Entry };
     self.queue.push_back(SimRaw { watch: handle, path: rel.to_path_buf(), what });
     if act != Act::Modify
-      && !direct
       && let Some(dir) = rel.parent()
+      && !dir.as_os_str().is_empty()
     {
       let what = What::Written { new: false };
       self.queue.push_back(SimRaw { watch: handle, path: dir.to_path_buf(), what });

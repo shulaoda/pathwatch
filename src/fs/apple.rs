@@ -27,6 +27,11 @@ struct AttrList {
   file: u32,
   fork: u32,
 }
+impl AttrList {
+  fn new(common: u32, dir: u32, file: u32) -> Self {
+    Self { bitmap_count: ATTR_BIT_MAP_COUNT, reserved: 0, common, volume: 0, dir, file, fork: 0 }
+  }
+}
 /// `struct statfs`. Only the device, the flags and the name of the file system are read.
 #[repr(C)]
 struct StatFs {
@@ -97,15 +102,8 @@ pub fn remote_disk(dir: &Path) -> Option<String> {
 pub fn read_dir(dir: &Path, volume: i32, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()> {
   // Not a pipe, which would wait for its writer.
   let dir = OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(dir)?;
-  let wanted = AttrList {
-    bitmap_count: ATTR_BIT_MAP_COUNT,
-    reserved: 0,
-    common: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | LOOK,
-    volume: 0,
-    dir: ATTR_DIR_MOUNTSTATUS,
-    file: ATTR_FILE_DATALENGTH,
-    fork: 0,
-  };
+  let common = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | LOOK;
+  let wanted = AttrList::new(common, ATTR_DIR_MOUNTSTATUS, ATTR_FILE_DATALENGTH);
   // An entry takes less than 1 KiB.
   let mut buffer = [0_u8; 16 * 1024];
   loop {
@@ -255,15 +253,7 @@ pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
   }
 
   let c_path = CString::new(path.as_os_str().as_bytes())?;
-  let wanted = AttrList {
-    bitmap_count: ATTR_BIT_MAP_COUNT,
-    reserved: 0,
-    common: ATTR_CMN_NAME | ATTR_CMN_OBJTYPE,
-    volume: 0,
-    dir: 0,
-    file: 0,
-    fork: 0,
-  };
+  let wanted = AttrList::new(ATTR_CMN_NAME | ATTR_CMN_OBJTYPE, 0, 0);
   let mut answer =
     Answer { length: 0, name_offset: 0, name_length: 0, object_type: 0, bytes: [0; NAME_BYTES] };
   // SAFETY: `c_path` ends with a NUL, `wanted` is a whole `attrlist` that the call only reads,

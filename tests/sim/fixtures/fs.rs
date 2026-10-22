@@ -58,7 +58,6 @@ impl SimFs {
       offline: None,
       calls: Calls::default(),
       watch_calls: Vec::new(),
-      seen_calls: 0,
       traps: Vec::new(),
       traps_run: 0,
       quiet: 0,
@@ -279,14 +278,6 @@ impl SimFs {
     state.tell_delivered();
   }
 
-  /// The engine asks to hear once every notification of a change before `after` came: the
-  /// reader of the backend reads the queue empty at that time, and says so at its end.
-  pub fn ask_delivered(&self, after: SystemTime) {
-    let mut state = self.lock();
-    state.kernel.delivered_after = Some(after);
-    state.tell_delivered();
-  }
-
   /// Sets how fine modification times are. With one second, two writes inside the same second
   /// leave the same time.
   pub fn set_time_step(&self, step: Duration) {
@@ -331,9 +322,9 @@ impl SimFs {
     self.lock().mount = Some(name.into());
   }
 
-  /// Other machines change the disk too: `Some` names its kind.
-  pub fn set_remote(&self, kind: Option<&str>) {
-    self.lock().remote = kind.map(str::to_owned);
+  /// Other machines change the disk too: `kind` is the kind of the disk.
+  pub fn set_remote(&self, kind: &str) {
+    self.lock().remote = Some(kind.to_owned());
   }
 
   /// The backend makes no more than this many OS watches.
@@ -363,7 +354,7 @@ impl SimFs {
   /// `after` such calls from now. Zero is the very next one.
   pub fn at_call(&self, after: u64, change: impl FnOnce(&SimFs) + Send + 'static) {
     let mut state = self.lock();
-    let at = state.seen_calls + after + 1;
+    let at = state.calls.total() + after + 1;
     state.traps.push((at, Box::new(change)));
   }
 
@@ -451,8 +442,7 @@ impl SimFs {
         return;
       }
       count(&mut state.calls);
-      state.seen_calls += 1;
-      let now = state.seen_calls;
+      let now = state.calls.total();
       let (due, later) = mem::take(&mut state.traps).into_iter().partition(|(at, _)| *at <= now);
       state.traps = later;
       due.into_iter().map(|(_, trap)| trap).collect()
@@ -479,11 +469,7 @@ impl Fs for SimFs {
     self.enter(|calls| calls.read_dir += 1);
     let state = self.lock();
     let id = state.look_up(dir, true)?;
-    let entries = state.entries(id)?;
-    if state.inodes[&id].denied {
-      return Err(error(io::ErrorKind::PermissionDenied));
-    }
-    for (name, child) in entries {
+    for (name, child) in state.entries(id)? {
       let meta = state.meta(*child);
       each(
         name,
@@ -614,9 +600,8 @@ pub(crate) struct State {
   offline: Option<io::ErrorKind>,
   pub(crate) calls: Calls,
   /// Every `watch` and `unwatch` call of the backend, in the order of the calls.
-  watch_calls: Vec<WatchCall>,
-  /// Calls of the engine so far, and the traps with the count at which each one runs.
-  seen_calls: u64,
+  pub(crate) watch_calls: Vec<WatchCall>,
+  /// The traps, with the count of `Calls::total` at which each one runs.
   traps: Vec<(u64, Trap)>,
   traps_run: u64,
   /// Above zero: the calls are made by a test, not by the engine. They are not counted and
@@ -628,7 +613,7 @@ pub(crate) struct State {
 impl State {
   /// Puts the answer to the question of the engine at the end of the queue once the clock
   /// passed its time.
-  fn tell_delivered(&mut self) {
+  pub(crate) fn tell_delivered(&mut self) {
     let now = SystemTime::UNIX_EPOCH + Duration::from_nanos(self.clock);
     if self.kernel.delivered_after.is_some_and(|after| after <= now) {
       self.kernel.delivered_after = None;
@@ -652,7 +637,9 @@ impl State {
   }
 
   fn entries(&self, dir: u64) -> io::Result<&BTreeMap<OsString, u64>> {
-    match &self.inodes[&dir].content {
+    let inode = &self.inodes[&dir];
+    match &inode.content {
+      Content::Dir(_) if inode.denied => Err(error(io::ErrorKind::PermissionDenied)),
       Content::Dir(entries) => Ok(entries),
       _ => Err(error(io::ErrorKind::NotADirectory)),
     }
@@ -690,10 +677,7 @@ impl State {
 
   /// `lstat` or `stat`: what is at the path.
   fn look(&self, path: &Path, follow: bool) -> io::Result<Meta> {
-    if let Some(kind) = self.offline {
-      return Err(error(kind));
-    }
-    Ok(self.meta(self.resolve(path, follow)?))
+    self.look_up(path, follow).map(|id| self.meta(id))
   }
 
   fn walk(&self, from: u64, path: &Path, follow: bool, links: u32) -> io::Result<u64> {
@@ -707,9 +691,6 @@ impl State {
         Component::Prefix(_) => return Err(error(io::ErrorKind::InvalidInput)),
         Component::Normal(name) => {
           self.entries(at)?;
-          if self.inodes[&at].denied {
-            return Err(error(io::ErrorKind::PermissionDenied));
-          }
           let (_, child) = self.entry(at, name).ok_or_else(|| error(io::ErrorKind::NotFound))?;
           at = match &self.inodes[&child].content {
             Content::Link(target) if follow || parts.peek().is_some() => {
@@ -732,9 +713,6 @@ impl State {
     let name = path.file_name().ok_or_else(|| error(io::ErrorKind::InvalidInput))?;
     let dir = self.resolve(path.parent().unwrap_or(Path::new("/")), true)?;
     self.entries(dir)?;
-    if self.inodes[&dir].denied {
-      return Err(error(io::ErrorKind::PermissionDenied));
-    }
     let spelled = self.entry(dir, name).map_or(name, |(spelled, _)| spelled.as_os_str());
     Ok((dir, spelled.to_owned()))
   }
@@ -742,8 +720,7 @@ impl State {
   /// The directory at `dir` as a backend finds it when it asks the OS for a watch.
   pub(crate) fn watchable(&self, dir: &Path) -> io::Result<u64> {
     let id = self.look_up(dir, true)?;
-    self.entries(id)?;
-    if self.inodes[&id].denied { Err(error(io::ErrorKind::PermissionDenied)) } else { Ok(id) }
+    self.entries(id).map(|_| id)
   }
 
   /// The path of an inode without any link in it.
@@ -779,7 +756,7 @@ impl State {
     }
   }
 
-  fn create(&mut self, dir: u64, name: &OsStr, content: Content) -> u64 {
+  fn create(&mut self, dir: u64, name: &OsStr, content: Content) {
     let id = self.next_id;
     self.next_id += 1;
     let number = self.free_numbers.pop().unwrap_or_else(|| {
@@ -807,7 +784,6 @@ impl State {
     self.entries_mut(dir).insert(name.to_owned(), id);
     self.touch(dir);
     self.notify(dir, name, Act::Create, is_dir);
-    id
   }
 
   /// The content of the inode changed: for a directory, an entry came or went. That moves the
@@ -850,10 +826,6 @@ impl State {
     is_dir
   }
 
-  pub(crate) fn log_watch(&mut self, call: WatchCall) {
-    self.watch_calls.push(call);
-  }
-
   pub(crate) fn log_unwatch(&mut self, key: DirKey) {
     self.calls.unwatch += 1;
     let asked = self.watch_calls.iter().rev().find(|call| call.key == key && call.want.is_some());
@@ -874,7 +846,7 @@ impl State {
         let mut rel = PathBuf::from(name);
         let mut at = dir;
         loop {
-          self.kernel.by_handle(at, &rel, act, is_dir, at == dir);
+          self.kernel.by_handle(at, &rel, act, is_dir);
           if at == ROOT {
             break;
           }
@@ -915,13 +887,11 @@ fn error(kind: io::ErrorKind) -> io::Error {
 }
 
 /// The error of a link that leads back to itself. Its kind has no stable name, so it is made
-/// from the error number where that is known.
+/// from the error number.
 fn link_loop() -> io::Error {
-  if cfg!(any(target_os = "linux", target_os = "android")) {
-    io::Error::from_raw_os_error(40)
-  } else if cfg!(any(target_vendor = "apple", target_os = "freebsd")) {
-    io::Error::from_raw_os_error(62)
-  } else {
-    io::Error::other("too many levels of symbolic links")
-  }
+  #[cfg(target_vendor = "apple")]
+  let number = 62;
+  #[cfg(not(target_vendor = "apple"))]
+  let number = libc::ELOOP;
+  io::Error::from_raw_os_error(number)
 }

@@ -52,7 +52,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub fn check_idle(&self) -> Result<(), String> {
     let left = [
       (self.flush_at.is_some(), "a flush is due"),
-      (self.tree.holds().next().is_some(), "a delete is pending"),
+      (self.tree.hold_count() > 0, "a delete is pending"),
       (!self.hold_queue.is_empty(), "the queue of held nodes is not empty"),
       (self.tree.has_work(), "marks or scans wait"),
       (self.tree.lost, "lost notifications wait for their scan"),

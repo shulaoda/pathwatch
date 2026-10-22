@@ -6,7 +6,7 @@ use std::{error, fmt, hash::Hash, io, path::Path, sync::Arc, time::SystemTime};
 use rustc_hash::FxHashMap;
 
 /// An OS watch API as the engine sees it. Every method runs on the watcher thread.
-pub trait Backend: Send + 'static {
+pub trait Backend: 'static {
   /// One raw notification, as the thread of the backend copies it into the [`Sink`].
   type Raw: Send + 'static;
 

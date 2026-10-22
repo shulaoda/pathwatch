@@ -9,7 +9,8 @@ use std::{
 use pathwatch::EventKind::{Create, Delete, Update};
 
 use crate::{
-  Disk, Settings, disk::files_at, each, everywhere, everywhere_with, on_disk, on_disk_with, skipped,
+  Disk, Settings, World, disk::files_at, each, everywhere, everywhere_with, on_disk, on_disk_with,
+  skipped,
 };
 
 /// A delete delay that the changes of a test fit into on a slow machine.

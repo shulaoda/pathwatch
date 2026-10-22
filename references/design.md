@@ -33,7 +33,7 @@ watcher.close();
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
 | `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `RemoteDisk`, `Io`, `Closed`. One error of a kind is handed over for a flush, and one `RemoteDisk` for each disk (5.12). Its text is these three in a row (see below). |
-| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, none on macOS, 10 ms on Windows and 20 ms on Linux (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and Windows and 50 ms on Linux, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Engine::new`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
+| `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, none on macOS, 10 ms on Windows and 20 ms on Linux (5.13); `with_delete_delay(d)`: the delete delay, 10 ms on macOS and Windows and 50 ms on Linux, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Config`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
 
@@ -355,9 +355,9 @@ that gives each spelling a number of its own, vboxsf and sshfs; a disk that fold
 forms and not the case).
 
 A second name is evidence only while its node is there. So when a look leaves nothing at a
-name (the filter ignores it, or it is gone) and the node goes, the marked nodes that can be
-the same name are looked at first, as names that no listing gave (`Engine::check`). The order
-of two looks in one flush must not decide.
+name (the filter ignores it, or it is gone) and the node goes, its marked twins (the names
+that differ from it only in the case of ASCII letters) are looked at first, as names that no
+listing gave (`Engine::check`). The order of two looks in one flush must not decide.
 
 In a loose directory the question is asked for a new name and for a name with a twin, not
 for the edit of a file that the tree knows. A name with a real twin (`Makefile` next to
@@ -377,12 +377,11 @@ follows the child with the very name of the hint, and also
 The walk goes on below each of them when the hint has more names, and the marks at the end
 are deep. If no child can be the name, the hint costs no look at the disk.
 
-Two names can be one name (`can_be_one_name`) when they are equal with the case of ASCII
-letters left out, or when none of the two is plain. A **plain** name (`is_plain`) has only
-ASCII characters and Han ideographs. An ideograph has no case and no second form, so a plain
-name has another spelling only in its ASCII letters. How a disk folds any other letter (an
-accent, Greek, kana, Hangul) is not known here, so two names that are not plain can always
-be one name.
+Two names can be one name when they are equal with the case of ASCII letters left out, or
+when none of the two is plain. A **plain** name (`is_plain`) has only ASCII characters and Han
+ideographs. An ideograph has no case and no second form, so a plain name has another spelling
+only in its ASCII letters. How a disk folds any other letter (an accent, Greek, kana, Hangul)
+is not known here, so two names that are not plain can always be one name.
 
 A plain name is found through the table: its hash leaves out the case of ASCII letters
 (`child_hash`), so the children that differ only in that are filed under one hash. So is any
@@ -902,12 +901,13 @@ next commit. The watch state of the node:
   delay, as when the backend cannot start.
 
 **The poll.** The tree keeps a list of the directories that the timer looks at
-(`Tree::polled`), so a poll does not walk every node. A directory is put on it when the
-backend answers for it and when its scan ends, and a stale key stays until a tidy: each poll
-tidies the list, and so does a push that finds it longer than twice the arena, and the end of
-the poll when nothing is watched any more. So a `watch` and `unwatch` of ever new paths, each
-shorter than the poll interval, cannot grow it without bound. On the poll timer, for each node
-on the list whose directory is on disk:
+(`Tree::polled`), so a poll does not walk every node. A directory is put on it when its watch
+state is set (the answer of the backend, or polled with no backend to ask), when a look in it
+fails, and when it is held, and a stale key stays until a tidy: each poll tidies the list, and
+so does a push that finds it longer than twice the arena, and the end of the poll when nothing
+is watched any more. So a `watch` and `unwatch` of ever new paths, each shorter than the poll
+interval, cannot grow it without bound. On the poll timer, for each node on the list whose
+directory is on disk:
 
 - `Failed`: ask the backend again (it may have room now),
 - `Polled`, or a scan of it had an error: queue a shallow scan,
@@ -1056,7 +1056,7 @@ the tests.
 at most 16 MiB of signals wait (`Backend::raw_bytes` says how big a raw notification is). A
 signal that would make it more is dropped and a flag is set, which the engine takes as lost
 notifications (`overflow`). The drop that sets the flag also sends one message that wakes the
-thread, so the flag is read at once, and at the place of the drop in the queue, and only there:
+thread, so the flag is taken at once, and at the place of the drop in the queue, and only there:
 a delivery (rule 13) that comes behind it says nothing of the signal that was dropped, and taken
 at the end of the turn, before the overflow, it ended the doubt of a young file whose write that
 signal could have been (5.8, `a_delivery_behind_a_dropped_signal_does_not_end_the_doubt`). A
@@ -1952,7 +1952,8 @@ the order in which a change meets them.
   (`Options::loose_spelling`).
 - **Plain.** A name of ASCII characters and Han ideographs only, so that its other spellings are
   only the case of its ASCII letters, and the table of the tree finds all of them.
-- **Twin.** Another node of the same directory that can be the same name as this one.
+- **Twin.** Another node of the same directory whose name differs from this one only in the
+  case of ASCII letters.
 - **Unlisted.** A registered node whose entry the directory above lists under another spelling.
   It is the path of its caller, and no entry of that directory.
 - **Rest.** After the scans that a loss report asked for took a time `t`, such scans wait

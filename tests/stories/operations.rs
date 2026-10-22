@@ -7,7 +7,7 @@ use pathwatch::{
   Watcher,
 };
 
-use crate::{disk::PATIENCE, everywhere, on_disk, skipped};
+use crate::{World, disk::PATIENCE, everywhere, on_disk, skipped};
 
 /// Every write of a file is an `Update`: in place, appended, cut to nothing, and the same
 /// content written again. Not the last one on Windows: NTFS leaves the time of an empty file

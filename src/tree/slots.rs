@@ -12,12 +12,11 @@ const BLOCK: usize = 1024;
 pub(super) struct Slots {
   /// Full blocks, and a last one that grows like a `Vec` up to the size of a block.
   blocks: Vec<Vec<Slot>>,
-  len: usize,
 }
 
 impl Slots {
   pub fn len(&self) -> usize {
-    self.len
+    self.blocks.last().map_or(0, |last| (self.blocks.len() - 1) * BLOCK + last.len())
   }
 
   #[cfg(test)]
@@ -38,18 +37,16 @@ impl Slots {
   }
 
   pub fn push(&mut self, slot: Slot) {
-    if self.len.is_multiple_of(BLOCK) {
+    if self.blocks.last().is_none_or(|block| block.len() == BLOCK) {
       self.blocks.push(Vec::new());
     }
     self.blocks.last_mut().expect("a block").push(slot);
-    self.len += 1;
   }
 
   /// Takes the last slot away, and the block if that leaves it empty.
   pub fn pop(&mut self) {
     let Some(block) = self.blocks.last_mut() else { return };
     block.pop();
-    self.len -= 1;
     if block.is_empty() {
       self.blocks.pop();
     }

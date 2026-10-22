@@ -103,7 +103,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Marks each held node whose time is over. `true`: a flush has to run.
   pub(super) fn mark_due_holds(&mut self, now: Instant) -> bool {
-    let mut any = false;
     while let Some(&Reverse((until, key))) = self.hold_queue.peek()
       && until <= now
     {
@@ -112,14 +111,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if self.tree.held_until(key) == Some(until) {
         self.tree.mark(key, Mark::default());
         self.due_holds.push(key);
-        any = true;
       }
     }
     // Many holds at once (a tree removed file by file) must not keep their room for ever.
     if let Some(room) = room_to_keep(self.hold_queue.len(), self.hold_queue.capacity()) {
       self.hold_queue.shrink_to(room);
     }
-    any
+    !self.due_holds.is_empty()
   }
 }
 

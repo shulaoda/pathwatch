@@ -93,32 +93,6 @@ pub fn relative_scratch() -> (TempDir, PathBuf) {
   (dir, rel)
 }
 
-/// Makes a symbolic link at `link` to `target`, to a directory or to a file as the target is.
-/// `false`: this user may not make one (Windows without the developer mode).
-pub fn symlink(target: &Path, link: &Path) -> bool {
-  #[cfg(unix)]
-  {
-    std::os::unix::fs::symlink(target, link).unwrap();
-    true
-  }
-  #[cfg(windows)]
-  {
-    use std::os::windows::fs::{symlink_dir, symlink_file};
-    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
-    let made = if target.is_dir() { symlink_dir(target, link) } else { symlink_file(target, link) };
-    match made {
-      Ok(()) => true,
-      Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => false,
-      Err(error) => panic!("a symbolic link cannot be made: {error}"),
-    }
-  }
-  #[cfg(not(any(unix, windows)))]
-  {
-    let _ = (target, link);
-    false
-  }
-}
-
 pub struct Disk {
   // Dropped before the directories, so their removal is not watched.
   pub watcher: Arc<Watcher>,
@@ -207,78 +181,6 @@ impl Disk {
     }
   }
 
-  pub fn path(&self, rel: &str) -> PathBuf {
-    self.dir.path().join(rel)
-  }
-
-  pub fn watch(&self, rels: &[&str]) {
-    self.watcher.watch(&rels.iter().map(|rel| self.path(rel)).collect::<Vec<_>>()).unwrap();
-  }
-
-  pub fn unwatch(&self, rels: &[&str]) {
-    self.watcher.unwatch(&rels.iter().map(|rel| self.path(rel)).collect::<Vec<_>>()).unwrap();
-  }
-
-  /// Writes a file, making the directories above it.
-  pub fn write(&self, rel: &str, content: &str) {
-    let path = self.path(rel);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, content).unwrap();
-  }
-
-  pub fn append(&self, rel: &str, content: &str) {
-    use std::io::Write as _;
-    let mut file = fs::File::options().append(true).open(self.path(rel)).unwrap();
-    file.write_all(content.as_bytes()).unwrap();
-  }
-
-  pub fn mkdir(&self, rel: &str) {
-    fs::create_dir_all(self.path(rel)).unwrap();
-  }
-
-  pub fn remove(&self, rel: &str) {
-    let path = self.path(rel);
-    let kind = fs::symlink_metadata(&path).unwrap().file_type();
-    // A link to a directory is removed as a file; Windows removes it as a directory.
-    #[cfg(windows)]
-    if std::os::windows::fs::FileTypeExt::is_symlink_dir(&kind) {
-      return fs::remove_dir(path).unwrap();
-    }
-    if kind.is_dir() {
-      fs::remove_dir_all(path).unwrap();
-    } else {
-      fs::remove_file(path).unwrap();
-    }
-  }
-
-  /// Windows refuses to rename a directory while a listing of the watcher holds one below it
-  /// open, for a moment (README, "Holes"): the rename is tried again, for a second at most.
-  pub fn rename(&self, from: &str, to: &str) {
-    let (from, to) = (self.path(from), self.path(to));
-    let end = Instant::now() + Duration::from_secs(1);
-    loop {
-      match fs::rename(&from, &to) {
-        Ok(()) => return,
-        Err(error)
-          if cfg!(windows)
-            && error.kind() == io::ErrorKind::PermissionDenied
-            && Instant::now() < end =>
-        {
-          thread::sleep(Duration::from_millis(1));
-        }
-        Err(error) => panic!("{} to {}: {error}", from.display(), to.display()),
-      }
-    }
-  }
-
-  pub fn symlink(&self, target: &str, link: &str) -> bool {
-    let made = symlink(&self.path(target), &self.path(link));
-    if !made {
-      skipped("this user may not make a symbolic link");
-    }
-    made
-  }
-
   pub fn set_modified(&self, rel: &str, time: SystemTime) {
     fs::File::options().write(true).open(self.path(rel)).unwrap().set_modified(time).unwrap();
   }
@@ -298,10 +200,6 @@ impl Disk {
     }
   }
 
-  pub fn may_pass(&mut self, rel: &str) {
-    self.passing.push(self.path(rel));
-  }
-
   /// Waits until the events since the last `expect` are the expected ones.
   pub fn wait(&mut self, expected: &[(EventKind, &str)]) {
     let expected = self.expected(expected);
@@ -310,18 +208,6 @@ impl Disk {
       let left = end.saturating_duration_since(Instant::now());
       assert!(self.receive(left), "{}: {}", self.backend, differences(&expected, &self.history()));
     }
-  }
-
-  /// `wait`, and then nothing else may come for a quiet time. The events start empty after it.
-  pub fn expect(&mut self, expected: &[(EventKind, &str)]) {
-    self.wait(expected);
-    self.sync();
-    let end = Instant::now() + QUIET;
-    while self.receive(end.saturating_duration_since(Instant::now())) {}
-    let expected = self.expected(expected);
-    let history = self.history();
-    assert!(history == expected, "{}: {}", self.backend, differences(&expected, &history));
-    self.events.clear();
   }
 
   /// For a story that cannot tell which events come: every event must fit what the handler
@@ -405,11 +291,7 @@ impl Disk {
 
 impl World for Disk {
   fn path(&self, rel: &str) -> PathBuf {
-    Disk::path(self, rel)
-  }
-
-  fn name(&self) -> &'static str {
-    self.backend
+    self.dir.path().join(rel)
   }
 
   fn polls(&self) -> bool {
@@ -421,46 +303,112 @@ impl World for Disk {
   }
 
   fn watch(&mut self, rels: &[&str]) {
-    Disk::watch(self, rels);
+    self.watcher.watch(&rels.iter().map(|rel| self.path(rel)).collect::<Vec<_>>()).unwrap();
   }
 
   fn unwatch(&mut self, rels: &[&str]) {
-    Disk::unwatch(self, rels);
+    self.watcher.unwatch(&rels.iter().map(|rel| self.path(rel)).collect::<Vec<_>>()).unwrap();
   }
 
   fn write(&mut self, rel: &str, content: &str) {
-    Disk::write(self, rel, content);
+    let path = self.path(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, content).unwrap();
   }
 
   fn append(&mut self, rel: &str, content: &str) {
-    Disk::append(self, rel, content);
+    use std::io::Write as _;
+    let mut file = fs::File::options().append(true).open(self.path(rel)).unwrap();
+    file.write_all(content.as_bytes()).unwrap();
   }
 
   fn mkdir(&mut self, rel: &str) {
-    Disk::mkdir(self, rel);
+    fs::create_dir_all(self.path(rel)).unwrap();
   }
 
   fn remove(&mut self, rel: &str) {
-    Disk::remove(self, rel);
+    let path = self.path(rel);
+    let kind = fs::symlink_metadata(&path).unwrap().file_type();
+    // A link to a directory is removed as a file; Windows removes it as a directory.
+    #[cfg(windows)]
+    if std::os::windows::fs::FileTypeExt::is_symlink_dir(&kind) {
+      return fs::remove_dir(path).unwrap();
+    }
+    if kind.is_dir() {
+      fs::remove_dir_all(path).unwrap();
+    } else {
+      fs::remove_file(path).unwrap();
+    }
   }
 
+  /// Windows refuses to rename a directory while a listing of the watcher holds one below it
+  /// open, for a moment (README, "Holes"): the rename is tried again, for a second at most.
   fn rename(&mut self, from: &str, to: &str) {
-    Disk::rename(self, from, to);
+    let (from, to) = (self.path(from), self.path(to));
+    let end = Instant::now() + Duration::from_secs(1);
+    loop {
+      match fs::rename(&from, &to) {
+        Ok(()) => return,
+        Err(error)
+          if cfg!(windows)
+            && error.kind() == io::ErrorKind::PermissionDenied
+            && Instant::now() < end =>
+        {
+          thread::sleep(Duration::from_millis(1));
+        }
+        Err(error) => panic!("{} to {}: {error}", from.display(), to.display()),
+      }
+    }
   }
 
+  /// To a directory or to a file as the target is.
   fn symlink(&mut self, target: &str, link: &str) -> bool {
-    Disk::symlink(self, target, link)
+    let (target, link) = (self.path(target), self.path(link));
+    #[cfg(unix)]
+    let made = {
+      std::os::unix::fs::symlink(target, link).unwrap();
+      true
+    };
+    #[cfg(windows)]
+    let made = {
+      use std::os::windows::fs::{symlink_dir, symlink_file};
+      const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+      let made =
+        if target.is_dir() { symlink_dir(target, link) } else { symlink_file(target, link) };
+      match made {
+        Ok(()) => true,
+        Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => false,
+        Err(error) => panic!("a symbolic link cannot be made: {error}"),
+      }
+    };
+    #[cfg(not(any(unix, windows)))]
+    let made = {
+      let _ = (target, link);
+      false
+    };
+    if !made {
+      skipped("this user may not make a symbolic link");
+    }
+    made
   }
 
   fn pass(&mut self, time: Duration) {
     thread::sleep(time);
   }
 
+  /// `wait`, and then nothing else may come for a quiet time. The events start empty after it.
   fn expect(&mut self, expected: &[(EventKind, &str)]) {
-    Disk::expect(self, expected);
+    self.wait(expected);
+    self.sync();
+    let end = Instant::now() + QUIET;
+    while self.receive(end.saturating_duration_since(Instant::now())) {}
+    let expected = self.expected(expected);
+    let history = self.history();
+    assert!(history == expected, "{}: {}", self.backend, differences(&expected, &history));
+    self.events.clear();
   }
 
   fn may_pass(&mut self, rel: &str) {
-    Disk::may_pass(self, rel);
+    self.passing.push(self.path(rel));
   }
 }

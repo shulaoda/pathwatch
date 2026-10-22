@@ -5,6 +5,7 @@ use std::{
   borrow::Cow,
   cell::Cell,
   env, fmt, io,
+  marker::PhantomData,
   path::{Path, PathBuf},
   sync::{
     Arc, Mutex, PoisonError,
@@ -333,8 +334,8 @@ impl Watcher {
           Ok(backend) => {
             let mut engine = Engine::new(backend, StdFs, options);
             engine.fall_back_to(fallback);
-            engine.stop_with(Arc::clone(&stop));
-            run(engine, handler, &inbox, &from_inside, &queue, &stop);
+            engine.stop_with(stop);
+            run(engine, handler, &inbox, &from_inside, &queue);
           }
           Err(error) => {
             // A limit says by itself what is missing and that the watcher polls.
@@ -345,9 +346,9 @@ impl Watcher {
               (ErrorKind::Io, context(what, error))
             };
             handler(Err(Error::new(kind, None, Some(error))));
-            let mut engine = Engine::new(PollBackend::<B::Raw>::for_queue(), StdFs, fallback);
-            engine.stop_with(Arc::clone(&stop));
-            run(engine, handler, &inbox, &from_inside, &queue, &stop);
+            let mut engine = Engine::new(PollBackend::<B::Raw>(PhantomData), StdFs, fallback);
+            engine.stop_with(stop);
+            run(engine, handler, &inbox, &from_inside, &queue);
           }
         }
       })
@@ -390,8 +391,7 @@ type Done = Option<SyncSender<()>>;
 /// The way into the queue of the watcher thread: a sender, and on Windows the wake-up of the
 /// thread (`inbox`).
 struct Post<R> {
-  /// Given up before the wake-up of the drop: a thread that wakes then finds the queue closed.
-  sender: Option<Sender<Message<R>>>,
+  sender: Sender<Message<R>>,
   #[cfg(windows)]
   wake: Arc<inbox::Wake>,
 }
@@ -399,7 +399,7 @@ struct Post<R> {
 impl<R> Post<R> {
   /// `false`: the watcher thread is gone.
   fn send(&self, message: Message<R>) -> bool {
-    let sent = self.sender.as_ref().is_some_and(|sender| sender.send(message).is_ok());
+    let sent = self.sender.send(message).is_ok();
     #[cfg(windows)]
     self.wake.set();
     sent
@@ -413,14 +413,6 @@ impl<R> Clone for Post<R> {
       #[cfg(windows)]
       wake: Arc::clone(&self.wake),
     }
-  }
-}
-
-impl<R> Drop for Post<R> {
-  fn drop(&mut self) {
-    self.sender = None;
-    #[cfg(windows)]
-    self.wake.set();
   }
 }
 
@@ -446,16 +438,11 @@ impl<R> Inbox<R> {
     #[cfg(windows)]
     {
       let wake = Arc::new(inbox::Wake::new()?);
-      let post = Post { sender: Some(sender), wake: Arc::clone(&wake) };
+      let post = Post { sender, wake: Arc::clone(&wake) };
       Ok((post, Self { receiver, wake, timer: inbox::Timer::new()? }))
     }
     #[cfg(not(windows))]
-    Ok((Post { sender: Some(sender) }, Self { receiver }))
-  }
-
-  /// A message that waits, if any.
-  fn try_take(&self) -> Option<Message<R>> {
-    self.receiver.try_recv().ok()
+    Ok((Post { sender }, Self { receiver }))
   }
 
   /// The next message, or `None` when `deadline` came first.
@@ -628,7 +615,6 @@ fn run<B: Backend>(
   inbox: &Inbox<B::Raw>,
   inside: &Receiver<Command>,
   queue: &Queue,
-  stop: &AtomicBool,
 ) {
   let mut out = Output::default();
   loop {
@@ -640,7 +626,7 @@ fn run<B: Backend>(
 
     let mut taken = 0;
     while let Some(message) = next {
-      if stop.load(Ordering::Acquire) {
+      if engine.stopped() {
         return;
       }
       let done = match message {
@@ -667,33 +653,29 @@ fn run<B: Backend>(
           None
         }
       };
-      deliver(&mut engine, &mut out, &mut handler, inside, stop);
+      deliver(&mut engine, &mut out, &mut handler, inside);
       if let Some(done) = done {
         // The caller may be gone.
         let _ = done.send(());
       }
       taken += 1;
-      next = if taken < MESSAGES_PER_TURN { inbox.try_take() } else { None };
+      next = if taken < MESSAGES_PER_TURN { inbox.receiver.try_recv().ok() } else { None };
     }
 
-    if stop.load(Ordering::Acquire) {
+    if engine.stopped() {
       return;
     }
-    let now = Instant::now();
-    if engine.deadline().is_some_and(|deadline| deadline <= now) {
-      engine.tick(now, &mut out);
-      deliver(&mut engine, &mut out, &mut handler, inside, stop);
-    }
+    engine.tick(Instant::now(), &mut out);
+    deliver(&mut engine, &mut out, &mut handler, inside);
   }
 }
 
 /// Tells the engine of the signals that the queue dropped since the last `Wake`.
 fn take_overflow<B: Backend>(engine: &mut Engine<B, StdFs>, queue: &Queue) {
-  if queue.overflow.swap(false, Ordering::AcqRel) {
-    engine.overflow(Instant::now());
-    if let Some(error) = queue.failed.lock().unwrap_or_else(PoisonError::into_inner).take() {
-      engine.signal(Signal::Failed(error), Instant::now());
-    }
+  queue.overflow.store(false, Ordering::Release);
+  engine.overflow(Instant::now());
+  if let Some(error) = queue.failed.lock().unwrap_or_else(PoisonError::into_inner).take() {
+    engine.signal(Signal::Failed(error), Instant::now());
   }
 }
 
@@ -707,18 +689,17 @@ fn deliver<B: Backend>(
   out: &mut Output,
   handler: &mut impl FnMut(Result<Vec<Event>, Error>),
   inside: &Receiver<Command>,
-  stop: &AtomicBool,
 ) {
   loop {
     for error in out.errors.drain(..) {
-      if !stop.load(Ordering::Acquire) {
+      if !engine.stopped() {
         handler(Err(error));
       }
     }
-    if !out.events.is_empty() && !stop.load(Ordering::Acquire) {
+    if !out.events.is_empty() && !engine.stopped() {
       handler(Ok(std::mem::take(&mut out.events)));
     }
-    if stop.load(Ordering::Acquire) {
+    if engine.stopped() {
       return;
     }
     match inside.try_recv() {
@@ -792,7 +773,7 @@ mod tests {
     time::{Duration, Instant},
   };
 
-  use super::{Closed, Inbox, Message};
+  use super::{Inbox, Message};
 
   /// The wait ends with the deadline, not with the next tick of the clock (15.6 ms).
   #[test]
@@ -821,16 +802,5 @@ mod tests {
     assert!(matches!(taken, Ok(Some(Message::Wake))));
     assert!(start.elapsed() < Duration::from_millis(100), "{:?}", start.elapsed());
     drop(sender.join().unwrap());
-  }
-
-  #[test]
-  fn the_last_post_dropped_ends_the_wait() {
-    let (post, inbox) = Inbox::<()>::new().unwrap();
-    let dropper = thread::spawn(move || {
-      thread::sleep(Duration::from_millis(5));
-      drop(post);
-    });
-    assert!(matches!(inbox.take(None), Err(Closed)));
-    dropper.join().unwrap();
   }
 }

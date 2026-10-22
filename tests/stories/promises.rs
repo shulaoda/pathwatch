@@ -18,7 +18,9 @@
 //! 9. Calls inside the handler: `watch_and_unwatch_inside_the_handler`,
 //!    `close_inside_the_handler`.
 //! 10. The ignore filter: `c::s14`, `an_ignored_directory_is_not_read`,
-//!     `an_ignored_directory_comes_and_goes`, `a_watched_path_is_never_filtered`.
+//!     `an_ignored_directory_comes_and_goes`,
+//!     `a_watched_path_that_the_filter_ignores_counts_as_missing`,
+//!     `a_watched_path_below_an_ignored_directory_gets_nothing`.
 //! 11. Nothing beside a watched path: `nothing_is_reported_beside_a_watched_path`.
 //! 12. Symbolic links: `p::two_spellings_of_one_directory`,
 //!     `p::watched_paths_below_a_symlinked_prefix`, `a_watched_link_to_a_file_is_followed`,
@@ -46,7 +48,7 @@ use pathwatch::{
 };
 
 use crate::{
-  Inside, Settings,
+  Inside, Settings, World,
   disk::{PATIENCE, relative_scratch},
   each, everywhere, everywhere_with, on_disk, on_disk_inside, on_disk_with, skipped,
 };
@@ -60,12 +62,8 @@ fn a_file_is_anything_that_is_not_a_directory() {
     w.mkdir("r");
     // macOS 26 says nothing when a socket is made: there the sockets exist before the watch,
     // and only their removal is heard.
-    let bind = || {
-      (
-        UnixListener::bind(w.path("r/socket")).unwrap(),
-        UnixListener::bind(w.path("socket")).unwrap(),
-      )
-    };
+    let (inner, outer) = (w.path("r/socket"), w.path("socket"));
+    let bind = || (UnixListener::bind(&inner).unwrap(), UnixListener::bind(&outer).unwrap());
     let before = cfg!(target_os = "macos").then(bind);
     w.watch(&["r", "socket"]);
     let sockets = before.unwrap_or_else(bind);

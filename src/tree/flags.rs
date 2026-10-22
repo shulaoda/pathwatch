@@ -104,8 +104,7 @@ impl Node {
     self.flags.contains(Flags::IS_PATH)
   }
 
-  /// Only [`super::Tree::make_path`] and [`super::Tree::drop_path`] call it: they keep the
-  /// counts of the nodes above right.
+  /// Only [`super::Tree::set_path`] calls it: it keeps the counts of the nodes above right.
   pub(super) fn set_path(&mut self, is_path: bool) {
     self.flags.set(Flags::IS_PATH, is_path);
   }

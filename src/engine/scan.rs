@@ -10,7 +10,7 @@ use super::{
 use crate::{
   backend::{Backend, DirKey},
   fs::{DirId, Entry, FileType, Fs, is_missing},
-  tree::{Depth, Dir, Kind, Mark, Watch},
+  tree::{Depth, Dir, Kind, Mark, Node, Watch},
 };
 
 /// One node to check in a scan, with what the listing said about it.
@@ -37,7 +37,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.scan_had_error = false;
     names.clear();
     names.extend(self.tree.children(key).map(|child| (child, Listed::NotAsked)));
-    let known = names.len();
     self.listed.clear();
     let listing =
       if self.tree[key].is_complete() { self.list_new(key, path, names) } else { Listing::None };
@@ -50,7 +49,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let names_only = depth == Depth::Names && names_are_known;
 
     let why = if depth == Depth::Deep { Mark::DEEP } else { Mark::default() };
-    for (index, &(child, listed)) in names.iter().enumerate() {
+    for &(child, listed) in names.iter() {
       if self.stopped() {
         return;
       }
@@ -60,18 +59,18 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         }
         said => said,
       };
-      // The tree knew the node as an entry, and the listing names it: it is as it was. Not a
-      // name that is not plain in a loose directory: the hint that asked for this scan can have
-      // meant it, under another spelling that the table does not find.
+      // The tree has the node as an entry (known before, or looked at in this scan), and the
+      // listing names it: it is as it was. Not a name that is not plain in a loose directory:
+      // the hint that asked for this scan can have meant it, under another spelling that the
+      // table does not find.
       if names_only
-        && index < known
         && listed.is_named()
-        && self.tree[child].is_entry()
+        && self.tree.get(child).is_some_and(Node::is_entry)
         && self.tree.is_plain(child)
       {
         continue;
       }
-      // A check frees no node but its own.
+      // A check can free a later node, a twin or the name it follows: its key names none then.
       self.check(child, path, listed, why);
     }
     // This runs after the commit, so a watch that is said to have failed did fail.
@@ -80,7 +79,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let still = names_only && dir.has_error;
       dir.has_error = still || self.scan_had_error || dir.watch == Watch::Failed;
     }
-    self.tree.list_if_polled(key);
   }
 
   /// Lists the directory and adds a node for each entry the tree does not know. With loose
@@ -139,7 +137,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       // Gone: the parent looks. The directory can be there after all (away and back while it
       // was read): then the deep mark keeps the work for the next flush, as when the disk gives
       // no answer.
-      Some(error) if is_missing(&error) => self.check_from_parent(key, path),
+      Some(error) if is_missing(&error) => {
+        let parent = self.tree.parent(key).expect("a complete node has a parent");
+        self.tree.path_into(parent, path);
+        self.check(key, path, Listed::NotAsked, Mark::default());
+        // The same directory is still there, not held (`Node::dir`), and no scan of it is queued.
+        self.tree.get(key).and_then(Node::dir).is_some_and(|dir| dir.scan.is_none())
+      }
       // No answer: the parent checks it at the next flush, and the deep mark keeps the work,
       // with what this scan knew of lost hints (5.8). Only the root has no parent, and it is
       // never complete.
@@ -153,16 +157,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.tree.mark(key, self.retry(Mark::default()));
     }
     Listing::Stop
-  }
-
-  /// The directory is gone: its parent finds out what is at its path now. True: the same
-  /// directory is still there, not held (`Node::dir`), and no scan of it is queued.
-  fn check_from_parent(&mut self, key: DirKey, path: &mut PathBuf) -> bool {
-    let Some(parent) = self.tree.parent(key) else { return false };
-    self.tree.path_into(parent, path);
-    self.check(key, path, Listed::NotAsked, Mark::default());
-    let Some(node) = self.tree.get(key) else { return false };
-    node.dir().is_some_and(|dir| dir.scan.is_none())
   }
 }
 

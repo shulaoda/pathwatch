@@ -49,7 +49,7 @@ pub fn normalize(path: &Path) -> Option<Cow<'_, Path>> {
 
 /// The longest name that can be watched, in units. No disk takes more than 255, and the tree
 /// keeps the length of a name in 16 bits of bytes: 3 bytes a unit, two names for a share.
-pub(crate) const MAX_NAME: usize = 10_000;
+const MAX_NAME: usize = 10_000;
 
 /// Splits a clean path at its top directory: `/a/b` gives `/` and `a/b`.
 pub(crate) fn split_top(path: &Path) -> Option<(&OsStr, &Path)> {

@@ -8,6 +8,10 @@ const FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// With a pause of zero the watcher thread would never sleep.
 const SHORTEST_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
+/// No time of the settings is longer: `Duration::MAX` is a way to say "never", and a time that
+/// far ahead of now is no `Instant`.
+const LONGEST_SETTING: Duration = Duration::from_hours(365 * 24);
+
 /// The settings of a [`Watcher`](crate::Watcher). They cannot be changed after it is made.
 #[derive(Clone)]
 pub struct Config {
@@ -75,7 +79,7 @@ impl Config {
   /// and 500 ms after it at most, unless the quiet time is longer. The most is a year.
   #[must_use]
   pub fn with_debounce(mut self, debounce: Duration) -> Self {
-    self.debounce = debounce;
+    self.debounce = debounce.min(LONGEST_SETTING);
     self
   }
 
@@ -92,7 +96,7 @@ impl Config {
   /// the path gone, and such a file is a `Delete` and a `Create`. The most is a year.
   #[must_use]
   pub fn with_delete_delay(mut self, delay: Duration) -> Self {
-    self.delete_delay = delay;
+    self.delete_delay = delay.min(LONGEST_SETTING);
     self
   }
 
@@ -130,7 +134,7 @@ impl Config {
   /// 50 ms on APFS), so with many files a longer pause saves the CPU.
   #[must_use]
   pub fn with_poll_interval(mut self, interval: Duration) -> Self {
-    self.poll_interval = interval.max(SHORTEST_POLL_INTERVAL);
+    self.poll_interval = interval.clamp(SHORTEST_POLL_INTERVAL, LONGEST_SETTING);
     self
   }
 

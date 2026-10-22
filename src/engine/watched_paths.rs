@@ -32,22 +32,17 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // directory above it. The way ends at a held node, since nothing is on disk below it, and
     // at a name that the disk spelled in another way at its last look: that answer can be old,
     // and the baseline of what is below is decided by it.
-    let mut anchor = None;
+    let mut anchor = Tree::ROOT;
     let mut below_directories = true;
     let mut at = Tree::ROOT;
     for name in iter::once(top).chain(rest.iter()) {
       let node = &mut self.tree[at];
       below_directories &= node.is_dir() && !node.is_unlisted();
       // A directory on the way was asked about, or there is no filter: the node keeps that.
-      if at != Tree::ROOT {
-        node.set_ignored(EntryKind::Dir, false);
-      }
-      at = match self.tree.child(at, name) {
-        Some(child) => child,
-        None => self.tree.insert_child(at, name),
-      };
+      node.set_ignored(EntryKind::Dir, false);
+      at = self.tree.child(at, name).unwrap_or_else(|| self.tree.insert_child(at, name));
       if below_directories {
-        anchor = Some(at);
+        anchor = at;
       }
       let node = &mut self.tree[at];
       if !node.is_registered() {
@@ -66,7 +61,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if ignored_file {
       node.set_ignored(EntryKind::Dir, false);
     }
-    if !self.tree.make_path(at) {
+    if !self.tree.set_path(at, true) {
       return;
     }
     let node = &mut self.tree[at];
@@ -83,19 +78,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     {
       self.ask(parent, parent_path, Want::Contents);
     }
-    if let Some(anchor) = anchor
-      && let Some(parent) = self.tree.parent(anchor)
+    if let Some(parent) = self.tree.parent(anchor)
       // A directory whose every name is checked anyway checks the node then. A scan of the
       // names alone skips what the listing names.
       && self.tree[parent].dir().is_some_and(|dir| dir.scan.is_none_or(|depth| depth == Depth::Names))
     {
       self.tree.mark(anchor, Mark::DEEP);
     }
-  }
-
-  /// Whether a new file at the node is part of the baseline of the running `watch`.
-  pub(super) fn is_baseline_file(&self, key: DirKey) -> bool {
-    !self.reported_before(key)
   }
 
   /// Whether what is in a directory that appears, or becomes complete, is the baseline.
@@ -107,7 +96,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Whether what is at the node had to be reported before the running `watch`.
-  fn reported_before(&self, key: DirKey) -> bool {
+  pub(super) fn reported_before(&self, key: DirKey) -> bool {
     let node = &self.tree[key];
     if node.is_path() && node.added() == Added::No {
       return true;
@@ -132,9 +121,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Makes `path` a path like any other again. A path that is not watched is left alone.
   pub(super) fn unregister(&mut self, path: &Path) {
-    if let Some(key) = self.find(path) {
-      self.forget(key);
+    let Some((top, rest)) = split_top(path) else { return };
+    let mut at = Tree::ROOT;
+    for name in iter::once(top).chain(rest.iter()) {
+      let Some(child) = self.tree.child(at, name) else { return };
+      at = child;
     }
+    self.forget(at);
   }
 
   /// Asks each directory that a `forget` of this call left on the list whether it wants less
@@ -149,19 +142,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.narrowing = emptied(dirs);
   }
 
-  /// The node of `path`, if the tree has one.
-  fn find(&self, path: &Path) -> Option<DirKey> {
-    let (top, rest) = split_top(path)?;
-    let mut at = Tree::ROOT;
-    for name in iter::once(top).chain(rest.iter()) {
-      at = self.tree.child(at, name)?;
-    }
-    Some(at)
-  }
-
   /// The node is no watched path any more, and the handler hears nothing of what is forgotten.
   fn forget(&mut self, key: DirKey) {
-    if !self.tree.drop_path(key) {
+    if !self.tree.set_path(key, false) {
       return;
     }
     let Some(parent) = self.tree.parent(key) else { return };

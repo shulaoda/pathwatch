@@ -282,7 +282,7 @@ fn a_disk_that_other_machines_change_is_told_once() {
   on_all(&Options::default(), |d, on| {
     d.fs().mkdir_all("/net/a").unwrap();
     d.fs().mkdir_all("/net/b").unwrap();
-    d.fs().set_remote(Some("nfs"));
+    d.fs().set_remote("nfs");
     d.watch(&["/net/a"]);
     d.watch(&["/net/b"]);
     let told: &[ErrorKind] = if on == "Poll" { &[] } else { &[ErrorKind::RemoteDisk] };
@@ -299,7 +299,7 @@ fn each_disk_that_other_machines_change_is_told() {
     d.fs().set_mount("m");
     d.fs().mkdir_all("/net/a").unwrap();
     d.fs().mkdir_all("/m/b").unwrap();
-    d.fs().set_remote(Some("nfs"));
+    d.fs().set_remote("nfs");
     d.watch(&["/net/a", "/m/b"]);
     let told: &[ErrorKind] = if on == "Poll" { &[] } else { &[ErrorKind::RemoteDisk; 2] };
     assert_eq!(d.errors(), told, "{on}");

@@ -2,7 +2,7 @@
 
 use std::{
   ffi::{OsStr, OsString},
-  fs::{self, File, Metadata},
+  fs::{self, Metadata},
   hash::Hasher,
   io::{self, Read},
   path::{Path, PathBuf},
@@ -139,21 +139,16 @@ impl Fs for StdFs {
     for entry in fs::read_dir(literal(dir)).map_err(told)? {
       let entry = entry.map_err(told)?;
       let name = entry.file_name();
-      // Windows: a name with a separator in it, which a disk that another system filled can
-      // hold, is left out: no path names such an entry. Both are one byte in the encoded form.
-      if cfg!(windows) && name.as_encoded_bytes().iter().any(|&byte| matches!(byte, b'\\' | b'/')) {
+      #[cfg(windows)]
+      if windows::has_separator(&name) {
         continue;
       }
-      let kind = entry.file_type().ok().map(|file_type| {
-        if file_type.is_dir() {
-          FileType::Dir
-        } else if file_type.is_symlink() {
-          FileType::Symlink
-        } else {
-          FileType::File
-        }
-      });
-      each(&name, kind.map_or(Entry::Name, Entry::Kind));
+      let listed = match entry.file_type() {
+        Ok(kind) if kind.is_dir() => Entry::Kind(FileType::Dir),
+        Ok(_) => Entry::Kind(FileType::File),
+        Err(_) => Entry::Name,
+      };
+      each(&name, listed);
     }
     Ok(())
   }
@@ -197,7 +192,7 @@ impl Fs for StdFs {
   }
 
   fn name_on_disk(&self, path: &Path) -> io::Result<OsString> {
-    name_on_disk(path).map_err(told)
+    name_on_disk(path)
   }
 
   fn now(&self) -> SystemTime {
@@ -209,21 +204,10 @@ impl Fs for StdFs {
     START.get_or_init(Instant::now).elapsed()
   }
 
+  // Windows: a server of SMB tells of its changes, and the handle reports them.
+  #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
   fn remote_disk(&self, dir: &Path) -> Option<String> {
-    #[cfg(target_vendor = "apple")]
-    {
-      apple::remote_disk(dir)
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-      linux_remote_disk(dir)
-    }
-    // Windows: a server of SMB tells of its changes, and the handle reports them.
-    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-    {
-      let _ = dir;
-      None
-    }
+    remote_disk(dir)
   }
 
   fn listing_lags(&self) -> bool {
@@ -235,7 +219,7 @@ impl Fs for StdFs {
 /// `fuseblk`, and later `virtiofs`). FUSE counts, as a folder of the host in a VM is one; so
 /// does a local disk through FUSE, which only costs it one error too many.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn linux_remote_disk(dir: &Path) -> Option<String> {
+fn remote_disk(dir: &Path) -> Option<String> {
   use std::{ffi::CString, mem, os::unix::ffi::OsStrExt};
 
   const KINDS: [(i128, &str); 6] = [
@@ -263,9 +247,9 @@ fn linux_remote_disk(dir: &Path) -> Option<String> {
 mod windows;
 
 #[cfg(windows)]
-pub(crate) use self::windows::{SHARE_ALL, Unknown, kernel32, literal, wide_name};
+pub(crate) use self::windows::{SHARE_ALL, is_delete_pending, kernel32, literal, wide_name};
 #[cfg(windows)]
-use self::windows::{name_on_disk, stat, told};
+use self::windows::{name_on_disk, open_regular, stat, told};
 
 #[cfg(not(windows))]
 fn told(error: io::Error) -> io::Error {
@@ -275,28 +259,16 @@ fn told(error: io::Error) -> io::Error {
 /// Opens the regular file at `path` for reading, and nothing else: a link that took the place of
 /// the file since the look is not followed, and a FIFO or a device is not waited for. `None`: no
 /// regular file is at the path.
-fn open_regular(path: &Path) -> io::Result<Option<File>> {
+#[cfg(not(windows))]
+fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
+  let mut options = fs::OpenOptions::new();
   #[cfg(unix)]
-  {
-    use std::os::unix::fs::OpenOptionsExt;
-    let opened = fs::OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_NONBLOCK).open(path);
-    let file = opened.map_err(told)?;
-    // A FIFO or a device is no file to read: a regular file and nothing else is.
-    #[expect(clippy::filetype_is_file, reason = "a regular file and nothing else is read")]
-    let is_regular = file.metadata()?.file_type().is_file();
-    Ok(is_regular.then_some(file))
-  }
-  #[cfg(windows)]
-  {
-    windows::open_regular(path)
-  }
-  #[cfg(not(any(unix, windows)))]
-  {
-    let file = File::open(path).map_err(told)?;
-    #[expect(clippy::filetype_is_file, reason = "a regular file and nothing else is read")]
-    let is_regular = file.metadata()?.file_type().is_file();
-    Ok(is_regular.then_some(file))
-  }
+  std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, O_NOFOLLOW | O_NONBLOCK);
+  let file = options.read(true).open(path)?;
+  // A FIFO or a device is no file to read: a regular file and nothing else is.
+  #[expect(clippy::filetype_is_file, reason = "a regular file and nothing else is read")]
+  let is_regular = file.metadata()?.file_type().is_file();
+  Ok(is_regular.then_some(file))
 }
 
 /// `O_NOFOLLOW`: the open fails on a link. `O_NONBLOCK`: the open of a FIFO does not wait for a
@@ -316,16 +288,9 @@ pub(crate) fn is_missing(error: &io::Error) -> bool {
 
 /// Whether the error says that the entry is being deleted (Windows): its name goes when the
 /// last handle on it is closed, unless the holder takes the deletion back.
-pub(crate) fn is_delete_pending(error: &io::Error) -> bool {
-  #[cfg(windows)]
-  {
-    windows::is_delete_pending(error)
-  }
-  #[cfg(not(windows))]
-  {
-    let _ = error;
-    false
-  }
+#[cfg(not(windows))]
+pub(crate) fn is_delete_pending(_error: &io::Error) -> bool {
+  false
 }
 
 /// Only Windows reads a name as another one than the path says.
@@ -340,7 +305,7 @@ mod apple;
 #[cfg(target_vendor = "apple")]
 pub(crate) use self::apple::name_and_kind;
 #[cfg(target_vendor = "apple")]
-use self::apple::name_on_disk;
+use self::apple::{name_on_disk, remote_disk};
 
 /// Everywhere else every disk tells two spellings of a name apart, and the engine never asks.
 #[cfg(not(any(target_vendor = "apple", windows)))]

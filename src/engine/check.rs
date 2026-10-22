@@ -121,14 +121,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       None => why,
     };
     let Some(parent) = self.tree.parent(key) else { return };
-    let Some(asked) = self.tree[parent].dir().map(|dir| dir.asked) else {
-      return self.tree.prune(key);
-    };
     let node = &self.tree[key];
     let registered = node.is_registered();
-    let below_names_only = registered && asked == Some(Want::Names);
-    // What the tree had, also while the node is held.
-    let (had, was_unlisted) = (node.kind, node.is_unlisted());
+    let below_names_only = registered && self.tells_names_only(parent);
+    // The look can change it.
+    let was_unlisted = node.is_unlisted();
 
     push_name(path, self.tree.name(key));
     let mut listed_as = None;
@@ -139,7 +136,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       Found::OtherSpelling(name) => Some(name.clone()),
       _ => listed_as,
     };
-    self.apply(key, path, found, had, was_unlisted, why);
+    self.apply(key, path, found, was_unlisted, why);
 
     // A registered name with no directory at it makes its directory want the contents.
     let wants_more = below_names_only && !self.tree[key].is_dir();
@@ -161,10 +158,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // hint said of the entry. Once only, so that a disk whose answers do not agree with each
     // other cannot keep the flush busy; a second step waits for the next flush.
     if let Some(name) = on_disk {
-      let node = match self.tree.child(parent, &name) {
-        Some(node) => node,
-        None => self.tree.insert_child(parent, &name),
-      };
+      let node =
+        self.tree.child(parent, &name).unwrap_or_else(|| self.tree.insert_child(parent, &name));
       let pending = self.tree.take_mark(node).unwrap_or_default();
       let written = why.written || pending.written;
       let mark = Mark { deep: true, written, lost: false, since: why.since };
@@ -183,11 +178,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     key: DirKey,
     path: &mut PathBuf,
     found: Found,
-    had: Kind,
     was_unlisted: bool,
     why: Mark,
   ) {
-    match (found, had) {
+    match (found, self.tree[key].kind) {
       // No answer: the look is tried again.
       (Found::Unknown, _) => self.tree.mark(key, self.retry(why)),
 
@@ -204,7 +198,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         self.store_file(key, path, kind, file, why);
       }
 
-      (Found::Dir { id, complete, relinked, young }, Kind::Missing | Kind::File(_)) => {
+      (Found::Dir { id, complete, relinked, young }, had @ (Kind::Missing | Kind::File(_))) => {
         let baseline = self.is_baseline_dir(key, relinked);
         if let Kind::File(_) = had {
           // A change of kind is never an `Update`: the file is gone.
@@ -487,8 +481,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     fingerprint: Fingerprint,
     why: Mark,
   ) {
-    // A held node still has its file: this is its second look.
-    let was_held = self.tree[key].is_held();
     let old = match self.tree[key].kind {
       Kind::File(old) => Some((old, self.tree.content(key))),
       _ => None,
@@ -526,13 +518,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         || match content {
           None => false,
           Some(Content::Hash(old)) => hash != Some(old),
-          Some(Content::Pending) if trusts_hints => self.hint_may_be_lost(key, why, was_held),
+          Some(Content::Pending) if trusts_hints => self.hint_may_be_lost(key, why),
           Some(Content::Unknown | Content::Pending) => !update_waits,
         }
     } else {
       // The handler may believe in a file the tree forgot earlier in this flush: nothing says it
       // is the same one.
-      let baseline = self.is_baseline_file(key);
+      let baseline = !self.reported_before(key);
       let node = &mut self.tree[key];
       node.set_baseline(baseline);
       node.told()
@@ -644,14 +636,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// Whether the hint of a write that left the fingerprint as it is can have gone by since the
   /// last look at the file, so that a young file that was not read counts as written (5.8): a
   /// loss report asked for the look, or one waits; the look is one of the scan of a directory
-  /// that was away (`Dir::away`), or such a scan is queued above; or the file was held (it was
-  /// away itself, or its hint went into the look that found it missing).
-  fn hint_may_be_lost(&self, key: DirKey, why: Mark, was_held: bool) -> bool {
+  /// that was away (`Dir::away`), or such a scan is queued above; or the file was held, and a
+  /// held node keeps its file until this second look (it was away itself, or its hint went into
+  /// the look that found it missing).
+  fn hint_may_be_lost(&self, key: DirKey, why: Mark) -> bool {
     why.lost
-      || was_held
+      || self.tree[key].is_held()
       || self.away_scan
       || self.loss.scanning
-      || self.tree.lost
       || self.loss.waits
       || self.below_away(key)
   }

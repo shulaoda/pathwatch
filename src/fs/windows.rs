@@ -20,8 +20,8 @@ use std::{
 use windows_sys::Win32::{
   Foundation::{
     ERROR_ACCESS_DENIED, ERROR_BAD_NETPATH, ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION,
-    ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION, INVALID_HANDLE_VALUE, MAX_PATH, NTSTATUS,
-    STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE,
+    ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION, FARPROC, INVALID_HANDLE_VALUE, MAX_PATH,
+    NTSTATUS, STATUS_DELETE_PENDING, STATUS_FILE_IS_A_DIRECTORY, STATUS_NO_SUCH_FILE,
     STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
   },
   Storage::FileSystem::{
@@ -159,23 +159,18 @@ const STAT_BASIC: i32 = 3;
 
 /// A function of `kernel32.dll` that not every Windows has: an import of it would keep the
 /// program from starting there.
-pub fn kernel32(name: &CStr) -> Option<Unknown> {
-  let kernel32: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+pub fn kernel32(name: &CStr) -> FARPROC {
   // SAFETY: both names end with a NUL. `kernel32.dll` is loaded in every process and is
   // never unloaded, so the address stays good.
-  unsafe { GetProcAddress(GetModuleHandleW(kernel32.as_ptr()), name.as_ptr().cast()) }
+  unsafe { GetProcAddress(GetModuleHandleW(windows_sys::w!("kernel32.dll")), name.as_ptr().cast()) }
 }
-
-/// A function whose signature only its name tells.
-pub type Unknown = unsafe extern "system" fn() -> isize;
 
 /// The call, where this Windows has it (Windows 11 24H2 and later).
 fn by_name_call() -> Option<ByName> {
   static CALL: OnceLock<Option<ByName>> = OnceLock::new();
   *CALL.get_or_init(|| {
-    let found = kernel32(c"GetFileInformationByName");
     // SAFETY: the function with this name has this signature.
-    found.map(|call| unsafe { mem::transmute::<Unknown, ByName>(call) })
+    unsafe { mem::transmute::<FARPROC, Option<ByName>>(kernel32(c"GetFileInformationByName")) }
   })
 }
 
@@ -308,11 +303,10 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
 
   let mut records = Aligned([0; 16 * 1024]);
   let size = u32::try_from(records.0.len()).unwrap_or(u32::MAX);
-  // The units of a name and its text, kept for the next entry: a listing asks for no memory
-  // for each entry (a directory of 50,000 files: 615 ns an entry with a name made for each,
-  // 571 ns now, measured).
-  let (mut name, mut text) = (Vec::new(), String::new());
-  let dot = u16::from(b'.');
+  // The text of a name, kept for the next entry: a listing asks for no memory for each entry
+  // (a directory of 50,000 files: 615 ns an entry with a name made for each, 571 ns now,
+  // measured).
+  let mut text = String::new();
   let mut class = FileIdBothDirectoryRestartInfo;
   loop {
     // SAFETY: the handle is open, and the call writes at most `size` bytes into `records`.
@@ -334,11 +328,12 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
     class = FileIdBothDirectoryInfo;
     let mut rest = &records.0[..];
     loop {
-      let read = record(rest, u64::from(serial), &mut name);
-      let (next, told) = read.ok_or_else(|| io::Error::other("a listing gave no entry"))?;
-      let is_dot = name == [dot] || name == [dot, dot];
-      if !is_dot && !has_separator(&name) {
-        each(&wide_name(name.iter().copied(), &mut text), told);
+      let read = record(rest, u64::from(serial));
+      let (next, name, told) = read.ok_or_else(|| io::Error::other("a listing gave no entry"))?;
+      let units = name.as_chunks().0.iter().map(|&unit| u16::from_ne_bytes(unit));
+      let name = wide_name(units, &mut text);
+      if !matches!(name.as_encoded_bytes(), b"." | b"..") && !has_separator(&name) {
+        each(&name, told);
       }
       match next {
         0 => break,
@@ -349,8 +344,8 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
 }
 
 /// The record at the start of `bytes`: where the next one starts (zero: none) and what it
-/// tells, with its name in `name`. `None`: it does not fit into the bytes.
-fn record(bytes: &[u8], volume: u64, name: &mut Vec<u16>) -> Option<(usize, Entry)> {
+/// tells, with the bytes of its name. `None`: it does not fit into the bytes.
+fn record(bytes: &[u8], volume: u64) -> Option<(usize, &[u8], Entry)> {
   let u32_at = |at: usize| Some(u32::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
   let u64_at = |at: usize| Some(u64::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
   let next = usize::try_from(u32_at(NEXT)?).ok()?;
@@ -358,8 +353,6 @@ fn record(bytes: &[u8], volume: u64, name: &mut Vec<u16>) -> Option<(usize, Entr
   if next != 0 && (next < NAME + name_bytes.len() || next >= bytes.len()) {
     return None;
   }
-  name.clear();
-  name.extend(name_bytes.as_chunks().0.iter().map(|&unit| u16::from_ne_bytes(unit)));
   let (attributes, index) = (u32_at(ATTRIBUTES)?, u64_at(INDEX)?);
   let plain = attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
   let told = match kind(attributes, u32_at(TAG)?) {
@@ -374,7 +367,7 @@ fn record(bytes: &[u8], volume: u64, name: &mut Vec<u16>) -> Option<(usize, Entr
     },
     kind => Entry::Kind(kind),
   };
-  Some((next, told))
+  Some((next, name_bytes, told))
 }
 
 /// Whether Windows reads a name of `path` as another one, unless the path has the `\\?\` form:
@@ -458,9 +451,9 @@ pub fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
 }
 
 /// A name with a separator in it, which a disk that another system filled can hold: no path
-/// names such an entry, so it is left out of a listing.
-fn has_separator(name: &[u16]) -> bool {
-  name.iter().any(|&unit| unit == u16::from(b'\\') || unit == u16::from(b'/'))
+/// names such an entry, so it is left out of a listing. Both are one byte in the encoded form.
+pub(super) fn has_separator(name: &OsStr) -> bool {
+  name.as_encoded_bytes().iter().any(|&byte| matches!(byte, b'\\' | b'/'))
 }
 
 /// A name that Windows gives as UTF-16 units, through `text`: a name is Unicode text unless it

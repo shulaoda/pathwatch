@@ -26,7 +26,7 @@ pub fn each_backend(settings: &Settings, story: &(impl Fn(&mut dyn World) + Sync
     };
     let mut sim = Sim::new(Driver::sim(mode, options.clone()), name, settings.loose_disk);
     story(&mut sim);
-    sim.end();
+    caught_up(&mut sim.driver);
   }
   if settings.delete_delay.is_some() {
     skipped("polling has no delete delay");
@@ -36,7 +36,7 @@ pub fn each_backend(settings: &Settings, story: &(impl Fn(&mut dyn World) + Sync
   let options = Options { delete_delay: Duration::ZERO, ..options };
   let mut sim = Sim::new(Driver::<PollBackend>::poll(options), "sim polling", settings.loose_disk);
   story(&mut sim);
-  sim.end();
+  caught_up(&mut sim.driver);
 }
 
 fn options(settings: &Settings) -> Options {
@@ -66,11 +66,6 @@ impl<B: Deliver> Sim<B> {
     Self { driver, name, loose, passing: Vec::new() }
   }
 
-  /// The end of the story: everything settles, and the engine has caught up with the disk.
-  fn end(&mut self) {
-    caught_up(&mut self.driver);
-  }
-
   fn paths(&self, rels: &[&str]) -> Vec<PathBuf> {
     rels.iter().map(|rel| self.path(rel)).collect()
   }
@@ -79,10 +74,6 @@ impl<B: Deliver> Sim<B> {
 impl<B: Deliver> World for Sim<B> {
   fn path(&self, rel: &str) -> PathBuf {
     Path::new(ROOT).join(rel)
-  }
-
-  fn name(&self) -> &'static str {
-    self.name
   }
 
   fn polls(&self) -> bool {
@@ -119,13 +110,7 @@ impl<B: Deliver> World for Sim<B> {
   }
 
   fn remove(&mut self, rel: &str) {
-    let path = self.path(rel);
-    let fs = &self.driver.fs;
-    if fs.read_link(&path).is_none() && fs.dir_object(&path).is_some() {
-      fs.remove_all(path).unwrap();
-    } else {
-      fs.remove(path).unwrap();
-    }
+    self.driver.fs.remove_all(self.path(rel)).unwrap();
   }
 
   fn rename(&mut self, from: &str, to: &str) {

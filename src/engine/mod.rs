@@ -24,7 +24,6 @@ use std::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::{check::Listed, scan::ScanEntry};
-pub use crate::tree::Fingerprint;
 use crate::{
   backend::{Backend, DirKey, Hint, Signal},
   config::EntryKind,
@@ -49,10 +48,6 @@ const LONGEST_LOSS_REST: Duration = Duration::from_millis(500);
 /// A flush counts for no more than this in the rest: the clock runs on while the machine
 /// sleeps, and a flush that the sleep fell into would rest for hours.
 const LONGEST_FLUSH: Duration = Duration::from_secs(60);
-
-/// No time of the settings is longer: `Duration::MAX` is a way to say "never", and a time that
-/// far ahead of now is no `Instant`.
-const LONGEST_SETTING: Duration = Duration::from_hours(365 * 24);
 
 /// The ignore filter: `true` for a path that must not be reported. It must give the same
 /// answer for the same path and kind: the node keeps it.
@@ -219,7 +214,6 @@ impl<B: Backend, F: Fs> fmt::Debug for Engine<B, F> {
 
 impl<B: Backend, F: Fs> Engine<B, F> {
   pub fn new(backend: B, fs: F, options: Options) -> Self {
-    let options = within_a_year(options);
     let mut tree = Tree::new();
     tree.loose_spelling = options.loose_spelling;
     Self {
@@ -265,10 +259,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// The settings once the backend has died and every node is polled: the watcher then works
   /// as one that polls everything, as it does when the backend cannot start.
   pub fn fall_back_to(&mut self, options: Options) {
-    self.fallback = Some(within_a_year(options));
+    self.fallback = Some(options);
   }
 
-  fn stopped(&self) -> bool {
+  pub(crate) fn stopped(&self) -> bool {
     self.stop.as_ref().is_some_and(|stop| stop.load(Ordering::Relaxed))
   }
 
@@ -437,7 +431,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let rest_is_over = self.loss.rest_until.is_none_or(|until| until <= now);
     let mut loss_scans_ran = rest_is_over && mem::take(&mut self.tree.lost);
     if loss_scans_ran {
-      self.tree.scan_all();
+      self.tree.queue_scan(Tree::ROOT, Depth::Deep);
     }
     self.loss.scanning = loss_scans_ran;
     self.loss.waits = self.tree.lost;
@@ -452,7 +446,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     // The scans took the marks of the nodes they looked at: what is left on the list is work.
     self.tree.tidy_marked();
-    self.loss.scanning = false;
     (self.path, self.names) = (path, emptied(names));
     // A big listing is not kept for ever, as `emptied` does for a list.
     self.listed.clear();
@@ -512,10 +505,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// The nodes above the held nodes whose second look is due, sorted.
   fn above_due_holds(&self) -> Vec<DirKey> {
-    let mut above = Vec::new();
-    for &held in &self.due_holds {
-      above.extend(self.tree.ancestors(held));
-    }
+    let mut above: Vec<DirKey> =
+      self.due_holds.iter().flat_map(|&held| self.tree.ancestors(held)).collect();
     above.sort_unstable();
     above.dedup();
     above
@@ -557,12 +548,4 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.errors.push(Error::new(kind, path, source));
     }
   }
-}
-
-/// No time of the settings is longer than `LONGEST_SETTING`.
-fn within_a_year(mut options: Options) -> Options {
-  for time in [&mut options.debounce, &mut options.delete_delay, &mut options.poll_interval] {
-    *time = (*time).min(LONGEST_SETTING);
-  }
-  options
 }
