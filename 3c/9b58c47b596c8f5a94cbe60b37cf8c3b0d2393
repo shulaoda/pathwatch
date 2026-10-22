@@ -1,0 +1,23 @@
+references/design.md
+  s_984144a74f8d15::t_47e88ddf2e922d 1065-1072
+src/watcher.rs
+  s_984144a74f8d15::t_3d3c4be5be2ca7 703-705,722,725-729
+tests/watcher.rs
+  s_984144a74f8d15::t_8e4e5c02d9d2dc 11,21,744-794
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3c9b58c47b596c8f5a94cbe60b37cf8c3b0d2393",
+  "prompts": {},
+  "sessions": {
+    "s_984144a74f8d15": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "73c5f10f-52fa-4304-b79a-16193b8abb71",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}

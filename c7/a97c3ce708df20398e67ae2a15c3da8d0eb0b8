@@ -1,0 +1,47 @@
+references/design.md
+  s_984144a74f8d15::t_d6855eb5c541fe 29,205-206,1195-1197
+src/backend.rs
+  s_984144a74f8d15::t_0b958a29dbac35 36-37
+src/engine/check.rs
+  s_984144a74f8d15::t_3f370330ff071c 20-23,92-93,130-131,142,181-189,194-195,198,201,207,209-212,218,221-222,320-325,384,435-437,439-442,524,529-530,548,568-572,605,659-664,701,708-714
+src/engine/filter.rs
+  s_984144a74f8d15::t_df7faec9c804dd 64-65,69-74,79,81-88,92
+src/engine/mod.rs
+  s_984144a74f8d15::t_f9e1a512a10d9d 21,87-88,148,167-169,242,302-303,367,423-424,428-430,436
+src/engine/os_watch.rs
+  s_984144a74f8d15::t_27404440fb2ad3 149-151
+src/engine/scan.rs
+  s_984144a74f8d15::t_d6c06ffedf8a55 13,95,127-128,131,134,138-144,146-155,157,161,167
+src/engine/watched_paths.rs
+  s_984144a74f8d15::t_fdc39f0b331691 123-125
+src/error.rs
+  s_984144a74f8d15::t_09e33188fa74ae 58-59,64
+src/fsevents.rs
+  s_984144a74f8d15::t_2ebe499e32c288 455-456,560-562,604-606
+src/path.rs
+  s_984144a74f8d15::t_76cbc32e2f181a 115-118,122-123,126,132,136-141,143-145,149-158,164-166,200
+src/tree/flags.rs
+  s_984144a74f8d15::t_0035802a4aeb04 36-45,127,132
+src/tree/mod.rs
+  s_984144a74f8d15::t_eda922fa4c7d52 3-4,17,170-171,175-179,365,367-374,455,810,871,1082,1128,1138,1140,1161,1164,1170,1172-1174,1176-1178,1215-1216,1305
+src/watcher.rs
+  s_984144a74f8d15::t_f0acf09b59f82c 244,246,253,732-733
+src/windows.rs
+  s_984144a74f8d15::t_1d1d95fe89a0b7 608-609,611-617,1167,1211,1238-1240,1383
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c7a97c3ce708df20398e67ae2a15c3da8d0eb0b8",
+  "prompts": {},
+  "sessions": {
+    "s_984144a74f8d15": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "73c5f10f-52fa-4304-b79a-16193b8abb71",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
