@@ -241,17 +241,16 @@ fn process_is_exiting() -> bool {
 
 impl Watcher {
   /// Cleans the paths and hands the usable ones to the thread as one command.
-  fn command<P: AsRef<Path>>(
+  fn command(
     &self,
-    paths: impl IntoIterator<Item = P>,
+    paths: &[impl AsRef<Path>],
     command: fn(Vec<PathBuf>, Done) -> Command,
   ) -> Result<(), Error> {
     let closed = || Error::new(ErrorKind::Closed, None, None);
     if self.stop.load(Ordering::Acquire) {
       return Err(closed());
     }
-    let paths = paths.into_iter();
-    let mut usable = Vec::with_capacity(paths.size_hint().0);
+    let mut usable = Vec::with_capacity(paths.len());
     let mut skipped = None;
     for path in paths {
       match clean(path.as_ref()) {
@@ -730,7 +729,8 @@ fn deliver<B: Backend>(
   }
 }
 
-/// The form of `path` that the engine takes: absolute and clean. `None`: it cannot be used.
+/// The form of `path` that the engine takes: absolute and clean. `Err`: it cannot be used, with
+/// the error of the current directory when a relative path needed it and it could not be read.
 ///
 /// A relative path is joined to the current directory; [`normalize`] does the rest.
 fn clean(path: &Path) -> Result<PathBuf, Option<io::Error>> {

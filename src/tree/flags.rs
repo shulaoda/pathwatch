@@ -33,6 +33,16 @@ bitflags! {
   }
 }
 
+impl Flags {
+  /// Whether the filter was asked about `kind`, and what it said.
+  fn of_filter(kind: EntryKind) -> (Self, Self) {
+    match kind {
+      EntryKind::File => (Self::FILE_ASKED, Self::FILE_IGNORED),
+      EntryKind::Dir => (Self::DIR_ASKED, Self::DIR_IGNORED),
+    }
+  }
+}
+
 impl Node {
   /// The last look found nothing where `kind` has a file or a directory. The second look
   /// decides; until then the node and everything below it stay as they are.
@@ -114,18 +124,12 @@ impl Node {
 
   /// What the filter said about a file, or a directory, at the path. `None`: it was not asked.
   pub fn ignored(&self, kind: EntryKind) -> Option<bool> {
-    let (asked, answer) = match kind {
-      EntryKind::File => (Flags::FILE_ASKED, Flags::FILE_IGNORED),
-      EntryKind::Dir => (Flags::DIR_ASKED, Flags::DIR_IGNORED),
-    };
+    let (asked, answer) = Flags::of_filter(kind);
     self.flags.contains(asked).then(|| self.flags.contains(answer))
   }
 
   pub fn set_ignored(&mut self, kind: EntryKind, ignored: bool) {
-    let (asked, answer) = match kind {
-      EntryKind::File => (Flags::FILE_ASKED, Flags::FILE_IGNORED),
-      EntryKind::Dir => (Flags::DIR_ASKED, Flags::DIR_IGNORED),
-    };
+    let (asked, answer) = Flags::of_filter(kind);
     self.flags.insert(asked);
     self.flags.set(answer, ignored);
   }

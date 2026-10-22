@@ -26,7 +26,7 @@ watcher.close();
 
 | Name | What it is |
 |---|---|
-| `Watcher::new(handler)`, `with_config(config, handler)` | Start the watcher thread and the backend. They fail only when the thread cannot start. When the watch API of the OS cannot start, the handler is told once (`WatchLimit` or `Io`) and the watcher polls everything. |
+| `Watcher::new(handler)`, `with_config(config, handler)` | Start the watcher thread and the backend. They fail only when the thread, or the queue into it, cannot be made. When the watch API of the OS cannot start, the handler is told once (`WatchLimit` or `Io`) and the watcher polls everything. |
 | `watch(paths)` | Register a batch and return when every path is watched and its state is known. What exists then is the **baseline** and is not reported. A path that is watched already is skipped. |
 | `unwatch(paths)` | Take back a `watch` of the very same paths, and report nothing but the change of a link inside a watched directory that is a plain file again (5.7). |
 | `close()` | Stops the backend and waits for the thread. After it the handler is not called again, and `watch` and `unwatch` return `Closed`. A check of the disk that runs ends at its next step, so the wait is one look at most. Dropping the watcher calls it. |
@@ -202,7 +202,8 @@ the heap of a watcher of 50,000 files went up to 8.0 MiB for 4.3 MiB in use, and
 it. In blocks: 4.8 MiB, and 14 MiB allocated in all instead of 39.) A node has the list of its
 children, and one table for the whole tree finds a child by (parent, name). Small tables next to the
 arena hold what only a few nodes have: the link of a registered name (5.14), the content hash of a
-young file (5.8), and the time of a hold (5.9).
+young file (5.8), the time of a hold (5.9), the first look at a file whose time is ahead of the
+clock (5.8), and the registered names that are not plain, by their directory (5.2).
 
 A tree that gets smaller gives its memory back (`Tree::give_back`). A node never moves,
 because its key is its place. So only the end of the arena can go, as far as no node lives
@@ -1191,8 +1192,9 @@ type has its own `new(sink: Sink<Self::Raw>)`.
     `dir` itself: the watch is gone, the directory was moved away, or notifications were lost.
     The engine checks the directory, watches it again and scans everything below it. It paces
     these scans (5.13), so a backend may send this often.
-  - `Written { dir, rel }`: the content of the file at `rel` was written. For a directory it
-    means nothing.
+  - `Written { dir, rel, new }`: the content of the file at `rel` was written. `new`: a file was
+    created or moved in there (inotify), with other content than the name had before; a twin
+    of the name is left to its look (5.2). For a directory it means nothing.
   - `Lost`: notifications were lost, and the backend cannot say where. Check everything.
   - `Mount { path }`: a volume was mounted or unmounted at the real path `path`, and the backend
     knows no key for it (inotify, 7.1). The engine checks the node at that path, if it has one.

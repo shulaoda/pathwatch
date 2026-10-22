@@ -605,15 +605,16 @@ mod handles {
       }
       self.open.extend(new);
 
-      let mut place_of = FxHashMap::default();
-      for place in &places {
-        let Some(at) = self.open.iter().position(|handle| handle.dir == place.dir) else {
-          continue;
-        };
-        place_of.extend(place.keys.iter().map(|&key| (key, at)));
+      for served in self.keys.values_mut() {
+        served.handle = None;
       }
-      for (key, served) in &mut self.keys {
-        served.handle = place_of.get(key).map(|&at| self.open[at].id);
+      for place in &places {
+        let id = self.open.iter().find(|handle| handle.dir == place.dir).map(|handle| handle.id);
+        for key in &place.keys {
+          if let Some(served) = self.keys.get_mut(key) {
+            served.handle = id;
+          }
+        }
       }
       for key in behind_a_link {
         self.forget(key);
@@ -1163,7 +1164,7 @@ mod port {
           Some(at) => {
             let now = Instant::now();
             if at <= now {
-              self.rearm(now);
+              self.rearm(Some(now));
               continue;
             }
             // The timeout of the port counts in ticks of the clock (15.6 ms): the port is
@@ -1207,15 +1208,7 @@ mod port {
     /// `false`: the worker stops.
     fn read_empty(&mut self) -> bool {
       self.draining = true;
-      let resting: Vec<usize> =
-        self.watches.iter().filter(|(_, w)| w.rest_until.is_some()).map(|(&t, _)| t).collect();
-      for token in resting {
-        let Some(watch) = self.watches.get_mut(&token) else { continue };
-        watch.rest_until = None;
-        if let Err(error) = watch.read() {
-          self.died(token, error);
-        }
-      }
+      self.rearm(None);
       let went_on = loop {
         let began = SystemTime::now();
         match self.iocp.wait(0) {
@@ -1242,9 +1235,9 @@ mod port {
       went_on
     }
 
-    /// Queues the next read of every handle whose rest is over.
-    fn rearm(&mut self, now: Instant) {
-      let over = |watch: &Watch| watch.rest_until.is_some_and(|at| at <= now);
+    /// Queues the next read of every handle whose rest is over at `now`, or of every resting one.
+    fn rearm(&mut self, now: Option<Instant>) {
+      let over = |watch: &Watch| watch.rest_until.is_some_and(|at| now.is_none_or(|now| at <= now));
       let due: Vec<usize> = self.watches.iter().filter(|(_, w)| over(w)).map(|(&t, _)| t).collect();
       for token in due {
         let Some(watch) = self.watches.get_mut(&token) else { continue };
@@ -1387,10 +1380,7 @@ mod port {
     }
 
     fn stop(mut self) {
-      for watch in self.watches.values_mut() {
-        watch.closing = Closing::Asked;
-        watch.cancel();
-      }
+      self.watches.values_mut().for_each(Watch::cancel);
       self.watches.retain(|_, watch| watch.pending);
       while !self.watches.is_empty() {
         match self.iocp.wait(STOP_WAIT_MS) {

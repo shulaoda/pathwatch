@@ -1,7 +1,7 @@
 //! The data of the engine: a tree of the paths that matter, and the work that waits in it.
 //! Nothing here reads the disk. One node is one name. All nodes live in one arena, with a table
-//! that finds a child by its name; the names are in one buffer (`names.rs`), and the small
-//! facts of a node are bits (`flags.rs`).
+//! that finds a child by its name; the names are in blocks of 64 KiB (`names.rs`), and the
+//! small facts of a node are bits (`flags.rs`).
 
 mod flags;
 mod names;
@@ -14,7 +14,7 @@ use std::{
   mem,
   ops::{Index, IndexMut},
   path::{Component, Components, MAIN_SEPARATOR_STR, Path, PathBuf, is_separator},
-  time::{Instant, SystemTime},
+  time::{Duration, Instant, SystemTime},
 };
 
 use hashbrown::HashTable;
@@ -166,11 +166,15 @@ impl Fingerprint {
 
 /// Nanoseconds since 1970. A time that does not fit (before 1678, after 2262) becomes the nearest.
 pub(crate) fn nanos(time: SystemTime) -> i64 {
-  let fit = |nanos: u128| i64::try_from(nanos).unwrap_or(i64::MAX);
   match time.duration_since(SystemTime::UNIX_EPOCH) {
-    Ok(after) => fit(after.as_nanos()),
-    Err(before) => -fit(before.duration().as_nanos()),
+    Ok(after) => nanos_of(after),
+    Err(before) => -nanos_of(before.duration()),
   }
+}
+
+/// A duration in nanoseconds, or the longest that fits.
+pub(crate) fn nanos_of(time: Duration) -> i64 {
+  i64::try_from(time.as_nanos()).unwrap_or(i64::MAX)
 }
 
 /// What the tree keeps for a directory that is on disk. All of it goes away with the directory.
@@ -358,9 +362,16 @@ impl Tree {
     (parent != NONE).then(|| self.key(parent))
   }
 
-  /// The directories above the node, from its parent up to the top.
+  /// The directories above the node, from its parent up to the root.
   pub fn ancestors(&self, key: DirKey) -> impl Iterator<Item = DirKey> {
-    iter::successors(self.parent(key), |&at| self.parent(at))
+    self.above(key).map(|at| self.key(at))
+  }
+
+  /// The slots above the node, from its parent up to the root. None for a key that names no node.
+  fn above(&self, key: DirKey) -> impl Iterator<Item = u32> {
+    let up = |at: u32| (at != NONE).then_some(at);
+    let first = self.get(key).and_then(|node| up(node.parent));
+    iter::successors(first, move |&at| up(linked(&self.slots, at).parent))
   }
 
   pub fn child(&self, parent: DirKey, name: &OsStr) -> Option<DirKey> {
@@ -441,13 +452,7 @@ impl Tree {
 
   /// How many nodes are above the node. Zero for a key that names no node.
   pub fn level(&self, key: DirKey) -> usize {
-    let mut level = 0;
-    let mut parent = self.get(key).map_or(NONE, |node| node.parent);
-    while parent != NONE {
-      level += 1;
-      parent = linked(&self.slots, parent).parent;
-    }
-    level
+    self.above(key).count()
   }
 
   /// Makes the node a watched path. `false`: it is one already.
@@ -802,7 +807,7 @@ pub(crate) fn emptied<T>(mut list: Vec<T>) -> Vec<T> {
 
 /// What a hint says of the last name of its path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Said {
+enum Said {
   /// Something changed there.
   Changed,
   /// The file was written: an `Update`, also with an equal fingerprint.
@@ -863,7 +868,7 @@ impl Tree {
 
   /// Marks the place to check for a change at `rel` below `dir`: the name itself, or the highest
   /// name on the way that the tree does not know as a directory. `false`: nothing to do.
-  pub fn mark_below(&mut self, dir: DirKey, rel: &Path, said: Said) -> bool {
+  fn mark_below(&mut self, dir: DirKey, rel: &Path, said: Said) -> bool {
     let Some(node) = self.get(dir) else { return false };
     if !node.is_dir() {
       return self.mark_from_above(dir);
@@ -1074,7 +1079,7 @@ impl Tree {
   /// list that shrank gives its memory back.
   pub fn tidy_polled(&mut self) {
     let mut polled = mem::take(&mut self.polled);
-    polled.sort_unstable_by_key(|key| (key.index(), key.generation()));
+    polled.sort_unstable();
     polled.dedup();
     let is_polled = |node: &Node| matches!(node.kind, Kind::Dir(dir) if dir.is_polled());
     polled.retain(|&key| self.get(key).is_some_and(is_polled));
@@ -1120,9 +1125,7 @@ impl Tree {
   /// child that can be the same name, and in a complete node any child that differs only in the
   /// case of ASCII letters. Why: design.md 5.2.
   fn others_meant(&self, at: u32, name: &OsStr, exact: Option<u32>) -> Vec<u32> {
-    let parent = linked(&self.slots, at);
-    let loose = self.loose_spelling;
-    let any_child = parent.is_complete();
+    let any_child = linked(&self.slots, at).is_complete();
     let is_meant = |&child: &u32| {
       let node = linked(&self.slots, child);
       Some(child) != exact
@@ -1132,12 +1135,9 @@ impl Tree {
     };
     if is_plain(name) {
       self.index.iter_hash(child_hash(at, name)).copied().filter(is_meant).collect()
-    } else if loose {
+    } else if self.loose_spelling {
       let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
-      let not_plain = |&child: &u32| {
-        Some(child) != exact && !is_plain(name_of(&self.names, linked(&self.slots, child)))
-      };
-      listed.iter().copied().filter(not_plain).collect()
+      listed.iter().copied().filter(|&child| Some(child) != exact).collect()
     } else {
       Vec::new()
     }
@@ -1158,31 +1158,24 @@ impl Tree {
   /// Whether the tree cannot say that the node has its name as the disk spells it: another node of
   /// the directory can be the same name, or the name is not plain.
   pub fn has_other_spelling(&self, key: DirKey) -> bool {
-    !is_plain(self.name(key)) || self.has_twin(key)
+    !is_plain(self.name(key)) || self.twins(key).next().is_some()
   }
 
-  /// Whether the table has another node of the same directory that can be the same name as
-  /// the node `key`.
-  pub fn has_twin(&self, key: DirKey) -> bool {
-    self.twins(key).next().is_some()
-  }
-
-  /// The nodes that `has_twin` speaks of, if they have a mark.
+  /// The twins of the node `key` that have a mark.
   pub fn marked_twins(&self, key: DirKey) -> Vec<DirKey> {
     let marked = self.twins(key).filter(|&twin| linked(&self.slots, twin).is_marked());
     marked.map(|twin| self.key(twin)).collect()
   }
 
+  /// The other nodes of the directory that the table finds as the same name as the node `key`.
   fn twins(&self, key: DirKey) -> impl Iterator<Item = u32> + '_ {
-    let node = self.get(key);
-    let hash = node.map_or(0, |node| child_hash(node.parent, name_of(&self.names, node)));
-    self.index.iter_hash(hash).copied().filter(move |&other| {
+    let node = &self[key];
+    let name = name_of(&self.names, node);
+    self.index.iter_hash(child_hash(node.parent, name)).copied().filter(move |&other| {
       let other_node = linked(&self.slots, other);
-      node.is_some_and(|node| {
-        other != key.index()
-          && other_node.parent == node.parent
-          && can_be_one_name(name_of(&self.names, other_node), name_of(&self.names, node))
-      })
+      other != key.index()
+        && other_node.parent == node.parent
+        && can_be_one_name(name_of(&self.names, other_node), name)
     })
   }
 }
@@ -1219,7 +1212,8 @@ pub enum Content {
   Pending,
 }
 
-/// What only a few nodes have, kept beside the arena: links, contents and holds.
+/// What only a few nodes have, kept beside the arena: links, contents, holds, and the times of
+/// files ahead of the clock.
 impl Tree {
   /// A hash of the real path behind the node, if it was a symbolic link at its last check.
   pub fn link(&self, key: DirKey) -> Option<u64> {
@@ -1308,18 +1302,7 @@ impl Tree {
 
   /// Whether a node above is held: then nothing is done here before its second look.
   pub fn frozen(&self, key: DirKey) -> bool {
-    if self.holds.is_empty() {
-      return false;
-    }
-    let mut parent = self.get(key).map_or(NONE, |node| node.parent);
-    while parent != NONE {
-      let node = linked(&self.slots, parent);
-      if node.is_held() {
-        return true;
-      }
-      parent = node.parent;
-    }
-    false
+    !self.holds.is_empty() && self.above(key).any(|at| linked(&self.slots, at).is_held())
   }
 
   /// For the tests: checks the links, the table and the counts.

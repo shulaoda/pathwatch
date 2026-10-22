@@ -33,7 +33,8 @@ pub trait Backend: Send + 'static {
   /// file that was not read stays `Pending` until a look reports it (design.md 5.8).
   fn ask_delivered(&mut self, _after: SystemTime) {}
 
-  /// How many bytes `raw` counts for in the queue of the watcher.
+  /// How many bytes `raw` keeps on the heap: the queue of the watcher counts them on top of
+  /// the message.
   fn raw_bytes(_raw: &Self::Raw) -> usize {
     0
   }

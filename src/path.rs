@@ -111,58 +111,59 @@ pub(crate) mod windows_rules {
   /// Whether [`windows`] would give `text` back as it is. Only the usual form is looked at,
   /// `C:\a\b`: a clean path on a share is cleaned again, which gives the same path.
   pub(crate) fn windows_is_clean<U: Unit>(text: &[U]) -> bool {
-    let [letter, colon, slash, rest @ ..] = text else { return false };
-    let is_letter =
-      char::from_u32((*letter).into()).is_some_and(|letter| letter.is_ascii_alphabetic());
-    // `/` separates too, and the clean form has none.
-    let has_slash = rest.iter().any(|&unit| is(unit, b'/'));
     let back = |unit: U| is(unit, b'\\');
-    is_letter
-      && is(*colon, b':')
-      && back(*slash)
-      && !has_slash
-      && names_are_clean(rest, back, is_name)
+    // `/` separates too, and the clean form has none.
+    after_drive(text, back).is_some_and(|rest| {
+      !rest.iter().any(|&unit| is(unit, b'/')) && names_are_clean(rest, back, is_name)
+    })
   }
 
   pub(crate) fn windows<U: Unit>(text: &[U]) -> Option<Vec<U>> {
-    let either = |unit: U| is(unit, b'\\') || is(unit, b'/');
-    let back = |unit: U| is(unit, b'\\');
+    let either: fn(U) -> bool = |unit| is(unit, b'\\') || is(unit, b'/');
+    let back: fn(U) -> bool = |unit| is(unit, b'\\');
     let mut clean = Vec::with_capacity(text.len());
 
-    if let Some(verbatim) = strip(text, br"\\?\") {
+    let (rest, separator) = if let Some(verbatim) = strip(text, br"\\?\") {
       // In a verbatim path only `\` separates, and `/` is a plain character that the normal form
       // cannot hold.
       if verbatim.iter().any(|&unit| is(unit, b'/')) {
         return None;
       }
-      let rest = match strip_no_case(verbatim, br"UNC\") {
+      let rest = match strip(verbatim, br"UNC\") {
         Some(share) => push_share(&mut clean, share, back)?,
         None => push_drive(&mut clean, verbatim, back)?,
       };
-      push_names(&mut clean, rest, back, b'\\', is_name)?;
-    } else if text.len() >= 2 && either(text[0]) && either(text[1]) {
-      let rest = push_share(&mut clean, &text[2..], either)?;
-      push_names(&mut clean, rest, either, b'\\', is_name)?;
+      (rest, back)
+    } else if let [first, second, share @ ..] = text
+      && either(*first)
+      && either(*second)
+    {
+      (push_share(&mut clean, share, either)?, either)
     } else {
-      let rest = push_drive(&mut clean, text, either)?;
-      push_names(&mut clean, rest, either, b'\\', is_name)?;
-    }
+      (push_drive(&mut clean, text, either)?, either)
+    };
+    push_names(&mut clean, rest, separator, b'\\', is_name)?;
     Some(clean)
   }
 
-  /// Appends `C:\` and returns what comes after it. `C:name` and `\name` are not absolute.
+  /// What comes after `C:\` at the start of `text`, where `separator` says what `\` can be.
+  /// `C:name` and `\name` are not absolute.
+  fn after_drive<U: Unit>(text: &[U], separator: impl Fn(U) -> bool) -> Option<&[U]> {
+    let [letter, colon, slash, rest @ ..] = text else { return None };
+    let is_letter =
+      char::from_u32((*letter).into()).is_some_and(|letter| letter.is_ascii_alphabetic());
+    (is_letter && is(*colon, b':') && separator(*slash)).then_some(rest)
+  }
+
+  /// Appends `C:\` and returns what comes after it.
   fn push_drive<'a, U: Unit>(
     clean: &mut Vec<U>,
     text: &'a [U],
     separator: impl Fn(U) -> bool,
   ) -> Option<&'a [U]> {
-    let [letter, colon, slash, rest @ ..] = text else { return None };
-    let is_letter =
-      char::from_u32((*letter).into()).is_some_and(|letter| letter.is_ascii_alphabetic());
-    if !is_letter || !is(*colon, b':') || !separator(*slash) {
-      return None;
-    }
-    clean.extend([*letter, *colon, U::from(b'\\')]);
+    let rest = after_drive(text, separator)?;
+    clean.extend_from_slice(&text[..2]);
+    clean.push(U::from(b'\\'));
     Some(rest)
   }
 
@@ -196,12 +197,8 @@ pub(crate) mod windows_rules {
     Some(rest)
   }
 
+  /// What comes after `prefix` at the start of `text`, in any case of its ASCII letters.
   fn strip<'a, U: Unit>(text: &'a [U], prefix: &[u8]) -> Option<&'a [U]> {
-    let (head, rest) = text.split_at_checked(prefix.len())?;
-    head.iter().zip(prefix).all(|(&unit, &byte)| is(unit, byte)).then_some(rest)
-  }
-
-  fn strip_no_case<'a, U: Unit>(text: &'a [U], prefix: &[u8]) -> Option<&'a [U]> {
     let (head, rest) = text.split_at_checked(prefix.len())?;
     let same = |(&unit, &byte): (&U, &u8)| {
       char::from_u32(unit.into()).is_some_and(|unit| unit.eq_ignore_ascii_case(&char::from(byte)))

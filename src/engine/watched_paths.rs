@@ -120,14 +120,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.tree[parent].is_complete() {
       !self.tree[parent].baseline()
     } else {
-      self.tracked_before(parent)
+      // A partial directory that had to track every entry before the call: the tree can be
+      // behind while an older look waits for the disk.
+      self.is_covered(parent, true)
     }
-  }
-
-  /// Whether the partial directory had to track every entry before the running `watch`: the
-  /// tree can be behind while an older look waits for the disk.
-  fn tracked_before(&self, key: DirKey) -> bool {
-    self.levels_below_path(key, true).is_some_and(|levels| !self.is_ignored_on_the_way(key, levels))
   }
 }
 

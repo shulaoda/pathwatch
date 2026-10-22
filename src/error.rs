@@ -55,13 +55,13 @@ impl fmt::Display for Error {
 }
 
 /// `what: error`, with `error` kept as the source: its OS error code stays readable.
-pub(crate) fn context(what: &str, error: io::Error) -> io::Error {
-  io::Error::new(error.kind(), Context { what: what.to_owned(), error })
+pub(crate) fn context(what: &'static str, error: io::Error) -> io::Error {
+  io::Error::new(error.kind(), Context { what, error })
 }
 
 #[derive(Debug)]
 struct Context {
-  what: String,
+  what: &'static str,
   error: io::Error,
 }
 

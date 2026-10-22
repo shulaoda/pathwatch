@@ -452,8 +452,8 @@ impl Streams {
     let (placed, keep) = if replace {
       // With room for the paths of the next few commits: a few new directories must not
       // replace every stream again.
-      let placed =
-        place(covers.dir_of.values().cloned().collect(), MAX_STREAM_PATHS - MAX_NEW_STREAMS);
+      let covered = covers.by_dir.keys().map(Path::to_owned).collect();
+      let placed = place(covered, MAX_STREAM_PATHS - MAX_NEW_STREAMS);
       let keep = self.keep(&placed, covers);
       (placed, keep)
     } else {
@@ -557,11 +557,9 @@ impl Streams {
 
   /// The stream paths at and below `dirs` are trusted no more.
   fn distrust(&mut self, dirs: &[PathBuf]) {
-    let at = dirs.iter().filter(|dir| self.paths.contains(dir)).map(PathBuf::as_path);
-    let below = self.paths.below(dirs).map(|(path, ())| path);
-    let moved: Vec<PathBuf> = at.chain(below).map(Path::to_owned).collect();
-    for path in moved {
-      self.paths.remove(&path);
+    let below: Vec<PathBuf> = self.paths.below(dirs).map(|(path, ())| path.to_owned()).collect();
+    for path in dirs.iter().chain(&below) {
+      self.paths.remove(path);
     }
   }
 
@@ -603,13 +601,11 @@ impl Streams {
         && (covers.by_dir.contains(path)
           || covers.by_dir.below(slice::from_ref(path)).next().is_some())
     };
-    let is_idle = |running: &Running| !running.paths.iter().any(needed);
-    if !self.running.iter().any(is_idle) {
+    let idle: Vec<Running> =
+      self.running.extract_if(.., |running| !running.paths.iter().any(needed)).collect();
+    if idle.is_empty() {
       return;
     }
-    let (idle, kept): (Vec<Running>, Vec<Running>) =
-      mem::take(&mut self.running).into_iter().partition(is_idle);
-    self.running = kept;
     for path in idle.iter().flat_map(|running| &running.paths) {
       self.paths.remove(path);
     }

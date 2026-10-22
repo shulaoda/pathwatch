@@ -18,7 +18,7 @@ use std::{
     Arc,
     atomic::{AtomicBool, Ordering},
   },
-  time::{Duration, Instant, SystemTime},
+  time::{Duration, Instant},
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -84,8 +84,8 @@ pub struct Options {
   /// directory tells them apart.
   pub loose_spelling: bool,
   /// A junction or a directory link is a plain directory first, and the second step gives no
-  /// record (Windows): a directory that the tree did not know is looked at once more at the
-  /// next flush.
+  /// record (Windows): a young directory that the tree did not know is looked at once more at
+  /// the next flush.
   pub two_step_links: bool,
   /// Every write to a file that an OS watch covers gives a `Written` hint (inotify, Windows).
   /// Then a young file is not read for a hash: the hint tells of a write that leaves the
@@ -145,7 +145,7 @@ pub struct Engine<B: Backend, F: Fs> {
   flush_at: Option<Instant>,
   /// The latest time for that flush, so hints that keep coming do not hold it back.
   flush_by: Option<Instant>,
-  /// The next poll. `None` while nothing is registered.
+  /// The next poll. `None` while a poll has nothing to look at (`has_poll_work`).
   poll_at: Option<Instant>,
   /// The held nodes by the time of their second look, the earliest on top. An entry can be stale.
   hold_queue: BinaryHeap<Reverse<(Instant, DirKey)>>,
@@ -164,8 +164,9 @@ pub struct Engine<B: Backend, F: Fs> {
   // The running flush.
   /// The time of the running flush. `None` before the first.
   now: Option<Instant>,
-  /// The time of the disk at the start of the flush: the rule for young files compares with it.
-  flush_time: SystemTime,
+  /// The time of the disk at the start of the flush, in nanoseconds since 1970: the rule for
+  /// young files compares with it.
+  flush_time: i64,
   /// `Fs::ticks` at the start of the flush.
   flush_ticks: Duration,
   /// The running scan is of a directory that can have been away and back, or whose watch lost
@@ -238,7 +239,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       asked: i64::MIN,
       away_scan: false,
       now: None,
-      flush_time: SystemTime::UNIX_EPOCH,
+      flush_time: 0,
       flush_ticks: Duration::ZERO,
       gave_back: false,
       touched: Vec::new(),
@@ -298,7 +299,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// The flush of a `watch` or `unwatch` call: at once, without the quiet time, as its baseline
   /// is decided by a tree that is in line with the hints.
   fn flush_now(&mut self, now: Instant, out: &mut Output) {
-    let took = self.flush(now, true);
+    self.flush_at = None;
+    let took = self.flush(now);
     self.finish(out);
     self.set_poll(now + took + self.options.poll_interval);
   }
@@ -362,7 +364,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if !flush && !poll && !second_look {
       return;
     }
-    let took = self.flush(now, flush);
+    let took = self.flush(now);
     self.finish(out);
     if poll {
       // The next poll counts from the end of this one: a pause of the poll interval, and at
@@ -418,20 +420,20 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// A check for every mark, then rounds of scans until nothing is queued. Says how long the
-  /// looks at the disk took. `take_hints`: the marks of hints are checked whether their quiet
-  /// time is over or not.
-  fn flush(&mut self, now: Instant, take_hints: bool) -> Duration {
+  /// looks at the disk took.
+  fn flush(&mut self, now: Instant) -> Duration {
     // The marks of hints wait for the quiet time, which can be longer than the poll interval:
     // a poll or a second look that runs before it checks its own work and leaves them, but for
     // a hint above a held node, which decides for it. A `watch` or `unwatch` call ends the
-    // quiet time: its baseline is decided by a tree that is in line with the hints.
-    let hints_due = take_hints || self.flush_at.is_none_or(|at| at <= now);
+    // quiet time: its baseline is decided by a tree that is in line with the hints. A loss
+    // report waits for the quiet time too (`loss_wait`).
+    let hints_due = self.flush_at.is_none_or(|at| at <= now);
     if hints_due {
       self.flush_at = None;
       self.flush_by = None;
     }
     self.now = Some(now);
-    self.flush_time = self.fs.now();
+    self.flush_time = nanos(self.fs.now());
     self.flush_ticks = self.fs.ticks();
     // The scans that loss reports ask for are paced: after one flush of them, the next wait
     // for a rest.

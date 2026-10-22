@@ -10,7 +10,7 @@ use super::{
 use crate::{
   backend::{Backend, DirKey},
   fs::{DirId, Entry, FileType, Fs, is_missing},
-  tree::{Depth, Dir, Kind, Mark, Watch, nanos},
+  tree::{Depth, Dir, Kind, Mark, Watch},
 };
 
 /// One node to check in a scan, with what the listing said about it.
@@ -92,7 +92,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let heard =
       matches!(self.tree[key].watch(), Watch::Watched | Watch::WatchedTree | Watch::FromAbove);
     let lags = self.fs.listing_lags() && !heard;
-    let flush_time = nanos(self.flush_time);
+    let flush_time = self.flush_time;
     let tree = &mut self.tree;
     let mut listed = tree.loose_spelling.then_some(&mut self.listed);
     let result = self.fs.read_dir(path, &mut |name, entry| {
@@ -124,51 +124,47 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           {
             return Listing::Whole;
           }
-          Ok(_) => {
-            for (new, _) in names.drain(known..) {
-              self.tree.prune(new);
-            }
-            self.tree.mark(key, self.retry(Mark::default()));
-            return Listing::Stop;
-          }
-          Err(error) => error,
+          Ok(_) => None,
+          Err(error) => Some(error),
         }
       }
-      Err(error) => error,
+      Err(error) => Some(error),
     };
 
-    // What the listing gave before it failed is forgotten.
+    // What the listing gave is forgotten.
     for (new, _) in names.drain(known..) {
       self.tree.prune(new);
     }
-    if is_missing(&error) {
-      if self.check_from_parent(key, path) {
-        // The directory is there after all (away and back while it was read): the deep mark
-        // keeps the work for the next flush, as when the disk gives no answer.
-        self.tree.mark(key, self.retry(Mark::default()));
-      }
-      return Listing::Stop;
-    }
-    if matches!(self.disk_error(key, path, error), Found::Unknown) {
+    let read_again = match error {
+      // Something else took the place of the directory.
+      None => true,
+      // Gone: the parent looks. The directory can be there after all (away and back while it
+      // was read): then the deep mark keeps the work for the next flush, as when the disk gives
+      // no answer.
+      Some(error) if is_missing(&error) => self.check_from_parent(key, path),
       // No answer: the parent checks it at the next flush, and the deep mark keeps the work,
-      // with what this scan knew of lost hints (5.8).
-      if self.tree.parent(key).is_some() {
-        self.tree.mark(key, self.retry(Mark::default()));
-      }
-      return Listing::Stop;
+      // with what this scan knew of lost hints (5.8). Only the root has no parent, and it is
+      // never complete.
+      Some(error) => match self.disk_error(key, path, error) {
+        Found::Unknown => true,
+        // Permission denied: nothing in here can be read, so every node is checked as missing.
+        _ => return Listing::None,
+      },
+    };
+    if read_again {
+      self.tree.mark(key, self.retry(Mark::default()));
     }
-    // Permission denied: nothing in here can be read, so every node is checked as missing.
-    Listing::None
+    Listing::Stop
   }
 
   /// The directory is gone: its parent finds out what is at its path now. True: the same
-  /// directory is still there, not held, and no scan of it is queued.
+  /// directory is still there, not held (`Node::dir`), and no scan of it is queued.
   fn check_from_parent(&mut self, key: DirKey, path: &mut PathBuf) -> bool {
     let Some(parent) = self.tree.parent(key) else { return false };
     self.tree.path_into(parent, path);
     self.check(key, path, Listed::NotAsked, Mark::default());
     let Some(node) = self.tree.get(key) else { return false };
-    !node.is_held() && node.dir().is_some_and(|dir| dir.scan.is_none())
+    node.dir().is_some_and(|dir| dir.scan.is_none())
   }
 }
 

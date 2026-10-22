@@ -119,9 +119,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(super) fn commit(&mut self) -> Vec<DirKey> {
     let Some(backend) = &mut self.backend else { return Vec::new() };
     let Committed { now_watched, failed } = backend.commit();
-    if failed.is_empty() {
-      return now_watched;
-    }
     for (key, error) in failed {
       let asked = self.tree.get(key).and_then(Node::dir).is_some_and(|dir| dir.asked.is_some());
       if asked {
@@ -149,14 +146,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// What the directory asks from the backend (design.md 5.10).
   fn want(&mut self, key: DirKey, path: &mut PathBuf) -> Want {
-    if self.tree[key].is_complete() {
-      return Want::Contents;
-    }
-    let for_a_child = match self.tree.want(key) {
-      Some(want) => want == Want::Contents,
-      None => self.has_no_dir_at_a_watched_child(key, path),
-    };
-    if for_a_child { Want::Contents } else { Want::Names }
+    self.tree.want(key).unwrap_or_else(|| {
+      if self.has_no_dir_at_a_watched_child(key, path) { Want::Contents } else { Want::Names }
+    })
   }
 
   /// Whether a watched path in the directory, where the tree has nothing, has no directory on
