@@ -8,7 +8,7 @@ use std::{
   path::{Path, PathBuf},
   sync::{
     Arc, OnceLock,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
   },
   thread,
@@ -18,7 +18,7 @@ use std::{
 use pathwatch::{
   Config, Error, ErrorKind, Event, EventKind, Watcher,
   backend::{Backend, Coverage, DirKey, Hint, Sink, Want, watch_limit},
-  engine::Options,
+  engine::{Ignored, Options},
   poll::PollBackend,
 };
 use tempfile::TempDir;
@@ -739,6 +739,57 @@ fn a_watch_inside_the_handler_comes_before_the_queue() {
   open.send(()).unwrap();
   let created = Event { path, kind: EventKind::Create };
   while !results.recv_timeout(PATIENCE).expect("the new file is reported").contains(&created) {}
+}
+
+/// Each call from inside the handler hands over a batch of its own: the disk can change between
+/// two of them, and a batch has at most one event for a path. Here the first `watch` finds the
+/// file, and the filter writes it again when the last one asks about its first path.
+#[test]
+fn each_call_inside_the_handler_is_a_batch_of_its_own() {
+  let dir = tempfile::tempdir().unwrap();
+  let (file, trigger) = (dir.path().join("p.txt"), dir.path().join("trigger"));
+  let ignored: Ignored = {
+    let (file, trigger, written) = (file.clone(), trigger.clone(), AtomicBool::new(false));
+    Arc::new(move |path: &Path, _| {
+      if path == trigger && !written.swap(true, Ordering::Relaxed) {
+        fs::write(&file, "22").unwrap();
+      }
+      false
+    })
+  };
+  let (sender, results) = mpsc::channel();
+  let slot: Arc<OnceLock<Watcher>> = Arc::default();
+  let watcher = {
+    let (slot, file, trigger) = (Arc::clone(&slot), file.clone(), trigger.clone());
+    Watcher::with_backend(
+      Options { ignored: Some(ignored), ..quick() },
+      move |result: Result<Vec<Event>, Error>| {
+        let events = result.unwrap();
+        if events.iter().any(|event| event.path.ends_with("a.txt")) {
+          fs::write(&file, "1").unwrap();
+          let watcher = slot.get().expect("the slot is filled");
+          watcher.watch(&[&file]).unwrap();
+          watcher.unwatch(&[&file]).unwrap();
+          watcher.watch(&[&trigger, &file]).unwrap();
+        }
+        let _ = sender.send(events);
+      },
+      PollBackend::new,
+    )
+    .unwrap()
+  };
+  watcher.watch(&[dir.path()]).unwrap();
+  slot.set(watcher).unwrap();
+  fs::write(dir.path().join("a.txt"), "1").unwrap();
+
+  let mut seen = Vec::new();
+  while !seen.contains(&Event { path: file.clone(), kind: EventKind::Update }) {
+    let events = results.recv_timeout(PATIENCE).expect("the second write is reported");
+    let on_file = events.iter().filter(|event| event.path == file).count();
+    assert!(on_file <= 1, "a batch has one event for a path: {events:?}");
+    seen.extend(events);
+  }
+  assert!(seen.contains(&Event { path: file, kind: EventKind::Create }));
 }
 
 /// The settings reach the thread, at both ends. With a delete delay of zero, a file that is

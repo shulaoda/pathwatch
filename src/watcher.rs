@@ -700,8 +700,9 @@ fn take_overflow<B: Backend>(engine: &mut Engine<B, StdFs>, queue: &Queue) {
 
 /// Hands the output of the engine to the handler, and does what the handler asked for on the
 /// way: a `watch` or `unwatch` from inside it takes effect when it has returned, before the
-/// next message of the queue. After a `close` (the handler can call it) the handler is not
-/// called again.
+/// next message of the queue. One call at a time, each handing over its own batch: the disk can
+/// change between two of them, and a batch has at most one event for a path. After a `close`
+/// (the handler can call it) the handler is not called again.
 fn deliver<B: Backend>(
   engine: &mut Engine<B, StdFs>,
   out: &mut Output,
@@ -718,17 +719,13 @@ fn deliver<B: Backend>(
     if !out.events.is_empty() && !stop.load(Ordering::Acquire) {
       handler(Ok(std::mem::take(&mut out.events)));
     }
-    let mut asked = false;
-    while let Ok(command) = inside.try_recv() {
-      asked = true;
-      match command {
-        Command::Watch(paths, _) => engine.watch(paths, Instant::now(), out),
-        Command::Unwatch(paths, _) => engine.unwatch(paths, Instant::now(), out),
-        Command::Stop => {}
-      }
-    }
-    if !asked || stop.load(Ordering::Acquire) {
+    if stop.load(Ordering::Acquire) {
       return;
+    }
+    match inside.try_recv() {
+      Ok(Command::Watch(paths, _)) => engine.watch(paths, Instant::now(), out),
+      Ok(Command::Unwatch(paths, _)) => engine.unwatch(paths, Instant::now(), out),
+      Ok(Command::Stop) | Err(_) => return,
     }
   }
 }

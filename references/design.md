@@ -1062,13 +1062,14 @@ Commands (`watch`, `unwatch`) are never dropped and not counted. The loop takes 
 messages, then does what is due, so a flood cannot hold back a flush. A command from inside the
 handler goes a way of its own: the thread takes it when the handler has returned, before the
 next message of the queue, so what the handler asked for is in place before anything that came
-in meanwhile. On Windows the thread does not wait on the channel for a deadline: a timed wait of
-a channel ends at a tick of the clock, which comes every 15.6 ms unless a program asked for more
-(a wait of 20 ms took 31 ms, and one of 1 ms 15.6 ms, measured), and that was the whole of the
-11 ms between the quiet time and the reported edit. The thread waits on an event that every
-sender sets after its message and on a waitable timer of high resolution, which comes within
-half a millisecond (`watcher::inbox`); on the other systems the wait of the channel keeps the
-time.
+in meanwhile. Each such command hands over its own batch: the disk can change between two of them,
+and a batch has at most one event for a path (`each_call_inside_the_handler_is_a_batch_of_its_own`).
+On Windows the thread does not wait on the channel for a deadline: a timed wait of a channel ends at
+a tick of the clock, which comes every 15.6 ms unless a program asked for more (a wait of 20 ms took
+31 ms, and one of 1 ms 15.6 ms, measured), and that was the whole of the 11 ms between the quiet
+time and the reported edit. The thread waits on an event that every sender sets after its message
+and on a waitable timer of high resolution, which comes within half a millisecond
+(`watcher::inbox`); on the other systems the wait of the channel keeps the time.
 
 **The debounce.** The disk is checked when no hint came for the quiet time: every hint that
 leaves work moves the flush to one quiet time after it. So a save in several steps is one
