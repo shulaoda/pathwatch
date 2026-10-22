@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::fixtures::{Deliver, Driver, Mode, caught_up};
-use pathwatch::{EventKind, engine::Options, poll::PollBackend};
+use pathwatch::{EventKind, backend::poll::PollBackend, engine::Options};
 
 use crate::{Settings, World, differences, expected_history, history_of, skipped};
 

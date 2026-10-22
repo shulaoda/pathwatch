@@ -123,8 +123,7 @@ The table is these rules in examples. `R` is a watched path.
 |---|---|
 | `config`, `error`, `event`, `watcher` | The API. `watcher.rs` has the one thread and its queue, and picks the backend. |
 | `engine/`, `tree`, `fs`, `path` | The engine, the tree, the disk as the engine sees it (`Fs`), path cleaning. No thread, no clock, no OS watch API. |
-| `backend` | The `Backend` trait and its types. |
-| `inotify`, `fsevents`, `windows`, `poll` | One backend each, in one file. Of the crate they use `backend`, and the calls of the system in `fs` that the engine makes too. |
+| `backend/` | The `Backend` trait and its types (`mod.rs`), and the backends below it: `inotify`, `fsevents`, `windows`, `poll`, one in each file. Of the crate they use `backend`, and the calls of the system in `fs` that the engine makes too. |
 
 The modules that are not the API are `pub` but hidden from the docs: the tests need them. The
 tests of the engine on a simulated disk, and their fixtures, are in `tests/sim` (section 8).
@@ -171,8 +170,8 @@ The words, each for one idea:
 | young | a file whose modification time is too close to the check to trust | `Content` |
 | quiet time | the debounce: how long no hint must come before the disk is checked | `Options::debounce` |
 | rest | the pause after work that no hint asked for by name: a poll, the scans after loss reports | `REST`, `rest_until` |
-| cover | FSEvents only: a directory that the engine watches and a stream reports | `Covers` in `fsevents.rs` |
-| stream path | FSEvents only: a directory that a stream was started for; it reports the whole tree below | `Streams::paths` in `fsevents.rs` |
+| cover | FSEvents only: a directory that the engine watches and a stream reports | `Covers` in `backend/fsevents.rs` |
+| stream path | FSEvents only: a directory that a stream was started for; it reports the whole tree below | `Streams::paths` in `backend/fsevents.rs` |
 
 `tree/mod.rs` holds the data, and `engine/` has one file for each job (each file says which in its first lines).
 
@@ -1158,7 +1157,7 @@ sleeps, and a flush that the sleep fell into would pause for hours.
 
 ## 6. Backend interface
 
-`src/backend.rs`. The engine asks a backend to watch directories, and the
+`src/backend/mod.rs`. The engine asks a backend to watch directories, and the
 backend tells the engine where to check. A backend never says what happened: the engine reads
 the disk itself. The items of the file have short docs; this section is the one place for the
 rules.
@@ -1259,7 +1258,7 @@ type has its own `new(sink: Sink<Self::Raw>)`.
 
 ## 7. Backends
 
-### 7.1 inotify (`inotify.rs`)
+### 7.1 inotify (`backend/inotify.rs`)
 
 - One kernel watch for one directory. It does not reach the directories below, so every answer
   is `Watched` and the engine asks for every directory of a tree.
@@ -1353,7 +1352,7 @@ default, two events for a new file):
   which the tests of the backend rest on. After an overflow the engine reads everything
   again (`Lost`).
 
-### 7.2 FSEvents (`fsevents.rs`)
+### 7.2 FSEvents (`backend/fsevents.rs`)
 
 Facts from probes on macOS (APFS):
 
@@ -1645,7 +1644,7 @@ What stays open:
   cannot go: a cover whose path changes has missed the records that spelled the new path,
   whatever made it change, and the backend does not know that a scan is on its way.
 
-### 7.3 ReadDirectoryChangesW (`windows.rs`)
+### 7.3 ReadDirectoryChangesW (`backend/windows.rs`)
 
 The tests of this backend (`tests/windows/os.rs`, and `tests/windows/parts.rs` for the parts that
 make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Windows 11 with NTFS.
@@ -1761,7 +1760,7 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   directory behind a link that wants the contents gets a handle of its own (above), so such
   a key never makes the handles move back and forth.
 
-### 7.4 Poll (`poll.rs`)
+### 7.4 Poll (`backend/poll.rs`)
 
 `watch` answers `NotWatched`, and nothing else does anything. See 5.10.
 

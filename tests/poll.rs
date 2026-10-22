@@ -14,10 +14,9 @@ use std::{
 
 use pathwatch::{
   ErrorKind, Event, EventKind,
-  backend::{Signal, Sink},
+  backend::{Signal, Sink, poll::PollBackend},
   engine::{Engine, Options, Output},
   fs::{Entry, Fs, Meta, StdFs},
-  poll::PollBackend,
 };
 
 const INTERVAL: Duration = Duration::from_millis(100);

@@ -71,8 +71,8 @@ fn dir(path: &str) -> PathBuf {
 mod place {
   use std::path::PathBuf;
 
-  use pathwatch::{
-    backend::Want::{self, Contents, Names},
+  use pathwatch::backend::{
+    Want::{self, Contents, Names},
     windows::{MAX_HANDLES, place},
   };
 
@@ -294,8 +294,8 @@ mod handles {
     path::{Path, PathBuf},
   };
 
-  use pathwatch::{
-    backend::{Coverage, Want, is_watch_limit},
+  use pathwatch::backend::{
+    Coverage, Want, is_watch_limit,
     windows::{Handles, MAX_HANDLES, System, Told, WatchId, place},
   };
 
@@ -964,7 +964,7 @@ mod handles {
 }
 
 mod records {
-  use pathwatch::windows::{Malformed, Records};
+  use pathwatch::backend::windows::{Malformed, Records};
 
   use super::{FILE_NAME, encode};
 
@@ -1112,8 +1112,8 @@ mod translate {
     path::{MAIN_SEPARATOR_STR, Path, PathBuf},
   };
 
-  use pathwatch::{
-    backend::{Coverage, Hint, Want},
+  use pathwatch::backend::{
+    Coverage, Hint, Want,
     windows::{Handles, Raw, System, WatchId, translate},
   };
 
@@ -1293,10 +1293,7 @@ mod translate {
   /// A read counts for its bytes in the queue of the watcher, and a loss for its keys.
   #[test]
   fn a_raw_notification_counts_its_bytes() {
-    use pathwatch::{
-      backend::{Backend, DirKey},
-      windows::WindowsBackend,
-    };
+    use pathwatch::backend::{Backend, DirKey, windows::WindowsBackend};
     let bytes = <WindowsBackend as Backend>::raw_bytes(&read(WatchId(0), "/p", Ok(vec![0; 1000])));
     assert!(bytes >= 1000, "{bytes}");
     let lost = Raw::Lost(vec![DirKey::new(1, 0), DirKey::new(2, 0)]);

@@ -48,18 +48,6 @@ pub mod path;
 #[doc(hidden)]
 pub mod tree;
 
-#[cfg(target_os = "macos")]
-#[doc(hidden)]
-pub mod fsevents;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[doc(hidden)]
-pub mod inotify;
-#[doc(hidden)]
-pub mod poll;
-#[cfg(target_os = "windows")]
-#[doc(hidden)]
-pub mod windows;
-
 pub use crate::{
   config::{Config, EntryKind},
   error::{Error, ErrorKind},

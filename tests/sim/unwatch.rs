@@ -10,9 +10,11 @@ use crate::fixtures::{
   on_a_small_stack, on_all, on_modes, os_watches, settled, sorted, taken, window,
 };
 use pathwatch::{
-  backend::Want::{self, Contents, Names},
+  backend::{
+    Want::{self, Contents, Names},
+    poll::PollBackend,
+  },
   engine::Options,
-  poll::PollBackend,
 };
 
 /// `unwatch` of a directory above a chain deeper than the stack of a thread takes: the names

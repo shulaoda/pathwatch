@@ -17,14 +17,13 @@ use std::{
 };
 
 use crate::{
-  backend::{Backend, Signal, Sink, is_watch_limit},
+  backend::{Backend, Signal, Sink, is_watch_limit, poll::PollBackend},
   config::Config,
   engine::{Engine, Options, Output},
   error::{Error, ErrorKind, context},
   event::Event,
   fs::StdFs,
   path::normalize,
-  poll::PollBackend,
 };
 
 /// How many bytes of backend signals wait at most. One more is dropped, and the engine checks
@@ -129,15 +128,18 @@ impl Watcher {
     // Which target has which native backend: the one place that says it. Any other target polls.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-      Self::start(config.into_options(false), poll, handler, crate::inotify::InotifyBackend::new)
+      use crate::backend::inotify::InotifyBackend;
+      Self::start(config.into_options(false), poll, handler, InotifyBackend::new)
     }
     #[cfg(target_os = "macos")]
     {
-      Self::start(config.into_options(false), poll, handler, crate::fsevents::FsEventsBackend::new)
+      use crate::backend::fsevents::FsEventsBackend;
+      Self::start(config.into_options(false), poll, handler, FsEventsBackend::new)
     }
     #[cfg(windows)]
     {
-      Self::start(config.into_options(false), poll, handler, crate::windows::WindowsBackend::new)
+      use crate::backend::windows::WindowsBackend;
+      Self::start(config.into_options(false), poll, handler, WindowsBackend::new)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
     {

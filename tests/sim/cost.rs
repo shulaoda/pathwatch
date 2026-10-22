@@ -18,10 +18,9 @@ use std::{
 use crate::fixtures::{Mode, SimBackend, SimFs};
 use pathwatch::{
   EventKind,
-  backend::{Backend, Committed, Coverage, DirKey, Hint, Signal, Want},
+  backend::{Backend, Committed, Coverage, DirKey, Hint, Signal, Want, poll::PollBackend},
   engine::{Engine, Ignored, Options, Output},
   fs::{Entry, Fs, Meta},
-  poll::PollBackend,
 };
 
 // ---- counting memory ----

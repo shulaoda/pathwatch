@@ -1,5 +1,13 @@
-//! The `Backend` trait: what the engine asks of an OS watch API. The rules for a backend are in
-//! `references/design.md`, section 6.
+//! The `Backend` trait: what the engine asks of an OS watch API, and the backends, one in each
+//! file. The rules for a backend are in `references/design.md`, section 6.
+
+#[cfg(target_os = "macos")]
+pub mod fsevents;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod inotify;
+pub mod poll;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 use std::{error, fmt, hash::Hash, io, path::Path, sync::Arc, time::SystemTime};
 

@@ -16,8 +16,8 @@ use std::{
   time::{Duration, Instant, SystemTime},
 };
 
-use pathwatch::{
-  backend::{Backend, Coverage, DirKey, Hint, Signal, Sink, Want},
+use pathwatch::backend::{
+  Backend, Coverage, DirKey, Hint, Signal, Sink, Want,
   windows::{MAX_HANDLES, Raw, WindowsBackend},
 };
 use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;

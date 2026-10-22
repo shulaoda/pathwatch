@@ -10,10 +10,9 @@ use std::{
 
 use pathwatch::{
   EntryKind, Error, ErrorKind, Event, EventKind,
-  backend::{Backend, Signal, Want},
+  backend::{Backend, Signal, Want, poll::PollBackend},
   engine::{Engine, Ignored, Options, Output},
   path::normalize,
-  poll::PollBackend,
 };
 
 use super::{Mode, SimBackend, SimFs, SimRaw, WatchCall, check_fingerprints, reportable};

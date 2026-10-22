@@ -9,7 +9,7 @@ use crate::fixtures::{
   Deliver, Driver, Mode, NONE, Sim, SimBackend, caught_up, known, on_all, settled, show, taken,
   window,
 };
-use pathwatch::{engine::Options, poll::PollBackend};
+use pathwatch::{backend::poll::PollBackend, engine::Options};
 
 fn poll_with_coarse_time(step: Duration, options: Options) -> Driver<PollBackend> {
   let d = Driver::poll(options);

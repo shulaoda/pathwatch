@@ -358,8 +358,8 @@ src/
   lib.rs                 the crate docs; re-exports the API
   config.rs  error.rs  event.rs
   watcher.rs             the thread and the queue; picks the backend
-  backend.rs             the `Backend` trait: what the engine asks of an OS watch API
-  inotify.rs  fsevents.rs  windows.rs  poll.rs     one backend each
+  backend/               mod.rs: the `Backend` trait, what the engine asks of an OS watch API;
+                         inotify.rs  fsevents.rs  windows.rs  poll.rs: one backend each
   engine/                the engine: watched_paths, check, filter, scan, os_watch, events,
                          and test_hooks, what the tests see of it
   tree/  fs/  path.rs

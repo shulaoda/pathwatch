@@ -9,7 +9,7 @@ use crate::fixtures::{
   Deliver, Driver, Mode, NONE, Sim, SimBackend, SimFs, caught_up, flush, ignore_node_modules,
   known, on_all, settled, taken,
 };
-use pathwatch::{ErrorKind, engine::Options, poll::PollBackend};
+use pathwatch::{ErrorKind, backend::poll::PollBackend, engine::Options};
 
 fn inode() -> Driver<SimBackend> {
   Driver::sim(Mode::Inode, Options::default())

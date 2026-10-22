@@ -23,13 +23,16 @@ use std::{
 };
 
 use pathwatch::{
-  backend::{Backend, Coverage, DirKey, Hint, Signal, Sink, Want, is_watch_limit},
+  backend::{
+    Backend, Coverage, DirKey, Hint, Signal, Sink, Want,
+    fsevents::{
+      FsEventsBackend, MAX_NEW_STREAMS, MAX_PATHS_PER_STREAM, MAX_STREAM_PATHS, MAX_STREAMS, Raw,
+      flag, is_too_high,
+    },
+    is_watch_limit,
+  },
   engine::{Engine, Options, Output},
   fs::{Entry, Fs, Meta, StdFs},
-  fsevents::{
-    FsEventsBackend, MAX_NEW_STREAMS, MAX_PATHS_PER_STREAM, MAX_STREAM_PATHS, MAX_STREAMS, Raw,
-    flag, is_too_high,
-  },
 };
 use tempfile::TempDir;
 

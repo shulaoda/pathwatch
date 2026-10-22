@@ -10,9 +10,11 @@ use crate::fixtures::{
   os_watches, settled, sorted, window, window_then_settled,
 };
 use pathwatch::{
-  backend::Want::{Contents, Names},
+  backend::{
+    Want::{Contents, Names},
+    poll::PollBackend,
+  },
   engine::Options,
-  poll::PollBackend,
 };
 
 /// How long the clock may move in a story where no poll runs: less than the poll interval.

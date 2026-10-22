@@ -21,9 +21,8 @@ use std::{
   time::{Duration, Instant, SystemTime},
 };
 
-use pathwatch::{
-  backend::{Backend, Coverage, DirKey, Hint, Signal, Sink, Want, is_watch_limit},
-  inotify::InotifyBackend,
+use pathwatch::backend::{
+  Backend, Coverage, DirKey, Hint, Signal, Sink, Want, inotify::InotifyBackend, is_watch_limit,
 };
 use tempfile::TempDir;
 

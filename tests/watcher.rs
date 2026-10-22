@@ -17,9 +17,8 @@ use std::{
 
 use pathwatch::{
   Config, Error, ErrorKind, Event, EventKind, Watcher,
-  backend::{Backend, Coverage, DirKey, Hint, Sink, Want, watch_limit},
+  backend::{Backend, Coverage, DirKey, Hint, Sink, Want, poll::PollBackend, watch_limit},
   engine::{Ignored, Options},
-  poll::PollBackend,
 };
 use tempfile::TempDir;
 

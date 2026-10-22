@@ -21,10 +21,9 @@ use crate::fixtures::{
 };
 use pathwatch::{
   EntryKind, Event, EventKind,
-  backend::Signal,
+  backend::{Signal, poll::PollBackend},
   engine::{Engine, Ignored, Options, Output},
   fs::{FileType, Fs},
-  poll::PollBackend,
 };
 
 // ---- random numbers ----

@@ -8,7 +8,7 @@ use crate::fixtures::{
   Deliver, Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, caught_up, ignore_node_modules, settled,
   show, taken, window,
 };
-use pathwatch::{ErrorKind, engine::Options, poll::PollBackend};
+use pathwatch::{ErrorKind, backend::poll::PollBackend, engine::Options};
 
 fn driver(mode: Mode) -> Driver<SimBackend> {
   Driver::sim(mode, Options::default())
