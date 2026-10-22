@@ -1,0 +1,49 @@
+references/design.md
+  s_a1db2b4cad16c8::t_8d27e134cd4c80 1759
+src/engine/check.rs
+  s_a1db2b4cad16c8::t_e17edefe4f6077 503,523,525
+src/engine/mod.rs
+  s_a1db2b4cad16c8::t_066288f945d8a2 353,363,412-416,426
+src/engine/test_hooks.rs
+  s_a1db2b4cad16c8::t_94164d95758a23 7,190
+src/engine/watched_paths.rs
+  s_a1db2b4cad16c8::t_8239b08e665c2f 233
+src/fs/apple.rs
+  s_a1db2b4cad16c8::t_e008e1542d33b1 22-28
+src/fs/mod.rs
+  s_a1db2b4cad16c8::t_0da12715f7a8bb 132-133,136-137,266
+src/fs/windows.rs
+  s_a1db2b4cad16c8::t_190a183ecbfcd3 44,283-285,484-486
+src/fsevents.rs
+  s_61e143c58a845a::t_22e160b793a2bb 149-151,463,467,485-487,570,615
+src/inotify.rs
+  s_a1db2b4cad16c8::t_af6489a134dbc5 287-290
+src/path.rs
+  s_a1db2b4cad16c8::t_de15962012d00f 68,74,83,97,103-104,106,113,115,118
+src/windows.rs
+  s_a1db2b4cad16c8::t_454b8e32951cc0 197-200,206,261-270,294,498,567-568,682,942,956,1067,1549
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7bb6f3643991c38dd30af30ff2358a6e6d2a55e7",
+  "prompts": {},
+  "sessions": {
+    "s_61e143c58a845a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa6b18d10b8ece155",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    },
+    "s_a1db2b4cad16c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b2bcce2e-a981-496d-a4a7-22d64d07982f",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
