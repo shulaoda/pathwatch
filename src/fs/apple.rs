@@ -19,13 +19,13 @@ use super::{DirId, Entry, FileType, nanos};
 /// `struct attrlist`.
 #[repr(C)]
 struct AttrList {
-  pub bitmap_count: u16,
-  pub reserved: u16,
-  pub common: u32,
-  pub volume: u32,
-  pub dir: u32,
-  pub file: u32,
-  pub fork: u32,
+  bitmap_count: u16,
+  reserved: u16,
+  common: u32,
+  volume: u32,
+  dir: u32,
+  file: u32,
+  fork: u32,
 }
 /// `struct statfs`. Only the device, the flags and the name of the file system are read.
 #[repr(C)]

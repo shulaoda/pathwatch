@@ -500,7 +500,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let only_polled = self.only_polled(key);
     let trusts_hints = self.options.written_hints && !only_polled;
     // Compared when the fingerprint is the same, and one last time when the file is old.
-    let kept = old.and_then(|(old, content)| content.filter(|_| old == fingerprint));
+    let kept = old.and_then(|(_, content)| content).filter(|_| same);
     let compare = matches!(kept, Some(Content::Hash(_)));
     let hash = if compare || (young && !trusts_hints) {
       match self.content_hash(key, path, kind, fingerprint.size) {
@@ -520,9 +520,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // old reports one `Update` for all. Where no poll comes, every look reports.
     let update_waits = young && hash.is_none() && only_polled;
 
-    let changed = if let Some((old, content)) = old {
+    let changed = if let Some((_, content)) = old {
       why.written
-        || old != fingerprint
+        || !same
         || match content {
           None => false,
           Some(Content::Hash(old)) => hash != Some(old),

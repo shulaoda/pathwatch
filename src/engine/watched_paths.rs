@@ -222,7 +222,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// The node is not registered any more: an entry like the others inside a watched directory,
   /// and nothing anywhere else.
   fn let_go(&mut self, key: DirKey) {
-    let Some(parent) = self.tree.parent(key) else { return };
     let inside = self.is_inside(key);
     // Asked while the node still says that the directory above lists it under another name.
     let stays = self.stays_as_an_entry(key);
@@ -231,7 +230,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // it.
     if self.tree.link(key).is_some() {
       self.tree.set_link(key, None);
-      if inside && matches!(self.tree[parent].kind, Kind::Dir(_)) {
+      if inside {
         self.tree.mark(key, Mark::default());
       }
     }

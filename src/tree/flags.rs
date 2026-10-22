@@ -148,7 +148,6 @@ impl Node {
   }
 
   pub(super) fn set_mark(&mut self, mark: Option<Mark>) {
-    let mark = mark.as_ref();
     self.flags.set(Flags::MARKED, mark.is_some());
     self.flags.set(Flags::MARK_DEEP, mark.is_some_and(|mark| mark.deep));
     self.flags.set(Flags::MARK_WRITTEN, mark.is_some_and(|mark| mark.written));

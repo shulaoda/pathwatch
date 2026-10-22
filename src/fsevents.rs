@@ -146,11 +146,9 @@ impl Backend for FsEventsBackend {
       && self.streams.pending.contains(&dir)
     {
       self.streams.pending.remove(&dir);
-      let below: Vec<PathBuf> =
-        self.covers.by_dir.below(&[&dir]).map(|(below, _)| below.to_owned()).collect();
-      for below in below {
-        if !self.streams.paths.holds(&below) {
-          self.streams.pending.insert(below, ());
+      for (below, _) in self.covers.by_dir.below(&[&dir]) {
+        if !self.streams.paths.holds(below) {
+          self.streams.pending.insert(below.to_owned(), ());
         }
       }
     }
@@ -462,11 +460,11 @@ impl Streams {
     let kept = self.running.iter().zip(&keep).filter(|(_, keep)| **keep);
     let kept: FxHashSet<&Path> =
       kept.flat_map(|(running, _)| &running.paths).map(PathBuf::as_path).collect();
-    let paths: Vec<PathBuf> =
+    let mut paths: Vec<PathBuf> =
       placed.iter().filter(|path| !kept.contains(path.as_path())).cloned().collect();
     let unguarded =
       self.guard.open(paths.iter().map(PathBuf::as_path), named.values().map(PathBuf::as_path));
-    let paths: Vec<PathBuf> = paths.into_iter().filter(|path| !unguarded.holds(path)).collect();
+    paths.retain(|path| !unguarded.holds(path));
     if paths.is_empty() {
       return Started { fresh: Vec::new(), unguarded, failed: None };
     }
@@ -484,10 +482,9 @@ impl Streams {
     let fresh = paths.iter().filter(|path| !self.paths.contains(path)).cloned().collect();
     // The new streams run before the old ones stop: nothing is missed in between.
     if replace {
-      let (kept, replaced): (Vec<_>, Vec<_>) =
-        mem::take(&mut self.running).into_iter().zip(keep).partition(|(_, keep)| *keep);
-      self.running = kept.into_iter().map(|(running, _)| running).collect();
-      let replaced: Vec<Running> = replaced.into_iter().map(|(running, _)| running).collect();
+      let mut keep = keep.into_iter();
+      let replaced: Vec<Running> =
+        self.running.extract_if(.., |_| keep.next() == Some(false)).collect();
       if !replaced.is_empty() {
         self.stop(replaced, covers);
       }
@@ -567,11 +564,10 @@ impl Streams {
   /// and a cover, can have changed between `watch` and the start of the stream.
   fn moved_since_asked(&mut self, started: &[PathBuf], covers: &Covers) -> Raw {
     let mut moved = Raw::default();
-    let mut gone = Vec::new();
     for path in started {
       let is_there = fs::canonicalize(path).is_ok_and(|real| real == *path);
       if !is_there {
-        gone.push(path.clone());
+        self.distrust(slice::from_ref(path));
         moved.push(path.as_os_str().as_bytes(), flag::MUST_SCAN_SUB_DIRS);
         continue;
       }
@@ -589,7 +585,6 @@ impl Streams {
         }
       }
     }
-    self.distrust(&gone);
     moved
   }
 
@@ -617,7 +612,7 @@ impl Streams {
   /// stream that stops takes what it has not delivered. A cover above them has a stream of its
   /// own: trusted stream paths never lie one below another.
   fn stop(&self, stopped: Vec<Running>, covers: &Covers) {
-    let paths = top_most(stopped.iter().flat_map(|old| old.paths.clone()).collect());
+    let paths = top_most(stopped.iter().flat_map(|old| &old.paths).cloned().collect());
     let lost = covers.keys_at_or_below(&paths).collect();
     let sink = Arc::clone(&self.sink);
     self.queue.run(move || {

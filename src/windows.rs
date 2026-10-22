@@ -194,13 +194,16 @@ mod place {
         if count <= max {
           break 'deepest_first;
         }
-        if shared[at..end].contains(&depth) && may_hold_a_handle(&first_parts(tops[at], depth)) {
+        if shared[at..end].contains(&depth)
+          && let common = first_parts(tops[at], depth)
+          && may_hold_a_handle(&common)
+        {
           // A directory with a link between the common directory and itself cannot be served
           // from there; the others join, also across it. The tops of a group have no link
           // below their common directory, so a link above it holds back all of them.
           let mut first = None;
           for top in at..=end {
-            if leads_through(tops[top], depth, is_link) {
+            if link_between(&common, tops[top], &mut *is_link).is_some() {
               continue;
             }
             let first = *first.get_or_insert(top);
@@ -247,19 +250,22 @@ mod place {
     places
   }
 
-  /// Whether a link lies on the way from the directory `depth` parts up to `dir`, `dir` itself
-  /// included.
-  fn leads_through(dir: &Path, depth: usize, is_link: &mut dyn FnMut(&Path) -> bool) -> bool {
-    let below = dir.components().count().saturating_sub(depth);
-    dir.ancestors().take(below).any(is_link)
-  }
-
   fn common_parts(a: &Path, b: &Path) -> usize {
     a.components().zip(b.components()).take_while(|(a, b)| a == b).count()
   }
 
   fn first_parts(path: &Path, count: usize) -> PathBuf {
     path.components().take(count).collect()
+  }
+
+  /// The deepest link on the way from `top` down to `dir`, `dir` itself included.
+  pub(super) fn link_between<'a>(
+    top: &Path,
+    dir: &'a Path,
+    mut is_link: impl FnMut(&Path) -> bool,
+  ) -> Option<&'a Path> {
+    let names = dir.strip_prefix(top).map_or(0, |below| below.components().count());
+    dir.ancestors().take(names).find(|path| is_link(path))
   }
 
   pub(super) fn may_hold_a_handle(dir: &Path) -> bool {
@@ -285,7 +291,7 @@ mod handles {
 
   use rustc_hash::{FxHashMap, FxHashSet};
 
-  use super::place::{may_hold_a_handle, place};
+  use super::place::{link_between, may_hold_a_handle, place};
   use crate::{
     backend::{Coverage, DirKey, Want, give_room_back, same, watch_limit},
     fs::wide_name,
@@ -489,7 +495,7 @@ mod handles {
       fresh: bool,
       system: &mut dyn System,
     ) -> Coverage {
-      if leads_through_a_link(system, &self.open[at].dir, dir) {
+      if link_between(&self.open[at].dir, dir, |path| system.is_link(path)).is_some() {
         return Coverage::NotWatched;
       }
       // A `watch` for the very directory of the handle puts a new handle there: the old one may
@@ -558,8 +564,8 @@ mod handles {
               |path: &Path| *looked.entry(path.to_owned()).or_insert_with(|| system.is_link(path));
             if let Some(link) = link_between(&place.dir, &served.dir, is_link) {
               behind.push(key);
-              if !links.contains(&link) {
-                links.push(link);
+              if !links.iter().any(|known| known == link) {
+                links.push(link.to_owned());
                 found_more = true;
               }
             }
@@ -671,29 +677,10 @@ mod handles {
           self.at.remove(&lower);
         }
       }
-      self.shrink();
-      Some(gone)
-    }
-
-    /// The two tables are given back when most of their keys are gone.
-    fn shrink(&mut self) {
       give_room_back(&mut self.keys);
       give_room_back(&mut self.at);
+      Some(gone)
     }
-  }
-
-  fn leads_through_a_link(system: &mut dyn System, top: &Path, dir: &Path) -> bool {
-    link_between(top, dir, |path| system.is_link(path)).is_some()
-  }
-
-  /// The deepest link on the way from `top` down to `dir`, `dir` itself included.
-  fn link_between(
-    top: &Path,
-    dir: &Path,
-    mut is_link: impl FnMut(&Path) -> bool,
-  ) -> Option<PathBuf> {
-    let names = dir.strip_prefix(top).map_or(0, |below| below.components().count());
-    dir.ancestors().take(names).find(|path| is_link(path)).map(Path::to_owned)
   }
 
   /// `path` with its names in lower case (`lower_name`). The drive or the share stays as it is.
@@ -952,8 +939,7 @@ mod port {
     Storage::FileSystem::{
       FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
       FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-      FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-      ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation,
+      FILE_NOTIFY_CHANGE_SIZE, ReadDirectoryChangesW, ReadDirectoryNotifyExtendedInformation,
     },
     System::{
       IO::{
@@ -967,7 +953,7 @@ mod port {
   use super::{Raw, System, WatchId};
   use crate::{
     backend::Sink,
-    fs::{FileType, Fs, StdFs, Unknown, kernel32},
+    fs::{FileType, Fs, SHARE_ALL, StdFs, Unknown, kernel32},
   };
 
   // No creation time: a tool that only sets it would give a `Written` hint.
@@ -1078,10 +1064,7 @@ mod port {
       self.send(Command::Open { id, dir: Arc::from(dir), reply }).inspect_err(|_| {
         let _ = self.commands.send(Command::Close { id });
       })?;
-      match answer.recv() {
-        Ok(result) => result,
-        Err(mpsc::RecvError) => Err(stopped()),
-      }
+      answer.recv().unwrap_or_else(|mpsc::RecvError| Err(stopped()))
     }
 
     fn close(&mut self, id: WatchId) {
@@ -1563,7 +1546,7 @@ mod port {
   fn open_dir(path: &Path) -> io::Result<File> {
     let dir = OpenOptions::new()
       .access_mode(FILE_LIST_DIRECTORY)
-      .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+      .share_mode(SHARE_ALL)
       .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED)
       .open(crate::fs::literal(path))?;
     if dir.metadata()?.is_dir() { Ok(dir) } else { Err(io::ErrorKind::NotADirectory.into()) }

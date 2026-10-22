@@ -350,7 +350,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// The next time [`Engine::tick`] has work.
   pub fn deadline(&self) -> Option<Instant> {
-    [self.flush_at, self.loss_wait(), self.next_hold(), self.poll_at].into_iter().flatten().min()
+    [self.next_flush(), self.next_hold(), self.poll_at].into_iter().flatten().min()
   }
 
   /// Does what is due at `now`.
@@ -360,7 +360,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if poll {
       self.mark_polled();
     }
-    let flush = [self.flush_at, self.loss_wait()].into_iter().flatten().any(|at| at <= now);
+    let flush = self.next_flush().is_some_and(|at| at <= now);
     if !flush && !poll && !second_look {
       return;
     }
@@ -409,14 +409,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.flush_at = Some((now + debounce).min(latest));
   }
 
-  /// The time at which a loss report that had to wait gets its scans: the end of the rest, and
-  /// not before the quiet time, which its mark waits for like every hint.
-  fn loss_wait(&self) -> Option<Instant> {
-    if !self.loss.waits {
-      return None;
-    }
-    let rest_until = self.loss.rest_until?;
-    Some(self.flush_at.map_or(rest_until, |at| at.max(rest_until)))
+  /// The time of the next flush: the end of the quiet time, or else the end of the rest that a
+  /// loss report waits for. Its scans come then, and not before the quiet time, which its mark
+  /// waits for like every hint.
+  fn next_flush(&self) -> Option<Instant> {
+    self.flush_at.or(self.loss.rest_until.filter(|_| self.loss.waits))
   }
 
   /// A check for every mark, then rounds of scans until nothing is queued. Says how long the
@@ -426,7 +423,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // a poll or a second look that runs before it checks its own work and leaves them, but for
     // a hint above a held node, which decides for it. A `watch` or `unwatch` call ends the
     // quiet time: its baseline is decided by a tree that is in line with the hints. A loss
-    // report waits for the quiet time too (`loss_wait`).
+    // report waits for the quiet time too (`next_flush`).
     let hints_due = self.flush_at.is_none_or(|at| at <= now);
     if hints_due {
       self.flush_at = None;

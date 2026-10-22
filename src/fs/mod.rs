@@ -129,16 +129,12 @@ impl Fs for StdFs {
 
   fn read_dir(&self, dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()> {
     #[cfg(target_vendor = "apple")]
-    {
-      if let Some(volume) = apple::apfs_volume(dir) {
-        return apple::read_dir(dir, volume, each);
-      }
+    if let Some(volume) = apple::apfs_volume(dir) {
+      return apple::read_dir(dir, volume, each);
     }
     #[cfg(windows)]
-    {
-      if windows::read_dir(dir, each)? {
-        return Ok(());
-      }
+    if windows::read_dir(dir, each)? {
+      return Ok(());
     }
     for entry in fs::read_dir(literal(dir)).map_err(told)? {
       let entry = entry.map_err(told)?;
@@ -267,7 +263,7 @@ fn linux_remote_disk(dir: &Path) -> Option<String> {
 mod windows;
 
 #[cfg(windows)]
-pub(crate) use self::windows::{Unknown, kernel32, literal, wide_name};
+pub(crate) use self::windows::{SHARE_ALL, Unknown, kernel32, literal, wide_name};
 #[cfg(windows)]
 use self::windows::{name_on_disk, stat, told};
 

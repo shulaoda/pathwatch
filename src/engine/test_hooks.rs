@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, iter, path::PathBuf, time::Instant};
 
 use super::Engine;
 use crate::{
-  backend::{Backend, DirKey, Want},
+  backend::{Backend, DirKey},
   fs::Fs,
   tree::{Added, Fingerprint, Kind, Node, Tree, Watch},
 };
@@ -187,7 +187,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
       // 6. A directory asked for names only holds no registered name without a directory, unless
       // it is frozen or a mark waits above it.
-      let names_only = self.tree[parent].dir().is_some_and(|dir| dir.asked == Some(Want::Names));
+      let names_only = self.tells_names_only(parent);
       if names_only && node.is_registered() && !node.is_dir() && !frozen && !waits {
         return fail("is a registered name with no directory at it, and its directory tells names");
       }

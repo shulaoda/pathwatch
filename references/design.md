@@ -1756,7 +1756,7 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   before them.
 - Directories are compared by path text, and a handle reports nothing for what is behind a
   junction or a directory link below it. So each name between a handle and a key that it
-  would serve is looked at (`leads_through_a_link`), and a key behind a link, below a
+  would serve is looked at (`link_between`), and a key behind a link, below a
   directory that has a handle anyway, is answered `NotWatched`: the engine polls it. A
   directory behind a link that wants the contents gets a handle of its own (above), so such
   a key never makes the handles move back and forth.

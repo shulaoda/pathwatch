@@ -41,7 +41,7 @@ use super::{DirId, Entry, FileType, Meta, meta};
 /// Other programs may still write, delete and rename what is looked at. Not rename another
 /// file over it, nor a directory above it: Windows refuses that while any handle is open,
 /// whatever the handle shares.
-const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+pub const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 /// From 1601 to 1970, in the steps of 100 ns that Windows counts time in.
 const TO_1970: u64 = 116_444_736_000_000_000;
 /// The bit of a reparse tag that makes the entry a link for std, and so here.
@@ -280,7 +280,9 @@ const INDEX: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileId);
 const NAME: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
 
 /// Lists `dir` with what `lstat` tells of each regular file, 0.35 us for an entry (measured).
-/// `Ok(false)`: the disk is not NTFS, the only one where this was measured to match `lstat`.
+/// `Ok(false)`: std lists it instead. The disk is not NTFS, the only one where this was measured
+/// to match `lstat`, or the first answer fails (the disk does not know the class, or `dir` is a
+/// file).
 /// The listing is behind for a file that a writer has open (`Fs::listing_lags`) and for a
 /// hard link written through another name.
 pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<bool> {
@@ -432,13 +434,6 @@ fn verbatim(path: &Path, always: bool) -> Vec<u16> {
   prefix.encode_utf16().chain(rest.iter().copied()).collect()
 }
 
-/// `path` with a NUL at its end, in the form that names this very entry.
-fn wide_path(path: &Path) -> Vec<u16> {
-  let mut units = verbatim(path, is_odd(path));
-  units.push(0);
-  units
-}
-
 /// Opens the regular file at `path` for reading. A link or a junction (a reparse point that
 /// stands for another name) is not followed: `None`. Any other reparse point (a file of a cloud
 /// drive, a compressed file) is the file itself, and is read as such.
@@ -486,7 +481,9 @@ pub(crate) fn wide_name(
 /// may be passed but not listed the question has no answer, which says nothing against the
 /// name, as on Linux.
 pub fn name_on_disk(path: &Path) -> io::Result<OsString> {
-  let wide = wide_path(path);
+  // In the form that names this very entry.
+  let mut wide = verbatim(path, is_odd(path));
+  wide.push(0);
   // SAFETY: all zeros is a valid value of this plain struct of numbers.
   let mut found: WIN32_FIND_DATAW = unsafe { mem::zeroed() };
   // SAFETY: `wide` ends with a NUL, and the call writes one whole struct into `found`. The

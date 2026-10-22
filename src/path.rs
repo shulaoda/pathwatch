@@ -65,13 +65,13 @@ pub(crate) fn split_top(path: &Path) -> Option<(&OsStr, &Path)> {
 
 /// A byte on Unix, a UTF-16 unit on Windows. The rules are generic, so that the Windows rules
 /// are tested on every system.
-pub(crate) trait Unit: Copy + Into<u32> + From<u8> {}
+trait Unit: Copy + Into<u32> + From<u8> {}
 
 impl<U: Copy + Into<u32> + From<u8>> Unit for U {}
 
 /// Whether [`unix`] would give `text` back as it is.
 #[cfg(any(unix, test))]
-pub(crate) fn unix_is_clean<U: Unit>(text: &[U]) -> bool {
+fn unix_is_clean<U: Unit>(text: &[U]) -> bool {
   let is_slash = |unit: U| is(unit, b'/');
   text
     .split_first()
@@ -80,7 +80,7 @@ pub(crate) fn unix_is_clean<U: Unit>(text: &[U]) -> bool {
 
 /// The Unix rules: the path starts with `/`, and only `/` separates.
 #[cfg(any(not(windows), test))]
-pub(crate) fn unix<U: Unit>(text: &[U]) -> Option<Vec<U>> {
+fn unix<U: Unit>(text: &[U]) -> Option<Vec<U>> {
   let (first, rest) = text.split_first()?;
   if !is(*first, b'/') {
     return None;
@@ -94,31 +94,28 @@ pub(crate) fn unix<U: Unit>(text: &[U]) -> Option<Vec<U>> {
 
 /// The Windows rules. They are compiled for the tests of every system.
 #[cfg(any(windows, test))]
-pub(crate) mod windows_rules {
+mod windows_rules {
   use super::{MAX_NAME, Unit, has_nul, is, names_are_clean, push_names};
 
   /// Whether Windows finds an entry under this very name. It takes a dot or a space off the end
   /// of a name, reads `:` as the start of a stream of the file, and has no name with a control
   /// character or one of `< > " | ? *`. A path with such a name would be watched and never get
-  /// an event: no record of the OS spells it so.
-  pub(crate) fn is_name<U: Unit>(name: &[U]) -> bool {
+  /// an event: no record of the OS spells it so. `/` separates, and the clean form has none.
+  fn is_name<U: Unit>(name: &[U]) -> bool {
     let is_kept =
-      |unit: U| unit.into() >= 0x20 && !br#"<>:"|?*"#.iter().any(|&byte| is(unit, byte));
+      |unit: U| unit.into() >= 0x20 && !br#"<>:"|?*/"#.iter().any(|&byte| is(unit, byte));
     let ends_well = name.last().is_none_or(|&last| !is(last, b'.') && !is(last, b' '));
     ends_well && name.iter().all(|&unit| is_kept(unit))
   }
 
   /// Whether [`windows`] would give `text` back as it is. Only the usual form is looked at,
   /// `C:\a\b`: a clean path on a share is cleaned again, which gives the same path.
-  pub(crate) fn windows_is_clean<U: Unit>(text: &[U]) -> bool {
+  pub(super) fn windows_is_clean<U: Unit>(text: &[U]) -> bool {
     let back = |unit: U| is(unit, b'\\');
-    // `/` separates too, and the clean form has none.
-    after_drive(text, back).is_some_and(|rest| {
-      !rest.iter().any(|&unit| is(unit, b'/')) && names_are_clean(rest, back, is_name)
-    })
+    after_drive(text, back).is_some_and(|rest| names_are_clean(rest, back, is_name))
   }
 
-  pub(crate) fn windows<U: Unit>(text: &[U]) -> Option<Vec<U>> {
+  pub(super) fn windows<U: Unit>(text: &[U]) -> Option<Vec<U>> {
     let either: fn(U) -> bool = |unit| is(unit, b'\\') || is(unit, b'/');
     let back: fn(U) -> bool = |unit| is(unit, b'\\');
     let mut clean = Vec::with_capacity(text.len());

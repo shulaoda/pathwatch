@@ -284,8 +284,10 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
     // returns, the loss report too, so every event of a change before that time is sent
     // (design.md 7.1). One read a turn: a flood can keep the queue from being empty for long,
     // and the reader still sees a stop. A later question stays.
-    if asked != 0 && nanos(SystemTime::now()) >= asked {
-      let began = nanos(SystemTime::now());
+    if asked != 0
+      && let began = nanos(SystemTime::now())
+      && began >= asked
+    {
       match (&fds.inotify).read(&mut buffer) {
         Ok(0) => break io::ErrorKind::UnexpectedEof.into(),
         Ok(len) => sink.raw(buffer[..len].to_vec()),
