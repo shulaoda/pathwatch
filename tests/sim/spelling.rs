@@ -583,6 +583,15 @@ fn a_new_entry_costs_one_look_and_one_question() {
     d.fs.rename("/p/r/file1.js", "/p/r/FILE1.js").unwrap();
     assert_eq!(window(&mut d), ["C /p/r/FILE1.js", "D /p/r/file1.js"], "{entries}");
     assert_eq!(since(before, &d), [2, 2, 0], "{entries}");
+
+    // A new name with a letter outside ASCII: the table does not find its other spellings, so
+    // one listing shows which entries it can be, and a look at the directory that it is still
+    // the one that was listed. The known entries that it names are not looked at; the new one
+    // is, once more.
+    let before = asked(&d);
+    d.fs.write("/p/r/caf\u{e9}.js", "1").unwrap();
+    assert_eq!(window(&mut d), ["C /p/r/caf\u{e9}.js"], "{entries}");
+    assert_eq!(since(before, &d), [3, 1, 1], "{entries}");
     caught_up(&mut d);
   }
 }
