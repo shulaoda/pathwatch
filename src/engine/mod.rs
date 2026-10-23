@@ -51,17 +51,6 @@ const LONGEST_FLUSH: Duration = Duration::from_secs(60);
 /// answer for the same path and kind: the node keeps it.
 pub type Ignored = Arc<dyn Fn(&Path, EntryKind) -> bool + Send + Sync>;
 
-/// The pacing of the scans that loss reports ask for (5.13).
-#[derive(Default)]
-struct Loss {
-  /// The scans wait until then: the rest after the last ones.
-  rest_until: Option<Instant>,
-  /// A loss report waits for the end of that rest.
-  waits: bool,
-  /// The running flush makes the scans of a loss report: a young file counts as written (5.8).
-  scanning: bool,
-}
-
 /// The settings of an [`Engine`]. `Options::default()` is for the tests (a quiet time of
 /// 10 ms); `Config` makes the ones of a watcher.
 #[derive(Clone)]
@@ -199,12 +188,24 @@ pub struct Engine<B: Backend, F: Fs> {
   asked_disks: FxHashSet<u64>,
 }
 
+/// The pacing of the scans that loss reports ask for (5.13).
+#[derive(Default)]
+struct Loss {
+  /// The scans wait until then: the rest after the last ones.
+  rest_until: Option<Instant>,
+  /// A loss report waits for the end of that rest.
+  waits: bool,
+  /// The running flush makes the scans of a loss report: a young file counts as written (5.8).
+  scanning: bool,
+}
+
 impl<B: Backend, F: Fs> fmt::Debug for Engine<B, F> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("Engine").field("backend", &self.backend.is_some()).finish_non_exhaustive()
   }
 }
 
+/// Making an engine.
 impl<B: Backend, F: Fs> Engine<B, F> {
   pub fn new(backend: B, fs: F, options: Options) -> Self {
     Self { backend: Some(backend), ..Self::without_backend(fs, options) }
@@ -264,7 +265,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(crate) fn stopped(&self) -> bool {
     self.stop.as_ref().is_some_and(|stop| stop.load(Ordering::Relaxed))
   }
+}
 
+/// The calls of the watcher thread, and when the next work is due.
+impl<B: Backend, F: Fs> Engine<B, F> {
   /// Makes every path a watched path and checks the disk once: what exists then is the baseline,
   /// known without an event. Each path is clean, as `path::normalize` gives it: the watcher
   /// cleans them.
@@ -410,7 +414,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   fn next_flush(&self) -> Option<Instant> {
     self.flush_at.or(self.loss.rest_until.filter(|_| self.loss.waits))
   }
+}
 
+/// A flush: the checks of the marks, then rounds of scans.
+impl<B: Backend, F: Fs> Engine<B, F> {
   /// A check for every mark, then rounds of scans until nothing is queued. Says how long the
   /// looks at the disk took.
   fn flush(&mut self, now: Instant) -> Duration {

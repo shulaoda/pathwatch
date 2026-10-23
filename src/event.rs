@@ -1,3 +1,5 @@
+//! The events that the handler gets.
+
 use std::path::PathBuf;
 
 /// One change of one file. A batch has at most one event for a path.

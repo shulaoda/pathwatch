@@ -1,3 +1,5 @@
+//! The settings of a watcher, and what the ignore filter is asked about.
+
 use std::{fmt, path::Path, sync::Arc, time::Duration};
 
 use crate::engine::{Ignored, Options};
@@ -20,15 +22,6 @@ pub struct Config {
   delete_delay: Duration,
   pub(crate) polling: bool,
   poll_interval: Duration,
-}
-
-/// What the ignore filter is asked about.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum EntryKind {
-  /// Anything that is not a directory: a symbolic link too.
-  File,
-  /// A directory.
-  Dir,
 }
 
 impl Default for Config {
@@ -151,4 +144,13 @@ impl Config {
       written_hints: cfg!(any(target_os = "linux", target_os = "android", windows)) && !polling,
     }
   }
+}
+
+/// What the ignore filter is asked about.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum EntryKind {
+  /// Anything that is not a directory: a symbolic link too.
+  File,
+  /// A directory.
+  Dir,
 }

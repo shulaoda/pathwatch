@@ -19,6 +19,23 @@ pub struct WindowsBackend {
   covered: Vec<DirKey>,
 }
 
+/// What the port sends: the bytes of one read on a handle, the keys that lost their handle,
+/// and the answer to `ask_delivered`.
+#[derive(Debug)]
+pub enum Raw {
+  /// What one read on the handle `watch`, which stands on `dir`, gave.
+  Read {
+    watch: WatchId,
+    dir: Arc<Path>,
+    extended: bool,
+    result: io::Result<Vec<u8>>,
+  },
+  Lost(Vec<DirKey>),
+  /// Every record of a change before this time, by the clock of the system, came before: the
+  /// answer to `ask_delivered`.
+  Delivered(SystemTime),
+}
+
 impl WindowsBackend {
   pub fn new(sink: Sink<Raw>) -> io::Result<Self> {
     let port = Port::new(sink.clone())?;
@@ -77,21 +94,7 @@ impl Backend for WindowsBackend {
   }
 }
 
-#[derive(Debug)]
-pub enum Raw {
-  /// What one read on the handle `watch`, which stands on `dir`, gave.
-  Read {
-    watch: WatchId,
-    dir: Arc<Path>,
-    extended: bool,
-    result: io::Result<Vec<u8>>,
-  },
-  Lost(Vec<DirKey>),
-  /// Every record of a change before this time, by the clock of the system, came before: the
-  /// answer to `ask_delivered`.
-  Delivered(SystemTime),
-}
-
+/// The hints of one message of the port.
 pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
   let lost = |key| Hint::Changed { dir: key, rel: Path::new("") };
   let (watch, dir, extended, result) = match raw {
@@ -281,17 +284,44 @@ mod handles {
     fs::wide_name,
   };
 
+  /// At most this many handles are open: more go up to a directory they have in common
+  /// (`place`).
   pub const MAX_HANDLES: usize = 64;
 
+  /// One open handle: new for each open, so a read of a handle that closed is told apart.
   #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
   pub struct WatchId(pub usize);
 
+  /// What the handles ask of the system: the port, or a fake one in the tests.
   pub trait System {
     fn open(&mut self, id: WatchId, dir: &Path) -> io::Result<()>;
 
     fn close(&mut self, id: WatchId);
 
     fn is_link(&mut self, path: &Path) -> bool;
+  }
+
+  /// What a call tells besides its answer: the keys that lost their handle, and the keys that
+  /// waited and that a new handle covers.
+  #[derive(Debug, Default, PartialEq, Eq)]
+  pub struct Told {
+    pub lost: Vec<DirKey>,
+    pub covered: Vec<DirKey>,
+  }
+
+  /// The handles, and the keys that each serves (`references/design.md` 7.3).
+  #[derive(Debug, Default)]
+  pub struct Handles {
+    keys: FxHashMap<DirKey, Served>,
+    at: FxHashMap<PathBuf, Vec<DirKey>>,
+    open: Vec<Handle>,
+    next_id: usize,
+    unsettled: bool,
+    refused: FxHashSet<DirKey>,
+    waiting: FxHashMap<DirKey, PathBuf>,
+    /// The keys whose last handle died before it delivered anything. Kept by key, not by the
+    /// directory of the handle: a shared handle stands on a directory of no key.
+    dead: FxHashMap<DirKey, Death>,
   }
 
   #[derive(Debug)]
@@ -309,12 +339,6 @@ mod handles {
     handle: Option<WatchId>,
   }
 
-  #[derive(Debug, Default, PartialEq, Eq)]
-  pub struct Told {
-    pub lost: Vec<DirKey>,
-    pub covered: Vec<DirKey>,
-  }
-
   /// What the last handle of a key died of, and whether it died before it delivered anything
   /// while the death before it was still on record.
   #[derive(Debug)]
@@ -323,20 +347,7 @@ mod handles {
     error: io::Error,
   }
 
-  #[derive(Debug, Default)]
-  pub struct Handles {
-    keys: FxHashMap<DirKey, Served>,
-    at: FxHashMap<PathBuf, Vec<DirKey>>,
-    open: Vec<Handle>,
-    next_id: usize,
-    unsettled: bool,
-    refused: FxHashSet<DirKey>,
-    waiting: FxHashMap<DirKey, PathBuf>,
-    /// The keys whose last handle died before it delivered anything. Kept by key, not by the
-    /// directory of the handle: a shared handle stands on a directory of no key.
-    dead: FxHashMap<DirKey, Death>,
-  }
-
+  /// The calls of the backend, and what a read on a handle tells.
   impl Handles {
     pub fn watch(
       &mut self,
@@ -446,37 +457,11 @@ mod handles {
         self.dead.remove(key);
       }
     }
+  }
 
-    /// The way to the keys for the records of a read on the handle at `dir`.
-    pub(super) fn route_below(&self, dir: &Path) -> Route<'_> {
-      let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
-      let lower_dir = lowered(dir);
-      let mut path = dir.as_os_str().as_encoded_bytes().to_vec();
-      let mut lower = lower_dir.as_os_str().as_encoded_bytes().to_vec();
-      path.push(b'\\');
-      lower.push(b'\\');
-      // The directories on the way up, each with its spelling in lower case. The names below
-      // one start after the separators that follow it in `path`.
-      let above = dir.ancestors().zip(lower_dir.ancestors()).filter_map(|(up, lower_up)| {
-        let keys = self.at.get(lower_up)?;
-        let end = up.as_os_str().len();
-        Some((
-          keys.as_slice(),
-          end + path[end..].iter().take_while(|byte| is_separator(byte)).count(),
-        ))
-      });
-      let above = above.collect();
-      let base = (path.len(), lower.len());
-      let (ends, text, name) = (Vec::new(), String::new(), String::new());
-      Route { at: &self.at, above, path, lower, base, ends, text, name }
-    }
-
-    pub(super) fn below(&self, dir: &Path) -> Vec<DirKey> {
-      let dir = lowered(dir);
-      let below = self.at.iter().filter(|(lower, _)| lower.starts_with(&dir));
-      below.flat_map(|(_, keys)| keys).copied().collect()
-    }
-
+  /// Where the handles stand: worked out at a commit for every key together (`place`), and the
+  /// keys that each serves.
+  impl Handles {
     /// The key is forgotten. A handle that it alone used closes now (rule 6: the OS watch goes
     /// with its last key); where the handles stand is worked out once, at the next commit, not
     /// for each key that goes.
@@ -519,15 +504,13 @@ mod handles {
         let places = place(&wanted, MAX_HANDLES, &mut |path| looked.get(path) == Some(&true));
         let mut behind = Vec::new();
         for place in &places {
-          let id = self.open.iter().find(|handle| handle.dir == place.dir).map(|handle| handle.id);
+          let id = self.handle_on(&place.dir);
           for &key in &place.keys {
             let served = &self.keys[&key];
             if id.is_some() && id == served.handle {
               continue;
             }
-            let is_link =
-              |path: &Path| *looked.entry(path.to_owned()).or_insert_with(|| system.is_link(path));
-            if link_between(&place.dir, &served.dir, is_link) {
+            if link_between(&place.dir, &served.dir, |path| is_link(&mut looked, system, path)) {
               behind.push(key);
             }
           }
@@ -539,7 +522,7 @@ mod handles {
 
       let mut new = Vec::new();
       for place in &places {
-        if self.open.iter().any(|handle| handle.dir == place.dir) {
+        if self.handle_on(&place.dir).is_some() {
           continue;
         }
         let id = self.next_id();
@@ -564,9 +547,7 @@ mod handles {
         let waiting = self.waiting.iter().filter(|(_, dir)| dir.starts_with(&handle.dir));
         // A key behind a link below the new handle is not reported by it.
         let covered = waiting.filter(|(_, dir)| {
-          let is_link =
-            |path: &Path| *looked.entry(path.to_owned()).or_insert_with(|| system.is_link(path));
-          !link_between(&handle.dir, dir.as_path(), is_link)
+          !link_between(&handle.dir, dir, |path| is_link(&mut looked, system, path))
         });
         told.covered.extend(covered.map(|(&key, _)| key));
       }
@@ -576,7 +557,7 @@ mod handles {
         served.handle = None;
       }
       for place in &places {
-        let id = self.open.iter().find(|handle| handle.dir == place.dir).map(|handle| handle.id);
+        let id = self.handle_on(&place.dir);
         for key in &place.keys {
           if let Some(served) = self.keys.get_mut(key) {
             served.handle = id;
@@ -588,6 +569,11 @@ mod handles {
         told.lost.push(key);
       }
       Ok(())
+    }
+
+    /// The open handle on `dir`.
+    fn handle_on(&self, dir: &Path) -> Option<WatchId> {
+      self.open.iter().find(|handle| handle.dir == dir).map(|handle| handle.id)
     }
 
     fn reopen(&mut self, at: usize, system: &mut dyn System) -> io::Result<()> {
@@ -630,6 +616,11 @@ mod handles {
     }
   }
 
+  /// Whether `path` is a junction or a directory link: the system is asked once for each path.
+  fn is_link(looked: &mut FxHashMap<PathBuf, bool>, system: &mut dyn System, path: &Path) -> bool {
+    *looked.entry(path.to_owned()).or_insert_with(|| system.is_link(path))
+  }
+
   /// `path` with its names in lower case (`lower_name`). The drive or the share stays as it is.
   fn lowered(path: &Path) -> PathBuf {
     let (mut lower, mut text) = (PathBuf::new(), String::new());
@@ -650,6 +641,39 @@ mod handles {
     text.clear();
     text.extend(name.chars().flat_map(char::to_lowercase));
     Cow::Borrowed(OsStr::new(text.as_str()))
+  }
+
+  /// The way from the records of a read to the keys.
+  impl Handles {
+    /// The way to the keys for the records of a read on the handle at `dir`.
+    pub(super) fn route_below(&self, dir: &Path) -> Route<'_> {
+      let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
+      let lower_dir = lowered(dir);
+      let mut path = dir.as_os_str().as_encoded_bytes().to_vec();
+      let mut lower = lower_dir.as_os_str().as_encoded_bytes().to_vec();
+      path.push(b'\\');
+      lower.push(b'\\');
+      // The directories on the way up, each with its spelling in lower case. The names below
+      // one start after the separators that follow it in `path`.
+      let above = dir.ancestors().zip(lower_dir.ancestors()).filter_map(|(up, lower_up)| {
+        let keys = self.at.get(lower_up)?;
+        let end = up.as_os_str().len();
+        Some((
+          keys.as_slice(),
+          end + path[end..].iter().take_while(|byte| is_separator(byte)).count(),
+        ))
+      });
+      let above = above.collect();
+      let base = (path.len(), lower.len());
+      let (ends, text, name) = (Vec::new(), String::new(), String::new());
+      Route { at: &self.at, above, path, lower, base, ends, text, name }
+    }
+
+    pub(super) fn below(&self, dir: &Path) -> Vec<DirKey> {
+      let dir = lowered(dir);
+      let below = self.at.iter().filter(|(lower, _)| lower.starts_with(&dir));
+      below.flat_map(|(_, keys)| keys).copied().collect()
+    }
   }
 
   /// The way of the records of one read to every key whose directory holds the path of the
@@ -911,33 +935,6 @@ mod port {
 
   const BUFFER_BYTES: u32 = 64 * 1024;
   const BUFFER_WORDS: usize = BUFFER_BYTES as usize / size_of::<u64>();
-
-  type ReadExtended = unsafe extern "system" fn(
-    HANDLE,
-    *mut c_void,
-    u32,
-    i32,
-    u32,
-    *mut u32,
-    *mut OVERLAPPED,
-    LPOVERLAPPED_COMPLETION_ROUTINE,
-    i32,
-  ) -> i32;
-
-  fn read_extended() -> Option<ReadExtended> {
-    static CALL: OnceLock<Option<ReadExtended>> = OnceLock::new();
-    *CALL.get_or_init(|| {
-      // SAFETY: the function with this name has this signature.
-      unsafe {
-        mem::transmute::<FARPROC, Option<ReadExtended>>(kernel32(c"ReadDirectoryChangesExW"))
-      }
-    })
-  }
-
-  fn not_supported(error: &io::Error) -> bool {
-    let code = error.raw_os_error().map(i32::cast_unsigned);
-    matches!(code, Some(ERROR_INVALID_FUNCTION | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED))
-  }
 
   const MAX_EMPTY_READS: u8 = 16;
 
@@ -1475,6 +1472,33 @@ mod port {
     /// The time given to the wait is over.
     Timeout,
     Nothing(io::Error),
+  }
+
+  type ReadExtended = unsafe extern "system" fn(
+    HANDLE,
+    *mut c_void,
+    u32,
+    i32,
+    u32,
+    *mut u32,
+    *mut OVERLAPPED,
+    LPOVERLAPPED_COMPLETION_ROUTINE,
+    i32,
+  ) -> i32;
+
+  fn read_extended() -> Option<ReadExtended> {
+    static CALL: OnceLock<Option<ReadExtended>> = OnceLock::new();
+    *CALL.get_or_init(|| {
+      // SAFETY: the function with this name has this signature.
+      unsafe {
+        mem::transmute::<FARPROC, Option<ReadExtended>>(kernel32(c"ReadDirectoryChangesExW"))
+      }
+    })
+  }
+
+  fn not_supported(error: &io::Error) -> bool {
+    let code = error.raw_os_error().map(i32::cast_unsigned);
+    matches!(code, Some(ERROR_INVALID_FUNCTION | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED))
   }
 
   fn open_dir(path: &Path) -> io::Result<File> {

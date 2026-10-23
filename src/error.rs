@@ -1,3 +1,5 @@
+//! The error that the handler and the calls of the watcher get, and its kinds.
+
 use std::{
   error, fmt, io,
   path::{Path, PathBuf},

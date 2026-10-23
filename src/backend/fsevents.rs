@@ -84,6 +84,32 @@ pub struct FsEventsBackend {
   last_parent: Option<(PathBuf, PathBuf)>,
 }
 
+/// What a stream or the guard sends: the records of one callback, each a path with its flags,
+/// and the keys that the backend reports lost by itself.
+#[derive(Debug, Default)]
+pub struct Raw {
+  paths: Vec<u8>,
+  records: Vec<(usize, u32)>,
+  /// The keys that the backend reports lost by itself, with no record.
+  pub lost: Vec<DirKey>,
+}
+
+impl Raw {
+  pub fn push(&mut self, path: &[u8], flags: u32) {
+    self.paths.extend_from_slice(path);
+    self.records.push((self.paths.len(), flags));
+  }
+
+  pub fn records(&self) -> impl Iterator<Item = (&Path, u32)> {
+    let mut start = 0;
+    self.records.iter().map(move |&(end, flags)| {
+      let path = &self.paths[start..end];
+      start = end;
+      (Path::new(OsStr::from_bytes(path)), flags)
+    })
+  }
+}
+
 impl FsEventsBackend {
   pub fn new(sink: Sink<Raw>) -> io::Result<Self> {
     let sink = Arc::new(sink);
@@ -254,6 +280,44 @@ impl Backend for FsEventsBackend {
   }
 }
 
+impl Drop for FsEventsBackend {
+  fn drop(&mut self) {
+    // No notice is read once this returns, and the streams stop on their queue after the stops
+    // that wait there: no report of theirs comes after this.
+    self.guard.notices.cancel();
+    let streams = mem::take(&mut self.running);
+    self.queue.sync(move || drop(streams));
+  }
+}
+
+/// What the tests look at.
+impl FsEventsBackend {
+  pub fn stream_count(&self) -> usize {
+    self.running.len()
+  }
+
+  pub fn covers(&self) -> Vec<&Path> {
+    self.covers.by_dir.paths()
+  }
+
+  pub fn cover_of_key(&self) -> &FxHashMap<DirKey, PathBuf> {
+    &self.covers.dir_of
+  }
+
+  pub fn guarded(&self) -> Vec<&Path> {
+    self.guard.dirs.keys().map(PathBuf::as_path).collect()
+  }
+
+  pub fn streamed(&self) -> Vec<&Path> {
+    self.paths.paths()
+  }
+
+  pub fn pending(&self) -> Vec<&Path> {
+    self.pending.paths()
+  }
+}
+
+/// The real path of a directory: the one that FSEvents reports.
 impl FsEventsBackend {
   fn real_path(&mut self, dir: &Path) -> io::Result<PathBuf> {
     let real = match (dir.parent(), dir.file_name()) {
@@ -279,24 +343,22 @@ impl FsEventsBackend {
     }
     Ok(real)
   }
+}
 
-  /// The keys at and below the directories whose guards told since the last look: renamed, also
-  /// only in letter case, removed, or a volume came or went at or above them. Each key checks
-  /// its directory, and each cover is read again, as its stream heard nothing while its path
-  /// was another one, also when the path is back by now. The stream paths at and below these
-  /// directories are trusted no more (`references/design.md` 7.2).
-  fn told(&mut self) -> Vec<DirKey> {
-    let moved = self.guard.take();
-    if moved.is_empty() {
-      return Vec::new();
-    }
-    self.guard_is_stale = true;
-    self.distrust(&moved);
-    let is_below = |dir: &Path| moved.iter().any(|moved| dir.starts_with(moved));
-    let named = self.named.iter().filter(|(_, dir)| is_below(dir)).map(|(&key, _)| key);
-    named.chain(self.covers.keys_at_or_below(&moved)).collect()
-  }
+/// `realpath` spells `/Users` as `/System/Volumes/Data/Users`, and FSEvents reports the short
+/// path. The short path is taken when it is the same directory and a real path itself.
+fn short_way(real: PathBuf) -> PathBuf {
+  let Ok(below) = real.strip_prefix(DATA_VOLUME) else { return real };
+  let short = Path::new("/").join(below);
+  let id = |path: &Path| fs::metadata(path).map(|found| (found.dev(), found.ino())).ok();
+  let is_same = fs::canonicalize(&short).is_ok_and(|own| own == short)
+    && id(&short).is_some_and(|short| Some(short) == id(&real));
+  if is_same { short } else { real }
+}
 
+/// The streams: where they stand, when they start, and when they stop (`references/design.md`
+/// 7.2).
+impl FsEventsBackend {
   /// Starts the streams for the pending paths, after the guard of the directories at and above
   /// them, and of the `named` ones: a directory renamed between the guard and the start is told
   /// too. A pending path below a directory that got no guard gets no stream.
@@ -389,23 +451,6 @@ impl FsEventsBackend {
     keep
   }
 
-  /// Closes the guards that no stream path and none of `named` needs. Only after the start: the
-  /// old stream paths keep theirs until new streams stand, or for good if none could start.
-  fn fit_guard(&mut self) {
-    let wanted = wanted(self.paths.keys(), self.named.values().map(PathBuf::as_path));
-    self.guard.dirs.retain(|dir, _| wanted.binary_search(&dir.as_path()).is_ok());
-    give_room_back(&mut self.guard.dirs);
-    self.guard_is_stale = false;
-  }
-
-  /// The stream paths at and below `dirs` are trusted no more.
-  fn distrust(&mut self, dirs: &[PathBuf]) {
-    let below: Vec<PathBuf> = self.paths.below(dirs).map(|(path, ())| path.to_owned()).collect();
-    for path in dirs.iter().chain(&below) {
-      self.paths.remove(path);
-    }
-  }
-
   /// The check after the start (`references/design.md` 7.2): a stream path, or a name between it
   /// and a cover, can have changed between `watch` and the start of the stream.
   fn moved_since_asked(&mut self, started: &[PathBuf]) -> Vec<DirKey> {
@@ -432,6 +477,14 @@ impl FsEventsBackend {
       }
     }
     moved
+  }
+
+  /// The stream paths at and below `dirs` are trusted no more.
+  fn distrust(&mut self, dirs: &[PathBuf]) {
+    let below: Vec<PathBuf> = self.paths.below(dirs).map(|(path, ())| path.to_owned()).collect();
+    for path in dirs.iter().chain(&below) {
+      self.paths.remove(path);
+    }
   }
 
   /// Stops the streams that no cover needs any more: their records would reach no key, so
@@ -467,108 +520,6 @@ impl FsEventsBackend {
   }
 }
 
-impl Drop for FsEventsBackend {
-  fn drop(&mut self) {
-    // No notice is read once this returns, and the streams stop on their queue after the stops
-    // that wait there: no report of theirs comes after this.
-    self.guard.notices.cancel();
-    let streams = mem::take(&mut self.running);
-    self.queue.sync(move || drop(streams));
-  }
-}
-
-/// What the tests look at.
-impl FsEventsBackend {
-  pub fn stream_count(&self) -> usize {
-    self.running.len()
-  }
-
-  pub fn covers(&self) -> Vec<&Path> {
-    self.covers.by_dir.paths()
-  }
-
-  pub fn cover_of_key(&self) -> &FxHashMap<DirKey, PathBuf> {
-    &self.covers.dir_of
-  }
-
-  pub fn guarded(&self) -> Vec<&Path> {
-    self.guard.dirs.keys().map(PathBuf::as_path).collect()
-  }
-
-  pub fn streamed(&self) -> Vec<&Path> {
-    self.paths.paths()
-  }
-
-  pub fn pending(&self) -> Vec<&Path> {
-    self.pending.paths()
-  }
-}
-
-#[derive(Debug, Default)]
-pub struct Raw {
-  paths: Vec<u8>,
-  records: Vec<(usize, u32)>,
-  /// The keys that the backend reports lost by itself, with no record.
-  pub lost: Vec<DirKey>,
-}
-
-impl Raw {
-  pub fn push(&mut self, path: &[u8], flags: u32) {
-    self.paths.extend_from_slice(path);
-    self.records.push((self.paths.len(), flags));
-  }
-
-  pub fn records(&self) -> impl Iterator<Item = (&Path, u32)> {
-    let mut start = 0;
-    self.records.iter().map(move |&(end, flags)| {
-      let path = &self.paths[start..end];
-      start = end;
-      (Path::new(OsStr::from_bytes(path)), flags)
-    })
-  }
-}
-
-#[derive(Debug, Default)]
-struct Covers {
-  by_dir: Dirs<Vec<DirKey>>,
-  dir_of: FxHashMap<DirKey, PathBuf>,
-}
-
-impl Covers {
-  fn insert(&mut self, key: DirKey, dir: PathBuf) {
-    if self.dir_of.get(&key) == Some(&dir) {
-      return;
-    }
-    match self.by_dir.get_mut(&dir) {
-      Some(keys) => keys.push(key),
-      None => self.by_dir.insert(dir.clone(), vec![key]),
-    }
-    self.dir_of.insert(key, dir);
-  }
-
-  /// Forgets the cover of `key`. Gives its directory when no key is left at it.
-  fn remove(&mut self, key: DirKey) -> Option<PathBuf> {
-    let dir = self.dir_of.remove(&key)?;
-    give_room_back(&mut self.dir_of);
-    let keys = self.by_dir.get_mut(&dir)?;
-    keys.retain(|known| *known != key);
-    if !keys.is_empty() {
-      return None;
-    }
-    self.by_dir.remove(&dir);
-    Some(dir)
-  }
-
-  /// The keys of the covers at and below a directory of `dirs`.
-  fn keys_at_or_below<'a>(
-    &'a self,
-    dirs: &'a [impl AsRef<Path>],
-  ) -> impl Iterator<Item = DirKey> + 'a {
-    let at = dirs.iter().filter_map(|dir| self.by_dir.get(dir.as_ref()));
-    at.chain(self.by_dir.below(dirs).map(|(_, keys)| keys)).flatten().copied()
-  }
-}
-
 struct Started {
   /// The paths that got a stream and had none before.
   fresh: Vec<PathBuf>,
@@ -587,6 +538,94 @@ struct Running {
   paths: Vec<PathBuf>,
 }
 
+/// Whether a stream path there would report far more than the covers: `/`, a directory in
+/// it, one more name down, and the temporary directory of the user with the names above it.
+pub fn is_too_high(dir: &Path) -> bool {
+  let dir = dir.strip_prefix(DATA_VOLUME).unwrap_or(dir);
+  let names: Vec<&[u8]> = dir.iter().filter(|&name| name != "/").map(OsStrExt::as_bytes).collect();
+  match names.as_slice() {
+    [] | [_] | [_, _] => true,
+    [b"private", b"var", b"folders", below @ ..] => below.len() <= 3,
+    _ => false,
+  }
+}
+
+/// At most `max` stream paths for the covers: paths go up to directories that covers have in
+/// common, the deepest first, but never to one that is too high.
+fn place(covers: Vec<PathBuf>, max: usize) -> Vec<PathBuf> {
+  let paths = top_most(covers);
+  let too_many = paths.len().saturating_sub(max);
+  if too_many == 0 {
+    return paths;
+  }
+  let joins: Vec<usize> = paths
+    .windows(2)
+    .map(|pair| {
+      let shared = pair[0].components().zip(pair[1].components()).take_while(|(a, b)| a == b);
+      let depth = shared.count();
+      let dir: PathBuf = pair[0].components().take(depth).collect();
+      if is_too_high(&dir) { 0 } else { depth }
+    })
+    .collect();
+  let mut deepest_first: Vec<usize> = joins.iter().copied().filter(|&depth| depth > 0).collect();
+  deepest_first.sort_unstable_by(|a, b| b.cmp(a));
+  let level = deepest_first.get(too_many - 1).copied().unwrap_or(1);
+  let mut left = paths.len() - deepest_first.iter().take_while(|&&depth| depth > level).count();
+  let mut placed = Vec::new();
+  let mut kept = usize::MAX;
+  let mut takes_level = None;
+  for (path, join) in paths.into_iter().zip(joins.into_iter().chain([0])) {
+    if join < level {
+      takes_level = None;
+    }
+    if join > level || join == level && *takes_level.get_or_insert(left > max) {
+      left -= usize::from(join == level);
+      kept = kept.min(join);
+    } else {
+      placed.push(path.components().take(kept).collect());
+      kept = usize::MAX;
+    }
+  }
+  placed
+}
+
+/// The paths that lie below no other one of them, sorted.
+fn top_most(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+  paths.sort_unstable();
+  paths.dedup_by(|path, kept| path.starts_with(kept));
+  paths
+}
+
+/// The guard of the directories at and above the stream paths, and of the ones that keys ask
+/// names of.
+impl FsEventsBackend {
+  /// The keys at and below the directories whose guards told since the last look: renamed, also
+  /// only in letter case, removed, or a volume came or went at or above them. Each key checks
+  /// its directory, and each cover is read again, as its stream heard nothing while its path
+  /// was another one, also when the path is back by now. The stream paths at and below these
+  /// directories are trusted no more (`references/design.md` 7.2).
+  fn told(&mut self) -> Vec<DirKey> {
+    let moved = self.guard.take();
+    if moved.is_empty() {
+      return Vec::new();
+    }
+    self.guard_is_stale = true;
+    self.distrust(&moved);
+    let is_below = |dir: &Path| moved.iter().any(|moved| dir.starts_with(moved));
+    let named = self.named.iter().filter(|(_, dir)| is_below(dir)).map(|(&key, _)| key);
+    named.chain(self.covers.keys_at_or_below(&moved)).collect()
+  }
+
+  /// Closes the guards that no stream path and none of `named` needs. Only after the start: the
+  /// old stream paths keep theirs until new streams stand, or for good if none could start.
+  fn fit_guard(&mut self) {
+    let wanted = wanted(self.paths.keys(), self.named.values().map(PathBuf::as_path));
+    self.guard.dirs.retain(|dir, _| wanted.binary_search(&dir.as_path()).is_ok());
+    give_room_back(&mut self.guard.dirs);
+    self.guard_is_stale = false;
+  }
+}
+
 /// The open files of the guards of every watcher in the process: at most half of what the
 /// process may open.
 static GUARD_FILES: AtomicUsize = AtomicUsize::new(0);
@@ -599,33 +638,6 @@ struct Guard {
   notices: Notices,
   dirs: FxHashMap<PathBuf, Guarded>,
   last_id: usize,
-}
-
-#[derive(Debug)]
-struct Guarded {
-  file: File,
-  _ticket: Ticket,
-  id: usize,
-}
-
-/// One of the open files that the guards may hold.
-#[derive(Debug)]
-struct Ticket;
-
-impl Ticket {
-  fn take() -> io::Result<Self> {
-    if GUARD_FILES.fetch_add(1, Ordering::Relaxed) < ffi::open_file_limit() / 2 {
-      return Ok(Self);
-    }
-    GUARD_FILES.fetch_sub(1, Ordering::Relaxed);
-    Err(watch_limit(ERROR_NO_GUARD))
-  }
-}
-
-impl Drop for Ticket {
-  fn drop(&mut self) {
-    GUARD_FILES.fetch_sub(1, Ordering::Relaxed);
-  }
 }
 
 impl Guard {
@@ -690,6 +702,33 @@ impl Guard {
   }
 }
 
+#[derive(Debug)]
+struct Guarded {
+  file: File,
+  _ticket: Ticket,
+  id: usize,
+}
+
+/// One of the open files that the guards may hold.
+#[derive(Debug)]
+struct Ticket;
+
+impl Ticket {
+  fn take() -> io::Result<Self> {
+    if GUARD_FILES.fetch_add(1, Ordering::Relaxed) < ffi::open_file_limit() / 2 {
+      return Ok(Self);
+    }
+    GUARD_FILES.fetch_sub(1, Ordering::Relaxed);
+    Err(watch_limit(ERROR_NO_GUARD))
+  }
+}
+
+impl Drop for Ticket {
+  fn drop(&mut self) {
+    GUARD_FILES.fetch_sub(1, Ordering::Relaxed);
+  }
+}
+
 /// The directories at and above `paths`, and `named`, sorted: each before the ones below it.
 fn wanted<'a>(
   paths: impl Iterator<Item = &'a Path>,
@@ -701,72 +740,46 @@ fn wanted<'a>(
   wanted
 }
 
-/// `realpath` spells `/Users` as `/System/Volumes/Data/Users`, and FSEvents reports the short
-/// path. The short path is taken when it is the same directory and a real path itself.
-fn short_way(real: PathBuf) -> PathBuf {
-  let Ok(below) = real.strip_prefix(DATA_VOLUME) else { return real };
-  let short = Path::new("/").join(below);
-  let id = |path: &Path| fs::metadata(path).map(|found| (found.dev(), found.ino())).ok();
-  let is_same = fs::canonicalize(&short).is_ok_and(|own| own == short)
-    && id(&short).is_some_and(|short| Some(short) == id(&real));
-  if is_same { short } else { real }
+/// The covers: the keys by the real path of their directory, and the real path of each key.
+#[derive(Debug, Default)]
+struct Covers {
+  by_dir: Dirs<Vec<DirKey>>,
+  dir_of: FxHashMap<DirKey, PathBuf>,
 }
 
-/// Whether a stream path there would report far more than the covers: `/`, a directory in
-/// it, one more name down, and the temporary directory of the user with the names above it.
-pub fn is_too_high(dir: &Path) -> bool {
-  let dir = dir.strip_prefix(DATA_VOLUME).unwrap_or(dir);
-  let names: Vec<&[u8]> = dir.iter().filter(|&name| name != "/").map(OsStrExt::as_bytes).collect();
-  match names.as_slice() {
-    [] | [_] | [_, _] => true,
-    [b"private", b"var", b"folders", below @ ..] => below.len() <= 3,
-    _ => false,
-  }
-}
-
-/// At most `max` stream paths for the covers: paths go up to directories that covers have in
-/// common, the deepest first, but never to one that is too high.
-fn place(covers: Vec<PathBuf>, max: usize) -> Vec<PathBuf> {
-  let paths = top_most(covers);
-  let too_many = paths.len().saturating_sub(max);
-  if too_many == 0 {
-    return paths;
-  }
-  let joins: Vec<usize> = paths
-    .windows(2)
-    .map(|pair| {
-      let shared = pair[0].components().zip(pair[1].components()).take_while(|(a, b)| a == b);
-      let depth = shared.count();
-      let dir: PathBuf = pair[0].components().take(depth).collect();
-      if is_too_high(&dir) { 0 } else { depth }
-    })
-    .collect();
-  let mut deepest_first: Vec<usize> = joins.iter().copied().filter(|&depth| depth > 0).collect();
-  deepest_first.sort_unstable_by(|a, b| b.cmp(a));
-  let level = deepest_first.get(too_many - 1).copied().unwrap_or(1);
-  let mut left = paths.len() - deepest_first.iter().take_while(|&&depth| depth > level).count();
-  let mut placed = Vec::new();
-  let mut kept = usize::MAX;
-  let mut takes_level = None;
-  for (path, join) in paths.into_iter().zip(joins.into_iter().chain([0])) {
-    if join < level {
-      takes_level = None;
+impl Covers {
+  fn insert(&mut self, key: DirKey, dir: PathBuf) {
+    if self.dir_of.get(&key) == Some(&dir) {
+      return;
     }
-    if join > level || join == level && *takes_level.get_or_insert(left > max) {
-      left -= usize::from(join == level);
-      kept = kept.min(join);
-    } else {
-      placed.push(path.components().take(kept).collect());
-      kept = usize::MAX;
+    match self.by_dir.get_mut(&dir) {
+      Some(keys) => keys.push(key),
+      None => self.by_dir.insert(dir.clone(), vec![key]),
     }
+    self.dir_of.insert(key, dir);
   }
-  placed
-}
 
-fn top_most(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
-  paths.sort_unstable();
-  paths.dedup_by(|path, kept| path.starts_with(kept));
-  paths
+  /// Forgets the cover of `key`. Gives its directory when no key is left at it.
+  fn remove(&mut self, key: DirKey) -> Option<PathBuf> {
+    let dir = self.dir_of.remove(&key)?;
+    give_room_back(&mut self.dir_of);
+    let keys = self.by_dir.get_mut(&dir)?;
+    keys.retain(|known| *known != key);
+    if !keys.is_empty() {
+      return None;
+    }
+    self.by_dir.remove(&dir);
+    Some(dir)
+  }
+
+  /// The keys of the covers at and below a directory of `dirs`.
+  fn keys_at_or_below<'a>(
+    &'a self,
+    dirs: &'a [impl AsRef<Path>],
+  ) -> impl Iterator<Item = DirKey> + 'a {
+    let at = dirs.iter().filter_map(|dir| self.by_dir.get(dir.as_ref()));
+    at.chain(self.by_dir.below(dirs).map(|(_, keys)| keys)).flatten().copied()
+  }
 }
 
 /// Directories by path, in path order: the ones that hold a path and the ones below a path

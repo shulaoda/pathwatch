@@ -161,6 +161,8 @@ pub enum Signal<R> {
   Failed(io::Error),
 }
 
+/// The error of a limit of the OS on watches: a backend makes it (`watch_limit`), and the
+/// watcher tells it as `ErrorKind::WatchLimit`.
 #[derive(Debug)]
 struct Limit(&'static str);
 
@@ -178,6 +180,11 @@ pub fn watch_limit(message: &'static str) -> io::Error {
 
 pub fn is_watch_limit(error: &io::Error) -> bool {
   limit(error).is_some()
+}
+
+/// The message of the error, when it is a limit (`Limit`).
+fn limit(error: &io::Error) -> Option<&'static str> {
+  Some(error.get_ref()?.downcast_ref::<Limit>()?.0)
 }
 
 /// A copy of the error, for a backend that tells one error for many keys: an `io::Error` is not
@@ -215,8 +222,4 @@ pub(crate) fn give_room_back<K: Eq + Hash, V>(table: &mut FxHashMap<K, V>) {
   if capacity > 64 && len * 4 < capacity {
     table.shrink_to(len * 2);
   }
-}
-
-fn limit(error: &io::Error) -> Option<&'static str> {
-  Some(error.get_ref()?.downcast_ref::<Limit>()?.0)
 }

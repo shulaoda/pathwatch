@@ -11,6 +11,8 @@ use crate::{
   tree::{Added, Dir, Kind, Mark, Node, Watch, emptied, room_to_keep},
 };
 
+/// The end of a flush: one event for each node it changed. And what the tree forgets of a node
+/// whose file or directory is gone.
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Hands the events of the touched nodes over as one batch, and ends the baseline of a `watch`.
   pub(super) fn finish(&mut self, out: &mut Output) {
@@ -36,6 +38,28 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.forget_delivered();
   }
 
+  /// What the tree has at the node is gone for good.
+  pub(super) fn gone(&mut self, key: DirKey) {
+    match self.tree[key].kind {
+      Kind::File(_) => self.forget_file(key),
+      Kind::Dir(_) => self.vanish(key),
+      Kind::Missing => {}
+    }
+  }
+
+  /// Forgets the file at the node; the end of the flush tells the handler.
+  pub(super) fn forget_file(&mut self, key: DirKey) {
+    self.tree[key].kind = Kind::Missing;
+    self.tree.set_content(key, None);
+    self.tree.set_ahead_since(key, None);
+    self.tree.unhold(key);
+    self.touched.push(key);
+  }
+}
+
+/// The delete delay (design.md 5.9): the first look that finds nothing holds the node, and the
+/// second look decides.
+impl<B: Backend, F: Fs> Engine<B, F> {
   /// Nothing is at the node, and the tree has something: the first look holds it, the second look
   /// decides (design.md 5.9). The delay counts from the hint that asked for the look, `since`.
   pub(super) fn missing(&mut self, key: DirKey, since: Option<Instant>) {
@@ -76,24 +100,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let tree = &self.tree;
       self.hold_queue.retain(|&Reverse((until, key))| tree.held_until(key) == Some(until));
     }
-  }
-
-  /// What the tree has at the node is gone for good.
-  pub(super) fn gone(&mut self, key: DirKey) {
-    match self.tree[key].kind {
-      Kind::File(_) => self.forget_file(key),
-      Kind::Dir(_) => self.vanish(key),
-      Kind::Missing => {}
-    }
-  }
-
-  /// Forgets the file at the node; the end of the flush tells the handler.
-  pub(super) fn forget_file(&mut self, key: DirKey) {
-    self.tree[key].kind = Kind::Missing;
-    self.tree.set_content(key, None);
-    self.tree.set_ahead_since(key, None);
-    self.tree.unhold(key);
-    self.touched.push(key);
   }
 
   /// Marks each held node whose time is over. `true`: a flush has to run.

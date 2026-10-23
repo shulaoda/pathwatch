@@ -19,6 +19,19 @@ pub(super) type ScanEntry = (DirKey, Listed);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ScanEntry>() == 40);
 
+/// What a scan got from the listing of its directory.
+#[derive(PartialEq, Eq)]
+enum Listing {
+  /// Every entry of the directory was named.
+  Whole,
+  /// There is none: the node is partial, or the directory cannot be read.
+  None,
+  /// The scan ends here, because the directory is gone or the disk did not answer.
+  Stop,
+}
+
+/// The scan of a directory: a check of every node, and a listing that adds what the tree does
+/// not know.
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Checks every node of the directory, and what a listing shows on top if the node is complete.
   /// `path` and `names` are buffers.
@@ -160,17 +173,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 }
 
-/// What a scan got from the listing of its directory.
-#[derive(PartialEq, Eq)]
-enum Listing {
-  /// Every entry of the directory was named.
-  Whole,
-  /// There is none: the node is partial, or the directory cannot be read.
-  None,
-  /// The scan ends here, because the directory is gone or the disk did not answer.
-  Stop,
-}
-
+/// What a directory that appears, is still there, or vanishes, does to the tree.
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// A directory is on disk where the tree had none. `relinked`: as for `is_baseline_dir`.
   pub(super) fn appear(

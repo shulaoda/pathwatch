@@ -212,59 +212,6 @@ impl Watcher {
       let _ = thread.join();
     }
   }
-
-  /// Whether this is the thread of the watcher: inside the handler, or the backend.
-  fn on_its_thread(&self) -> bool {
-    WATCHER_THREAD.get() == self.number
-  }
-}
-
-/// Whether the process is exiting: `ExitProcess` has ended every other thread.
-#[cfg(windows)]
-fn process_is_exiting() -> bool {
-  #[link(name = "ntdll")]
-  unsafe extern "system" {
-    safe fn RtlDllShutdownInProgress() -> u8;
-  }
-
-  RtlDllShutdownInProgress() != 0
-}
-
-impl Watcher {
-  /// Cleans the paths and hands the usable ones to the thread as one command.
-  fn command(
-    &self,
-    paths: &[impl AsRef<Path>],
-    command: fn(Vec<PathBuf>, Done) -> Command,
-  ) -> Result<(), Error> {
-    let closed = || Error::new(ErrorKind::Closed, None, None);
-    if self.stop.load(Ordering::Acquire) {
-      return Err(closed());
-    }
-    let mut usable = Vec::with_capacity(paths.len());
-    let mut skipped = None;
-    for path in paths {
-      match clean(path.as_ref()) {
-        Ok(path) => usable.push(path),
-        Err(why) => skipped = skipped.or_else(|| Some((path.as_ref().to_path_buf(), why))),
-      }
-    }
-    if self.on_its_thread() {
-      // Inside the handler: the thread cannot wait for itself. It takes the command when the
-      // handler has returned.
-      if self.inside.send(command(usable, None)).is_err() {
-        return Err(closed());
-      }
-    } else {
-      let (done, wait) = mpsc::sync_channel(1);
-      if !(self.send)(command(usable, Some(done))) {
-        return Err(closed());
-      }
-      // The thread drops the channel when it stops before the command is done.
-      wait.recv().map_err(|_| closed())?;
-    }
-    skipped.map_or(Ok(()), |(path, why)| Err(Error::new(ErrorKind::InvalidPath, Some(path), why)))
-  }
 }
 
 impl Drop for Watcher {
@@ -273,6 +220,7 @@ impl Drop for Watcher {
   }
 }
 
+/// The thread of the watcher: how it starts, and how a call reaches it.
 impl Watcher {
   /// [`with_config`](Self::with_config) with a backend of the caller's choice, for the tests.
   /// It is not part of the API.
@@ -349,6 +297,57 @@ impl Watcher {
       thread: Mutex::new(Some(thread)),
     })
   }
+
+  /// Cleans the paths and hands the usable ones to the thread as one command.
+  fn command(
+    &self,
+    paths: &[impl AsRef<Path>],
+    command: fn(Vec<PathBuf>, Done) -> Command,
+  ) -> Result<(), Error> {
+    let closed = || Error::new(ErrorKind::Closed, None, None);
+    if self.stop.load(Ordering::Acquire) {
+      return Err(closed());
+    }
+    let mut usable = Vec::with_capacity(paths.len());
+    let mut skipped = None;
+    for path in paths {
+      match clean(path.as_ref()) {
+        Ok(path) => usable.push(path),
+        Err(why) => skipped = skipped.or_else(|| Some((path.as_ref().to_path_buf(), why))),
+      }
+    }
+    if self.on_its_thread() {
+      // Inside the handler: the thread cannot wait for itself. It takes the command when the
+      // handler has returned.
+      if self.inside.send(command(usable, None)).is_err() {
+        return Err(closed());
+      }
+    } else {
+      let (done, wait) = mpsc::sync_channel(1);
+      if !(self.send)(command(usable, Some(done))) {
+        return Err(closed());
+      }
+      // The thread drops the channel when it stops before the command is done.
+      wait.recv().map_err(|_| closed())?;
+    }
+    skipped.map_or(Ok(()), |(path, why)| Err(Error::new(ErrorKind::InvalidPath, Some(path), why)))
+  }
+
+  /// Whether this is the thread of the watcher: inside the handler, or the backend.
+  fn on_its_thread(&self) -> bool {
+    WATCHER_THREAD.get() == self.number
+  }
+}
+
+/// Whether the process is exiting: `ExitProcess` has ended every other thread.
+#[cfg(windows)]
+fn process_is_exiting() -> bool {
+  #[link(name = "ntdll")]
+  unsafe extern "system" {
+    safe fn RtlDllShutdownInProgress() -> u8;
+  }
+
+  RtlDllShutdownInProgress() != 0
 }
 
 enum Message<R> {

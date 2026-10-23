@@ -7,6 +7,11 @@ use std::{
   path::{MAIN_SEPARATOR_STR, Path, PathBuf, is_separator},
 };
 
+/// The longest name that can be watched, in bytes. No disk takes a name of more than 765 bytes
+/// (255 UTF-16 units of 3 bytes), and the tree keeps the length of a name in 16 bits: two names
+/// for a share.
+const MAX_NAME: usize = 10_000;
+
 /// The registered form of `path`: absolute, no `.` or `..`, no repeated or trailing separator.
 ///
 /// `None` when the path is relative, has a NUL, names a top directory (`/`, `C:\`,
@@ -25,37 +30,6 @@ pub fn normalize(path: &Path) -> Option<PathBuf> {
   let clean = unix(text)?;
   // SAFETY: `clean` is pieces of `text` cut next to ASCII bytes, joined by ASCII bytes.
   Some(PathBuf::from(unsafe { OsString::from_encoded_bytes_unchecked(clean) }))
-}
-
-/// The longest name that can be watched, in bytes. No disk takes a name of more than 765 bytes
-/// (255 UTF-16 units of 3 bytes), and the tree keeps the length of a name in 16 bits: two names
-/// for a share.
-const MAX_NAME: usize = 10_000;
-
-/// Splits a clean path at its top directory: `/a/b` gives `/` and `a/b`.
-pub(crate) fn split_top(path: &Path) -> Option<(&OsStr, &Path)> {
-  // On Unix the top directory is always `/`: it is cut off at the front.
-  #[cfg(unix)]
-  let top = Path::new("/");
-  // Anywhere else it can be `C:\` or `\\server\share\`. It is found from the end of the path.
-  #[cfg(not(unix))]
-  let top = path.ancestors().last()?;
-  let rest = path.strip_prefix(top).ok()?;
-  Some((top.as_os_str(), rest))
-}
-
-/// Appends `name` to `path` as one more name, by its text: `PathBuf::push` would start the path
-/// anew for a name that reads as a drive or a root (`C:`, `\\a`), which a disk that another system
-/// filled can list on Windows. `pop` takes such a name off again; a name with a separator in it
-/// never reaches the tree (`fs::read_dir` leaves it out).
-pub(crate) fn push_name(path: &mut PathBuf, name: &OsStr) {
-  let text = path.as_mut_os_string();
-  let last = text.as_encoded_bytes().last().copied();
-  if !text.is_empty() && !last.is_some_and(|byte| byte.is_ascii() && is_separator(char::from(byte)))
-  {
-    text.push(MAIN_SEPARATOR_STR);
-  }
-  text.push(name);
 }
 
 /// The Unix rules: the path starts with `/`, and only `/` separates.
@@ -184,6 +158,32 @@ fn push_names(
     }
   }
   (clean.len() > top).then_some(())
+}
+
+/// Splits a clean path at its top directory: `/a/b` gives `/` and `a/b`.
+pub(crate) fn split_top(path: &Path) -> Option<(&OsStr, &Path)> {
+  // On Unix the top directory is always `/`: it is cut off at the front.
+  #[cfg(unix)]
+  let top = Path::new("/");
+  // Anywhere else it can be `C:\` or `\\server\share\`. It is found from the end of the path.
+  #[cfg(not(unix))]
+  let top = path.ancestors().last()?;
+  let rest = path.strip_prefix(top).ok()?;
+  Some((top.as_os_str(), rest))
+}
+
+/// Appends `name` to `path` as one more name, by its text: `PathBuf::push` would start the path
+/// anew for a name that reads as a drive or a root (`C:`, `\\a`), which a disk that another system
+/// filled can list on Windows. `pop` takes such a name off again; a name with a separator in it
+/// never reaches the tree (`fs::read_dir` leaves it out).
+pub(crate) fn push_name(path: &mut PathBuf, name: &OsStr) {
+  let text = path.as_mut_os_string();
+  let last = text.as_encoded_bytes().last().copied();
+  if !text.is_empty() && !last.is_some_and(|byte| byte.is_ascii() && is_separator(char::from(byte)))
+  {
+    text.push(MAIN_SEPARATOR_STR);
+  }
+  text.push(name);
 }
 
 #[cfg(test)]
