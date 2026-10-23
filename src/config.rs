@@ -1,18 +1,19 @@
-//! The settings of a watcher, and what the ignore filter is asked about.
-
 use std::{fmt, path::Path, sync::Arc, time::Duration};
 
 use crate::engine::{Ignored, Options};
 
-/// With a native backend: how often the watcher polls what the OS does not watch.
+const LONGEST_SETTING: Duration = Duration::from_hours(365 * 24);
 const FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-/// With a pause of zero the watcher thread would never sleep.
 const SHORTEST_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-/// No time of the settings is longer: `Duration::MAX` is a way to say "never", and a time that
-/// far ahead of now is no `Instant`.
-const LONGEST_SETTING: Duration = Duration::from_hours(365 * 24);
+/// What the ignore filter is asked about.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum EntryKind {
+  /// Anything that is not a directory: a symbolic link too.
+  File,
+  /// A directory.
+  Dir,
+}
 
 /// The settings of a [`Watcher`](crate::Watcher). They cannot be changed after it is made.
 #[derive(Clone)]
@@ -20,16 +21,12 @@ pub struct Config {
   ignored: Option<Ignored>,
   debounce: Duration,
   delete_delay: Duration,
-  pub(crate) polling: bool,
+  polling: bool,
   poll_interval: Duration,
 }
 
 impl Default for Config {
   fn default() -> Self {
-    // FSEvents tells of a change about 10 ms after it, when the steps of a save are done: that
-    // is the quiet time already. Elsewhere the saves of the IDEs write in place, rename, or
-    // leave the path missing for microseconds, and 10 ms of each was enough, also on a busy
-    // machine (`references/design.md` 5.9 and 5.13).
     Self {
       ignored: None,
       debounce: Duration::from_millis(if cfg!(target_os = "macos") { 0 } else { 10 }),
@@ -53,36 +50,20 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
-  /// The quiet time: a batch goes out when no change was noticed for this long. Default: 10 ms
-  /// on Linux and Windows, long enough for the steps of one save (a temporary file, a rename;
-  /// on Windows the records at the open and at the close) to be one batch, and short enough not
-  /// to be felt. On macOS none: FSEvents tells of a change about 10 ms after it, when a save is
-  /// done, but a temporary file that lives longer (the swap file of vim) is reported, a
-  /// `Create` and a `Delete`. vim and Neovim on Linux sync the new file before they close it:
-  /// a sync longer than the quiet time reports the save twice, and 20 ms holds it together.
-  ///
-  /// While changes keep coming, a batch still goes out four quiet times after the first of them,
-  /// and 500 ms after it at most, unless the quiet time is longer. The most is a year.
+  /// The quiet time: a batch goes out when no change was noticed for this long. While changes
+  /// keep coming, it goes out four quiet times after the first of them, and 500 ms after it at
+  /// most, unless the quiet time is longer. Default: none on macOS, 10 ms elsewhere. The most is
+  /// a year.
   #[must_use]
   pub fn with_debounce(mut self, debounce: Duration) -> Self {
     self.debounce = debounce.min(LONGEST_SETTING);
     self
   }
 
-  /// How long a `Delete` waits for the path to come back. Default: 10 ms. It does not apply
-  /// when the watcher polls everything, as the quiet
-  /// time does not, and as in chokidar, notify and watchdog: a round that falls into a save that
-  /// leaves the path empty for a moment reports a `Delete` and a `Create` (vim on Linux, polled
-  /// every 100 ms: 4 of 100 saves).
-  ///
-  /// A file that is removed and written again within this time is one `Update`, as the tools
-  /// that replace a file that way expect (`git checkout` removes and writes it, a JetBrains IDE
-  /// renames it away and the new one in). vim and Neovim on Linux rename the file away and sync
-  /// their swap file before they write the new one, which on a busy machine leaves the path
-  /// empty for longer: 50 ms, with a quiet time of 20 ms, keeps nearly every such save one
-  /// `Update`. A real delete is reported this long after the OS said that the path is gone, or
-  /// after the quiet time if that is longer. Zero: a `Delete` comes at the first look that finds
-  /// the path gone, and such a file is a `Delete` and a `Create`. The most is a year.
+  /// How long a `Delete` waits for the path to come back: a file that is removed and written
+  /// again within this time is one `Update`, and a real delete is reported this long after the
+  /// path went, or after the quiet time if that is longer. Default: 10 ms; none when the watcher
+  /// polls everything. Zero: no waiting. The most is a year.
   #[must_use]
   pub fn with_delete_delay(mut self, delay: Duration) -> Self {
     self.delete_delay = delay.min(LONGEST_SETTING);
@@ -92,11 +73,9 @@ impl Config {
   /// A path for which `ignored` returns `true` is never reported, and an ignored directory is
   /// never read or watched. Default: nothing is ignored.
   ///
-  /// The path is absolute. The filter must give the same answer for the same path and kind,
-  /// and when it ignores a directory, it should ignore everything below it. It decides about
-  /// the paths given to `watch` too: one below a directory that it ignores, or ignored as a
-  /// file and as a directory, is not watched at all, and one ignored for the kind that is
-  /// there counts as missing (README, promise 10).
+  /// The path is absolute. The filter must give the same answer for the same path and kind, and
+  /// should ignore everything below a directory that it ignores. It decides about the paths
+  /// given to `watch` too (README, promise 10).
   #[must_use]
   pub fn with_ignored(
     mut self,
@@ -106,21 +85,22 @@ impl Config {
     self
   }
 
-  /// Reads the disk on a timer and does not use the watch API of the OS. Default: `false`.
-  ///
-  /// For network drives and other places where the OS reports no changes.
+  /// Reads the disk on a timer in place of the watch API of the OS, for network drives and other
+  /// places where the OS reports no changes. Default: `false`.
   #[must_use]
   pub fn with_polling(mut self, polling: bool) -> Self {
     self.polling = polling;
     self
   }
 
-  /// The pause between two rounds of polling, when the watcher polls everything. Default:
-  /// 100 ms. It is never below 1 ms and never above a year.
-  ///
-  /// A round that takes longer than the pause is followed by a pause as long as itself: polling
-  /// takes half of a core at most. A round looks at every watched file once (20,000 files: about
-  /// 50 ms on APFS), so with many files a longer pause saves the CPU.
+  /// Whether the watcher polls everything ([`with_polling`](Self::with_polling)).
+  pub fn polling(&self) -> bool {
+    self.polling
+  }
+
+  /// The pause between two rounds of polling when the watcher polls everything, and at least as
+  /// long as the round took: polling takes half of a core at most. Default: 100 ms; at least
+  /// 1 ms, at most a year.
   #[must_use]
   pub fn with_poll_interval(mut self, interval: Duration) -> Self {
     self.poll_interval = interval.clamp(SHORTEST_POLL_INTERVAL, LONGEST_SETTING);
@@ -144,13 +124,4 @@ impl Config {
       written_hints: cfg!(any(target_os = "linux", target_os = "android", windows)) && !polling,
     }
   }
-}
-
-/// What the ignore filter is asked about.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum EntryKind {
-  /// Anything that is not a directory: a symbolic link too.
-  File,
-  /// A directory.
-  Dir,
 }

@@ -128,7 +128,7 @@ impl Watcher {
     use crate::backend::windows::WindowsBackend as Native;
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", windows))]
-    if !config.polling {
+    if !config.polling() {
       let poll = config.clone().into_options(true);
       return Self::start(config.into_options(false), poll, handler, Native::new);
     }
