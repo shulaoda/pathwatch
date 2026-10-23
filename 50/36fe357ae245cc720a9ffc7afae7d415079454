@@ -1,0 +1,35 @@
+references/design.md
+  s_0070b6318eca36::t_7d47e4b42bb2eb 177,197,1841-1842
+src/engine/check.rs
+  s_0070b6318eca36::t_8309c006b4e84d 20,22
+src/engine/os_watch.rs
+  s_0070b6318eca36::t_f36bb67a76992e 16-17
+src/engine/watched_paths.rs
+  s_0070b6318eca36::t_077dc35179d063 15-16
+src/path.rs
+  s_0070b6318eca36::t_460e479e59ef56 2-3,7,47-60
+src/tree/marks.rs
+  s_0070b6318eca36::t_52fef5c20c977e 1-326
+src/tree/mod.rs
+  s_0070b6318eca36::t_b310599850cf70 2-6,9,12,16,18,25-32,34,36,42-46,250-263,314-315,317,361,371-372,382-383,390,412-413,415,488,494,508,510,513,561,563,567,571,581-582,599,701,772-831,840
+src/tree/slots.rs
+  s_0070b6318eca36::t_a777d75e749ecb 6,35-43,95-121
+src/tree/spellings.rs
+  s_0070b6318eca36::t_a741f7ab4bc480 1-195
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5036fe357ae245cc720a9ffc7afae7d415079454",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
