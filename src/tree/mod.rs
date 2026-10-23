@@ -306,10 +306,14 @@ impl Tree {
     (node.generation == key.generation()).then_some(node)
   }
 
+  /// The key of the live node in the slot `index`.
+  fn key(&self, index: u32) -> DirKey {
+    DirKey::new(index, self.slots.linked(index).generation)
+  }
+
   /// Every node with its key, the root first.
   pub fn nodes(&self) -> impl Iterator<Item = (DirKey, &Node)> + '_ {
-    self.slots.iter().enumerate().filter_map(|(index, slot)| {
-      let index = u32::try_from(index).expect("the arena holds fewer than 2^32 nodes");
+    (0..).zip(self.slots.iter()).filter_map(|(index, slot)| {
       let node = slot.node()?;
       Some((DirKey::new(index, node.generation), node))
     })
@@ -339,6 +343,17 @@ impl Tree {
   pub fn child(&self, parent: DirKey, name: &OsStr) -> Option<DirKey> {
     self.get(parent)?;
     self.find(parent.index(), name).map(|index| self.key(index))
+  }
+
+  /// The slot of the child `name` of the slot `parent`.
+  fn find(&self, parent: u32, name: &OsStr) -> Option<u32> {
+    self
+      .index
+      .find(child_hash(parent, name), |&index| {
+        let node = self.slots.linked(index);
+        node.parent == parent && name_of(&self.names, node) == name
+      })
+      .copied()
   }
 
   /// The children of a node, the newest first.
@@ -393,72 +408,6 @@ impl Tree {
     }
   }
 
-  /// Writes the path of the node into `path`: empty for the root.
-  pub fn path_into(&self, key: DirKey, path: &mut PathBuf) {
-    path.clear();
-    if self.get(key).is_some() {
-      self.push_names(key.index(), path);
-    }
-  }
-
-  pub fn path(&self, key: DirKey) -> PathBuf {
-    let mut path = PathBuf::new();
-    self.path_into(key, &mut path);
-    path
-  }
-
-  /// Makes the node a watched path, or takes that back. `false`: it was so already.
-  pub fn set_path(&mut self, key: DirKey, is_path: bool) -> bool {
-    let node = &mut self[key];
-    if node.is_path() == is_path {
-      return false;
-    }
-    let was_registered = node.is_registered();
-    node.set_path(is_path);
-    if node.is_registered() != was_registered {
-      self.count_registered(key.index(), is_path);
-    }
-    true
-  }
-
-  /// What to ask of the backend for the directory: `Contents` when the node is complete or a
-  /// registered child is a file, `Names` when each is a directory, `None` when one has nothing.
-  pub fn want(&self, key: DirKey) -> Option<Want> {
-    let node = &self[key];
-    if node.is_complete() {
-      return Some(Want::Contents);
-    }
-    let mut unknown = false;
-    for child in self.children(key) {
-      let child = &self[child];
-      match child.kind {
-        // Kept for a mark only.
-        _ if !child.is_registered() => {}
-        Kind::Dir(_) if !child.is_held() => {}
-        Kind::Missing => unknown = true,
-        // A file, or a held directory.
-        Kind::File(_) | Kind::Dir(_) => return Some(Want::Contents),
-      }
-    }
-    if unknown { None } else { Some(Want::Names) }
-  }
-
-  /// The key of the live node in the slot `index`.
-  fn key(&self, index: u32) -> DirKey {
-    DirKey::new(index, self.slots.linked(index).generation)
-  }
-
-  /// The slot of the child `name` of the slot `parent`.
-  fn find(&self, parent: u32, name: &OsStr) -> Option<u32> {
-    self
-      .index
-      .find(child_hash(parent, name), |&index: &u32| {
-        let node = self.slots.linked(index);
-        node.parent == parent && name_of(&self.names, node) == name
-      })
-      .copied()
-  }
-
   /// Takes a node without children out of the tree. Its key never names a node again.
   fn remove(&mut self, key: DirKey) {
     let slot = &mut self.slots[key.index() as usize];
@@ -511,6 +460,20 @@ impl Tree {
     }
   }
 
+  pub fn path(&self, key: DirKey) -> PathBuf {
+    let mut path = PathBuf::new();
+    self.path_into(key, &mut path);
+    path
+  }
+
+  /// Writes the path of the node into `path`: empty for the root.
+  pub fn path_into(&self, key: DirKey, path: &mut PathBuf) {
+    path.clear();
+    if self.get(key).is_some() {
+      self.push_names(key.index(), path);
+    }
+  }
+
   fn push_names(&self, index: u32, path: &mut PathBuf) {
     let mut near = [NONE; 64];
     let mut far = Vec::new();
@@ -528,6 +491,20 @@ impl Tree {
     for &at in far.iter().rev().chain(near.iter().rev()) {
       push_name(path, name_of(&self.names, self.slots.linked(at)));
     }
+  }
+
+  /// Makes the node a watched path, or takes that back. `false`: it was so already.
+  pub fn set_path(&mut self, key: DirKey, is_path: bool) -> bool {
+    let node = &mut self[key];
+    if node.is_path() == is_path {
+      return false;
+    }
+    let was_registered = node.is_registered();
+    node.set_path(is_path);
+    if node.is_registered() != was_registered {
+      self.count_registered(key.index(), is_path);
+    }
+    true
   }
 
   /// The node in slot `child` was registered, or is no more: the counts above follow, up to a
@@ -565,6 +542,27 @@ impl Tree {
         self.not_plain.remove(&parent);
       }
     }
+  }
+
+  /// What to ask of the backend for the directory: `Contents` when the node is complete or a
+  /// registered child is a file, `Names` when each is a directory, `None` when one has nothing.
+  pub fn want(&self, key: DirKey) -> Option<Want> {
+    if self[key].is_complete() {
+      return Some(Want::Contents);
+    }
+    let mut unknown = false;
+    for child in self.children(key) {
+      let child = &self[child];
+      match child.kind {
+        // Kept for a mark only.
+        _ if !child.is_registered() => {}
+        Kind::Dir(_) if !child.is_held() => {}
+        Kind::Missing => unknown = true,
+        // A file, or a held directory.
+        Kind::File(_) | Kind::Dir(_) => return Some(Want::Contents),
+      }
+    }
+    if unknown { None } else { Some(Want::Names) }
   }
 
   /// A hash of the real path, if the node was a link at its last check.
