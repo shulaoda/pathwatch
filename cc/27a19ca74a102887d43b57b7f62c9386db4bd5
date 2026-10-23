@@ -1,0 +1,25 @@
+references/design.md
+  s_0070b6318eca36::t_e3f5735758bc53 1841
+src/fs/apple.rs
+  s_0070b6318eca36::t_84638988ebc5dd 1-3,63-66,92,104-108,135,282-326
+src/fs/mod.rs
+  s_0070b6318eca36::t_0e2128f9765b2f 1-8,20-23,26-34,152-153,238-250,261-262,272-277,336-365,367-380,382-384
+src/fs/windows.rs
+  s_0070b6318eca36::t_d4bef0c31d30cd 513
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cc27a19ca74a102887d43b57b7f62c9386db4bd5",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
