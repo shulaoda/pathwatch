@@ -510,11 +510,10 @@ mod tests {
   use std::{
     fs,
     io::{self, Write},
+    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
     path::Path,
     process::Command,
   };
-
-  use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
 
   use windows_sys::Win32::{
     Foundation::{ERROR_BAD_NETPATH, ERROR_SHARING_VIOLATION, GENERIC_READ},

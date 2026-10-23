@@ -1838,7 +1838,7 @@ The test files of the simulator:
 **The other tests** (`tests/`, and the `mod tests` of `src/`):
 
 - Private functions (a `mod tests` at the end of the file): `tree/mod.rs`, `tree/names.rs`,
-  `path.rs`, `fs/mod.rs`, `fs/windows.rs`, `engine/events.rs`, and helpers of the backends.
+  `path.rs`, `fs/apple.rs`, `fs/windows.rs`, `engine/events.rs`, and helpers of the backends.
 - The tree alone (`tests/tree.rs`): the arena, the table, and the way from a hint to a mark.
 - The engine on a real directory with the poll backend and a clock that the test moves
   (`tests/poll.rs`): a file whose time is ahead of the clock (5.8; it counts the reads), the

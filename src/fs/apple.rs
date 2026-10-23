@@ -1,6 +1,6 @@
-//! macOS: a listing with what `lstat` tells of each entry, in one call, and the name of one
-//! entry as the disk spells it. A file or a directory is taken from the listing on APFS only
-//! (`references/design.md` 5.4).
+//! macOS: a listing with what `lstat` tells of each entry, in one call, the name of one entry
+//! as the disk spells it, and the kind of a disk. A file or a directory is taken from the
+//! listing on APFS only (`references/design.md` 5.4).
 
 use std::{
   ffi::{CString, OsStr, OsString, c_char, c_void},
@@ -60,6 +60,10 @@ const LOOK: u32 =
 /// The content of the file is in a cloud, not on this disk.
 const SF_DATALESS: u32 = 0x4000_0000;
 const O_DIRECTORY: i32 = 0x0010_0000;
+// For `open_regular` and `is_link_loop`: the other systems take these from `libc`.
+pub(super) const O_NOFOLLOW: i32 = 0x0100;
+pub(super) const O_NONBLOCK: i32 = 0x0004;
+pub(super) const ELOOP: i32 = 62;
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
 const VLNK: u32 = 5;
@@ -85,7 +89,7 @@ fn stat_fs(dir: &Path) -> Option<StatFs> {
 }
 
 /// The device number of the disk under `dir`, if it is an APFS disk.
-pub fn apfs_volume(dir: &Path) -> Option<i32> {
+fn apfs_volume(dir: &Path) -> Option<i32> {
   stat_fs(dir).filter(|answer| answer.type_name.starts_with(b"apfs\0")).map(|answer| answer.id[0])
 }
 
@@ -97,9 +101,11 @@ pub fn remote_disk(dir: &Path) -> Option<String> {
   Some(String::from_utf8_lossy(name).into_owned())
 }
 
-/// `volume` is what `apfs_volume` gave for `dir`. An entry on another device is given as a
-/// name only: the directory can be another one by now.
-pub fn read_dir(dir: &Path, volume: i32, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<()> {
+/// Lists `dir` with what `lstat` tells of each entry. `Ok(false)`: std lists it instead, as the
+/// disk is not APFS. An entry on another device is given as a name only: the directory can be
+/// another one by now.
+pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<bool> {
+  let Some(volume) = apfs_volume(dir) else { return Ok(false) };
   // Not a pipe, which would wait for its writer.
   let dir = OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(dir)?;
   let common = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | LOOK;
@@ -126,7 +132,7 @@ pub fn read_dir(dir: &Path, volume: i32, each: &mut dyn FnMut(&OsStr, Entry)) ->
       return Err(error);
     }
     if count == 0 {
-      return Ok(());
+      return Ok(true);
     }
     let mut rest = &buffer[..];
     for _ in 0..count {
@@ -272,4 +278,49 @@ pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
 
 pub(super) fn name_on_disk(path: &Path) -> io::Result<OsString> {
   name_and_kind(path).map(|(name, _)| name)
+}
+
+#[cfg(test)]
+mod tests {
+  use std::{
+    fs,
+    io::{self, Write},
+    os::unix::fs::symlink,
+    process::Command,
+  };
+
+  use crate::fs::{Entry, FileType, Fs, StdFs};
+
+  /// On APFS the listing tells of a file and of a directory what `lstat` tells, also while the
+  /// file is open and written.
+  #[test]
+  fn the_listing_tells_what_lstat_tells() {
+    let top = tempfile::tempdir().unwrap();
+    fs::create_dir(top.path().join("dir")).unwrap();
+    symlink("file", top.path().join("link")).unwrap();
+    let mut file = fs::File::create(top.path().join("file")).unwrap();
+    file.write_all(b"written").unwrap();
+
+    let mut seen = Vec::new();
+    StdFs.read_dir(top.path(), &mut |name, entry| seen.push((name.to_owned(), entry))).unwrap();
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    let [
+      (_, Entry::Dir { id, modified: dir_modified }),
+      (_, Entry::File { modified, size, file_id }),
+      (_, Entry::Kind(FileType::Symlink)),
+    ] = seen[..]
+    else {
+      panic!("{seen:?}");
+    };
+    let meta = StdFs.lstat(&top.path().join("file")).unwrap();
+    assert_eq!((modified, size, file_id), (meta.modified, meta.size, meta.file_id));
+    let dir = StdFs.lstat(&top.path().join("dir")).unwrap();
+    assert_eq!((id, dir_modified), (dir.dir_id, dir.modified));
+
+    // A pipe is no directory: the listing fails and does not wait for a writer.
+    let pipe = top.path().join("pipe");
+    assert!(Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+    let error = StdFs.read_dir(&pipe, &mut |_, _| {}).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
+  }
 }
