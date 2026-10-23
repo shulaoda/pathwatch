@@ -1,6 +1,3 @@
-//! The tree of the paths that the engine knows, and the work that waits in it. It never reads
-//! the disk.
-
 mod flags;
 mod marks;
 mod names;
@@ -76,7 +73,6 @@ impl Node {
     }
   }
 
-  /// Whether a directory is on disk at the path. Not while the node is held.
   pub fn is_dir(&self) -> bool {
     self.dir().is_some()
   }
@@ -122,7 +118,6 @@ impl Node {
   }
 }
 
-/// What the tree has at a path.
 #[derive(Clone, Copy, Debug)]
 pub enum Kind {
   Missing,
@@ -130,7 +125,6 @@ pub enum Kind {
   Dir(Dir),
 }
 
-/// What tells one state of a file from the next without reading it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Fingerprint {
   pub modified: i64,
@@ -144,8 +138,7 @@ impl Fingerprint {
   }
 }
 
-/// What the tree keeps for a directory that is on disk.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 #[expect(clippy::struct_excessive_bools, reason = "each one is a state of the directory")]
 pub struct Dir {
   /// Tells this directory from another one at the same path.
@@ -169,9 +162,7 @@ pub struct Dir {
 impl Dir {
   /// A directory that was just found.
   pub fn new(id: DirId, complete: bool) -> Self {
-    let (asked, scan) = (None, None);
-    let (has_error, relist, away) = (false, false, false);
-    Self { id, complete, asked, watch: Watch::None, has_error, scan, relist, away }
+    Self { id, complete, ..Self::default() }
   }
 
   /// Whether the timer looks at the directory: no OS watch does, or it had an error.
@@ -181,9 +172,9 @@ impl Dir {
 }
 
 /// How changes in a directory are heard.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Watch {
-  /// The backend was not asked yet, or the node is no directory.
+  #[default]
   None,
   /// The backend watches this directory.
   Watched,
@@ -209,7 +200,6 @@ impl Watch {
   }
 }
 
-/// How far a scan goes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Depth {
   /// Only the names are compared with a listing; without a listing, a shallow scan.
@@ -220,7 +210,6 @@ pub enum Depth {
   Deep,
 }
 
-/// What the running `watch` call did with a node. The end of the call sets it back to `No`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Added {
   /// Nothing, or no call is running.
@@ -231,7 +220,6 @@ pub enum Added {
   Registered,
 }
 
-/// What is kept for a file whose fingerprint is not trusted at its next check.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Content {
   /// This hash of the content decides.
@@ -243,7 +231,6 @@ pub enum Content {
   Pending,
 }
 
-/// The nodes, the table that finds a child by its name, and the work that waits.
 #[derive(Debug)]
 pub struct Tree {
   /// The arena. Its last slot is never free ([`Tree::give_back`]).
@@ -287,7 +274,7 @@ impl Tree {
   pub fn new() -> Self {
     let mut names = Names::default();
     let mut root = Node::new(0, NONE, names.add(OsStr::new("")));
-    root.kind = Kind::Dir(Dir { watch: Watch::Polled, ..Dir::new(DirId::default(), false) });
+    root.kind = Kind::Dir(Dir { watch: Watch::Polled, ..Dir::default() });
     let mut slots = Slots::default();
     slots.push(Slot::Live(root));
     Self {
@@ -505,8 +492,7 @@ impl Tree {
     }
   }
 
-  /// Gives memory back after nodes went. A node never moves, so only the free end of the arena
-  /// goes; the table waits for an eighth in use, since it rehashes.
+  /// Gives memory back after nodes went.
   fn give_back(&mut self) {
     while let Some(&Slot::Free(generation)) = self.slots.last() {
       self.first_generation = self.first_generation.max(generation);
@@ -526,8 +512,6 @@ impl Tree {
   }
 
   fn push_names(&self, index: u32, path: &mut PathBuf) {
-    // No recursion: a tree can be deeper than the stack. Only a path deeper than 64 asks for
-    // memory.
     let mut near = [NONE; 64];
     let mut far = Vec::new();
     let mut count = 0;
@@ -617,11 +601,6 @@ impl Tree {
     }
   }
 
-  #[cfg(feature = "test-hooks")]
-  pub fn content_room(&self) -> usize {
-    self.contents.capacity()
-  }
-
   /// For a file far ahead of the clock: when a look first found its fingerprint.
   pub fn ahead_since(&self, key: DirKey) -> Option<Instant> {
     self.ahead.get(&key).copied()
@@ -663,6 +642,11 @@ impl Tree {
   /// Whether a node above is held: then nothing is done here before its second look.
   pub fn frozen(&self, key: DirKey) -> bool {
     !self.holds.is_empty() && self.above(key).any(|at| self.slots.linked(at).is_held())
+  }
+
+  #[cfg(feature = "test-hooks")]
+  pub fn content_room(&self) -> usize {
+    self.contents.capacity()
   }
 
   /// Checks the links, the table and the counts.
