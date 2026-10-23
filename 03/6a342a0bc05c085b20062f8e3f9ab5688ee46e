@@ -1,0 +1,25 @@
+Cargo.toml
+  s_0070b6318eca36::t_8091d691063a96 22-23
+src/backend/fsevents.rs
+  s_0070b6318eca36::t_0b8848daf66d25 662,664,885-886,926,971,974,998,1001-1002,1208,1211-1212,1306
+src/fs/apple.rs
+  s_0070b6318eca36::t_1ccb9640b40ce0 6,17-22,29-30,36-47,50,53,55,61-67,72-74,86,90-91,93,95,216,223
+src/fs/mod.rs
+  s_0070b6318eca36::t_067c7babed5444 20-21,28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "036a342a0bc05c085b20062f8e3f9ab5688ee46e",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
