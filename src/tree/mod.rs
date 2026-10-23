@@ -400,7 +400,7 @@ impl Tree {
     let free = iter::from_fn(|| self.free.pop()).find(|&index| (index as usize) < slots);
     let index = if let Some(index) = free {
       let slot = &mut self.slots[index as usize];
-      let Slot::Free { generation } = *slot else { unreachable!("the slot is on the free list") };
+      let Slot::Free(generation) = *slot else { unreachable!("the slot is on the free list") };
       *slot = Slot::Live(Node::new(generation, parent, name_at));
       index
     } else {
@@ -501,7 +501,7 @@ impl Tree {
   fn remove(&mut self, key: DirKey) {
     let slot = &mut self.slots[key.index() as usize];
     let Some(generation) = slot.node().map(|node| node.generation.wrapping_add(1)) else { return };
-    let Slot::Live(node) = mem::replace(slot, Slot::Free { generation }) else { return };
+    let Slot::Live(node) = mem::replace(slot, Slot::Free(generation)) else { return };
     self.free.push(key.index());
 
     if node.prev == NONE {
@@ -534,7 +534,7 @@ impl Tree {
   /// end of the arena can go. A block shrinks only when less than half is in use, so a tree that
   /// grows and shrinks by a little moves nothing; the table waits for an eighth, since it rehashes.
   fn give_back(&mut self) {
-    while let Some(&Slot::Free { generation }) = self.slots.last() {
+    while let Some(&Slot::Free(generation)) = self.slots.last() {
       self.first_generation = self.first_generation.max(generation);
       self.slots.pop();
     }
