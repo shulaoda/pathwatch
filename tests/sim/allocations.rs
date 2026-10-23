@@ -142,16 +142,13 @@ impl Story {
   }
 }
 
-/// Paths that are watched already, in their clean form: `watch` asks for no memory. A path is
-/// not copied to be cleaned, and nothing new goes into the tree.
+/// Paths that are watched already, in their clean form: `watch` asks for no memory. Nothing new
+/// goes into the tree.
 #[test]
 fn watching_the_same_paths_again_asks_for_nothing() {
   let mut s = story();
   let (again, mut out) = (paths(), Output::default());
   assert_eq!(requests(|| s.engine.watch(again, s.now, &mut out)), 0);
-  // A path that is not clean is copied once.
-  let (unclean, mut out) = (vec![PathBuf::from("/p//src/./a.js")], Output::default());
-  assert_eq!(requests(|| s.engine.watch(unclean, s.now, &mut out)), 1);
 }
 
 /// One changed file: the hint and its flush ask for memory once, for the path of the event.

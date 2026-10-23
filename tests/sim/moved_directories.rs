@@ -5,14 +5,10 @@
 use std::{path::Path, time::Duration};
 
 use crate::fixtures::{
-  Driver, Mode, NONE, RECURSIVE, SimBackend, SimRaw, caught_up, flush, known, on_a_small_stack,
-  on_all, on_modes, settled, sorted, taken, window, window_then_settled,
+  Driver, Mode, NONE, RECURSIVE, SimRaw, caught_up, flush, known, on_a_small_stack, on_all,
+  on_modes, settled, sorted, taken, window, window_then_settled,
 };
 use pathwatch::{ErrorKind, engine::Options};
-
-fn driver(mode: Mode) -> Driver<SimBackend> {
-  Driver::sim(mode, Options::default())
-}
 
 /// The watched directory is renamed away and back while its tree is read, at every moment of
 /// the call. The listing that fails finds the directory again from above, and nothing below it
@@ -22,7 +18,7 @@ fn driver(mode: Mode) -> Driver<SimBackend> {
 fn a_directory_away_and_back_while_its_tree_is_read() {
   for mode in Mode::ALL {
     let prepare = || {
-      let d = driver(mode);
+      let d = Driver::sim(mode, Options::default());
       d.fs.mkdir_all("/p/r/sub/deep").unwrap();
       d.fs.write("/p/r/a", "1").unwrap();
       d.fs.write("/p/r/sub/b", "1").unwrap();
@@ -61,7 +57,7 @@ fn a_directory_away_and_back_while_its_tree_is_read() {
 #[test]
 fn a_tree_deeper_than_the_stack_is_moved_away() {
   on_a_small_stack(|| {
-    let mut d = driver(Mode::Handle);
+    let mut d = Driver::sim(Mode::Handle, Options::default());
     let chain = "/p".to_owned() + &"/d".repeat(1500);
     d.fs.mkdir_all(&chain).unwrap();
     d.fs.write(format!("{chain}/leaf"), "1").unwrap();
@@ -123,7 +119,7 @@ fn away_and_back_inside_one_window() {
 /// so nothing is said about it.
 #[test]
 fn the_baseline_inside_a_replaced_directory() {
-  let mut d = driver(Mode::Inode);
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir_all("/p/d").unwrap();
   d.fs.mkdir_all("/p/next").unwrap();
   d.fs.write("/p/d/f", "1").unwrap();
@@ -370,7 +366,7 @@ fn a_directory_gets_a_new_stream_before_the_end_of_its_old_one_is_told() {
 /// watched directory `/p/x/d`, which has the only stream.
 #[test]
 fn a_polled_directory_gets_a_watch() {
-  let mut d = driver(Mode::Prefix);
+  let mut d = Driver::sim(Mode::Prefix, Options::default());
   d.fs.mkdir_all("/p/x/d").unwrap();
   d.fs.mkdir_all("/p/next/d").unwrap();
   d.fs.write("/p/x/d/f.js", "1").unwrap();
@@ -394,7 +390,7 @@ fn a_polled_directory_gets_a_watch() {
 /// mount point by its path. The engine checks the node there and finds another directory.
 #[test]
 fn a_volume_mounted_over_a_watched_directory() {
-  let mut d = driver(Mode::Inode);
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir_all("/w/sub").unwrap();
   d.fs.write("/w/sub/old.js", "1").unwrap();
   d.watch(&["/w"]);

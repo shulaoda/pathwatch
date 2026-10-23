@@ -82,11 +82,11 @@ impl Fs for Disk {
   }
 }
 
-/// The directory as the engine spells it: `canonicalize` gives the `\\?\` form on Windows,
-/// which the engine takes for the plain one.
+/// The directory as the engine takes it: `canonicalize` gives the `\\?\` form on Windows, and
+/// `normalize` the plain one.
 fn normalized(dir: &Path) -> PathBuf {
   let dir = dir.canonicalize().unwrap();
-  pathwatch::path::normalize(&dir).unwrap().into_owned()
+  pathwatch::path::normalize(&dir).unwrap()
 }
 
 /// The engine with the poll backend on a real directory, polled every 100 ms.
@@ -240,7 +240,7 @@ fn a_stopped_backend_is_polled_as_a_watcher_that_only_polls() {
   let mut engine = Engine::new(backend, StdFs, options.clone());
   engine.fall_back_to(Options { poll_interval: INTERVAL, delete_delay: Duration::ZERO, ..options });
   let (start, mut out) = (Instant::now(), Output::default());
-  engine.watch(vec![dir.path().to_owned()], start, &mut out);
+  engine.watch(vec![pathwatch::path::normalize(dir.path()).unwrap()], start, &mut out);
   let first_poll = engine.deadline().expect("only the poll is due, in an hour");
   assert!(first_poll >= start + hour && first_poll < start + hour + Duration::from_secs(1));
 

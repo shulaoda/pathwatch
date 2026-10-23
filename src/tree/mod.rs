@@ -400,7 +400,7 @@ impl Tree {
   }
 
   /// The next child in the list of the parent: a loop can change the tree on the way, as long as it
-  /// frees no node.
+  /// frees no node but the one it is at, after it read the next.
   pub fn next_sibling(&self, child: DirKey) -> Option<DirKey> {
     let next = self.get(child)?.next;
     (next != NONE).then(|| self.key(next))
@@ -1100,16 +1100,9 @@ impl Tree {
       let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
       return listed.iter().copied().filter(|&child| Some(child) != exact).collect();
     }
-    // The table files the names that differ only in the case of ASCII letters under one hash.
     let any_child = linked(&self.slots, at).is_complete();
-    let is_meant = |&child: &u32| {
-      let node = linked(&self.slots, child);
-      Some(child) != exact
-        && node.parent == at
-        && (any_child || node.is_registered())
-        && name_of(&self.names, node).eq_ignore_ascii_case(name)
-    };
-    self.index.iter_hash(child_hash(at, name)).copied().filter(is_meant).collect()
+    let alike = self.alike(at, name, exact);
+    alike.filter(|&child| any_child || linked(&self.slots, child).is_registered()).collect()
   }
 
   /// Whether the name of the node `key` is plain: the table finds every other spelling of it.
@@ -1137,15 +1130,20 @@ impl Tree {
   }
 
   /// The other nodes of the directory whose names differ from the name of `key` only in the case
-  /// of ASCII letters: the table files them under one hash.
+  /// of ASCII letters.
   fn twins(&self, key: DirKey) -> impl Iterator<Item = u32> + '_ {
     let node = &self[key];
-    let name = name_of(&self.names, node);
-    self.index.iter_hash(child_hash(node.parent, name)).copied().filter(move |&other| {
-      let other_node = linked(&self.slots, other);
-      other != key.index()
-        && other_node.parent == node.parent
-        && name_of(&self.names, other_node).eq_ignore_ascii_case(name)
+    self.alike(node.parent, name_of(&self.names, node), Some(key.index()))
+  }
+
+  /// The children of slot `parent` but `except` whose names differ from `name` in the case of
+  /// ASCII letters at most: the table files them under one hash.
+  fn alike(&self, parent: u32, name: &OsStr, except: Option<u32>) -> impl Iterator<Item = u32> {
+    self.index.iter_hash(child_hash(parent, name)).copied().filter(move |&index| {
+      let node = linked(&self.slots, index);
+      Some(index) != except
+        && node.parent == parent
+        && name_of(&self.names, node).eq_ignore_ascii_case(name)
     })
   }
 }
@@ -1308,18 +1306,16 @@ impl Tree {
     if reached != live || self.index.len() + 1 != live {
       return Err("a node is in no list of children, or not in the table".to_owned());
     }
+    // The names on the list: the registered ones that are not plain.
+    let registered = |node: &Node| node.is_registered() && !is_plain(name_of(&self.names, node));
     let listed = |(parent, children): (&u32, &Vec<u32>)| {
       !children.is_empty()
         && children.iter().all(|&child| {
           let node = self.slots.get(child as usize).and_then(Slot::node);
-          node.is_some_and(|node| {
-            node.parent == *parent && node.is_registered() && !is_plain(name_of(&self.names, node))
-          })
+          node.is_some_and(|node| node.parent == *parent && registered(node))
         })
     };
-    let registered = |node: &Node| node.is_registered() && !is_plain(name_of(&self.names, node));
     let on_lists: usize = self.not_plain.values().map(Vec::len).sum();
-    // The names on the list: the registered ones that are not plain.
     if !self.not_plain.iter().all(listed)
       || on_lists != self.nodes().filter(|(_, node)| registered(node)).count()
     {

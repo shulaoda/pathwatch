@@ -5,14 +5,10 @@
 use std::time::Duration;
 
 use crate::fixtures::{
-  Deliver, Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, caught_up, ignore_node_modules, settled,
-  show, taken, window,
+  Deliver, Driver, Mode, NONE, RECURSIVE, Sim, caught_up, ignore_node_modules, settled, show,
+  taken, window,
 };
 use pathwatch::{ErrorKind, backend::poll::PollBackend, engine::Options};
-
-fn driver(mode: Mode) -> Driver<SimBackend> {
-  Driver::sim(mode, Options::default())
-}
 
 /// With no delay, the flush is due as soon as a hint is there.
 #[test]
@@ -32,7 +28,7 @@ fn zero_delay() {
 /// A hint for a name that no watched path can see leaves none, and moves nothing.
 #[test]
 fn the_flush_waits_for_the_quiet_time() {
-  let mut d = driver(Mode::Inode);
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir("/p").unwrap();
   d.fs.write("/p/a", "1").unwrap();
   d.watch(&["/p/a"]);

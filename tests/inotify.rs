@@ -1,6 +1,9 @@
 //! The inotify backend alone, on the real kernel: its hints, its watches and its shutdown.
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
+#[path = "common/gate.rs"]
+mod gate;
+
 use std::{
   collections::HashSet,
   ffi::OsStr,
@@ -13,14 +16,14 @@ use std::{
   path::{Path, PathBuf},
   process::Command,
   sync::{
-    Arc, Condvar, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    Arc,
     mpsc::{self, Receiver, TryRecvError},
   },
   thread,
   time::{Duration, Instant, SystemTime},
 };
 
+use gate::Gate;
 use pathwatch::backend::{
   Backend, Coverage, DirKey, Hint, Signal, Sink, Want, inotify::InotifyBackend, is_watch_limit,
 };
@@ -68,48 +71,6 @@ fn event(wd: i32, mask: u32, name: &str) -> Vec<u8> {
   raw.extend(name.bytes());
   raw.resize(16 + name_len, 0);
   raw
-}
-
-/// While it is shut, the reader of the backend stops inside the sink.
-#[derive(Default)]
-struct Gate {
-  shut: Mutex<bool>,
-  moved: Condvar,
-  /// How many sends stop at the gate now.
-  waiting: AtomicUsize,
-}
-
-/// Opens the gate again when dropped, also when the test fails: a shut gate blocks the drop.
-struct Shut<'a>(&'a Gate);
-
-impl Gate {
-  fn shut(&self) -> Shut<'_> {
-    *self.shut.lock().unwrap() = true;
-    Shut(self)
-  }
-
-  fn pass(&self) {
-    let shut = self.shut.lock().unwrap();
-    self.waiting.fetch_add(1, Ordering::SeqCst);
-    drop(self.moved.wait_while(shut, |shut| *shut).unwrap());
-    self.waiting.fetch_sub(1, Ordering::SeqCst);
-  }
-
-  /// Returns once a send stops at the shut gate.
-  fn until_one_waits(&self) {
-    let deadline = Instant::now() + TIMEOUT;
-    while self.waiting.load(Ordering::SeqCst) == 0 {
-      assert!(Instant::now() < deadline, "nothing came to the gate");
-      thread::sleep(Duration::from_millis(1));
-    }
-  }
-}
-
-impl Drop for Shut<'_> {
-  fn drop(&mut self) {
-    *self.0.shut.lock().unwrap() = false;
-    self.0.moved.notify_all();
-  }
 }
 
 struct Harness {

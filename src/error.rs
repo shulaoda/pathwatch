@@ -6,21 +6,28 @@ use std::{
 /// What went wrong. The handler gets one error of a kind for a batch, with one path that shows
 /// the problem, and the watcher keeps running after every error.
 ///
-/// Its text is the kind, the path and the source in a row, each once. [`source`] gives the
-/// source once more, for code that looks at the error of the OS: a report that prints the text
-/// and then every source would say the last part twice.
+/// Its text is the kind, what happened to the watcher when the error is about it, the path and
+/// the source in a row, each once. [`source`] gives the source once more, for code that looks at
+/// the error of the OS: a report that prints the text and then every source would say the last
+/// part twice.
 ///
 /// [`source`]: std::error::Error::source
 #[derive(Debug)]
 pub struct Error {
   kind: ErrorKind,
+  what: Option<&'static str>,
   path: Option<PathBuf>,
   source: Option<io::Error>,
 }
 
 impl Error {
   pub(crate) fn new(kind: ErrorKind, path: Option<PathBuf>, source: Option<io::Error>) -> Self {
-    Self { kind, path, source }
+    Self { kind, what: None, path, source }
+  }
+
+  /// An `Io` error about the watcher itself: `what` says what happened to it.
+  pub(crate) fn of_watcher(what: &'static str, source: io::Error) -> Self {
+    Self { kind: ErrorKind::Io, what: Some(what), path: None, source: Some(source) }
   }
 
   /// Which kind of error it is.
@@ -44,6 +51,9 @@ impl fmt::Display for Error {
       ErrorKind::Io => "input or output error",
       ErrorKind::Closed => "the watcher is closed",
     })?;
+    if let Some(what) = self.what {
+      write!(f, ": {what}")?;
+    }
     if let Some(path) = &self.path {
       write!(f, ": {}", path.display())?;
     }
@@ -51,29 +61,6 @@ impl fmt::Display for Error {
       write!(f, ": {source}")?;
     }
     Ok(())
-  }
-}
-
-/// `what: error`, with `error` kept as the source: its OS error code stays readable.
-pub(crate) fn context(what: &'static str, error: io::Error) -> io::Error {
-  io::Error::new(error.kind(), Context { what, error })
-}
-
-#[derive(Debug)]
-struct Context {
-  what: &'static str,
-  error: io::Error,
-}
-
-impl fmt::Display for Context {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "{}: {}", self.what, self.error)
-  }
-}
-
-impl error::Error for Context {
-  fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-    Some(&self.error)
   }
 }
 

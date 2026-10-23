@@ -260,7 +260,7 @@ fn wide(high: u32, low: u32) -> u64 {
 
 /// The room for one answer of the system. The records in it start at multiples of eight.
 #[repr(C, align(8))]
-struct Aligned<const N: usize>([u8; N]);
+struct Aligned([u8; 16 * 1024]);
 
 // A record is read from its bytes at these offsets, each checked against the answer.
 const NEXT: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, NextEntryOffset);
@@ -301,7 +301,7 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
     return Ok(false);
   }
 
-  let mut records = Aligned([0; 16 * 1024]);
+  let mut records = Aligned([0; _]);
   let size = u32::try_from(records.0.len()).unwrap_or(u32::MAX);
   // The text of a name, kept for the next entry: a listing asks for no memory for each entry
   // (a directory of 50,000 files: 615 ns an entry with a name made for each, 571 ns now,

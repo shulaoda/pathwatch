@@ -2,8 +2,7 @@
 //! away, and no link is resolved. The disk is never asked.
 
 use std::{
-  borrow::Cow,
-  ffi::OsStr,
+  ffi::{OsStr, OsString},
   path::{Path, PathBuf},
 };
 
@@ -11,44 +10,25 @@ use std::{
 ///
 /// `None` when the path is relative, has a NUL, names a top directory (`/`, `C:\`,
 /// `\\server\share\`), goes above it with `..`, or has a name longer than `MAX_NAME`; on
-/// Windows also when a name is one that Windows does not take as it is (`is_name`). A path that
-/// is clean already is given back as it is: no copy.
-pub fn normalize(path: &Path) -> Option<Cow<'_, Path>> {
-  #[cfg(unix)]
-  {
-    use std::{
-      ffi::OsString,
-      os::unix::ffi::{OsStrExt, OsStringExt},
-    };
-    let bytes = path.as_os_str().as_bytes();
-    if unix_is_clean(bytes) {
-      return Some(Cow::Borrowed(path));
-    }
-    unix(bytes).map(|bytes| Cow::Owned(PathBuf::from(OsString::from_vec(bytes))))
-  }
-  #[cfg(windows)]
-  {
-    use std::{
-      ffi::OsString,
-      os::windows::ffi::{OsStrExt, OsStringExt},
-    };
-    // The bytes of the path, not its UTF-16 units: every character that the rules name is one
-    // ASCII byte there, and a name has at least as many bytes as units.
-    if windows_rules::windows_is_clean(path.as_os_str().as_encoded_bytes()) {
-      return Some(Cow::Borrowed(path));
-    }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    windows_rules::windows(&wide).map(|wide| Cow::Owned(PathBuf::from(OsString::from_wide(&wide))))
-  }
+/// Windows also when a name is one that Windows does not take as it is (`is_name`).
+pub fn normalize(path: &Path) -> Option<PathBuf> {
+  // The rules read the bytes of the path, on Windows too: every character that they name is one
+  // ASCII byte there, and every byte of another character is above 0x7F.
+  let text = path.as_os_str().as_encoded_bytes();
+  // Anywhere else a path must be UTF-8.
   #[cfg(not(any(unix, windows)))]
-  {
-    let bytes = unix(path.to_str()?.as_bytes())?;
-    String::from_utf8(bytes).ok().map(|clean| Cow::Owned(PathBuf::from(clean)))
-  }
+  path.to_str()?;
+  #[cfg(windows)]
+  let clean = windows_rules::windows(text)?;
+  #[cfg(not(windows))]
+  let clean = unix(text)?;
+  // SAFETY: `clean` is pieces of `text` cut next to ASCII bytes, joined by ASCII bytes.
+  Some(PathBuf::from(unsafe { OsString::from_encoded_bytes_unchecked(clean) }))
 }
 
-/// The longest name that can be watched, in units. No disk takes more than 255, and the tree
-/// keeps the length of a name in 16 bits of bytes: 3 bytes a unit, two names for a share.
+/// The longest name that can be watched, in bytes. No disk takes a name of more than 765 bytes
+/// (255 UTF-16 units of 3 bytes), and the tree keeps the length of a name in 16 bits: two names
+/// for a share.
 const MAX_NAME: usize = 10_000;
 
 /// Splits a clean path at its top directory: `/a/b` gives `/` and `a/b`.
@@ -63,158 +43,109 @@ pub(crate) fn split_top(path: &Path) -> Option<(&OsStr, &Path)> {
   Some((top.as_os_str(), rest))
 }
 
-/// A byte on Unix, a UTF-16 unit on Windows. The rules are generic, so that the Windows rules
-/// are tested on every system.
-trait Unit: Copy + Into<u32> + From<u8> {}
-
-impl<U: Copy + Into<u32> + From<u8>> Unit for U {}
-
-/// Whether [`unix`] would give `text` back as it is.
-#[cfg(any(unix, test))]
-fn unix_is_clean<U: Unit>(text: &[U]) -> bool {
-  let is_slash = |unit: U| is(unit, b'/');
-  text
-    .split_first()
-    .is_some_and(|(first, rest)| is_slash(*first) && names_are_clean(rest, is_slash, any_name))
-}
-
 /// The Unix rules: the path starts with `/`, and only `/` separates.
 #[cfg(any(not(windows), test))]
-fn unix<U: Unit>(text: &[U]) -> Option<Vec<U>> {
-  let (first, rest) = text.split_first()?;
-  if !is(*first, b'/') {
-    return None;
-  }
+fn unix(text: &[u8]) -> Option<Vec<u8>> {
+  let rest = text.strip_prefix(b"/")?;
   // The clean form is never longer than the text: one allocation is enough.
   let mut clean = Vec::with_capacity(text.len());
-  clean.push(U::from(b'/'));
-  push_names(&mut clean, rest, |unit| is(unit, b'/'), b'/', any_name)?;
+  clean.push(b'/');
+  push_names(&mut clean, rest, |byte| byte == b'/', b'/', |_| true)?;
   Some(clean)
 }
 
 /// The Windows rules. They are compiled for the tests of every system.
 #[cfg(any(windows, test))]
 mod windows_rules {
-  use super::{MAX_NAME, Unit, has_nul, is, names_are_clean, push_names};
+  use super::{MAX_NAME, push_names};
 
   /// Whether Windows finds an entry under this very name. It takes a dot or a space off the end
   /// of a name, reads `:` as the start of a stream of the file, and has no name with a control
   /// character or one of `< > " | ? *`. A path with such a name would be watched and never get
-  /// an event: no record of the OS spells it so. `/` separates, and the clean form has none.
-  fn is_name<U: Unit>(name: &[U]) -> bool {
-    let is_kept =
-      |unit: U| unit.into() >= 0x20 && !br#"<>:"|?*/"#.iter().any(|&byte| is(unit, byte));
-    let ends_well = name.last().is_none_or(|&last| !is(last, b'.') && !is(last, b' '));
-    ends_well && name.iter().all(|&unit| is_kept(unit))
+  /// an event: no record of the OS spells it so.
+  fn is_name(name: &[u8]) -> bool {
+    let is_kept = |byte: u8| byte >= 0x20 && !br#"<>:"|?*"#.contains(&byte);
+    !matches!(name.last(), Some(b'.' | b' ')) && name.iter().all(|&byte| is_kept(byte))
   }
 
-  /// Whether [`windows`] would give `text` back as it is. Only the usual form is looked at,
-  /// `C:\a\b`: a clean path on a share is cleaned again, which gives the same path.
-  pub(super) fn windows_is_clean<U: Unit>(text: &[U]) -> bool {
-    let back = |unit: U| is(unit, b'\\');
-    after_drive(text, back).is_some_and(|rest| names_are_clean(rest, back, is_name))
+  fn is_separator(byte: u8) -> bool {
+    matches!(byte, b'\\' | b'/')
   }
 
-  pub(super) fn windows<U: Unit>(text: &[U]) -> Option<Vec<U>> {
-    let either: fn(U) -> bool = |unit| is(unit, b'\\') || is(unit, b'/');
-    let back: fn(U) -> bool = |unit| is(unit, b'\\');
+  pub(super) fn windows(text: &[u8]) -> Option<Vec<u8>> {
     let mut clean = Vec::with_capacity(text.len());
-
-    let (rest, separator) = if let Some(verbatim) = strip(text, br"\\?\") {
+    let rest = if let Some(verbatim) = strip(text, br"\\?\") {
       // In a verbatim path only `\` separates, and `/` is a plain character that the normal form
-      // cannot hold.
-      if verbatim.iter().any(|&unit| is(unit, b'/')) {
+      // cannot hold. Such a path is refused, so the usual separators find the same names.
+      if verbatim.contains(&b'/') {
         return None;
       }
-      let rest = match strip(verbatim, br"UNC\") {
-        Some(share) => push_share(&mut clean, share, back)?,
-        None => push_drive(&mut clean, verbatim, back)?,
-      };
-      (rest, back)
-    } else if let [first, second, share @ ..] = text
-      && either(*first)
-      && either(*second)
-    {
-      (push_share(&mut clean, share, either)?, either)
+      match strip(verbatim, br"UNC\") {
+        Some(share) => push_share(&mut clean, share)?,
+        None => push_drive(&mut clean, verbatim)?,
+      }
+    } else if let [b'\\' | b'/', b'\\' | b'/', share @ ..] = text {
+      push_share(&mut clean, share)?
     } else {
-      (push_drive(&mut clean, text, either)?, either)
+      push_drive(&mut clean, text)?
     };
-    push_names(&mut clean, rest, separator, b'\\', is_name)?;
+    push_names(&mut clean, rest, is_separator, b'\\', is_name)?;
     Some(clean)
   }
 
-  /// What comes after `C:\` at the start of `text`, where `separator` says what `\` can be.
-  /// `C:name` and `\name` are not absolute.
-  fn after_drive<U: Unit>(text: &[U], separator: impl Fn(U) -> bool) -> Option<&[U]> {
-    let [letter, colon, slash, rest @ ..] = text else { return None };
-    let is_letter =
-      char::from_u32((*letter).into()).is_some_and(|letter| letter.is_ascii_alphabetic());
-    (is_letter && is(*colon, b':') && separator(*slash)).then_some(rest)
-  }
-
-  /// Appends `C:\` and returns what comes after it.
-  fn push_drive<'a, U: Unit>(
-    clean: &mut Vec<U>,
-    text: &'a [U],
-    separator: impl Fn(U) -> bool,
-  ) -> Option<&'a [U]> {
-    let rest = after_drive(text, separator)?;
-    clean.extend_from_slice(&text[..2]);
-    clean.push(U::from(b'\\'));
+  /// Appends `C:\` and returns what comes after it. `C:name` and `\name` are not absolute.
+  fn push_drive<'a>(clean: &mut Vec<u8>, text: &'a [u8]) -> Option<&'a [u8]> {
+    let [letter, b':', b'\\' | b'/', rest @ ..] = text else { return None };
+    if !letter.is_ascii_alphabetic() {
+      return None;
+    }
+    clean.extend([*letter, b':', b'\\']);
     Some(rest)
   }
 
   /// Appends `\\server\share\` and returns what comes after it. `text` starts at the server name.
-  fn push_share<'a, U: Unit>(
-    clean: &mut Vec<U>,
-    text: &'a [U],
-    separator: impl Fn(U) -> bool,
-  ) -> Option<&'a [U]> {
+  fn push_share<'a>(clean: &mut Vec<u8>, text: &'a [u8]) -> Option<&'a [u8]> {
     let mut rest = text;
-    clean.extend([U::from(b'\\'), U::from(b'\\')]);
+    clean.extend_from_slice(br"\\");
     for is_server in [true, false] {
-      let start = rest.iter().position(|&unit| !separator(unit))?;
+      let start = rest.iter().position(|&byte| !is_separator(byte))?;
       // Windows refuses a third separator before the server, and takes one too many before
       // the share.
       if is_server && start != 0 {
         return None;
       }
       let name = &rest[start..];
-      let end = name.iter().position(|&unit| separator(unit)).unwrap_or(name.len());
+      let end = name.iter().position(|&byte| is_separator(byte)).unwrap_or(name.len());
       let (name, after) = name.split_at(end);
       // `\\.\` and `\\?\` name devices, not shares.
-      let device = matches!(name, [only] if is(*only, b'.') || is(*only, b'?'));
-      if device || has_nul(name) || name.len() > MAX_NAME {
+      if matches!(name, [b'.' | b'?']) || name.contains(&0) || name.len() > MAX_NAME {
         return None;
       }
       clean.extend_from_slice(name);
-      clean.push(U::from(b'\\'));
+      clean.push(b'\\');
       rest = after;
     }
     Some(rest)
   }
 
   /// What comes after `prefix` at the start of `text`, in any case of its ASCII letters.
-  fn strip<'a, U: Unit>(text: &'a [U], prefix: &[u8]) -> Option<&'a [U]> {
+  fn strip<'a>(text: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     let (head, rest) = text.split_at_checked(prefix.len())?;
-    let same = |(&unit, &byte): (&U, &u8)| {
-      char::from_u32(unit.into()).is_some_and(|unit| unit.eq_ignore_ascii_case(&char::from(byte)))
-    };
-    head.iter().zip(prefix).all(same).then_some(rest)
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
   }
 }
 
 /// Appends the names of `text` to `clean`, which holds the top directory and ends with a
 /// separator. At least one name must be left, or the path is a top directory.
-fn push_names<U: Unit>(
-  clean: &mut Vec<U>,
-  text: &[U],
-  separator: impl Fn(U) -> bool,
+fn push_names(
+  clean: &mut Vec<u8>,
+  text: &[u8],
+  separator: impl Fn(u8) -> bool,
   join: u8,
-  is_name: fn(&[U]) -> bool,
+  is_name: fn(&[u8]) -> bool,
 ) -> Option<()> {
   let top = clean.len();
-  for name in text.split(|&unit| separator(unit)) {
+  for name in text.split(|&byte| separator(byte)) {
     match part_of(name, is_name) {
       Part::Nothing => {}
       Part::Unusable => return None,
@@ -223,34 +154,18 @@ fn push_names<U: Unit>(
         if clean.len() == top {
           return None;
         }
-        let last = clean[top..].iter().rposition(|&unit| is(unit, join)).unwrap_or(0);
+        let last = clean[top..].iter().rposition(|&byte| byte == join).unwrap_or(0);
         clean.truncate(top + last);
       }
       Part::Name => {
         if clean.len() > top {
-          clean.push(U::from(join));
+          clean.push(join);
         }
         clean.extend_from_slice(name);
       }
     }
   }
   (clean.len() > top).then_some(())
-}
-
-/// Whether what comes after a top directory is clean: names with one separator between them.
-#[cfg(any(unix, windows, test))]
-fn names_are_clean<U: Unit>(
-  text: &[U],
-  separator: impl Fn(U) -> bool,
-  is_name: fn(&[U]) -> bool,
-) -> bool {
-  text.split(|&unit| separator(unit)).all(|name| matches!(part_of(name, is_name), Part::Name))
-}
-
-/// The Unix rule for a name: every text is one.
-#[cfg(any(not(windows), test))]
-fn any_name<U: Unit>(_name: &[U]) -> bool {
-  true
 }
 
 /// What the text between two separators is.
@@ -265,40 +180,27 @@ enum Part {
   Name,
 }
 
-fn part_of<U: Unit>(name: &[U], is_name: fn(&[U]) -> bool) -> Part {
+fn part_of(name: &[u8], is_name: fn(&[u8]) -> bool) -> Part {
   match name {
-    [] => Part::Nothing,
-    [dot] if is(*dot, b'.') => Part::Nothing,
-    [dot, second] if is(*dot, b'.') && is(*second, b'.') => Part::Parent,
-    _ if has_nul(name) || name.len() > MAX_NAME || !is_name(name) => Part::Unusable,
+    [] | [b'.'] => Part::Nothing,
+    [b'.', b'.'] => Part::Parent,
+    _ if name.contains(&0) || name.len() > MAX_NAME || !is_name(name) => Part::Unusable,
     _ => Part::Name,
   }
-}
-
-fn has_nul<U: Unit>(name: &[U]) -> bool {
-  name.iter().any(|&unit| is(unit, 0))
-}
-
-fn is<U: Unit>(unit: U, byte: u8) -> bool {
-  unit.into() == u32::from(byte)
 }
 
 #[cfg(test)]
 mod tests {
   #[cfg(any(unix, windows))]
   use super::normalize;
-  use super::{
-    MAX_NAME, unix, unix_is_clean,
-    windows_rules::{windows, windows_is_clean},
-  };
+  use super::{MAX_NAME, unix, windows_rules::windows};
 
   fn clean_unix(text: &str) -> Option<String> {
     unix(text.as_bytes()).map(|bytes| String::from_utf8(bytes).unwrap())
   }
 
   fn clean_windows(text: &str) -> Option<String> {
-    let wide: Vec<u16> = text.encode_utf16().collect();
-    windows(&wide).map(|wide| String::from_utf16(&wide).unwrap())
+    windows(text.as_bytes()).map(|bytes| String::from_utf8(bytes).unwrap())
   }
 
   #[test]
@@ -331,8 +233,6 @@ mod tests {
     ];
     for (given, expected) in table {
       assert_eq!(clean_unix(given).as_deref(), expected, "{given:?}");
-      // A path is taken as it is when it is its own clean form, and only then.
-      assert_eq!(unix_is_clean(given.as_bytes()), expected == Some(given), "{given:?}");
     }
   }
 
@@ -354,6 +254,8 @@ mod tests {
       (r"\\?\C:\a\\b\", Some(r"C:\a\b")),
       (r"\\?\UNC\server\share\a", Some(r"\\server\share\a")),
       (r"\\?\unc\server\share\a", Some(r"\\server\share\a")),
+      // Names outside ASCII are bytes like the others.
+      ("C:\\\u{e9}\\\u{4e2d}", Some("C:\\\u{e9}\\\u{4e2d}")),
       // Not absolute.
       ("", None),
       (r"a\b", None),
@@ -405,18 +307,13 @@ mod tests {
     ];
     for (given, expected) in table {
       assert_eq!(clean_windows(given).as_deref(), expected, "{given:?}");
-      // A clean path with a drive letter is taken as it is. One on a share is cleaned again.
-      let taken = expected == Some(given) && !given.starts_with('\\');
-      assert_eq!(windows_is_clean(given.as_bytes()), taken, "{given:?}");
-      let wide: Vec<u16> = given.encode_utf16().collect();
-      assert_eq!(windows_is_clean(&wide), taken, "{given:?}");
     }
   }
 
-  /// The length of a name fits in 16 bits as bytes, also for a top directory of two UTF-16 names.
+  /// The length of a name fits in 16 bits, also for a top directory of two names.
   #[test]
   fn a_name_has_a_longest_length() {
-    u16::try_from(2 * 3 * MAX_NAME + 4).unwrap();
+    u16::try_from(2 * MAX_NAME + 4).unwrap();
 
     let (longest, too_long) = ("x".repeat(MAX_NAME), "x".repeat(MAX_NAME + 1));
     assert!(clean_unix(&format!("/a/{longest}/b")).is_some());
@@ -429,6 +326,10 @@ mod tests {
     assert_eq!(clean_windows(&format!(r"\\{too_long}\share\a")), None);
     assert_eq!(clean_windows(&format!(r"\\server\{too_long}\a")), None);
     assert_eq!(clean_windows(&format!(r"\\?\UNC\server\{too_long}\a")), None);
+    // The length is in bytes on Windows too: `é` is two.
+    let (longest, too_long) = ("\u{e9}".repeat(MAX_NAME / 2), "\u{e9}".repeat(MAX_NAME / 2 + 1));
+    assert!(clean_windows(&format!(r"C:\a\{longest}")).is_some());
+    assert_eq!(clean_windows(&format!(r"C:\a\{too_long}")), None);
   }
 
   #[cfg(unix)]
@@ -444,9 +345,21 @@ mod tests {
   #[cfg(windows)]
   #[test]
   fn the_host_rules_are_the_windows_rules() {
-    use std::path::Path;
+    use std::{
+      ffi::OsString,
+      os::windows::ffi::OsStringExt,
+      path::{Path, PathBuf},
+    };
 
     assert_eq!(normalize(Path::new(r"\\?\C:\a\.\b\")).as_deref(), Some(Path::new(r"C:\a\b")));
     assert_eq!(normalize(Path::new(r"C:\")), None);
+
+    // A name that is no UTF-16 is kept as it is, and the two halves of a character in two names
+    // stay apart.
+    let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+    let given = [wide(r"C:\a\"), vec![0xD83D], wide(r"\x\..\"), vec![0xDE00], wide(r"\.\")];
+    let expected = [wide(r"C:\a\"), vec![0xD83D], wide(r"\"), vec![0xDE00]];
+    let path = |units: Vec<u16>| PathBuf::from(OsString::from_wide(&units));
+    assert_eq!(normalize(&path(given.concat())), Some(path(expected.concat())));
   }
 }

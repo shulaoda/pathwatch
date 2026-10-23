@@ -144,9 +144,9 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
 }
 
 mod place {
-  use std::path::{Component, Path, PathBuf};
+  use std::path::{Path, PathBuf};
 
-  use crate::backend::{DirKey, Want};
+  use crate::backend::{DirKey, Want, may_watch_a_tree};
 
   #[derive(Debug, PartialEq, Eq)]
   pub struct Place {
@@ -165,7 +165,7 @@ mod place {
     is_link: &mut dyn FnMut(&Path) -> bool,
   ) -> Vec<Place> {
     let mut wanted: Vec<_> =
-      wanted.iter().copied().filter(|&(_, dir, _)| may_hold_a_handle(dir)).collect();
+      wanted.iter().copied().filter(|&(_, dir, _)| may_watch_a_tree(dir)).collect();
     wanted.sort_by(|a, b| a.1.cmp(b.1));
 
     let mut tops: Vec<&Path> = Vec::new();
@@ -196,7 +196,7 @@ mod place {
         }
         if shared[at..end].contains(&depth)
           && let common = first_parts(tops[at], depth)
-          && may_hold_a_handle(&common)
+          && may_watch_a_tree(&common)
         {
           // A directory with a link between the common directory and itself cannot be served
           // from there; the others join, also across it. The tops of a group have no link
@@ -263,18 +263,6 @@ mod place {
     let names = dir.strip_prefix(top).map_or(0, |below| below.components().count());
     dir.ancestors().take(names).any(is_link)
   }
-
-  pub(super) fn may_hold_a_handle(dir: &Path) -> bool {
-    let mut names = dir.components().filter_map(|part| match part {
-      Component::Normal(name) => Some(name),
-      _ => None,
-    });
-    match (names.next(), names.next(), names.next()) {
-      (None, ..) => false,
-      (Some(first), _, None) => !first.eq_ignore_ascii_case("Users"),
-      _ => true,
-    }
-  }
 }
 
 mod handles {
@@ -287,9 +275,9 @@ mod handles {
 
   use rustc_hash::{FxHashMap, FxHashSet};
 
-  use super::place::{link_between, may_hold_a_handle, place};
+  use super::place::{link_between, place};
   use crate::{
-    backend::{Coverage, DirKey, Want, give_room_back, same, watch_limit},
+    backend::{Coverage, DirKey, Want, give_room_back, may_watch_a_tree, same, watch_limit},
     fs::wide_name,
   };
 
@@ -384,7 +372,7 @@ mod handles {
           if want == Want::Contents { Coverage::WatchedTree } else { Coverage::Watched };
         return (coverage, told);
       }
-      if want == Want::Names || !may_hold_a_handle(dir) {
+      if want == Want::Names || !may_watch_a_tree(dir) {
         self.waiting.insert(key, dir.to_owned());
         return (Coverage::NotWatched, told);
       }

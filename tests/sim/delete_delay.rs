@@ -6,20 +6,15 @@
 use std::{collections::BTreeMap, io, time::Duration};
 
 use crate::fixtures::{
-  Deliver, Driver, Mode, NONE, Sim, SimBackend, SimFs, caught_up, flush, on_all, settled, show,
-  taken, window,
+  Deliver, Driver, Mode, NONE, Sim, SimFs, caught_up, flush, on_all, settled, show, taken, window,
 };
 use pathwatch::{ErrorKind, engine::Options};
-
-fn inode() -> Driver<SimBackend> {
-  Driver::sim(Mode::Inode, Options::default())
-}
 
 /// The delay counts from the hint of each file, not from the look that found it gone: a file
 /// that went earlier gets its `Delete` earlier, also when the look came to it last.
 #[test]
 fn the_delay_counts_from_the_hint_of_each_file() {
-  let mut d = inode();
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir("/p").unwrap();
   d.fs.write("/p/a", "1").unwrap();
   d.fs.write("/p/b", "1").unwrap();
@@ -47,7 +42,7 @@ fn the_delay_counts_from_the_hint_of_each_file() {
 /// the second look comes at once, and the `Delete` with the next batch.
 #[test]
 fn a_late_first_look_gets_its_second_look_at_once() {
-  let mut d = inode();
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir("/p").unwrap();
   d.fs.write("/p/a", "1").unwrap();
   d.watch(&["/p/a"]);
@@ -84,7 +79,7 @@ fn zero_turns_the_delay_off() {
 /// The check at the deadline finds a file that no notification announced.
 #[test]
 fn the_check_at_the_deadline_finds_the_file() {
-  let mut d = inode();
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir("/p").unwrap();
   d.fs.write("/p/a", "1").unwrap();
   d.watch(&["/p/a"]);
@@ -133,7 +128,7 @@ fn a_directory_comes_back_inside_the_delay() {
 /// batch after the delay has the 1,000 deletes.
 #[test]
 fn rm_r_of_1000_files_is_one_held_node() {
-  let mut d = inode();
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir_all("/p/r/big").unwrap();
   for file in 0..1000 {
     d.fs.write(format!("/p/r/big/f{file}"), "1").unwrap();
@@ -196,7 +191,7 @@ fn a_directory_that_is_back_with_no_hint_gets_no_delete() {
 /// is back, everything below it is compared with what was there before.
 #[test]
 fn nothing_below_a_held_directory_is_checked() {
-  let mut d = inode();
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir_all("/p/r/d/sub").unwrap();
   d.fs.mkdir("/q").unwrap();
   d.fs.write("/p/r/d/sub/f", "1").unwrap();
@@ -229,7 +224,7 @@ fn a_held_directory_below_a_held_directory() {
   let millis = Duration::from_millis;
   // When `d` comes back, in milliseconds after the start. `None`: never.
   for back_at in [None, Some(50), Some(120)] {
-    let mut d = inode();
+    let mut d = Driver::sim(Mode::Inode, Options::default());
     d.fs.mkdir_all("/p/r/d/sub").unwrap();
     d.fs.mkdir("/q").unwrap();
     d.fs.write("/p/r/d/sub/f", "1").unwrap();
@@ -330,7 +325,7 @@ fn a_poll_does_not_go_below_a_held_directory() {
 #[test]
 fn a_file_that_is_held_twice_waits_for_its_second_time() {
   let millis = Duration::from_millis;
-  let mut d = inode();
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir("/p").unwrap();
   d.fs.write("/p/a", "1").unwrap();
   d.watch(&["/p/a"]);

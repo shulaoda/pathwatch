@@ -24,7 +24,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use self::ffi::{Notices, Queue, Stream};
 use crate::{
   backend::{
-    Backend, Committed, Coverage, DirKey, Hint, Sink, Want, give_room_back, same, watch_limit,
+    Backend, Committed, Coverage, DirKey, Hint, Sink, Want, give_room_back, may_watch_a_tree, same,
+    watch_limit,
   },
   fs::{FileType, is_missing, name_and_kind},
 };
@@ -122,7 +123,7 @@ impl Backend for FsEventsBackend {
         }
         return Coverage::Watched;
       }
-      if !may_hold_a_stream(&real) {
+      if !may_watch_a_tree(real.strip_prefix(DATA_VOLUME).unwrap_or(&real)) {
         self.unwatch(key);
         return Coverage::NotWatched;
       }
@@ -197,7 +198,7 @@ impl Backend for FsEventsBackend {
     for key in raw.lost.iter().copied().chain(self.told()) {
       hint(Hint::Changed { dir: key, rel: Path::new("") });
     }
-    let covers = &self.covers;
+    let covers = &self.covers.by_dir;
     let mut lost_places = Vec::new();
     let mut moved_dirs = Vec::new();
     for (path, flags) in raw.records() {
@@ -218,14 +219,17 @@ impl Backend for FsEventsBackend {
       if is_dir && flags & flag::DIR_REPLACED != 0 {
         moved_dirs.push(path);
       }
-      for (keys, rel) in covers.by_dir.holders(path) {
+      for (keys, rel) in covers.holders(path) {
         for &key in keys {
           hint(Hint::Changed { dir: key, rel });
         }
       }
     }
-    let moved = covers.by_dir.below(&moved_dirs).flat_map(|(_, keys)| keys).copied();
-    for key in covers.keys_around(&lost_places).chain(moved) {
+    // Every cover that can see a place where records were lost, and every cover below such a
+    // place or a directory that moved.
+    let holding = lost_places.iter().flat_map(|place| covers.holders(place)).map(|(keys, _)| keys);
+    let below = covers.below(&lost_places).chain(covers.below(&moved_dirs)).map(|(_, keys)| keys);
+    for &key in holding.chain(below).flatten() {
       hint(Hint::Changed { dir: key, rel: Path::new("") });
     }
   }
@@ -263,14 +267,18 @@ impl FsEventsBackend {
     Ok(real)
   }
 
-  /// The keys at and below the directories whose guards told since the last look: each checks
+  /// The keys at and below the directories whose guards told since the last look: renamed, also
+  /// only in letter case, removed, or a volume came or went at or above them. Each key checks
   /// its directory, and each cover is read again, as its stream heard nothing while its path
-  /// was another one, also when the path is back by now.
+  /// was another one, also when the path is back by now. The stream paths at and below these
+  /// directories are trusted no more (`references/design.md` 7.2).
   fn told(&mut self) -> Vec<DirKey> {
-    let moved = self.streams.moved();
+    let moved = self.streams.guard.take();
     if moved.is_empty() {
       return Vec::new();
     }
+    self.streams.guard_is_stale = true;
+    self.streams.distrust(&moved);
     let is_below = |dir: &Path| moved.iter().any(|moved| dir.starts_with(moved));
     let named = self.named.iter().filter(|(_, dir)| is_below(dir)).map(|(&key, _)| key);
     named.chain(self.covers.keys_at_or_below(&moved)).collect()
@@ -370,14 +378,6 @@ impl Covers {
   ) -> impl Iterator<Item = DirKey> + 'a {
     let at = dirs.iter().filter_map(|dir| self.by_dir.get(dir.as_ref()));
     at.chain(self.by_dir.below(dirs).map(|(_, keys)| keys)).flatten().copied()
-  }
-
-  /// The keys of the covers that hold a directory of `dirs`, and of the covers below one: every
-  /// key that can see what is at or below them.
-  fn keys_around<'a>(&'a self, dirs: &'a [impl AsRef<Path>]) -> impl Iterator<Item = DirKey> + 'a {
-    let holding = dirs.iter().flat_map(|dir| self.by_dir.holders(dir.as_ref()));
-    let below = self.by_dir.below(dirs).map(|(_, keys)| keys);
-    holding.map(|(keys, _)| keys).chain(below).flatten().copied()
   }
 }
 
@@ -521,23 +521,12 @@ impl Streams {
     keep
   }
 
-  /// The directories whose guards told since the last look: renamed, also only in letter case,
-  /// removed, or a volume came or went at or above them. Their guards close, and the stream
-  /// paths at and below them are trusted no more (`references/design.md` 7.2).
-  fn moved(&mut self) -> Vec<PathBuf> {
-    let moved = self.guard.take();
-    if !moved.is_empty() {
-      self.guard_is_stale = true;
-      self.distrust(&moved);
-    }
-    top_most(moved)
-  }
-
   /// Closes the guards that no stream path and none of `named` needs. Only after the start: the
   /// old stream paths keep theirs until new streams stand, or for good if none could start.
   fn fit_guard(&mut self, named: &FxHashMap<DirKey, PathBuf>) {
     let wanted = wanted(self.paths.keys(), named.values().map(PathBuf::as_path));
     self.guard.dirs.retain(|dir, _| wanted.binary_search(&dir.as_path()).is_ok());
+    give_room_back(&mut self.guard.dirs);
     self.guard_is_stale = false;
   }
 
@@ -701,10 +690,10 @@ impl Guard {
     Ok(Guarded { file, _ticket: ticket, id: self.last_id })
   }
 
-  /// The directories of the guards that told since the last look, and after a volume came or
-  /// went, of the guards that stand on another directory than the one at their path now: the
-  /// volume tells no guard. Each is closed, and so is each guard below it, whose directory left
-  /// with it: other directories may be at their paths now.
+  /// The top-most directories of the guards that told since the last look, and after a volume
+  /// came or went, of the guards that stand on another directory than the one at their path now:
+  /// the volume tells no guard. Each is closed, and so is each guard below it, whose directory
+  /// left with it: other directories may be at their paths now.
   fn take(&mut self) -> Vec<PathBuf> {
     let told = self.notices.take();
     if told.is_empty() {
@@ -716,8 +705,7 @@ impl Guard {
       told.contains(&guarded.id)
         || (volumes && guarded.file.metadata().ok().map(id) != fs::metadata(dir).ok().map(id))
     };
-    let moved: Vec<PathBuf> =
-      self.dirs.iter().filter(has_moved).map(|(dir, _)| dir.clone()).collect();
+    let moved = top_most(self.dirs.iter().filter(has_moved).map(|(dir, _)| dir.clone()).collect());
     self.dirs.retain(|dir, _| !moved.iter().any(|moved| dir.starts_with(moved)));
     moved
   }
@@ -753,18 +741,6 @@ pub fn is_too_high(dir: &Path) -> bool {
     [] | [_] | [_, _] => true,
     [b"private", b"var", b"folders", below @ ..] => below.len() <= 3,
     _ => false,
-  }
-}
-
-/// Whether a stream may stand on the directory that a cover asks for: not on `/`, `/Users`
-/// or a home directory, where every program of the user writes. The same three that no
-/// handle of Windows is put on (`windows::place::may_hold_a_handle`).
-fn may_hold_a_stream(dir: &Path) -> bool {
-  let mut names = names_of(dir);
-  match (names.next(), names.next(), names.next()) {
-    (None, ..) => false,
-    (Some(first), _, None) => first != b"Users",
-    _ => true,
   }
 }
 
@@ -997,14 +973,7 @@ mod ffi {
         dispatch_resume(source.as_ptr());
       }
       let notices = Self { queue: fd, source, told };
-      notices.add(&KEvent {
-        ident: 0,
-        filter: EVFILT_FS,
-        flags: EV_ADD | EV_CLEAR,
-        fflags: VQ_MOUNT | VQ_UNMOUNT,
-        data: 0,
-        udata: ptr::without_provenance_mut(VOLUMES),
-      })?;
+      notices.add(0, EVFILT_FS, VQ_MOUNT | VQ_UNMOUNT, VOLUMES)?;
       Ok(notices)
     }
 
@@ -1022,19 +991,17 @@ mod ffi {
     /// Asks for the notice `id` when the directory of `file` is renamed or removed, or its
     /// volume goes. The ask goes with the file when it is closed.
     pub(super) fn watch(&self, file: &File, id: usize) -> io::Result<()> {
-      self.add(&KEvent {
-        ident: usize::try_from(file.as_raw_fd()).map_err(io::Error::other)?,
-        filter: EVFILT_VNODE,
-        flags: EV_ADD | EV_CLEAR,
-        fflags: NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE,
-        data: 0,
-        udata: ptr::without_provenance_mut(id),
-      })
+      let fd = usize::try_from(file.as_raw_fd()).map_err(io::Error::other)?;
+      self.add(fd, EVFILT_VNODE, NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE, id)
     }
 
-    fn add(&self, change: &KEvent) -> io::Result<()> {
+    /// Asks for the notice `id` of `filter` with `fflags` on `ident`.
+    fn add(&self, ident: usize, filter: i16, fflags: u32, id: usize) -> io::Result<()> {
+      let udata = ptr::without_provenance_mut(id);
+      let change = KEvent { ident, filter, flags: EV_ADD | EV_CLEAR, fflags, data: 0, udata };
       // SAFETY: `change` is one whole `kevent`; the call reads it, writes none, and does not wait.
-      let done = unsafe { kevent(self.queue, change, 1, ptr::null_mut(), 0, ptr::null()) };
+      let done =
+        unsafe { kevent(self.queue, &raw const change, 1, ptr::null_mut(), 0, ptr::null()) };
       if done < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
   }
@@ -1096,31 +1063,16 @@ mod ffi {
     }
 
     pub(super) fn sync<F: FnOnce() + Send>(&self, work: F) {
-      extern "C" fn run<F: FnOnce() + Send>(context: *mut c_void) {
-        // SAFETY: `context` is the `&mut Option<F>` of `sync` below, which waits until this ran:
-        // the value is alive, and nothing else touches it meanwhile.
-        let work = unsafe { &mut *context.cast::<Option<F>>() };
-        if let Some(work) = work.take() {
-          work();
-        }
-      }
-      let mut work = Some(work);
-      // SAFETY: the queue is open, and the call returns only when `run` has run, so `work`
-      // lives long enough.
-      unsafe { dispatch_sync_f(self.0.as_ptr(), (&raw mut work).cast(), run::<F>) };
+      // SAFETY: the queue is open, and `call` takes the box back once, before this returns.
+      unsafe { dispatch_sync_f(self.0.as_ptr(), Box::into_raw(Box::new(work)).cast(), call::<F>) };
     }
 
     /// Runs `work` on the queue, after what waits there, and does not wait for it: the queue
     /// can be busy for a long time with a callback. A `sync` after it waits for it too.
     pub(super) fn run<F: FnOnce() + Send + 'static>(&self, work: F) {
-      extern "C" fn run<F: FnOnce() + Send>(context: *mut c_void) {
-        // SAFETY: `context` came from `Box::into_raw` in `run` below, and the queue runs it once.
-        let work = unsafe { Box::from_raw(context.cast::<F>()) };
-        work();
-      }
       let work = Box::into_raw(Box::new(work));
-      // SAFETY: the queue is open, and libdispatch keeps it until the work has run.
-      unsafe { dispatch_async_f(self.0.as_ptr(), work.cast(), run::<F>) };
+      // SAFETY: the queue is open, and libdispatch keeps it until `call` has run.
+      unsafe { dispatch_async_f(self.0.as_ptr(), work.cast(), call::<F>) };
     }
   }
 
@@ -1129,6 +1081,14 @@ mod ffi {
       // SAFETY: the queue came from `dispatch_queue_create`, and this is its one release.
       unsafe { dispatch_release(self.0.as_ptr()) };
     }
+  }
+
+  /// The work of `Queue::sync` and `Queue::run`.
+  extern "C" fn call<F: FnOnce()>(context: *mut c_void) {
+    // SAFETY: `context` came from `Box::into_raw` of an `F` in `sync` or `run`, and the queue
+    // calls this once for it.
+    let work = unsafe { Box::from_raw(context.cast::<F>()) };
+    work();
   }
 
   #[derive(Debug)]
@@ -1411,7 +1371,7 @@ mod ffi {
 mod tests {
   use std::path::{Path, PathBuf};
 
-  use super::{DATA_VOLUME, Dirs, is_too_high, may_hold_a_stream, place, short_way};
+  use super::{DATA_VOLUME, Dirs, is_too_high, may_watch_a_tree, place, short_way};
 
   fn paths(paths: &[&str]) -> Vec<PathBuf> {
     paths.iter().map(PathBuf::from).collect()
@@ -1486,12 +1446,16 @@ mod tests {
 
   #[test]
   fn where_a_stream_may_stand_for_a_cover() {
+    let may_stand = |dir: &str| {
+      let dir = Path::new(dir);
+      may_watch_a_tree(dir.strip_prefix(DATA_VOLUME).unwrap_or(dir))
+    };
     for dir in ["/", "/Users", "/Users/me", "/System/Volumes/Data", "/System/Volumes/Data/Users/me"]
     {
-      assert!(!may_hold_a_stream(Path::new(dir)), "{dir}");
+      assert!(!may_stand(dir), "{dir}");
     }
     for dir in ["/Users/me/project", "/Volumes/disk", "/opt/homebrew", "/private/tmp", "/home"] {
-      assert!(may_hold_a_stream(Path::new(dir)), "{dir}");
+      assert!(may_stand(dir), "{dir}");
     }
   }
 

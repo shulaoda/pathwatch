@@ -32,7 +32,7 @@ watcher.close();
 | `close()` | Stops the backend and waits for the thread. After it the handler is not called again, and `watch` and `unwatch` return `Closed`. A check of the disk that runs ends at its next step, so the wait is one look at most. Dropping the watcher calls it. |
 | the handler | `FnMut(Result<Vec<Event>, Error>) + Send + 'static`. It runs on the watcher thread. A call of the watcher from inside it does not wait: it takes effect when the handler has returned. |
 | `Event { path, kind }` | `EventKind`: `Create`, `Update`, `Delete`. |
-| `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `RemoteDisk`, `Io`, `Closed`. One error of a kind is handed over for a flush, and one `RemoteDisk` for each disk (5.12). Its text is these three in a row (see below). |
+| `Error` | `kind()` (what the caller can do about it), `path()` (one path that shows the problem; none when the problem is the watcher itself), `source()` (what the OS or the backend said). `ErrorKind`: `InvalidPath`, `WatchLimit`, `PermissionDenied`, `RemoteDisk`, `Io`, `Closed`. One error of a kind is handed over for a flush, and one `RemoteDisk` for each disk (5.12). Its text is the kind, what happened to the watcher when the error is about it, the path and the source in a row, each once (see below). |
 | `Config` | `with_ignored(f)` (5.11); `with_debounce(d)`: the quiet time, none on macOS and 10 ms elsewhere (5.13); `with_delete_delay(d)`: the delete delay, 10 ms, none under polling, zero turns it off (5.9); `with_polling(bool)`; `with_poll_interval(d)`: 100 ms, at least 1 ms, used when the watcher polls everything. A time of the settings is a year at most (`Config`): `Duration::MAX` says "never", and is no time that can be added to a clock. |
 
 `Watcher` is `Send + Sync`.
@@ -53,7 +53,8 @@ never got an event (measured): no record of the OS spells it so.
 A path that does not exist is fine. A path that cannot be watched or read right now stays
 registered, the handler gets the error, and the path is polled.
 
-The text of an error is its kind, its path and its source, each said once:
+The text of an error is its kind, what happened to the watcher when the error is about it, its
+path and its source, each said once:
 
 ```text
 permission denied: /p/secret: Permission denied (os error 13)
@@ -64,7 +65,7 @@ input or output error: the OS watcher stopped, so every path is polled: Bad file
 The source of a limit is written by the backend that met it, so it names that very limit and
 what to raise. (Before, the kind named one limit for each OS, also when another one was met.)
 An error
-without a path is about the watcher: its backend did not start or has stopped, and the source
+without a path is about the watcher: its backend did not start or has stopped, and the text
 says which, and that every path is polled now.
 
 Not an option: with a native backend the poll of what the OS does not watch runs once a
@@ -232,8 +233,10 @@ when its parent is complete, and in both cases the filter does not ignore it as 
 Every check that finds the directory on disk works it out. The tree can be behind the rule for a
 while: a directory that becomes a watched path is complete in the tree after its next look.
 Where it matters, the rule itself is asked (`Engine::tracks_every_entry`): in `unwatch`, and in
-the check of a name that is not registered in a partial directory. It uses the answers of the
-filter that the nodes keep, and it asks nothing where the tree has no directory.
+the check of a name that is not registered in a partial directory. It only walks up to the
+watched path, and asks the filter nothing: every node with a file or a directory keeps the answer
+"not ignored" for that kind (invariant 8), and so does every name on the way to a watched path
+(5.11).
 
 A **held** node (5.9) still has the file or the directory that was there, and so has every node
 below it. But no directory is on disk at a held node: no hint goes into it, and nothing below
@@ -259,6 +262,10 @@ every engine call):
    the node or above it).
 7. A directory that relies on a watch above (`FromAbove`) has one there. The exception is a
    look that waits for the disk to answer: then a mark waits on the node or above it.
+8. Every node but the root that has a file or a directory keeps the answer of the filter for
+   that kind, and it is "not ignored": an ignored entry keeps no node, and an ignored watched
+   path counts as missing (5.11). This rests on the contract of the filter: the same answer for
+   the same path and kind.
 
 6 and 7 say nothing about what is below a held node: nothing is known there.
 
@@ -571,7 +578,8 @@ The one more look is spent by whatever flush comes next, a poll or the hints of 
 when that flush falls between the steps too, nothing looks again (measured with the steps 300
 ms apart, which no tool does; the story keeps them 50 ms apart, clear of the poll).
 
-`still_there(node, deep, away)`: `arm` the node, and with `deep` also queue a deep scan.
+`still_there(node, deep, away)`: `arm` the node, and with `deep` also queue a deep scan, else a
+shallow one when a listing named an entry that was gone (`relist`, below).
 `deep` is true for a `deep` mark, when the directory was held, when it is another directory
 than before, and when a link on the way changed (5.14).
 Nothing below the node is thrown away: the deep scan compares each file with the fingerprint
@@ -618,6 +626,9 @@ makes it complete now, sets `complete`, asks the backend with the higher want, a
 That scan checks the child directories in the same way, so this goes all the way down.
 
 ### 5.7 `watch` and the baseline, `unwatch`
+
+The engine takes the paths of `watch` and `unwatch` as they come: the watcher has cleaned
+them (section 2).
 
 **`watch`** (`engine/watched_paths.rs`). A path below a directory that the filter ignores, or
 one that it ignores as a file and as a directory, is left out (5.11). For each other new
@@ -893,7 +904,7 @@ next commit. The watch state of the node:
 | `Watched` | the backend watches this directory |
 | `WatchedTree` | the backend watches this directory and every real directory below it |
 | `FromAbove` | a node above is `WatchedTree`; the backend is not asked for this one |
-| `Polled` | no OS watch covers it (the answer `NotWatched`, a held node, or the backend is dead) |
+| `Polled` | no OS watch covers it (the answer `NotWatched`, a held node, or no backend: it did not start, or it died) |
 | `Failed` | the backend could not watch it; the error is reported once |
 | `None` | the directory was just found and the backend was not asked yet; also: no directory is on disk |
 
@@ -903,7 +914,8 @@ next commit. The watch state of the node:
 - If the backend says that it cannot go on, the error is reported once, every node becomes
   `Polled`, and everything is scanned. From then on the settings are those of a watcher that
   polls everything (`Engine::fall_back_to`): the poll interval of the settings and no delete
-  delay, as when the backend cannot start.
+  delay, as when the backend cannot start: then the engine has no backend from the start
+  (`Engine::without_backend`).
 
 **The poll.** The tree keeps a list of the directories that the timer looks at
 (`Tree::polled`), so a poll does not walk every node. A directory is put on it when its watch
@@ -1066,9 +1078,9 @@ a delivery (rule 13) that comes behind it says nothing of the signal that was dr
 at the end of the turn, before the overflow, it ended the doubt of a young file whose write that
 signal could have been (5.8, `a_delivery_behind_a_dropped_signal_does_not_end_the_doubt`). A
 `watch` or `unwatch` before that place needs no word of the loss either: a young file that its
-flush finds old keeps its doubt (5.8). A dropped word that the backend died is taken there too.
-Commands (`watch`, `unwatch`) are never dropped and not counted. The loop takes at most 512
-messages, then does what is due, so a flood cannot hold back a flush. A command from inside the
+flush finds old keeps its doubt (5.8). Commands (`watch`, `unwatch`) and the word that the
+backend died (it comes once, rule 12) are never dropped and not counted. The loop takes at most
+512 messages, then does what is due, so a flood cannot hold back a flush. A command from inside the
 handler goes a way of its own: the thread takes it when the handler has returned, before the
 next message of the queue, so what the handler asked for is in place before anything that came
 in meanwhile. Each such command hands over its own batch: the disk can change between two of them,
@@ -1455,9 +1467,9 @@ As built:
   answer is `WatchedTree`. `watch(key, dir, Names)`: `WatchedTree` if a stream reports the
   directory, else `Watched`: names come and go in a directory on the way only when one of them
   is renamed or removed, and the guard of that one tells (below), as its own guard does for
-  the directory. A stream never stands on `/`, `/Users` or a home directory
-  (`may_hold_a_stream`), where every program of the user writes: a cover there is answered
-  `NotWatched` and polled, as a handle of Windows is never put on `C:\`, `C:\Users` or
+  the directory. A stream never stands on `/`, `/Users` or a home directory, where every
+  program of the user writes: a cover there is answered `NotWatched` and polled, by the rule
+  (`may_watch_a_tree`) that puts no handle of Windows on `C:\`, `C:\Users` or
   `C:\Users\<name>` (7.3). (Before, a watched path whose lowest existing directory was the
   home directory put a stream on the home directory: 2,000 files written elsewhere in it gave
   3,680 records, each dropped after one lookup.)

@@ -151,11 +151,7 @@ fn read(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   if !has(ATTR_CMN_NAME) {
     return None;
   }
-  // The name: where it starts, counted from this field, and its length with the NUL.
-  let (reference, offset, len) = (fields.at, fields.i32()?, fields.u32()?);
-  let start = reference.checked_add_signed(isize::try_from(offset).ok()?)?;
-  let end = start.checked_add((len as usize).checked_sub(1)?)?;
-  let name = OsStr::from_bytes(entry.get(start..end)?);
+  let name = OsStr::from_bytes(fields.reference()?);
   let device = if has(ATTR_CMN_DEVID) { Some(fields.i32()?) } else { None };
   let kind = if has(ATTR_CMN_OBJTYPE) { Some(fields.u32()?) } else { None };
   let Some(kind) = kind.map(file_type) else { return Some((name, Entry::Name)) };
@@ -190,7 +186,7 @@ struct Fields<'a> {
   at: usize,
 }
 
-impl Fields<'_> {
+impl<'a> Fields<'a> {
   fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
     let field = self.bytes.get(self.at..)?.first_chunk::<N>()?;
     self.at += N;
@@ -215,6 +211,13 @@ impl Fields<'_> {
     let since = u64::try_from(seconds?).ok().zip(u32::try_from(nanos?).ok());
     since.map(|(seconds, nanos)| SystemTime::UNIX_EPOCH + Duration::new(seconds, nanos))
   }
+
+  /// An `attrreference_t`: the bytes it points to, counted from where it starts, without the NUL.
+  fn reference(&mut self) -> Option<&'a [u8]> {
+    let (from, offset, len) = (self.at, self.i32()?, self.u32()?);
+    let start = from.checked_add_signed(isize::try_from(offset).ok()?)?;
+    self.bytes.get(start..start.checked_add((len as usize).checked_sub(1)?)?)
+  }
 }
 
 fn file_type(object_type: u32) -> FileType {
@@ -229,19 +232,7 @@ fn file_type(object_type: u32) -> FileType {
 /// The name that the directory holds for the entry at `path`, and the kind of the entry, in
 /// one `getattrlist` call. A link at the end is not followed.
 pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
-  /// The answer: its length, the name as an offset from `name_offset` and a length with the
-  /// NUL, the object type, and then the bytes.
-  #[repr(C)]
-  struct Answer {
-    length: u32,
-    name_offset: i32,
-    name_length: u32,
-    object_type: u32,
-    bytes: [u8; NAME_BYTES],
-  }
   const FSOPT_NOFOLLOW: u32 = 0x1;
-  /// A name is at most 255 UTF-16 units, each at most three bytes here, and a NUL.
-  const NAME_BYTES: usize = 255 * 3 + 1;
   unsafe extern "C" {
     fn getattrlist(
       path: *const c_char,
@@ -254,30 +245,29 @@ pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
 
   let c_path = CString::new(path.as_os_str().as_bytes())?;
   let wanted = AttrList::new(ATTR_CMN_NAME | ATTR_CMN_OBJTYPE, 0, 0);
-  let mut answer =
-    Answer { length: 0, name_offset: 0, name_length: 0, object_type: 0, bytes: [0; NAME_BYTES] };
+  // The length, the name as an `attrreference_t`, the object type, then the name: at most 255
+  // UTF-16 units of at most three bytes here, and a NUL.
+  let mut answer = [0_u8; 4 * size_of::<u32>() + 255 * 3 + 1];
   // SAFETY: `c_path` ends with a NUL, `wanted` is a whole `attrlist` that the call only reads,
-  // and the call writes at most `size_of::<Answer>()` bytes into `answer`.
+  // and the call writes at most `answer.len()` bytes into `answer`.
   let result = unsafe {
     getattrlist(
       c_path.as_ptr(),
       (&raw const wanted).cast_mut().cast(),
-      (&raw mut answer).cast(),
-      size_of::<Answer>(),
+      answer.as_mut_ptr().cast(),
+      answer.len(),
       FSOPT_NOFOLLOW,
     )
   };
   if result != 0 {
     return Err(io::Error::last_os_error());
   }
-  let start = usize::try_from(answer.name_offset).ok().and_then(|from_the_field| {
-    (mem::offset_of!(Answer, name_offset) + from_the_field)
-      .checked_sub(mem::offset_of!(Answer, bytes))
-  });
-  let len = usize::try_from(answer.name_length).ok().and_then(|with_nul| with_nul.checked_sub(1));
-  let name = start.zip(len).and_then(|(start, len)| answer.bytes.get(start..start + len));
-  let name = name.ok_or_else(|| io::Error::other("getattrlist gave no name"))?;
-  Ok((OsStr::from_bytes(name).to_owned(), file_type(answer.object_type)))
+  let mut fields = Fields { bytes: &answer, at: size_of::<u32>() };
+  let (name, kind) = fields
+    .reference()
+    .zip(fields.u32())
+    .ok_or_else(|| io::Error::other("getattrlist gave no name"))?;
+  Ok((OsStr::from_bytes(name).to_owned(), file_type(kind)))
 }
 
 pub(super) fn name_on_disk(path: &Path) -> io::Result<OsString> {

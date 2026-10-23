@@ -4,7 +4,7 @@ use std::{
   cmp::Reverse,
   ffi::OsString,
   hash::{Hash, Hasher},
-  io, mem,
+  io,
   path::{Path, PathBuf},
   time::{Duration, SystemTime},
 };
@@ -123,7 +123,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let Some(parent) = self.tree.parent(key) else { return };
     let node = &self.tree[key];
     let registered = node.is_registered();
-    let below_names_only = registered && self.tells_names_only(parent);
     // The look can change it.
     let was_unlisted = node.is_unlisted();
 
@@ -139,7 +138,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.apply(key, path, found, was_unlisted, why);
 
     // A registered name with no directory at it makes its directory want the contents.
-    let wants_more = below_names_only && !self.tree[key].is_dir();
+    let wants_more = registered && !self.tree[key].is_dir() && self.tells_names_only(parent);
     let can_go = !registered && matches!(self.tree[key].kind, Kind::Missing);
     let gone_twins = if can_go { self.tree.marked_twins(key) } else { Vec::new() };
     self.tree.prune(key);
@@ -189,12 +188,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       (Found::Missing, Kind::File(_) | Kind::Dir(_)) => self.missing(key, why.since),
       (Found::OtherSpelling(_), _) => self.gone(key),
 
-      (Found::File(kind, file), Kind::File(_) | Kind::Missing) => {
-        self.store_file(key, path, kind, file, why);
-      }
-      (Found::File(kind, file), Kind::Dir(_)) => {
-        // A change of kind is never an `Update`: the files below are gone.
-        self.vanish(key);
+      (Found::File(kind, file), had) => {
+        if let Kind::Dir(_) = had {
+          // A change of kind is never an `Update`: the files below are gone.
+          self.vanish(key);
+        }
         self.store_file(key, path, kind, file, why);
       }
 
@@ -237,10 +235,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         let named = why.deep && from_above && why.since.is_some();
         let away = moved || why.lost || named || self.away_scan;
         self.still_there(key, path, why.deep || moved, away);
-        let relist = self.tree[key].dir_mut().is_some_and(|dir| mem::take(&mut dir.relist));
-        if relist && !(why.deep || moved) {
-          self.tree.queue_scan(key, Depth::Shallow);
-        }
         if id != old {
           self.look_again_at_a_new_dir(key, young);
         }
@@ -338,8 +332,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
       let was_unlisted = self.tree[key].is_unlisted();
       self.tree[key].set_unlisted(other.is_some());
-      // Only a registered node is followed.
-      let link = (meta.kind == FileType::Symlink).then(|| self.real_place(path));
+      // Only a registered node is followed, and its link kept as a hash of its real path (0 when
+      // that cannot be read).
+      let link = (meta.kind == FileType::Symlink)
+        .then(|| self.fs.real_path(path).map_or(0, |real| hash_of(&real)));
       let old = self.tree.link(key);
       relinked = old != link;
       self.tree.set_link(key, link);
@@ -437,11 +433,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.has_spellings(key) && (!was_entry || self.tree.has_other_spelling(key))
   }
 
-  /// A number for the real path behind the link at `path`.
-  fn real_place(&self, path: &Path) -> u64 {
-    self.fs.real_path(path).map_or(0, |real| hash_of(&real))
-  }
-
   /// What an error of the disk means for the path. `owner` is polled until the error is gone.
   pub(super) fn disk_error(&mut self, owner: DirKey, path: &Path, error: io::Error) -> Found {
     if is_missing(&error) {
@@ -466,7 +457,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       dir.has_error = true;
       self.tree.list_if_polled(owner);
       if let Some(kind) = kind {
-        self.report(kind, Some(path.to_path_buf()), Some(error));
+        self.report(kind, path, error);
       }
     }
     found
@@ -482,19 +473,18 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     why: Mark,
   ) {
     let old = match self.tree[key].kind {
-      Kind::File(old) => Some((old, self.tree.content(key))),
+      Kind::File(old) => Some(old),
       _ => None,
     };
-    let same = old.is_some_and(|(old, _)| old == fingerprint);
+    let same = old == Some(fingerprint);
     let young = kind != FileType::Other && self.is_young(key, fingerprint.modified, same);
     // Where every write gives a `written` hint, a young file is not read: the hint tells of a
     // write that leaves the fingerprint as it is (5.8). Not where only the poll looks at it.
     let only_polled = self.only_polled(key);
     let trusts_hints = self.options.written_hints && !only_polled;
+    let kept = if same { self.tree.content(key) } else { None };
     // Compared when the fingerprint is the same, and one last time when the file is old.
-    let kept = old.and_then(|(_, content)| content).filter(|_| same);
-    let compare = matches!(kept, Some(Content::Hash(_)));
-    let hash = if compare || (young && !trusts_hints) {
+    let hash = if matches!(kept, Some(Content::Hash(_))) || (young && !trusts_hints) {
       match self.content_hash(key, path, kind, fingerprint.size) {
         Ok(hash) => hash,
         // Gone after the `lstat`: this check says nothing, and the next flush looks again.
@@ -512,10 +502,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // old reports one `Update` for all. Where no poll comes, every look reports.
     let update_waits = young && hash.is_none() && only_polled;
 
-    let changed = if let Some((_, content)) = old {
+    let changed = if old.is_some() {
       why.written
         || !same
-        || match content {
+        || match kept {
           None => false,
           Some(Content::Hash(old)) => hash != Some(old),
           Some(Content::Pending) if trusts_hints => self.hint_may_be_lost(key, why),
@@ -548,7 +538,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       young.then(|| hash.map_or(Content::Unknown, Content::Hash))
     };
     self.tree.set_content(key, content);
-    if young && content == Some(Content::Pending) {
+    if young && trusts_hints {
       self.await_delivery(key, fingerprint.modified);
     }
   }
@@ -622,8 +612,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// for the work of hints, not for the backend.
   fn ask_delivered(&mut self) {
     let Some(&Reverse((old_at, _))) = self.pending.peek() else { return };
-    let covered = self.asked > self.delivered && self.asked >= old_at;
-    if old_at <= self.delivered || old_at == i64::MAX || covered {
+    // A question at or after `old_at` is not answered yet (`old_at` is after `delivered`), and
+    // covers it.
+    if old_at <= self.delivered || old_at == i64::MAX || self.asked >= old_at {
       return;
     }
     self.asked = old_at;

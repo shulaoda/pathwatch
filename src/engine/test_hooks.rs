@@ -5,6 +5,7 @@ use std::{collections::BTreeSet, iter, path::PathBuf, time::Instant};
 use super::Engine;
 use crate::{
   backend::{Backend, DirKey},
+  config::EntryKind,
   fs::Fs,
   tree::{Added, Fingerprint, Kind, Node, Tree, Watch},
 };
@@ -197,6 +198,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if node.watch() == Watch::FromAbove && !covered && !frozen && !waits {
         return fail("relies on a watch above, and there is none");
       }
+      // 8. Every node but the root that has a file or a directory keeps the answer "not
+      // ignored" for that kind.
+      if !keeps_not_ignored(node) {
+        return fail("has what the filter ignores, or what it was never asked about");
+      }
       if node.is_marked() {
         if !self.tree.marked.iter().any(|&(marked, _)| marked == key) {
           return fail("has a mark but is not on the list of marked nodes");
@@ -216,5 +222,15 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       return Err(format!("{key:?} is on the list of marked nodes and has no mark"));
     }
     Ok(())
+  }
+}
+
+/// Whether the node keeps the answer "not ignored" of the filter for the file or the directory
+/// at it. A node with nothing at it can keep any answer.
+fn keeps_not_ignored(node: &Node) -> bool {
+  match node.kind {
+    Kind::File(_) => node.ignored(EntryKind::File) == Some(false),
+    Kind::Dir(_) => node.ignored(EntryKind::Dir) == Some(false),
+    Kind::Missing => true,
   }
 }

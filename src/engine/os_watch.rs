@@ -11,7 +11,7 @@ use super::{Engine, Once};
 use crate::{
   backend::{Backend, Committed, Coverage, DirKey, Want, is_watch_limit},
   config::EntryKind,
-  error::{ErrorKind, context},
+  error::{Error, ErrorKind},
   fs::{FileType, Fs, is_missing},
   tree::{Depth, Kind, Mark, Node, Tree, Watch, push_name},
 };
@@ -61,7 +61,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     if let Some(kind) = self.fs.remote_disk(path) {
       let what = format!("a disk of {kind}: polling finds those changes (`with_polling`)");
-      self.report(ErrorKind::RemoteDisk, Some(path.to_path_buf()), Some(io::Error::other(what)));
+      self.report(ErrorKind::RemoteDisk, path, io::Error::other(what));
     }
   }
 
@@ -143,16 +143,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// What the directory asks from the backend (design.md 5.10).
+  /// What the directory asks from the backend (design.md 5.10). Where the tree has nothing at a
+  /// watched path in it, the disk says: the contents when no directory is there. A name on the
+  /// way is not asked: a directory is expected there.
   fn want(&mut self, key: DirKey, path: &mut PathBuf) -> Want {
-    self.tree.want(key).unwrap_or_else(|| {
-      if self.has_no_dir_at_a_watched_child(key, path) { Want::Contents } else { Want::Names }
-    })
-  }
-
-  /// Whether a watched path in the directory, where the tree has nothing, has no directory on
-  /// disk. A name on the way is not asked: a directory is expected there.
-  fn has_no_dir_at_a_watched_child(&mut self, key: DirKey, path: &mut PathBuf) -> bool {
+    if let Some(want) = self.tree.want(key) {
+      return want;
+    }
     let mut next = self.tree.children(key).next();
     while let Some(child) = next {
       next = self.tree.next_sibling(child);
@@ -164,10 +161,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let is_dir = self.is_dir_on_disk(child, path);
       path.pop();
       if !is_dir {
-        return true;
+        return Want::Contents;
       }
     }
-    false
+    Want::Names
   }
 
   /// Notes how changes in the directory are heard when the backend was not asked.
@@ -209,7 +206,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       };
       // A tree past the limit finds no room for one directory after the other.
       if kind != ErrorKind::WatchLimit || self.once.insert(Once::ToldWatchLimit) {
-        self.report(kind, Some(path.to_path_buf()), Some(error));
+        self.report(kind, path, error);
       }
     }
     if old == Watch::WatchedTree && new != Watch::WatchedTree {
@@ -291,8 +288,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.backend.take().is_none() {
       return;
     }
-    let error = context("the OS watcher stopped, so every path is polled", error);
-    self.report(ErrorKind::Io, None, Some(error));
+    // It comes outside a flush, where no other error waits.
+    self.errors.push(Error::of_watcher("the OS watcher stopped, so every path is polled", error));
     // The poll is all there is now: the watcher works as one that only polls, at its interval
     // and with no delete delay. A hold that waits keeps its time.
     if let Some(fallback) = self.fallback.take() {

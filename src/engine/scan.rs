@@ -1,7 +1,7 @@
 //! One directory: the scan of its entries, and what is done when a directory appears, is
 //! still there, or vanishes.
 
-use std::path::PathBuf;
+use std::{mem, path::PathBuf};
 
 use super::{
   Engine,
@@ -198,11 +198,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(super) fn still_there(&mut self, key: DirKey, path: &mut PathBuf, deep: bool, away: bool) {
     // Also when not deep: the node may want more, or the watch above may be gone.
     self.arm(key, path, deep);
+    let Some(dir) = self.tree[key].dir_mut() else { return };
+    dir.away |= away;
+    // A deep scan lists the directory again too (`Dir::relist`).
+    let relist = mem::take(&mut dir.relist);
     if deep {
       self.tree.queue_scan(key, Depth::Deep);
-    }
-    if away && let Some(dir) = self.tree[key].dir_mut() {
-      dir.away = true;
+    } else if relist {
+      self.tree.queue_scan(key, Depth::Shallow);
     }
   }
 
@@ -214,7 +217,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let first = self.touched.len();
     let mut next = Some(key);
     let mut stack = Vec::new();
-    let mut children = Vec::new();
     while let Some(key) = next.take().or_else(|| stack.pop()) {
       let node = &mut self.tree[key];
       let Kind::Dir(dir) = node.kind else { continue };
@@ -225,9 +227,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
       self.touched.push(key);
 
-      children.clear();
-      children.extend(self.tree.children(key));
-      for &child in &children {
+      let mut next_child = self.tree.children(key).next();
+      while let Some(child) = next_child {
+        next_child = self.tree.next_sibling(child);
         // Nothing can be checked in a directory that is gone: a mark in it is dropped.
         self.tree.take_mark(child);
         match self.tree[child].kind {

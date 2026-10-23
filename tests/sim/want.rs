@@ -6,39 +6,16 @@
 use std::time::Duration;
 
 use crate::fixtures::{
-  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, SimFs, asked, at, caught_up, known, on_all,
-  os_watches, settled, sorted, window, window_then_settled,
+  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, SimFs, asked, at, caught_up, known, makes,
+  on_all, os_watches, settled, sorted, window, window_then_settled,
 };
 use pathwatch::{
-  backend::{
-    Want::{Contents, Names},
-    poll::PollBackend,
-  },
+  backend::Want::{Contents, Names},
   engine::Options,
 };
 
 /// How long the clock may move in a story where no poll runs: less than the poll interval.
 const NO_POLL: Duration = Duration::from_secs(1);
-
-type Make = Box<dyn Fn() -> Box<dyn Sim>>;
-
-/// One way to make a driver for each backend, so that a story can be told many times.
-fn makes() -> [(&'static str, Make); 4] {
-  makes_with(&Options::default())
-}
-
-fn makes_with(options: &Options) -> [(&'static str, Make); 4] {
-  let with = |make: fn(Options) -> Box<dyn Sim>| -> Make {
-    let options = options.clone();
-    Box::new(move || make(options.clone()))
-  };
-  [
-    ("Inode", with(|options| Box::new(Driver::sim(Mode::Inode, options)))),
-    ("Prefix", with(|options| Box::new(Driver::sim(Mode::Prefix, options)))),
-    ("Handle", with(|options| Box::new(Driver::sim(Mode::Handle, options)))),
-    ("Poll", with(|options| Box::new(Driver::<PollBackend>::poll(options)))),
-  ]
-}
 
 /// A watched directory: the watch is on it, and not on the directory above.
 #[test]
@@ -170,7 +147,7 @@ fn a_watched_directory_becomes_a_file_and_is_written_at_any_moment() {
     d.fs().remove_all("/p/R").unwrap();
     d.fs().write("/p/R", "1").unwrap();
   }
-  for (on, make) in makes() {
+  for (on, make) in makes(&Options::default()) {
     let mut d = make();
     story(&mut *d);
     let before = d.fs().calls().total();
@@ -200,7 +177,7 @@ fn a_file_takes_the_place_of_the_directory_during_watch() {
   fn prepare(d: &mut dyn Sim) {
     d.fs().mkdir_all("/p/R").unwrap();
   }
-  for (on, make) in makes() {
+  for (on, make) in makes(&Options::default()) {
     let mut d = make();
     prepare(&mut *d);
     let before = d.fs().calls().total();
@@ -524,7 +501,7 @@ fn a_listing_that_tells_all_of_a_file_is_its_look() {
     },
   ];
   let loose = Options { loose_spelling: true, ..Options::default() };
-  for (on, make) in makes_with(&loose) {
+  for (on, make) in makes(&loose) {
     let calls = |meta: bool| {
       let mut d = make();
       prepare(&mut *d, meta);

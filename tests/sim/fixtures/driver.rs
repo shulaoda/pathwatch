@@ -1,7 +1,6 @@
 //! The driver: an engine on a simulated disk, and the short helpers that the tests share.
 
 use std::{
-  borrow::Cow,
   collections::BTreeSet,
   path::{Path, PathBuf},
   sync::Arc,
@@ -63,7 +62,7 @@ impl Driver<SimBackend> {
 
 impl Driver<PollBackend> {
   pub fn poll(options: Options) -> Self {
-    Self::new(PollBackend::default(), SimFs::new(), options)
+    Self::new(PollBackend, SimFs::new(), options)
   }
 }
 
@@ -89,19 +88,21 @@ impl<B: Deliver> Driver<B> {
     }
   }
 
+  /// Gives the engine the clean form of each path, as the watcher does. A path that cannot be
+  /// used is left out.
   pub fn watch<P: AsRef<Path>>(&mut self, paths: &[P]) {
     let mut out = Output::default();
-    let paths: Vec<PathBuf> = paths.iter().map(|path| path.as_ref().to_path_buf()).collect();
-    self.watched.extend(paths.iter().filter_map(|path| normalize(path)).map(Cow::into_owned));
+    let paths: Vec<PathBuf> = paths.iter().filter_map(|path| normalize(path.as_ref())).collect();
+    self.watched.extend(paths.iter().cloned());
     self.engine.watch(paths, self.now, &mut out);
     self.absorb(out, Call::Watch);
   }
 
   pub fn unwatch<P: AsRef<Path>>(&mut self, paths: &[P]) {
     let mut out = Output::default();
-    let paths: Vec<PathBuf> = paths.iter().map(|path| path.as_ref().to_path_buf()).collect();
-    for path in paths.iter().filter_map(|path| normalize(path)) {
-      self.watched.remove(&*path);
+    let paths: Vec<PathBuf> = paths.iter().filter_map(|path| normalize(path.as_ref())).collect();
+    for path in &paths {
+      self.watched.remove(path);
     }
     self.engine.unwatch(paths, self.now, &mut out);
     self.absorb(out, Call::Unwatch);
@@ -354,6 +355,23 @@ pub fn on_modes(modes: &[Mode], options: &Options, test: impl Fn(&mut dyn Sim, &
 pub fn on_all(options: &Options, test: impl Fn(&mut dyn Sim, &str)) {
   on_modes(&Mode::ALL, options, &test);
   test(&mut Driver::<PollBackend>::poll(options.clone()), "Poll");
+}
+
+pub type Make = Box<dyn Fn() -> Box<dyn Sim>>;
+
+/// One way to make a driver for each backend, so that a story can be told many times. The names
+/// are those of [`on_all`].
+pub fn makes(options: &Options) -> [(&'static str, Make); 4] {
+  let with = |make: fn(Options) -> Box<dyn Sim>| -> Make {
+    let options = options.clone();
+    Box::new(move || make(options.clone()))
+  };
+  [
+    ("Inode", with(|options| Box::new(Driver::sim(Mode::Inode, options)))),
+    ("Prefix", with(|options| Box::new(Driver::sim(Mode::Prefix, options)))),
+    ("Handle", with(|options| Box::new(Driver::sim(Mode::Handle, options)))),
+    ("Poll", with(|options| Box::new(Driver::<PollBackend>::poll(options)))),
+  ]
 }
 
 /// Runs the story on a thread with a quarter of the usual stack: a recursion through thousands

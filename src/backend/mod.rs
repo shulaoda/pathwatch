@@ -191,6 +191,23 @@ pub(crate) fn same(error: &io::Error) -> io::Error {
   }
 }
 
+/// Whether a watch of a tree, a stream of FSEvents or a handle of Windows, may stand on `dir`:
+/// not on a root, `Users` in it or a home directory, where every program of the user writes.
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn may_watch_a_tree(dir: &Path) -> bool {
+  use std::path::Component;
+
+  let mut names = dir.components().filter_map(|part| match part {
+    Component::Normal(name) => Some(name),
+    _ => None,
+  });
+  match (names.next(), names.next(), names.next()) {
+    (None, ..) => false,
+    (Some(first), _, None) => !first.eq_ignore_ascii_case("Users"),
+    _ => true,
+  }
+}
+
 /// Gives the room of a table back once a quarter of it is in use, keeping twice what is left:
 /// many entries that went at once leave no room behind for good.
 pub(crate) fn give_room_back<K: Eq + Hash, V>(table: &mut FxHashMap<K, V>) {

@@ -194,19 +194,13 @@ fn ignore_out() -> Options {
   }
 }
 
-/// How often the engine made each call to the disk and to the backend.
-fn all_calls(d: &dyn Sim) -> [u64; 9] {
-  let c = d.fs().calls();
-  [c.lstat, c.stat, c.read_dir, c.hash, c.link_target, c.real_path, c.watch, c.unwatch, c.commit]
-}
-
 /// A watched file and a watched directory that the filter ignores for both kinds are no
 /// watched paths. No event ever comes for them, and they cost nothing: the engine makes the
 /// same calls to the disk and to the backend as when they were never given to `watch`.
 #[test]
 fn a_path_that_is_ignored_for_both_kinds_costs_nothing() {
   let story = |paths: &'static [&'static str]| {
-    let calls = RefCell::new(Vec::<(String, [u64; 9])>::new());
+    let calls = RefCell::new(Vec::new());
     on_all(&ignore_out(), |d, on| {
       d.fs().mkdir_all("/p/out/sub").unwrap();
       d.fs().mkdir("/p/src").unwrap();
@@ -234,7 +228,7 @@ fn a_path_that_is_ignored_for_both_kinds_costs_nothing() {
       d.fs().write("/p/src/a.js", "22").unwrap();
       assert_eq!(d.settled(), ["U /p/src/a.js"], "{on}");
       d.caught_up();
-      calls.borrow_mut().push((on.to_owned(), all_calls(d)));
+      calls.borrow_mut().push((on.to_owned(), d.fs().calls()));
     });
     calls.into_inner()
   };

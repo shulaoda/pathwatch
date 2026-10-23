@@ -1012,7 +1012,9 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
 
     let traps = self.fs.traps_run();
     let mut out = Output::default();
-    self.engine.watch(texts.iter().map(PathBuf::from).collect(), self.now, &mut out);
+    // The engine takes clean paths only: a bad one is left out, as the watcher does.
+    let clean = texts.iter().filter_map(|text| pathwatch::path::normalize(Path::new(text)));
+    self.engine.watch(clean.collect(), self.now, &mut out);
     let trapped = self.fs.traps_run() != traps;
 
     // What `watch` leaves unsaid: with a change of the disk in the middle of the call, a file
@@ -1082,7 +1084,8 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
 
     let traps = self.fs.traps_run();
     let mut out = Output::default();
-    self.engine.unwatch(texts.iter().map(PathBuf::from).collect(), self.now, &mut out);
+    let clean = texts.iter().filter_map(|text| pathwatch::path::normalize(Path::new(text)));
+    self.engine.unwatch(clean.collect(), self.now, &mut out);
     let trapped = self.fs.traps_run() != traps;
 
     // The handler forgets what no watched path covers any more, and no event tells about it:
@@ -1505,7 +1508,7 @@ fn play(config: &Config, ops: &[Op]) -> Result<(), Failure> {
         Run::new(config, fs, backend, Arc::clone(&shared)).play(ops);
       }
       Target::Poll => {
-        Run::new(config, fs, PollBackend::default(), Arc::clone(&shared)).play(ops);
+        Run::new(config, fs, PollBackend, Arc::clone(&shared)).play(ops);
       }
     }
   }));

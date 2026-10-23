@@ -3,32 +3,19 @@
 //! A story makes the disk, calls `watch`, changes the disk and compares the events that come
 //! out (`C`, `U`, `D` and the path).
 
-use std::{io, path::Path, time::Duration};
+use std::{io, time::Duration};
 
 use crate::fixtures::{
-  Deliver, Driver, Mode, NONE, Sim, SimBackend, SimFs, caught_up, flush, ignore_node_modules,
-  known, on_all, settled, taken,
+  Deliver, Driver, Mode, NONE, Sim, SimFs, caught_up, flush, ignore_node_modules, known, makes,
+  on_all, settled, taken,
 };
-use pathwatch::{ErrorKind, backend::poll::PollBackend, engine::Options};
-
-fn inode() -> Driver<SimBackend> {
-  Driver::sim(Mode::Inode, Options::default())
-}
-
-/// Runs `test` on the three simulated backends and on the poll backend. The test makes as many
-/// drivers as it needs.
-fn on_every_backend(test: impl Fn(&mut dyn FnMut() -> Box<dyn Sim>)) {
-  for mode in Mode::ALL {
-    test(&mut || Box::new(Driver::sim(mode, Options::default())));
-  }
-  test(&mut || Box::new(Driver::poll(Options::default())));
-}
+use pathwatch::engine::Options;
 
 /// A watched directory that was missing appears, and before the flush a file in it becomes a
 /// watched path: the directory already had to report that file.
 #[test]
 fn an_older_watched_directory_appears_during_add() {
-  let mut d = inode();
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir("/p").unwrap();
   d.watch(&["/p/d"]);
 
@@ -51,18 +38,17 @@ fn an_older_watched_directory_appears_during_add() {
 /// holds it back.
 #[test]
 fn add_while_a_delete_waits() {
-  on_every_backend(|make| {
-    let mut d = make();
+  on_all(&Options::default(), |d, on| {
     d.fs().mkdir_all("/p/d").unwrap();
     d.fs().write("/p/d/a.js", "1").unwrap();
-    assert_eq!(d.watch(&["/p/d"]), NONE);
+    assert_eq!(d.watch(&["/p/d"]), NONE, "{on}");
 
     d.fs().rename("/p/d/a.js", "/p/d/b.js").unwrap();
-    assert_eq!(d.watch(&["/p/d/b.js"]), ["C /p/d/b.js"]);
+    assert_eq!(d.watch(&["/p/d/b.js"]), ["C /p/d/b.js"], "{on}");
     let mut rest = d.settled();
     rest.retain(|event| event != "U /p/d/b.js");
-    assert_eq!(rest, ["D /p/d/a.js"]);
-    assert_eq!(d.known(), ["/p/d/b.js"]);
+    assert_eq!(rest, ["D /p/d/a.js"], "{on}");
+    assert_eq!(d.known(), ["/p/d/b.js"], "{on}");
     d.caught_up();
   });
 }
@@ -72,23 +58,22 @@ fn add_while_a_delete_waits() {
 /// all the same: its check starts at the held directory, which is back.
 #[test]
 fn add_below_a_held_directory() {
-  on_every_backend(|make| {
-    let mut d = make();
+  on_all(&Options::default(), |d, on| {
     d.fs().mkdir_all("/c/b").unwrap();
     d.fs().mkdir("/q").unwrap();
     d.fs().write("/c/b/f.js", "1").unwrap();
-    assert_eq!(d.watch(&["/c/b/f.js"]), NONE);
+    assert_eq!(d.watch(&["/c/b/f.js"]), NONE, "{on}");
 
     d.fs().rename("/c", "/q/c").unwrap();
-    assert_eq!(d.window(), NONE);
-    assert_eq!(d.pending_deletes(), 1);
+    assert_eq!(d.window(), NONE, "{on}");
+    assert_eq!(d.pending_deletes(), 1, "{on}");
     d.fs().rename("/q/c", "/c").unwrap();
     d.fs().write("/c/b/g.js", "1").unwrap();
-    assert_eq!(d.watch(&["/c/b/g.js"]), NONE);
-    assert_eq!(d.known(), ["/c/b/f.js", "/c/b/g.js"]);
-    assert_eq!(d.pending_deletes(), 0);
+    assert_eq!(d.watch(&["/c/b/g.js"]), NONE, "{on}");
+    assert_eq!(d.known(), ["/c/b/f.js", "/c/b/g.js"], "{on}");
+    assert_eq!(d.pending_deletes(), 0, "{on}");
     // The notification of the write comes after the `watch`.
-    assert!(d.settled().iter().all(|event| event == "U /c/b/g.js"));
+    assert!(d.settled().iter().all(|event| event == "U /c/b/g.js"), "{on}");
     d.caught_up();
   });
 }
@@ -307,17 +292,15 @@ fn what_was_due_is_told_whatever_the_moment_of_add() {
   }
 }
 
+/// Three spellings of one path in a batch are one watched path: a change is told once, and a
+/// `watch` of the path again costs nothing.
 #[test]
-fn bad_paths_are_told_once_and_the_rest_is_registered() {
-  let mut d = inode();
+fn three_spellings_of_a_path_are_one_watched_path() {
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir("/p").unwrap();
   d.fs.write("/p/a.js", "1").unwrap();
-  d.watch(&["relative/a.js", "/p/../x", "/", "", "/p/a.js", "/p//a.js/", "/p/./a.js"]);
-  assert_eq!(d.errors.len(), 1);
-  assert_eq!(d.errors[0].kind(), ErrorKind::InvalidPath);
-  assert_eq!(d.errors[0].path(), Some(Path::new("relative/a.js")));
+  d.watch(&["/p/a.js", "/p//a.js/", "/p/./a.js"]);
 
-  // The three spellings are one watched path.
   d.fs.write("/p/a.js", "12").unwrap();
   assert_eq!(settled(&mut d), ["U /p/a.js"]);
   let stats = d.fs.calls();
@@ -448,14 +431,7 @@ fn calls_of_add(make: &dyn Fn() -> Box<dyn Sim>, path: &str) -> u64 {
 /// asks for its watches, commits and scans, is reported.
 #[test]
 fn a_later_add_opens_no_gap() {
-  type Make = Box<dyn Fn() -> Box<dyn Sim>>;
-  let makes: [(&str, Make); 4] = [
-    ("Inode", Box::new(|| Box::new(Driver::sim(Mode::Inode, Options::default())))),
-    ("Prefix", Box::new(|| Box::new(Driver::sim(Mode::Prefix, Options::default())))),
-    ("Handle", Box::new(|| Box::new(Driver::sim(Mode::Handle, Options::default())))),
-    ("Poll", Box::new(|| Box::new(Driver::<PollBackend>::poll(Options::default())))),
-  ];
-  for (on, make) in &makes {
+  for (on, make) in makes(&Options::default()) {
     let calls = calls_of_add(make.as_ref(), "/proj/other/new.js");
     assert!(calls >= 3, "{on}");
     for moment in 0..calls {

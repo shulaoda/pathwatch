@@ -150,7 +150,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let Some(parent) = self.tree.parent(key) else { return };
     // What is at the path can still count as an entry of a watched directory above: only then it
     // stays.
-    if self.tree[key].is_registered() && !self.stays_as_an_entry(key) {
+    if self.tree[key].is_registered() && !self.is_inside(key) {
       self.uncover(key, false);
     }
     // With no watched path below, the node is let go, and the nodes above that only led to it.
@@ -205,9 +205,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// The node is not registered any more: an entry like the others inside a watched directory,
   /// and nothing anywhere else.
   fn let_go(&mut self, key: DirKey) {
-    let inside = self.is_inside(key);
     // Asked while the node still says that the directory above lists it under another name.
-    let stays = self.stays_as_an_entry(key);
+    let inside = self.is_inside(key);
     self.tree[key].set_unlisted(false);
     // Only a registered node is followed: the link itself is the entry now, and a look must see
     // it.
@@ -217,26 +216,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         self.tree.mark(key, Mark::default());
       }
     }
-    if !stays {
+    if !inside {
       self.uncover(key, false);
     }
     self.tree.prune(key);
-  }
-
-  /// Whether what is at the node stays as an entry of the directory above when the node is no
-  /// watched path any more: that directory tracks every entry, and the filter does not ignore
-  /// this one. Whatever the node says of itself: a watched directory that is taken back is an
-  /// entry like the others now.
-  fn stays_as_an_entry(&mut self, key: DirKey) -> bool {
-    let kind = match self.tree[key].kind {
-      Kind::Missing => return false,
-      Kind::File(_) => EntryKind::File,
-      Kind::Dir(_) => EntryKind::Dir,
-    };
-    if !self.is_inside(key) {
-      return false;
-    }
-    let path = self.tree.path(key);
-    !self.ignores(key, &path, kind)
   }
 }

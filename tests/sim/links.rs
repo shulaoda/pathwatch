@@ -5,14 +5,10 @@
 use std::{collections::BTreeSet, io, path::PathBuf, time::Duration};
 
 use crate::fixtures::{
-  Deliver, Driver, Mode, NONE, SimBackend, caught_up, check_fingerprints, flush, on_all, settled,
-  sorted, taken, window,
+  Deliver, Driver, Mode, NONE, caught_up, check_fingerprints, flush, on_all, settled, sorted,
+  taken, window,
 };
 use pathwatch::engine::Options;
-
-fn driver(mode: Mode) -> Driver<SimBackend> {
-  Driver::sim(mode, Options::default())
-}
 
 /// The registered path goes through links (`/tmp` and `$TMPDIR` on macOS), and the OS
 /// reports real paths. The events carry the registered spelling, with no help from the poll.
@@ -41,7 +37,7 @@ fn linked_prefixes_keep_the_registered_spelling() {
 #[test]
 fn a_link_watched_inside_the_quiet_time_of_a_hint_with_a_name_that_is_not_plain() {
   for mode in Mode::ALL {
-    let mut d = driver(mode);
+    let mut d = Driver::sim(mode, Options::default());
     d.fs.mkdir_all("/p/dir").unwrap();
     d.fs.mkdir_all("/shared/real").unwrap();
     d.fs.write("/shared/real/c.js", "1").unwrap();
@@ -167,7 +163,7 @@ fn each_watched_path_keeps_its_spelling() {
 #[test]
 fn a_linked_directory_inside_a_covered_tree() {
   for mode in Mode::ALL {
-    let mut d = driver(mode);
+    let mut d = Driver::sim(mode, Options::default());
     d.fs.mkdir_all("/real/dir/deep").unwrap();
     d.fs.mkdir("/p").unwrap();
     d.fs.symlink("/real/dir", "/p/link").unwrap();
@@ -189,7 +185,7 @@ fn a_linked_directory_inside_a_covered_tree() {
 /// and the path behind the link stood below it: everything behind the link is scanned again.
 #[test]
 fn a_directory_above_the_one_behind_a_link_is_away_and_back() {
-  let mut d = driver(Mode::Prefix);
+  let mut d = Driver::sim(Mode::Prefix, Options::default());
   d.fs.mkdir_all("/t/a/real/sub").unwrap();
   d.fs.write("/t/a/real/sub/g.js", "1").unwrap();
   d.fs.symlink("/t/a/real", "/l").unwrap();

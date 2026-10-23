@@ -449,7 +449,8 @@ fn a_poll_interval_of_zero() {
   assert_eq!(batch.unwrap(), [Event { path, kind: EventKind::Create }]);
 }
 
-/// Dropped signals make the engine check everything; the word that the backend died is kept.
+/// Dropped signals make the engine check everything; the word that the backend died is never
+/// dropped.
 #[test]
 fn the_queue_is_bounded_by_bytes() {
   const MIB: usize = 1 << 20;
@@ -514,10 +515,8 @@ fn the_queue_is_bounded_by_bytes() {
   assert_eq!(translated.load(Ordering::Relaxed), 100_015);
 
   // The queue is filled to the last byte: a message with no bytes of its own fits as long as
-  // any message does. So the word that the backend died is dropped too, and kept all the same.
-  // It is taken with the overflow, where the first drop was in the queue: nothing behind that
-  // reaches the backend, which is gone. Had the word fit, every empty message that fit would
-  // have been translated before it.
+  // any message does. The word that the backend died still passes, behind every message that
+  // fit: those are translated before it, and their number depends on the size of a message.
   hold(&|| {
     flood(20, MIB);
     flood(100_000, 0);
@@ -534,7 +533,7 @@ fn the_queue_is_bounded_by_bytes() {
   }
   // The backend held the other end of this channel.
   assert_eq!(enter.recv_timeout(PATIENCE), Err(RecvTimeoutError::Disconnected));
-  assert_eq!(translated.load(Ordering::Relaxed), 100_030);
+  assert!(translated.load(Ordering::Relaxed) > 100_030);
   drop(watcher);
 }
 

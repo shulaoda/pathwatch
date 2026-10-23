@@ -30,7 +30,6 @@ use crate::{
   error::{Error, ErrorKind},
   event::Event,
   fs::Fs,
-  path::normalize,
   tree::{Depth, KEPT, Mark, Marked, Node, Tree, emptied, nanos},
 };
 
@@ -126,7 +125,7 @@ pub struct Output {
 
 /// Watches paths through a [`Backend`] and a disk ([`Fs`]), and turns hints into file events.
 pub struct Engine<B: Backend, F: Fs> {
-  /// `None`: the backend died and was dropped; every node is polled.
+  /// `None`: no backend (it did not start, or it died); every node is polled.
   backend: Option<B>,
   fs: F,
   options: Options,
@@ -214,10 +213,15 @@ impl<B: Backend, F: Fs> fmt::Debug for Engine<B, F> {
 
 impl<B: Backend, F: Fs> Engine<B, F> {
   pub fn new(backend: B, fs: F, options: Options) -> Self {
+    Self { backend: Some(backend), ..Self::without_backend(fs, options) }
+  }
+
+  /// An engine for a backend that did not start: every node is polled, as after its death.
+  pub(crate) fn without_backend(fs: F, options: Options) -> Self {
     let mut tree = Tree::new();
     tree.loose_spelling = options.loose_spelling;
     Self {
-      backend: Some(backend),
+      backend: None,
       fs,
       options,
       fallback: None,
@@ -267,23 +271,20 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Makes every path a watched path and checks the disk once: what exists then is the baseline,
-  /// known without an event. A path that cannot be used goes to `out.errors`.
+  /// known without an event. Each path is clean, as `path::normalize` gives it: the watcher
+  /// cleans them.
   pub fn watch(&mut self, paths: Vec<PathBuf>, now: Instant, out: &mut Output) {
     for path in paths {
-      match normalize(&path) {
-        Some(clean) => self.register(&clean),
-        None => self.report(ErrorKind::InvalidPath, Some(path), None),
-      }
+      self.register(&path);
     }
     self.flush_now(now, out);
   }
 
-  /// Takes back what `watch` did for every path, and reports nothing for them.
+  /// Takes back what `watch` did for every path, and reports nothing for them. Each path is
+  /// clean, as for `watch`.
   pub fn unwatch(&mut self, paths: Vec<PathBuf>, now: Instant, out: &mut Output) {
     for path in paths {
-      if let Some(clean) = normalize(&path) {
-        self.unregister(&clean);
-      }
+      self.unregister(&path);
     }
     self.narrow_all();
     // What still stands may need another watch now, or another look.
@@ -438,7 +439,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
     let mut path = mem::take(&mut self.path);
     loss_scans_ran |= self.check_marks(&mut path, rest_is_over, hints_due);
-    self.due_holds.clear();
+    self.due_holds = emptied(mem::take(&mut self.due_holds));
     let mut names = mem::take(&mut self.names);
     // A flush that only gave watches back commits too: the backend moves its watches then.
     while (!self.tree.to_scan.is_empty() || self.gave_back) && !self.stopped() {
@@ -541,11 +542,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Keeps one error of each kind for the next output, but every `RemoteDisk`: each is about
   /// another disk, and each disk is told once (`tell_remote_disk`).
-  fn report(&mut self, kind: ErrorKind, path: Option<PathBuf>, source: Option<io::Error>) {
+  fn report(&mut self, kind: ErrorKind, path: &Path, source: io::Error) {
     let kept =
       kind != ErrorKind::RemoteDisk && self.errors.iter().any(|error| error.kind() == kind);
     if !kept {
-      self.errors.push(Error::new(kind, path, source));
+      self.errors.push(Error::new(kind, Some(path.to_path_buf()), Some(source)));
     }
   }
 }

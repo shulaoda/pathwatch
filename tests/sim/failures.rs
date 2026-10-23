@@ -11,18 +11,14 @@ use std::{
 };
 
 use crate::fixtures::{
-  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, caught_up, flush, not_caught_up, on_all,
-  on_modes, settled, sorted, taken, window,
+  Driver, Mode, NONE, RECURSIVE, Sim, caught_up, flush, not_caught_up, on_all, on_modes, settled,
+  sorted, taken, window,
 };
 use pathwatch::{
   ErrorKind,
   backend::Signal,
   engine::{Options, Output},
 };
-
-fn driver(mode: Mode) -> Driver<SimBackend> {
-  Driver::sim(mode, Options::default())
-}
 
 /// A look that gets no answer is tried again deep. An older watched directory below the path,
 /// served by the tree watch of a directory between, is unwatched while the disk gives no
@@ -31,7 +27,7 @@ fn driver(mode: Mode) -> Driver<SimBackend> {
 fn a_look_that_got_no_answer_is_tried_again_deep() {
   // inotify watches `old` itself: the tree watch of `R` serves it with the other two.
   for mode in [Mode::Prefix, Mode::Handle] {
-    let mut d = driver(mode);
+    let mut d = Driver::sim(mode, Options::default());
     d.fs.mkdir_all("/p/R/sub/old").unwrap();
     d.fs.write("/p/R/top.js", "1").unwrap();
     d.fs.write("/p/R/sub/old/a.js", "1").unwrap();
@@ -169,7 +165,7 @@ fn a_lost_watch_reports_only_real_changes() {
 #[test]
 fn double_and_late_notifications() {
   for mode in Mode::ALL {
-    let mut d = driver(mode);
+    let mut d = Driver::sim(mode, Options::default());
     d.fs.mkdir_all("/p/r/sub").unwrap();
     d.fs.write("/p/r/sub/a", "1").unwrap();
     d.watch(&["/p/r"]);
@@ -196,7 +192,7 @@ fn double_and_late_notifications() {
 /// for again until it works.
 #[test]
 fn the_watch_limit() {
-  let mut d = driver(Mode::Inode);
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir_all("/p/r/a").unwrap();
   d.fs.mkdir_all("/p/r/b").unwrap();
   d.fs.write("/p/r/a/x", "1").unwrap();
@@ -262,7 +258,7 @@ fn a_failed_commit() {
 /// handler is told once.
 #[test]
 fn the_watch_limit_is_reported_once() {
-  let mut d = driver(Mode::Inode);
+  let mut d = Driver::sim(Mode::Inode, Options::default());
   d.fs.mkdir_all("/p/r").unwrap();
   d.fs.set_watch_limit(Some(2));
   d.watch(&["/p/r"]);
@@ -348,7 +344,7 @@ fn below_a_tree_watch_that_failed() {
 #[test]
 fn the_backend_dies() {
   for mode in Mode::ALL {
-    let mut d = driver(mode);
+    let mut d = Driver::sim(mode, Options::default());
     d.fs.mkdir_all("/p/r/sub").unwrap();
     d.fs.write("/p/r/sub/a", "1").unwrap();
     d.watch(&["/p/r"]);
@@ -378,7 +374,7 @@ fn the_backend_dies() {
 #[test]
 fn permission_denied() {
   for mode in Mode::ALL {
-    let mut d = driver(mode);
+    let mut d = Driver::sim(mode, Options::default());
     d.fs.mkdir_all("/p/r/locked").unwrap();
     d.fs.write("/p/r/locked/a", "1").unwrap();
     d.fs.write("/p/r/b", "1").unwrap();

@@ -37,11 +37,10 @@ impl Default for Config {
     // is the quiet time already. Elsewhere the saves of the IDEs write in place, rename, or
     // leave the path missing for microseconds, and 10 ms of each was enough, also on a busy
     // machine (`references/design.md` 5.9 and 5.13).
-    let (debounce, delete_delay) = if cfg!(target_os = "macos") { (0, 10) } else { (10, 10) };
     Self {
       ignored: None,
-      debounce: Duration::from_millis(debounce),
-      delete_delay: Duration::from_millis(delete_delay),
+      debounce: Duration::from_millis(if cfg!(target_os = "macos") { 0 } else { 10 }),
+      delete_delay: Duration::from_millis(10),
       polling: false,
       poll_interval: Duration::from_millis(100),
     }

@@ -1,7 +1,7 @@
 //! The inotify backend: one kernel watch for each directory. See `references/design.md` 7.1.
 
 use std::{
-  collections::hash_map::Entry,
+  collections::{BTreeSet, hash_map::Entry},
   ffi::OsStr,
   fs::File,
   io::{self, Read, Seek, SeekFrom, Write},
@@ -238,7 +238,7 @@ impl Drop for InotifyBackend {
 }
 
 /// `known`: the mounts when the backend started.
-fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
+fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
   let mut buffer = vec![0; READ_BUFFER_LEN];
   let mut next_read = Instant::now();
   let error = loop {
@@ -302,16 +302,16 @@ fn forward(fds: &Fds, mut known: Vec<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
   sink.failed(error);
 }
 
-/// The mounts of the namespace, each by its id with its mount point, in order. Mount ids and
-/// not only points: a volume mounted over another one at the same point is a change too.
+/// The mounts of the namespace, each by its id with its mount point. Mount ids and not only
+/// points: a volume mounted over another one at the same point is a change too.
 // The file stays open for the poll of the mounts, and is read again from its start: a read by
 // path (`fs::read`) could open another file under the name.
 #[expect(clippy::verbose_file_reads, reason = "the open file is read again, not a path")]
-fn read_mounts(mut file: &File) -> Option<Vec<(u64, Vec<u8>)>> {
+fn read_mounts(mut file: &File) -> Option<BTreeSet<(u64, Vec<u8>)>> {
   let mut text = Vec::new();
   file.seek(SeekFrom::Start(0)).ok()?;
   file.read_to_end(&mut text).ok()?;
-  let mut mounts: Vec<(u64, Vec<u8>)> = text
+  let mounts = text
     .split(|&byte| byte == b'\n')
     .filter_map(|line| {
       let mut fields = line.split(|&byte| byte == b' ');
@@ -319,36 +319,29 @@ fn read_mounts(mut file: &File) -> Option<Vec<(u64, Vec<u8>)>> {
       Some((id, unescape(fields.nth(3)?)))
     })
     .collect();
-  mounts.sort_unstable();
   Some(mounts)
 }
 
 /// A mount point with its space, tab, newline and backslash as the kernel writes them: `\040`.
-fn unescape(field: &[u8]) -> Vec<u8> {
+fn unescape(mut field: &[u8]) -> Vec<u8> {
   let mut text = Vec::with_capacity(field.len());
-  let mut rest = field;
-  while let Some((&byte, tail)) = rest.split_first() {
-    let octal = tail
-      .first_chunk::<3>()
-      .filter(|digits| byte == b'\\' && digits.iter().all(|digit| (b'0'..=b'7').contains(digit)));
-    if let Some(digits) = octal {
-      text.push(digits.iter().fold(0_u8, |sum, digit| sum.wrapping_mul(8) + (digit - b'0')));
-      rest = &tail[3..];
-    } else {
-      text.push(byte);
-      rest = tail;
-    }
+  loop {
+    let (byte, rest) = match field {
+      [b'\\', high @ b'0'..=b'3', mid @ b'0'..=b'7', low @ b'0'..=b'7', rest @ ..] => {
+        ((high - b'0') * 64 + (mid - b'0') * 8 + (low - b'0'), rest)
+      }
+      [byte, rest @ ..] => (*byte, rest),
+      [] => return text,
+    };
+    text.push(byte);
+    field = rest;
   }
-  text
 }
 
 /// One record for each mount point that came or went, laid out as the kernel lays out an event.
-fn mount_records(old: &[(u64, Vec<u8>)], new: &[(u64, Vec<u8>)]) -> Vec<u8> {
-  let came = new.iter().filter(|mount| old.binary_search(mount).is_err());
-  let went = old.iter().filter(|mount| new.binary_search(mount).is_err());
-  let mut points: Vec<&[u8]> = came.chain(went).map(|(_, point)| point.as_slice()).collect();
-  points.sort_unstable();
-  points.dedup();
+fn mount_records(old: &BTreeSet<(u64, Vec<u8>)>, new: &BTreeSet<(u64, Vec<u8>)>) -> Vec<u8> {
+  let points: BTreeSet<&[u8]> =
+    old.symmetric_difference(new).map(|(_, point)| point.as_slice()).collect();
   let mut raw = Vec::new();
   for point in points {
     push_record(&mut raw, MOUNT_WD, point);
@@ -456,6 +449,7 @@ mod ffi {
 #[cfg(test)]
 mod tests {
   use std::{
+    collections::BTreeSet,
     fs::File,
     os::{fd::OwnedFd, unix::net::UnixStream},
     sync::{
@@ -479,7 +473,7 @@ mod tests {
       let _ = sender.send(signal);
     });
 
-    forward(&fds, Vec::new(), &sink);
+    forward(&fds, BTreeSet::new(), &sink);
 
     let Ok(Signal::Failed(error)) = signals.try_recv() else { panic!("no failure was reported") };
     assert_eq!(error.raw_os_error(), Some(libc::EISDIR));

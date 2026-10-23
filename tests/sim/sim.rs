@@ -10,37 +10,25 @@ use crate::fixtures::{
 use pathwatch::{
   backend::{Backend, Coverage, DirKey, Hint, Want},
   engine::Options,
-  fs::{Fs, Meta},
+  fs::Fs,
 };
 
-fn lstat(fs: &SimFs, path: &str) -> Meta {
-  fs.lstat(Path::new(path)).unwrap()
-}
-
-fn names(fs: &SimFs, dir: &str) -> Vec<String> {
-  let mut names = Vec::new();
-  fs.read_dir(Path::new(dir), &mut |name, _| names.push(name.to_str().unwrap().to_owned()))
-    .unwrap();
-  names
-}
-
 // ---- a disk that ignores the case of letters ----
-
-fn disk_without_case() -> SimFs {
-  let fs = SimFs::new();
-  fs.set_ignore_case(true);
-  fs.mkdir_all("/Proj/Src").unwrap();
-  fs.write("/Proj/Src/App.js", "1").unwrap();
-  fs
-}
 
 /// Every spelling finds the entry. A listing and a real path spell it as the disk does.
 #[test]
 fn a_lookup_ignores_the_case_and_a_listing_does_not() {
-  let fs = disk_without_case();
+  let fs = SimFs::new();
+  fs.set_ignore_case(true);
+  fs.mkdir_all("/Proj/Src").unwrap();
+  fs.write("/Proj/Src/App.js", "1").unwrap();
   assert_eq!(fs.read("/proj/src/app.js"), Some(b"1".to_vec()));
-  assert_eq!(lstat(&fs, "/PROJ/SRC/APP.JS").file_id, lstat(&fs, "/Proj/Src/App.js").file_id);
-  assert_eq!(names(&fs, "/proj/SRC"), ["App.js"]);
+  let file_id = |path: &str| fs.lstat(Path::new(path)).unwrap().file_id;
+  assert_eq!(file_id("/PROJ/SRC/APP.JS"), file_id("/Proj/Src/App.js"));
+  let mut names = Vec::new();
+  fs.read_dir(Path::new("/proj/SRC"), &mut |name, _| names.push(name.to_str().unwrap().to_owned()))
+    .unwrap();
+  assert_eq!(names, ["App.js"]);
   assert_eq!(fs.real_path(Path::new("/proj/src/APP.js")).unwrap(), Path::new("/Proj/Src/App.js"));
   assert_eq!(fs.files(), [Path::new("/Proj/Src/App.js")]);
 

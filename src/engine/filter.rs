@@ -67,31 +67,21 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Whether the nearest watched path at or above the node covers it (`before_call`: the
   /// nearest that was one before the running `watch`): each node on the way up to it is an
-  /// entry of the directory above, and the filter ignores none of them as a directory. The path
-  /// is not asked: a watched directory that the filter ignores counts as missing, and has
-  /// nothing below it. Asked from the top down, so nothing is asked below an ignored one.
+  /// entry of the directory above. The filter ignores none of them as a directory: each has a
+  /// directory, or lies on the way to a watched path (design.md 5.1).
   pub(super) fn is_covered(&self, key: DirKey, before_call: bool) -> bool {
-    let (mut at, mut levels) = (key, 0);
+    let mut at = key;
     loop {
       let node = &self.tree[at];
       if node.is_path() && (!before_call || node.added() == Added::No) {
-        break;
+        return true;
       }
       // A node that is no entry of the directory above, or the root, comes first.
       let Some(parent) = self.tree.parent(at).filter(|_| !node.is_unlisted()) else {
         return false;
       };
-      (at, levels) = (parent, levels + 1);
+      at = parent;
     }
-    if self.options.ignored.is_none() {
-      return true;
-    }
-    let parent = |&at: &DirKey| self.tree.parent(at);
-    let way: Vec<DirKey> = iter::successors(Some(key), parent).take(levels).collect();
-    !way.iter().rev().any(|&at| {
-      let kept = self.tree[at].ignored(EntryKind::Dir);
-      kept.unwrap_or_else(|| self.ignored(&self.tree.path(at), EntryKind::Dir))
-    })
   }
 
   /// Asks the filter, without keeping the answer.

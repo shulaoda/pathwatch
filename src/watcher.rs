@@ -2,10 +2,8 @@
 //! backend.
 
 use std::{
-  borrow::Cow,
   cell::Cell,
   env, fmt, io,
-  marker::PhantomData,
   path::{Path, PathBuf},
   sync::{
     Arc, Mutex, PoisonError,
@@ -20,7 +18,7 @@ use crate::{
   backend::{Backend, Signal, Sink, is_watch_limit, poll::PollBackend},
   config::Config,
   engine::{Engine, Options, Output},
-  error::{Error, ErrorKind, context},
+  error::{Error, ErrorKind},
   event::Event,
   fs::StdFs,
   path::normalize,
@@ -317,10 +315,8 @@ impl Watcher {
     B: Backend,
     H: FnMut(Result<Vec<Event>, Error>) + Send + 'static,
   {
-    let (post, inbox) = Inbox::<B::Raw>::new().map_err(|error| {
-      let error = context("the queue of the watcher could not be made", error);
-      Error::new(ErrorKind::Io, None, Some(error))
-    })?;
+    let (post, inbox) = Inbox::<B::Raw>::new()
+      .map_err(|error| Error::of_watcher("the queue of the watcher could not be made", error))?;
     let (inside, from_inside) = mpsc::channel::<Command>();
     let queue = Arc::new(Queue::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -332,33 +328,28 @@ impl Watcher {
       thread::Builder::new().name("pathwatch".to_owned()).spawn(move || {
         WATCHER_THREAD.set(number);
         // The backend is made here: all of its methods run on this thread.
-        match make(sink) {
+        let mut engine = match make(sink) {
           Ok(backend) => {
             let mut engine = Engine::new(backend, StdFs, options);
             engine.fall_back_to(fallback);
-            engine.stop_with(stop);
-            run(engine, handler, &inbox, &from_inside, &queue);
+            engine
           }
           Err(error) => {
             // A limit says by itself what is missing and that the watcher polls.
-            let (kind, error) = if is_watch_limit(&error) {
-              (ErrorKind::WatchLimit, error)
+            handler(Err(if is_watch_limit(&error) {
+              Error::new(ErrorKind::WatchLimit, None, Some(error))
             } else {
-              let what = "the OS watcher did not start, so every path is polled";
-              (ErrorKind::Io, context(what, error))
-            };
-            handler(Err(Error::new(kind, None, Some(error))));
-            let mut engine = Engine::new(PollBackend::<B::Raw>(PhantomData), StdFs, fallback);
-            engine.stop_with(stop);
-            run(engine, handler, &inbox, &from_inside, &queue);
+              Error::of_watcher("the OS watcher did not start, so every path is polled", error)
+            }));
+            Engine::without_backend(StdFs, fallback)
           }
-        }
+        };
+        engine.stop_with(stop);
+        run(engine, handler, &inbox, &from_inside, &queue);
       })
     };
-    let thread = thread.map_err(|error| {
-      let error = context("the thread of the watcher did not start", error);
-      Error::new(ErrorKind::Io, None, Some(error))
-    })?;
+    let thread = thread
+      .map_err(|error| Error::of_watcher("the thread of the watcher did not start", error))?;
 
     Ok(Self {
       number,
@@ -580,28 +571,25 @@ struct Queue {
   bytes: AtomicUsize,
   /// A signal was dropped because too many bytes waited.
   overflow: AtomicBool,
-  /// A dropped signal was the word that the backend cannot go on.
-  failed: Mutex<Option<io::Error>>,
 }
 
 /// The sink of the backend: it puts a signal into the queue. A backend thread never blocks:
 /// when too much waits, the signal is dropped and a flag says so.
 fn sink<B: Backend>(post: Post<B::Raw>, queue: Arc<Queue>) -> Sink<B::Raw> {
   Sink::new(move |signal| {
-    let bytes = size_of::<Message<B::Raw>>()
-      + match &signal {
-        Signal::Raw(raw) => B::raw_bytes(raw),
-        Signal::Failed(_) => 0,
-      };
+    let Signal::Raw(raw) = &signal else {
+      // The word that the backend cannot go on comes once: like a command, it is never
+      // dropped and not counted.
+      post.send(Message::Signal(signal, 0));
+      return;
+    };
+    let bytes = size_of::<Message<B::Raw>>() + B::raw_bytes(raw);
     if queue.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes <= QUEUE_BYTES {
       // It fails only when the watcher thread is gone.
       post.send(Message::Signal(signal, bytes));
       return;
     }
     queue.bytes.fetch_sub(bytes, Ordering::AcqRel);
-    if let Signal::Failed(error) = signal {
-      *queue.failed.lock().unwrap_or_else(PoisonError::into_inner) = Some(error);
-    }
     // The thread may sleep with no deadline, so it is woken up to read the flag. Only the
     // drop that sets the flag sends the message: a flood cannot fill the queue with them.
     if !queue.overflow.swap(true, Ordering::AcqRel) {
@@ -651,7 +639,8 @@ fn run<B: Backend>(
         // (design.md 5.8) whose write the dropped signal can have been. Each flag that is set
         // sends one, so no drop goes untold.
         Message::Wake => {
-          take_overflow(&mut engine, queue);
+          queue.overflow.store(false, Ordering::Release);
+          engine.overflow(Instant::now());
           None
         }
       };
@@ -669,15 +658,6 @@ fn run<B: Backend>(
     }
     engine.tick(Instant::now(), &mut out);
     deliver(&mut engine, &mut out, &mut handler, inside);
-  }
-}
-
-/// Tells the engine of the signals that the queue dropped since the last `Wake`.
-fn take_overflow<B: Backend>(engine: &mut Engine<B, StdFs>, queue: &Queue) {
-  queue.overflow.store(false, Ordering::Release);
-  engine.overflow(Instant::now());
-  if let Some(error) = queue.failed.lock().unwrap_or_else(PoisonError::into_inner).take() {
-    engine.signal(Signal::Failed(error), Instant::now());
   }
 }
 
@@ -720,30 +700,22 @@ fn clean(path: &Path) -> Result<PathBuf, Option<io::Error>> {
   if path.as_os_str().is_empty() {
     return Err(None);
   }
+  // On Windows a path that starts with two separators is a share, or nothing. std sees one only
+  // in the form `\\server\share`; joined to the current directory, the others would name a path
+  // on its drive.
   #[cfg(windows)]
-  let absolute = path.is_absolute() || starts_like_a_share(path);
+  let absolute = path.is_absolute()
+    || matches!(path.as_os_str().as_encoded_bytes(), [b'\\' | b'/', b'\\' | b'/', ..]);
   #[cfg(not(windows))]
   let absolute = path.is_absolute();
   if absolute {
-    return normalize(path).map(Cow::into_owned).ok_or(None);
+    return normalize(path).ok_or(None);
   }
   // A relative path needs the current directory: when that cannot be read, the error says why.
   let current = env::current_dir().map_err(Some)?;
   #[cfg(windows)]
   let path = rest_of_the_drive(path, &current).ok_or(None)?;
-  normalize(&current.join(path)).map(Cow::into_owned).ok_or(None)
-}
-
-/// Windows: a path that starts with two separators is a share, or nothing. std sees one only in
-/// the form `\server\share`; joined to the current directory, the others would name a path on
-/// its drive.
-#[cfg(windows)]
-fn starts_like_a_share(path: &Path) -> bool {
-  use std::os::windows::ffi::OsStrExt;
-
-  let mut units = path.as_os_str().encode_wide();
-  let separator = |unit: Option<u16>| matches!(unit, Some(0x5C | 0x2F));
-  separator(units.next()) && separator(units.next())
+  normalize(&current.join(path)).ok_or(None)
 }
 
 /// Windows: `C:name` names `name` in the current directory of the drive, which is the current
@@ -753,19 +725,16 @@ fn starts_like_a_share(path: &Path) -> bool {
 fn rest_of_the_drive<'a>(path: &'a Path, current: &Path) -> Option<&'a Path> {
   use std::path::{Component, Prefix};
 
-  let drive = |path: &Path| match path.components().next() {
+  let drive = |part: Option<Component<'_>>| match part {
     Some(Component::Prefix(prefix)) => match prefix.kind() {
       Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => Some(letter),
       _ => None,
     },
     _ => None,
   };
-  let Some(letter) = drive(path) else { return Some(path) };
-  if drive(current) != Some(letter) {
-    return None;
-  }
-  let Some(Component::Prefix(prefix)) = path.components().next() else { return None };
-  path.strip_prefix(prefix.as_os_str()).ok()
+  let mut parts = path.components();
+  let Some(letter) = drive(parts.next()) else { return Some(path) };
+  (drive(current.components().next()) == Some(letter)).then_some(parts.as_path())
 }
 
 #[cfg(all(test, windows))]
