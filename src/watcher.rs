@@ -21,18 +21,10 @@ use crate::{
   path::normalize,
 };
 
-/// The most bytes of backend signals that wait in the queue. Past it a signal is dropped, and the
-/// engine checks everything. Bytes, because a signal can be a few bytes or a whole OS buffer.
 const QUEUE_BYTES: usize = 16 << 20;
-/// The most messages taken in one turn of the loop, so that a flood of signals cannot hold back
-/// a flush.
 const MESSAGES_PER_TURN: usize = 512;
 
 thread_local! {
-  /// The number of the watcher whose thread this is, 0 on any other thread. A `Cell` has no
-  /// destructor, so it can still be read while the thread exits, where `thread::current` panics.
-  // `allow`, not `expect`: on Android the lint takes the `const` for a plain initializer, but
-  // only where it can read the source of std.
   #[cfg_attr(
     target_os = "android",
     allow(clippy::missing_const_for_thread_local, reason = "the initializer is `const`")
@@ -40,7 +32,6 @@ thread_local! {
   static WATCHER_THREAD: Cell<usize> = const { Cell::new(0) };
 }
 
-/// The number of the next watcher, from 1.
 static NEXT_WATCHER: AtomicUsize = AtomicUsize::new(1);
 
 /// Watches paths and reports file changes: create, update, delete.
@@ -58,24 +49,24 @@ static NEXT_WATCHER: AtomicUsize = AtomicUsize::new(1);
 /// # }
 /// ```
 pub struct Watcher {
-  /// The number of its thread in `WATCHER_THREAD`.
+  /// The number of this watcher, which its thread keeps in `WATCHER_THREAD`.
   number: usize,
-  /// Sends a command to the thread; `false` when the thread is gone. A closure, since the
-  /// message type depends on the backend.
+  /// Sends a command to the thread. `false` if the thread is gone.
   send: Box<dyn Fn(Command) -> bool + Send + Sync>,
-  /// The commands from inside the handler, taken when the handler returns.
+  /// Commands from inside the handler, run after it returns.
   inside: Sender<Command>,
+  /// Set by `close`.
   stop: Arc<AtomicBool>,
-  /// Taken by `close` to wait for the thread.
+  /// Joined by `close`.
   thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Watcher {
-  /// Starts a watcher with the default [`Config`]. See [`with_config`](Self::with_config).
+  /// Starts a watcher with the default [`Config`].
   ///
   /// # Errors
   ///
-  /// The watcher thread, or the queue into it, could not be made.
+  /// As for [`with_config`](Self::with_config).
   pub fn new<H>(handler: H) -> Result<Self, Error>
   where
     H: FnMut(Result<Vec<Event>, Error>) + Send + 'static,
@@ -85,17 +76,15 @@ impl Watcher {
 
   /// Starts the watcher thread. Nothing is watched yet.
   ///
-  /// `handler` runs on that thread and gets `Ok(events)`, one batch (never empty, at most one
-  /// event for a path, in no set order), or `Err(error)`, after which the watcher keeps running.
-  /// It should only pass the batch on: a slow handler delays every check of the disk and every
-  /// call. A `watch`, `unwatch` or `close` on another thread waits for the handler, so the
-  /// handler must never wait for such a caller.
+  /// `handler` runs on that thread and gets a batch of events (never empty, at most one per path,
+  /// in no set order) or an error. It should only pass the batch on, and must not wait for a
+  /// thread that is calling `watch`, `unwatch` or `close`: those calls wait for the handler.
   ///
-  /// A handler or an ignore filter that panics ends the thread: nothing is reported after that,
-  /// and `watch` and `unwatch` return [`ErrorKind::Closed`].
+  /// If the handler or the ignore filter panics, the thread ends, and `watch` and `unwatch`
+  /// return [`ErrorKind::Closed`].
   ///
-  /// When the watch API of the OS does not start, or stops later, the watcher polls everything
-  /// and tells the handler once ([`ErrorKind::WatchLimit`] or [`ErrorKind::Io`]).
+  /// If the watch API of the OS does not start, or stops later, the watcher polls everything and
+  /// tells the handler once.
   ///
   /// # Errors
   ///
@@ -104,7 +93,6 @@ impl Watcher {
   where
     H: FnMut(Result<Vec<Event>, Error>) + Send + 'static,
   {
-    // The one place that says which target has which native backend. Any other target polls.
     #[cfg(target_os = "macos")]
     use crate::backend::fsevents::FsEventsBackend as Native;
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -121,14 +109,13 @@ impl Watcher {
     Self::start(poll.clone(), poll, handler, |_| Ok(PollBackend))
   }
 
-  /// Watches each path: a file, a directory with everything below it, or a path that does not
-  /// exist yet. Returns when every path is watched: what exists then is not reported, every
-  /// later change is. Watching a path again does nothing. Inside the handler it does not wait:
-  /// the paths are watched when the handler returns.
+  /// Watches each path: a file, a directory and everything below it, or a path that does not
+  /// exist yet. Returns when every path is watched; only later changes are reported. Watching a
+  /// path again does nothing. Inside the handler it returns at once, and the paths are watched
+  /// after the handler returns.
   ///
   /// A relative path is joined to the current directory, and `.`, `..` and repeated separators
-  /// are cleaned by text; no link is resolved and no letter case is changed (README, promise 8).
-  /// Every event path starts with the cleaned path.
+  /// are removed; links are not resolved (README, promise 8).
   ///
   /// # Errors
   ///
@@ -136,17 +123,15 @@ impl Watcher {
   ///   the error names the first one skipped.
   /// - [`ErrorKind::Closed`]: the watcher is closed.
   ///
-  /// A path that the OS cannot watch or read is no error here: the handler gets it.
+  /// A path that the OS cannot watch or read goes to the handler, not here.
   pub fn watch(&self, paths: &[impl AsRef<Path>]) -> Result<(), Error> {
     self.command(paths, Command::Watch)
   }
 
-  /// Takes back a [`watch`](Self::watch) of these very paths; a path that is not watched is
-  /// skipped. Nothing is reported for them: a file that only they covered is forgotten, and a
-  /// file that another watched path covers stays known. One exception is reported: a link inside
-  /// a watched directory that the path went through is a plain file of that directory again
-  /// (README, promise 12). To cut a part out of a watched directory, use
-  /// [`Config::with_ignored`]. Inside the handler it does not wait.
+  /// Takes back a [`watch`](Self::watch) of these exact paths; a path that is not watched is
+  /// skipped. Nothing is reported for them, except a link that is a plain file again (README,
+  /// promise 12). Files that another watched path covers stay watched. Inside the handler it
+  /// returns at once. To leave out part of a watched directory, use [`Config::with_ignored`].
   ///
   /// # Errors
   ///
@@ -157,34 +142,31 @@ impl Watcher {
     self.command(paths, Command::Unwatch)
   }
 
-  /// Stops the watcher and waits for its thread. After it the handler is not called again,
-  /// nothing is watched, and `watch` and `unwatch` return [`ErrorKind::Closed`]. Events not
-  /// handed over yet are dropped, and a running check of the disk ends at its next step. It can
-  /// be called many times. Inside the handler it does not wait: the thread ends when the handler
-  /// returns. While the process exits on Windows, the OS has ended the thread already, and
-  /// nothing is waited for.
+  /// Stops the watcher and waits for its thread. After that the handler is not called again,
+  /// and `watch` and `unwatch` return [`ErrorKind::Closed`]. Events not handed over yet are
+  /// dropped. It can be called more than once. Inside the handler it returns at once.
   pub fn close(&self) {
     self.stop.store(true, Ordering::Release);
-    // While the process exits, Windows has ended every other thread, and one of them can hold
-    // the lock of the queue, and `join` would panic: nothing is sent, and nothing is waited for.
+    // While the process exits, Windows has already ended the other threads: sending could block
+    // on a lock they held, and `join` would panic.
     #[cfg(windows)]
     if process_is_exiting() {
       return;
     }
-    // Wakes the thread up. It fails only when the thread is gone.
-    let _ = (self.send)(Command::Stop);
+    // Wakes the thread up.
+    (self.send)(Command::Stop);
     if self.on_its_thread() {
       return;
     }
-    // Held while waiting: a `close` on another thread returns only when the thread is gone too.
+    // Held while joining, so that a `close` on another thread waits too.
     let mut thread = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(thread) = thread.take() {
-      // `Err` when a panic of the handler ended the thread.
+      // `Err` if the handler panicked.
       let _ = thread.join();
     }
   }
 
-  /// [`with_config`](Self::with_config) with a backend of the caller's choice, for the tests.
+  /// [`with_config`](Self::with_config) with a given backend, for the tests.
   ///
   /// # Errors
   ///
@@ -203,8 +185,8 @@ impl Watcher {
     Self::start(options.clone(), options, handler, make)
   }
 
-  /// Starts the watcher thread, which makes the backend with `make`. When that fails, or the
-  /// backend stops later, the handler is told once and the watcher polls with `fallback`.
+  /// Starts the watcher thread, which makes the backend with `make`. If that fails, or the
+  /// backend stops later, the watcher polls with `fallback`.
   fn start<B, H>(
     options: Options,
     fallback: Options,
@@ -227,7 +209,7 @@ impl Watcher {
       let stop = Arc::clone(&stop);
       thread::Builder::new().name("pathwatch".to_owned()).spawn(move || {
         WATCHER_THREAD.set(number);
-        // Made here: every method of the backend runs on this thread.
+        // The backend lives on this thread.
         let mut engine = match make(sink) {
           Ok(backend) => {
             let mut engine = Engine::new(backend, StdFs, options);
@@ -235,7 +217,7 @@ impl Watcher {
             engine
           }
           Err(error) => {
-            // A limit says by itself what is missing and that the watcher polls.
+            // `WatchLimit` already says that the watcher polls.
             handler(Err(if is_watch_limit(&error) {
               Error::new(ErrorKind::WatchLimit, None, Some(error))
             } else {
@@ -259,7 +241,7 @@ impl Watcher {
     })
   }
 
-  /// Cleans the paths and sends the usable ones to the thread as one command.
+  /// Cleans the paths and sends the usable ones to the thread.
   fn command(
     &self,
     paths: &[impl AsRef<Path>],
@@ -278,11 +260,11 @@ impl Watcher {
       }
     }
     let sent = if self.on_its_thread() {
-      // The thread cannot wait for itself: it takes the command when the handler returns.
+      // Inside the handler: the command runs after it returns.
       self.inside.send(command(usable, None)).is_ok()
     } else {
       let (done, wait) = mpsc::sync_channel(1);
-      // `wait` fails when the thread stops before the command is done.
+      // `recv` fails if the thread stops first.
       (self.send)(command(usable, Some(done))) && wait.recv().is_ok()
     };
     if !sent {
@@ -291,7 +273,7 @@ impl Watcher {
     skipped.map_or(Ok(()), |(path, why)| Err(Error::new(ErrorKind::InvalidPath, Some(path), why)))
   }
 
-  /// Whether this is the thread of the watcher: inside the handler, or the backend.
+  /// Whether this runs on the thread of the watcher, as the handler does.
   fn on_its_thread(&self) -> bool {
     WATCHER_THREAD.get() == self.number
   }
@@ -309,7 +291,7 @@ impl fmt::Debug for Watcher {
   }
 }
 
-/// Whether the process is exiting: `ExitProcess` has ended every other thread.
+/// Whether the process is exiting.
 #[cfg(windows)]
 fn process_is_exiting() -> bool {
   #[link(name = "ntdll")]
@@ -321,26 +303,24 @@ fn process_is_exiting() -> bool {
 }
 
 enum Message<R> {
-  /// A signal of the backend, and the bytes it counts for in the queue.
+  /// A signal of the backend, and its size in the queue.
   Signal(Signal<R>, usize),
   Command(Command),
-  /// A signal was dropped. It wakes the thread up, which takes the overflow at its place in the
-  /// queue.
+  /// A signal was dropped. The thread takes the overflow here.
   Wake,
 }
 
 enum Command {
   Watch(Vec<PathBuf>, Done),
   Unwatch(Vec<PathBuf>, Done),
-  /// Only wakes the thread up. The stop flag says the rest.
+  /// Only wakes the thread up; the stop flag does the rest.
   Stop,
 }
 
-/// Where the thread says that a command is done. `None` for a command from inside the handler,
-/// for which nobody waits.
+/// Tells the caller that the command is done. `None` inside the handler.
 type Done = Option<SyncSender<()>>;
 
-/// The sending end of the queue. On Windows it also wakes the thread up (`inbox`).
+/// The sending end of the queue. On Windows it also sets the wake event.
 struct Post<R> {
   sender: Sender<Message<R>>,
   #[cfg(windows)]
@@ -348,7 +328,7 @@ struct Post<R> {
 }
 
 impl<R> Post<R> {
-  /// `false`: the watcher thread is gone.
+  /// `false` if the thread is gone.
   fn send(&self, message: Message<R>) -> bool {
     let sent = self.sender.send(message).is_ok();
     #[cfg(windows)]
@@ -367,7 +347,7 @@ impl<R> Clone for Post<R> {
   }
 }
 
-/// The receiving end of the queue, on the watcher thread.
+/// The receiving end of the queue.
 struct Inbox<R> {
   receiver: Receiver<Message<R>>,
   #[cfg(windows)]
@@ -393,8 +373,7 @@ impl<R> Inbox<R> {
     Ok((Post { sender }, Self { receiver }))
   }
 
-  /// The next message, or `None` when `deadline` comes first. `Stop` when every `Post` is gone:
-  /// the watcher was dropped.
+  /// The next message, or `None` at `deadline`. `Stop` once the watcher is dropped.
   #[cfg(windows)]
   fn take(&self, deadline: Option<Instant>) -> Option<Message<R>> {
     loop {
@@ -409,8 +388,7 @@ impl<R> Inbox<R> {
     }
   }
 
-  /// The next message, or `None` when `deadline` comes first. `Stop` when every `Post` is gone:
-  /// the watcher was dropped.
+  /// The next message, or `None` at `deadline`. `Stop` once the watcher is dropped.
   #[cfg(not(windows))]
   fn take(&self, deadline: Option<Instant>) -> Option<Message<R>> {
     let Some(deadline) = deadline else {
@@ -424,10 +402,8 @@ impl<R> Inbox<R> {
   }
 }
 
-/// The wait of the watcher thread on Windows. A timed wait of a channel ends only at a tick of
-/// the clock, every 15.6 ms by default: a wait of 20 ms takes 31 ms (measured). So the thread
-/// waits on an event that every sender sets, and on a high-resolution timer, which is due within
-/// half a millisecond.
+/// The wait of the watcher thread on Windows. A timed wait on a channel ends only at a clock
+/// tick (15.6 ms by default), so the thread waits on an event and a high-resolution timer.
 #[cfg(windows)]
 mod inbox {
   use std::{
@@ -445,8 +421,7 @@ mod inbox {
     },
   };
 
-  /// An event that a sender sets and the next wait resets. It stays set until a wait takes it,
-  /// so a message sent between a look at the queue and the wait is not missed.
+  /// An event that every send sets. It stays set until a wait takes it, so no message is missed.
   pub struct Wake(OwnedHandle);
 
   impl Wake {
@@ -467,7 +442,7 @@ mod inbox {
     }
   }
 
-  /// A high-resolution timer where Windows has one (10, 1803 and later), a plain one before.
+  /// A high-resolution timer where Windows has one (10, 1803 and later), else a plain one.
   pub struct Timer(OwnedHandle);
 
   impl Timer {
@@ -487,7 +462,7 @@ mod inbox {
       Ok(Self(unsafe { OwnedHandle::from_raw_handle(timer) }))
     }
 
-    /// Waits until `wake` is set, or until `until` when there is one. `false`: the time came.
+    /// Waits until `wake` is set or `until` comes. `false` if the time came.
     pub fn wait(&self, wake: &Wake, until: Option<Instant>) -> bool {
       let Some(until) = until else {
         // SAFETY: the handle is open.
@@ -495,14 +470,13 @@ mod inbox {
         return true;
       };
       let left = until.saturating_duration_since(Instant::now());
-      // Relative, in units of 100 ns, and negative to say so.
+      // Negative: relative, in units of 100 ns.
       let due = -i64::try_from(left.as_nanos() / 100).unwrap_or(i64::MAX);
       let timer = self.0.as_raw_handle();
       // SAFETY: the handle is open, `due` lives through the call, and no routine is given.
       let set = unsafe { SetWaitableTimer(timer, &raw const due, 0, None, ptr::null(), 0) };
       if set == 0 {
-        // Not with an open handle. A wait on the event alone could miss the time: a short
-        // sleep, and the caller looks again.
+        // Not with an open handle. Sleep a little, and the caller looks again.
         thread::sleep(left.min(Duration::from_millis(1)));
         return true;
       }
@@ -513,7 +487,7 @@ mod inbox {
         return false;
       }
       if which != WAIT_OBJECT_0 {
-        // Not with open handles. Against a spin, as above.
+        // Not with open handles. Sleep a little, so as not to spin.
         thread::sleep(left.min(Duration::from_millis(1)));
       }
       true
@@ -521,41 +495,38 @@ mod inbox {
   }
 }
 
-/// What the backend threads and the watcher thread share about the queue.
+/// The state of the queue, shared by the backend threads and the watcher thread.
 #[derive(Default)]
 struct Queue {
   /// The bytes of the signals that wait.
   bytes: AtomicUsize,
-  /// A signal was dropped because too many bytes waited.
+  /// A signal was dropped.
   overflow: AtomicBool,
 }
 
-/// The sink of the backend: it puts a signal into the queue. A backend thread never blocks:
-/// when too much waits, the signal is dropped and a flag says so.
+/// The sink of the backend. It never blocks: when the queue is full, the signal is dropped and
+/// `overflow` is set.
 fn sink<B: Backend>(post: Post<B::Raw>, queue: Arc<Queue>) -> Sink<B::Raw> {
   Sink::new(move |signal| {
     let Signal::Raw(raw) = &signal else {
-      // The word that the backend cannot go on comes once: like a command, it is never
-      // dropped and not counted.
+      // `Failed` comes once: it is never dropped and not counted.
       post.send(Message::Signal(signal, 0));
       return;
     };
     let bytes = size_of::<Message<B::Raw>>() + B::raw_bytes(raw);
     if queue.bytes.fetch_add(bytes, Ordering::AcqRel) + bytes <= QUEUE_BYTES {
-      // It fails only when the watcher thread is gone.
       post.send(Message::Signal(signal, bytes));
       return;
     }
     queue.bytes.fetch_sub(bytes, Ordering::AcqRel);
-    // The thread may sleep with no deadline, so it is woken up to read the flag. Only the
-    // drop that sets the flag sends the message: a flood cannot fill the queue with them.
+    // Only the drop that sets the flag wakes the thread up, so a flood sends one `Wake`.
     if !queue.overflow.swap(true, Ordering::AcqRel) {
       post.send(Message::Wake);
     }
   })
 }
 
-/// The loop of the watcher thread: take messages, then do what the engine says is due.
+/// The loop of the watcher thread: take messages, then do what is due.
 fn run<B: Backend>(
   mut engine: Engine<B, StdFs>,
   mut handler: impl FnMut(Result<Vec<Event>, Error>),
@@ -586,8 +557,8 @@ fn run<B: Backend>(
           done
         }
         Message::Command(Command::Stop) => return,
-        // Taken here, where the drop was in the queue: a delivery behind it must not end the
-        // doubt of a young file (design.md 5.8) whose write the dropped signal may have been.
+        // Taken at the place of the drop in the queue, before the signals after it (design.md
+        // 5.8).
         Message::Wake => {
           queue.overflow.store(false, Ordering::Release);
           engine.overflow(Instant::now());
@@ -612,9 +583,7 @@ fn run<B: Backend>(
 }
 
 /// Hands the output of the engine to the handler, then runs each `watch` and `unwatch` that the
-/// handler called, before the next message of the queue: one at a time, each with its own batch,
-/// since a batch has at most one event for a path. After a `close` the handler is not called
-/// again.
+/// handler called, one at a time, each with its own batch. Stops once the watcher is closed.
 fn deliver<B: Backend>(
   engine: &mut Engine<B, StdFs>,
   out: &mut Output,
@@ -622,13 +591,12 @@ fn deliver<B: Backend>(
   inside: &Receiver<Command>,
 ) {
   loop {
-    for error in out.errors.drain(..) {
-      if !engine.stopped() {
-        handler(Err(error));
+    let events = (!out.events.is_empty()).then(|| Ok(mem::take(&mut out.events)));
+    for result in out.errors.drain(..).map(Err).chain(events) {
+      if engine.stopped() {
+        return;
       }
-    }
-    if !out.events.is_empty() && !engine.stopped() {
-      handler(Ok(mem::take(&mut out.events)));
+      handler(result);
     }
     if engine.stopped() {
       return;
@@ -641,16 +609,13 @@ fn deliver<B: Backend>(
   }
 }
 
-/// The form of `path` that the engine takes: absolute and clean. `Err` when it cannot be used,
-/// with the error of the current directory when a relative path needed it and it could not be
-/// read.
+/// `path` made absolute and clean. `Err` if it cannot be used, with the error of reading the
+/// current directory if there was one.
 fn clean(path: &Path) -> Result<PathBuf, Option<io::Error>> {
   if path.as_os_str().is_empty() {
     return Err(None);
   }
-  // On Windows a path that starts with two separators is a share or nothing. std sees a share
-  // only as `\\server\share`; joined to the current directory, the others would name a path on
-  // its drive.
+  // On Windows a path that starts with two separators is a share, never relative.
   let absolute = path.is_absolute()
     || (cfg!(windows)
       && matches!(path.as_os_str().as_encoded_bytes(), [b'\\' | b'/', b'\\' | b'/', ..]));
@@ -663,9 +628,8 @@ fn clean(path: &Path) -> Result<PathBuf, Option<io::Error>> {
   normalize(&current.join(path)).ok_or(None)
 }
 
-/// Windows: `C:name` names `name` in the current directory of the drive, which is the current
-/// directory when that is on the drive. The rest of such a path, or the path as it is; `None`
-/// for another drive, whose current directory the watcher does not know.
+/// Windows: the rest of a `C:name` path when the current directory is on that drive, `None` for
+/// another drive, or the path as it is.
 #[cfg(windows)]
 fn rest_of_the_drive<'a>(path: &'a Path, current: &Path) -> Option<&'a Path> {
   use std::path::{Component, Prefix};
