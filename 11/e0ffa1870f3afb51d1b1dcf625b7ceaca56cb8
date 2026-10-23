@@ -1,0 +1,81 @@
+README.md
+  s_0070b6318eca36::t_bb3f6fed953f1e 370
+references/design.md
+  s_0070b6318eca36::t_b47741ad671605 175,758-768,984-985,1189-1190,1321-1324,1330-1331
+src/backend/fsevents.rs
+  s_0070b6318eca36::t_359710959f290b 14,69-79,83-84,89-91,94-101,124-125,129,137,145,148,157,162,164,166-167,178,181,184,190,202,204,206,262-263,265,289,293-294,303,312,314,324-326,349,368,377-378,394-395,411,417,421,439,441-442,459,461,470,480-589,718-719,1155
+src/backend/inotify.rs
+  s_0070b6318eca36::t_3a0420624772b7 13,54-65,92,134,175-179,219-223,241,265,267-268,271-273,286-290,293,340-342,345,452
+src/backend/poll.rs
+  s_0070b6318eca36::t_3396f2a713fc30 3,5
+src/config.rs
+  s_0070b6318eca36::t_74a02de5017ea8 21
+src/engine/check.rs
+  s_0070b6318eca36::t_f969de2339d6a3 19,204,265,272-274,575-576,588,640
+src/engine/mod.rs
+  s_0070b6318eca36::t_9c247ef1b87590 126,196-199,247-248,306,311-315,347-348,469-476,540
+src/engine/os_watch.rs
+  s_0070b6318eca36::t_dc9a6f3761dc20 6,10,28-32,166,183-190,199
+src/engine/scan.rs
+  s_0070b6318eca36::t_b1ccecdd143a46 13,69,175,182,184-186
+src/engine/watched_paths.rs
+  s_0070b6318eca36::t_941f2377aa0673 2-3,5-8,16,123-159,266-308
+src/fs/mod.rs
+  s_0070b6318eca36::t_5f34377f7e94b5 289-304
+src/path.rs
+  s_0070b6318eca36::t_c5b4085a106fad 149-153,160-163
+src/tree/mod.rs
+  s_0070b6318eca36::t_b17bffcf80b9f0 946,949,1144
+src/watcher.rs
+  s_0070b6318eca36::t_ad664eebc860d8 124-126,128-133,135-136,194-196,201-202,204-206,428-429,431,434-435,439,444-445,447,449,452-454,600,742,758
+tests/fsevents.rs
+  s_0070b6318eca36::t_9a15a378d397ec 249
+tests/inotify.rs
+  s_0070b6318eca36::t_3887f7d730ee92 28-30,80,160-163,184,205,268,400-402,733-735
+tests/poll.rs
+  s_0070b6318eca36::t_b868e3ae5b2e3e 17,110,238
+tests/sim/baseline.rs
+  s_0070b6318eca36::t_73f4ba2710dc31 9-10,275
+tests/sim/cost.rs
+  s_0070b6318eca36::t_99d7dc2b3b6bef 28,46,50,312,316,556,560
+tests/sim/counting.rs
+  s_0070b6318eca36::t_b295ecc89a92f7 1-2,7
+tests/sim/fixtures/driver.rs
+  s_0070b6318eca36::t_a784e37f32116c 286,331
+tests/sim/fixtures/mod.rs
+  s_0070b6318eca36::t_d9f5d0d547b698 72
+tests/sim/moved_directories.rs
+  s_0070b6318eca36::t_67f41099733c5a 8-9,49
+tests/sim/spelling.rs
+  s_0070b6318eca36::t_57c48952196c0b 10-11,177,390
+tests/sim/unwatch.rs
+  s_0070b6318eca36::t_626983b9caf651 9,144,353
+tests/sim/want.rs
+  s_0070b6318eca36::t_f2b0732369fade 9-10,227,381
+tests/sim/young.rs
+  s_0070b6318eca36::t_0704a138294916 9,70
+tests/stories/disk.rs
+  s_0070b6318eca36::t_72eb5ce8158696 7
+tests/stories/main.rs
+  s_0070b6318eca36::t_e78d66eb093ec6 42,46,84,117,123,130,134,139,146,152,156,175,183,200
+tests/watcher.rs
+  s_0070b6318eca36::t_523b87014fb3a9 52-53,55-63,69-70,81,84-87,103,251-280,350,391-393,412,453-454,469-470,473-474,476,480-481,488,503,508,516,519,528-530,541-542,546,549-550,556,558,563,573-575,581-582,593-595,603,613-615,620-621,623,720
+tests/windows/parts.rs
+  s_0070b6318eca36::t_b371e7daa6443f 70,75,95,294,298,405-406,436-437,1117,1204-1205
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "11e0ffa1870f3afb51d1b1dcf625b7ceaca56cb8",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
