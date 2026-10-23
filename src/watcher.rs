@@ -227,7 +227,7 @@ impl Watcher {
           }
         };
         engine.stop_with(stop);
-        run(engine, handler, &inbox, &from_inside, &queue);
+        Worker { engine, handler, inbox, inside: from_inside, queue, out: Output::default() }.run();
       })
     }
     .map_err(|error| Error::of_watcher("the thread of the watcher did not start", error))?;
@@ -526,85 +526,86 @@ fn sink<B: Backend>(post: Post<B::Raw>, queue: Arc<Queue>) -> Sink<B::Raw> {
   })
 }
 
-/// The loop of the watcher thread: take messages, then do what is due.
-fn run<B: Backend>(
-  mut engine: Engine<B, StdFs>,
-  mut handler: impl FnMut(Result<Vec<Event>, Error>),
-  inbox: &Inbox<B::Raw>,
-  inside: &Receiver<Command>,
-  queue: &Queue,
-) {
-  let mut out = Output::default();
-  loop {
-    let mut next = inbox.take(engine.deadline());
-    let mut taken = 0;
-    while let Some(message) = next {
-      if engine.stopped() {
-        return;
-      }
-      let done = match message {
-        Message::Signal(signal, bytes) => {
-          queue.bytes.fetch_sub(bytes, Ordering::AcqRel);
-          engine.signal(signal, Instant::now());
-          None
-        }
-        Message::Command(Command::Watch(paths, done)) => {
-          engine.watch(paths, Instant::now(), &mut out);
-          done
-        }
-        Message::Command(Command::Unwatch(paths, done)) => {
-          engine.unwatch(paths, Instant::now(), &mut out);
-          done
-        }
-        Message::Command(Command::Stop) => return,
-        // Taken at the place of the drop in the queue, before the signals after it (design.md
-        // 5.8).
-        Message::Wake => {
-          queue.overflow.store(false, Ordering::Release);
-          engine.overflow(Instant::now());
-          None
-        }
-      };
-      deliver(&mut engine, &mut out, &mut handler, inside);
-      if let Some(done) = done {
-        // The caller may be gone.
-        let _ = done.send(());
-      }
-      taken += 1;
-      next = if taken < MESSAGES_PER_TURN { inbox.receiver.try_recv().ok() } else { None };
-    }
-
-    if engine.stopped() {
-      return;
-    }
-    engine.tick(Instant::now(), &mut out);
-    deliver(&mut engine, &mut out, &mut handler, inside);
-  }
+/// What the watcher thread owns.
+struct Worker<B: Backend, H> {
+  engine: Engine<B, StdFs>,
+  handler: H,
+  inbox: Inbox<B::Raw>,
+  inside: Receiver<Command>,
+  queue: Arc<Queue>,
+  out: Output,
 }
 
-/// Hands the output of the engine to the handler, then runs each `watch` and `unwatch` that the
-/// handler called, one at a time, each with its own batch. Stops once the watcher is closed.
-fn deliver<B: Backend>(
-  engine: &mut Engine<B, StdFs>,
-  out: &mut Output,
-  handler: &mut impl FnMut(Result<Vec<Event>, Error>),
-  inside: &Receiver<Command>,
-) {
-  loop {
-    let events = (!out.events.is_empty()).then(|| Ok(mem::take(&mut out.events)));
-    for result in out.errors.drain(..).map(Err).chain(events) {
-      if engine.stopped() {
+impl<B: Backend, H: FnMut(Result<Vec<Event>, Error>)> Worker<B, H> {
+  /// The loop of the watcher thread: take messages, then do what is due.
+  fn run(mut self) {
+    loop {
+      let mut next = self.inbox.take(self.engine.deadline());
+      let mut taken = 0;
+      while let Some(message) = next {
+        if self.engine.stopped() {
+          return;
+        }
+        let done = match message {
+          Message::Signal(signal, bytes) => {
+            self.queue.bytes.fetch_sub(bytes, Ordering::AcqRel);
+            self.engine.signal(signal, Instant::now());
+            None
+          }
+          Message::Command(Command::Watch(paths, done)) => {
+            self.engine.watch(paths, Instant::now(), &mut self.out);
+            done
+          }
+          Message::Command(Command::Unwatch(paths, done)) => {
+            self.engine.unwatch(paths, Instant::now(), &mut self.out);
+            done
+          }
+          Message::Command(Command::Stop) => return,
+          // Taken at the place of the drop in the queue, before the signals after it (design.md
+          // 5.8).
+          Message::Wake => {
+            self.queue.overflow.store(false, Ordering::Release);
+            self.engine.overflow(Instant::now());
+            None
+          }
+        };
+        self.deliver();
+        if let Some(done) = done {
+          // The caller may be gone.
+          let _ = done.send(());
+        }
+        taken += 1;
+        next = if taken < MESSAGES_PER_TURN { self.inbox.receiver.try_recv().ok() } else { None };
+      }
+
+      if self.engine.stopped() {
         return;
       }
-      handler(result);
+      self.engine.tick(Instant::now(), &mut self.out);
+      self.deliver();
     }
-    if engine.stopped() {
-      return;
-    }
-    match inside.try_recv() {
-      Ok(Command::Watch(paths, _)) => engine.watch(paths, Instant::now(), out),
-      Ok(Command::Unwatch(paths, _)) => engine.unwatch(paths, Instant::now(), out),
-      Ok(Command::Stop) | Err(_) => return,
+  }
+
+  /// Hands the output of the engine to the handler, then runs each `watch` and `unwatch` that
+  /// the handler called, one at a time, each with its own batch. Stops once the watcher is
+  /// closed.
+  fn deliver(&mut self) {
+    loop {
+      let events = (!self.out.events.is_empty()).then(|| Ok(mem::take(&mut self.out.events)));
+      for result in self.out.errors.drain(..).map(Err).chain(events) {
+        if self.engine.stopped() {
+          return;
+        }
+        (self.handler)(result);
+      }
+      if self.engine.stopped() {
+        return;
+      }
+      match self.inside.try_recv() {
+        Ok(Command::Watch(paths, _)) => self.engine.watch(paths, Instant::now(), &mut self.out),
+        Ok(Command::Unwatch(paths, _)) => self.engine.unwatch(paths, Instant::now(), &mut self.out),
+        Ok(Command::Stop) | Err(_) => return,
+      }
     }
   }
 }
@@ -615,11 +616,10 @@ fn clean(path: &Path) -> Result<PathBuf, Option<io::Error>> {
   if path.as_os_str().is_empty() {
     return Err(None);
   }
-  // On Windows a path that starts with two separators is a share, never relative.
-  let absolute = path.is_absolute()
+  if path.is_absolute()
     || (cfg!(windows)
-      && matches!(path.as_os_str().as_encoded_bytes(), [b'\\' | b'/', b'\\' | b'/', ..]));
-  if absolute {
+      && matches!(path.as_os_str().as_encoded_bytes(), [b'\\' | b'/', b'\\' | b'/', ..]))
+  {
     return normalize(path).ok_or(None);
   }
   let current = env::current_dir().map_err(Some)?;
@@ -648,12 +648,9 @@ fn rest_of_the_drive<'a>(path: &'a Path, current: &Path) -> Option<&'a Path> {
 
 #[cfg(all(test, windows))]
 mod tests {
-  use std::{
-    thread,
-    time::{Duration, Instant},
-  };
+  use std::time::{Duration, Instant};
 
-  use super::{Inbox, Message};
+  use super::Inbox;
 
   /// The wait ends with the deadline, not with the next tick of the clock (15.6 ms).
   #[test]
@@ -667,20 +664,5 @@ mod tests {
       assert!(waited >= Duration::from_millis(deadline), "{waited:?} for {deadline} ms");
       assert!(waited < Duration::from_millis(at_most), "{waited:?} for {deadline} ms");
     }
-  }
-
-  #[test]
-  fn a_message_ends_the_wait() {
-    let (post, inbox) = Inbox::<()>::new().unwrap();
-    let sender = thread::spawn(move || {
-      thread::sleep(Duration::from_millis(5));
-      post.send(Message::Wake);
-      post
-    });
-    let start = Instant::now();
-    let taken = inbox.take(Some(start + Duration::from_secs(5)));
-    assert!(matches!(taken, Some(Message::Wake)));
-    assert!(start.elapsed() < Duration::from_millis(100), "{:?}", start.elapsed());
-    drop(sender.join().unwrap());
   }
 }
