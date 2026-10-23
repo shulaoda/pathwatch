@@ -1,0 +1,39 @@
+src/backend/windows.rs
+  s_0070b6318eca36::t_60f6f8ee7c5dbb 6,8,10-12,49
+src/backend/fsevents.rs
+  s_0070b6318eca36::t_94d79cf504e5e5 294,843
+references/design.md
+  s_0070b6318eca36::t_a451d00312e844 129-135
+Cargo.lock
+  s_0070b6318eca36::t_9a838d93c7ac2a 75
+src/watcher.rs
+  s_0070b6318eca36::t_401c3ef0bb02f2 232
+Cargo.toml
+  s_0070b6318eca36::t_eb524ad8a15bfe 28-32,34-35
+src/tree/mod.rs
+  s_0070b6318eca36::t_c53b87c6cc94c4 655,706
+.github/workflows/ci.yml
+  s_0070b6318eca36::t_62e5f75d581cec 57-58,95
+src/backend/inotify.rs
+  s_0070b6318eca36::t_4e219b41dea565 3-4,11,227-242
+README.md
+  s_0070b6318eca36::t_549593e0da78d4 395-396
+src/engine/mod.rs
+  s_0070b6318eca36::t_1ae15a85d20262 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f79d03912dadc1ab30ab78178598bc44e3bd9508",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
