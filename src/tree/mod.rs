@@ -32,14 +32,12 @@ use crate::{
   path::push_name,
 };
 
-/// A link to no node.
 const NONE: u32 = u32::MAX;
 
 fn slot(link: u32) -> Option<u32> {
   (link != NONE).then_some(link)
 }
 
-/// One name the tree knows. [`Tree::prune`] frees it when nothing needs it.
 #[derive(Debug)]
 pub struct Node {
   pub kind: Kind,
@@ -283,10 +281,7 @@ pub struct Tree {
   pub loose_spelling: bool,
 }
 
-/// The nodes: finding, adding and freeing them, and their paths.
 impl Tree {
-  /// The node above the top directories. It has no path and is always polled, so every top
-  /// directory has a parent that checks it.
   pub const ROOT: DirKey = DirKey::new(0, 0);
 
   pub fn new() -> Self {
@@ -587,10 +582,7 @@ impl Tree {
       }
     }
   }
-}
 
-/// What only a few nodes have, kept beside the arena.
-impl Tree {
   /// A hash of the real path, if the node was a link at its last check.
   pub fn link(&self, key: DirKey) -> Option<u64> {
     self.links.get(&key).copied()
