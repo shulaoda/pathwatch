@@ -1,19 +1,25 @@
-//! The error that the handler and the calls of the watcher get, and its kinds.
-
 use std::{
   error, fmt, io,
   path::{Path, PathBuf},
 };
 
-/// What went wrong. The handler gets one error of a kind for a batch, with one path that shows
-/// the problem, and the watcher keeps running after every error.
-///
-/// Its text is the kind, what happened to the watcher when the error is about it, the path and
-/// the source in a row, each once. [`source`] gives the source once more, for code that looks at
-/// the error of the OS: a report that prints the text and then every source would say the last
-/// part twice.
-///
-/// [`source`]: std::error::Error::source
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ErrorKind {
+  /// The path cannot be watched, for example an empty path or a file system root.
+  InvalidPath,
+  /// The OS has no room for more watches, so the rest is polled.
+  WatchLimit,
+  /// No permission to read or watch a path. Events treat the path as missing.
+  PermissionDenied,
+  /// The disk is shared with other machines (NFS, SMB, a VM or container folder), and the OS does
+  /// not report their changes.
+  RemoteDisk,
+  /// Any other error of the disk or the OS.
+  Io,
+  /// The watcher is closed.
+  Closed,
+}
+
 #[derive(Debug)]
 pub struct Error {
   kind: ErrorKind,
@@ -27,17 +33,16 @@ impl Error {
     Self { kind, what: None, path, source }
   }
 
-  /// An `Io` error about the watcher itself: `what` says what happened to it.
   pub(crate) fn of_watcher(what: &'static str, source: io::Error) -> Self {
     Self { kind: ErrorKind::Io, what: Some(what), path: None, source: Some(source) }
   }
 
-  /// Which kind of error it is.
+  /// The kind of the error.
   pub fn kind(&self) -> ErrorKind {
     self.kind
   }
 
-  /// The path that shows the problem, if the error is about one.
+  /// The path the error is about, if any.
   pub fn path(&self) -> Option<&Path> {
     self.path.as_deref()
   }
@@ -70,29 +75,4 @@ impl error::Error for Error {
   fn source(&self) -> Option<&(dyn error::Error + 'static)> {
     Some(self.source.as_ref()?)
   }
-}
-
-/// The kinds of [`Error`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum ErrorKind {
-  /// The path cannot be used: it is empty, has a NUL in it, names the root of a file system, or
-  /// has a name that is too long. On Windows also: a name in it ends with a dot or a space, or
-  /// has a `:`, a control character or one of `< > " | ? *`. Only `watch` and `unwatch` return
-  /// it.
-  InvalidPath,
-  /// The OS has no room for one more watch. What could not be watched is polled instead. A
-  /// watcher says it once.
-  WatchLimit,
-  /// A path cannot be read or watched for want of permission. For events it counts as missing.
-  PermissionDenied,
-  /// The path is on a disk that other machines can change too: NFS, SMB, a folder of the host
-  /// in a virtual machine or a container. The OS reports only what changes on this machine, and
-  /// nothing more is polled: `Config::with_polling(true)` finds the rest. A watcher says it once
-  /// for each disk.
-  RemoteDisk,
-  /// Any other error of the disk or of the watch API of the OS. Also the word that the watch
-  /// API could not start, or stopped, and that every path is polled from now on.
-  Io,
-  /// The watcher is closed. Only `watch` and `unwatch` return it.
-  Closed,
 }
