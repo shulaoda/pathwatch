@@ -491,23 +491,6 @@ fn marks_for_one_name_merge() {
   assert_eq!(f.tree.marked, [(f.tree.child(f.r, OsStr::new("a.js")).unwrap(), None)]);
 }
 
-/// A mark made while the engine turns hints into marks carries their time, one made by the
-/// engine itself carries none, and a second mark does not change the time.
-#[test]
-fn a_mark_carries_the_time_of_its_hint() {
-  let mut f = fixture();
-  let at = Instant::now();
-  f.tree.hint_time = Some(at);
-  assert!(f.tree.hint(changed(f.r, "a.js", false)));
-  f.tree.hint_time = None;
-  assert!(f.tree.hint(changed(f.r, "a.js", true)));
-  assert!(f.tree.hint(changed(f.r, "c.js", false)));
-  let a = f.tree.child(f.r, OsStr::new("a.js")).unwrap();
-  let c = f.tree.child(f.r, OsStr::new("c.js")).unwrap();
-  assert_eq!(f.tree.marked, [(a, Some(at)), (c, None)]);
-  assert_eq!(taken(&mut f.tree), [(4, f.r, a, Some(at)), (4, f.r, c, None)]);
-}
-
 /// A node whose mark a scan took, then marked again, is listed twice: it is taken once, with the
 /// time of the mark it has. A flush drops the keys of the nodes that have no mark.
 #[test]

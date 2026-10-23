@@ -10,7 +10,7 @@ use super::{
 use crate::{
   backend::{Backend, DirKey},
   fs::{DirId, Entry, FileType, Fs, is_missing},
-  tree::{Depth, Dir, Kind, Mark, Node, Watch},
+  tree::{Depth, Dir, Kind, Mark, Node, Watch, is_plain},
 };
 
 /// One node to check in a scan, with what the listing said about it.
@@ -66,7 +66,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if names_only
         && listed.is_named()
         && self.tree.get(child).is_some_and(Node::is_entry)
-        && self.tree.is_plain(child)
+        && is_plain(self.tree.name(child))
       {
         continue;
       }
@@ -172,21 +172,18 @@ enum Listing {
 }
 
 impl<B: Backend, F: Fs> Engine<B, F> {
-  /// A directory is on disk where the tree had none. `baseline`: what is in it is the baseline.
+  /// A directory is on disk where the tree had none. `relinked`: as for `is_baseline_dir`.
   pub(super) fn appear(
     &mut self,
     key: DirKey,
     path: &mut PathBuf,
     id: DirId,
     complete: bool,
-    baseline: bool,
+    relinked: bool,
   ) {
-    let node = &mut self.tree[key];
-    node.kind = Kind::Dir(Dir::new(id, complete));
-    // Only a complete node finds entries by itself.
-    node.set_baseline(complete && baseline);
-    if node.baseline() {
-      self.touched.push(key);
+    self.tree[key].kind = Kind::Dir(Dir::new(id, false));
+    if complete {
+      self.make_complete(key, relinked);
     }
     self.arm(key, path, false);
     // Also when a watch above covers it and none was asked for.

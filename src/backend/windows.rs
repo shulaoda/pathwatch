@@ -972,9 +972,7 @@ mod port {
         let iocp = Arc::clone(&iocp);
         move || {
           let (watches, waiting, deliver_after) = (FxHashMap::default(), None, None);
-          let commands = receiver;
-          let next_token = 0;
-          Worker { iocp, commands, sink, watches, next_token, waiting, deliver_after }.run();
+          Worker { iocp, commands: receiver, sink, watches, waiting, deliver_after }.run();
         }
       })?;
       Ok(Self { iocp, commands, worker: Some(worker), closing: false })
@@ -1053,14 +1051,13 @@ mod port {
     Stop,
   }
 
-  /// The handles. The port knows each by a token of its own, not by the id of the watch: a
-  /// watch whose handle is opened again keeps its id, and a packet names the handle.
+  /// The handles, each by its id, whose number is the key of its packets on the port:
+  /// every open gets a new id, and a read that failed at once sends no packet (`Watch::read`).
   struct Worker {
     iocp: Arc<Iocp>,
     commands: mpsc::Receiver<Command>,
     sink: Sink<Raw>,
-    watches: FxHashMap<usize, Watch>,
-    next_token: usize,
+    watches: FxHashMap<WatchId, Watch>,
     /// The reply that waits for the closes.
     waiting: Option<mpsc::SyncSender<()>>,
     /// The time the engine asked about (`Backend::ask_delivered`): then every handle is read
@@ -1112,7 +1109,7 @@ mod port {
               break;
             }
           }
-          Packet::Completed { token, result } => self.completed(token, result, false),
+          Packet::Completed { id, result } => self.completed(id, result, false),
           Packet::Timeout => {}
           Packet::Nothing(error) => {
             self.sink.failed(error);
@@ -1145,7 +1142,7 @@ mod port {
             }
             return true;
           }
-          Packet::Completed { token, result } => self.completed(token, result, true),
+          Packet::Completed { id, result } => self.completed(id, result, true),
           Packet::Wake => {
             if !self.run_commands() {
               return false;
@@ -1162,12 +1159,13 @@ mod port {
     /// Queues the next read of every handle whose rest is over at `now`, or of every resting one.
     fn rearm(&mut self, now: Option<Instant>) {
       let over = |watch: &Watch| watch.rest_until.is_some_and(|at| now.is_none_or(|now| at <= now));
-      let due: Vec<usize> = self.watches.iter().filter(|(_, w)| over(w)).map(|(&t, _)| t).collect();
-      for token in due {
-        let Some(watch) = self.watches.get_mut(&token) else { continue };
+      let due: Vec<WatchId> =
+        self.watches.iter().filter(|(_, w)| over(w)).map(|(&id, _)| id).collect();
+      for id in due {
+        let Some(watch) = self.watches.get_mut(&id) else { continue };
         watch.rest_until = None;
         if let Err(error) = watch.read() {
-          self.died(token, error);
+          self.died(id, error);
         }
       }
     }
@@ -1196,13 +1194,11 @@ mod port {
       let mut extended = read_extended().is_some();
       loop {
         let dir = open_dir(path)?;
-        let token = self.next_token;
-        self.next_token += 1;
-        self.iocp.attach(&dir, token)?;
-        let mut watch = Watch::new(id, dir, Arc::clone(path), extended);
+        self.iocp.attach(&dir, id)?;
+        let mut watch = Watch::new(dir, Arc::clone(path), extended);
         match watch.read() {
           Ok(()) => {
-            self.watches.insert(token, watch);
+            self.watches.insert(id, watch);
             return Ok(());
           }
           // The disk does not know the longer records: the plain read goes on a new handle.
@@ -1213,8 +1209,7 @@ mod port {
     }
 
     fn close(&mut self, id: WatchId) {
-      let found = self.watches.iter_mut().find(|(_, watch)| watch.id == id);
-      let Some((&token, watch)) = found else { return };
+      let Some(watch) = self.watches.get_mut(&id) else { return };
       // A resting handle keeps its records in the kernel: the read after the close takes them.
       let resting = watch.rest_until.take().is_some();
       watch.closing =
@@ -1222,7 +1217,7 @@ mod port {
       if watch.pending {
         watch.cancel();
       } else {
-        self.watches.remove(&token);
+        self.watches.remove(&id);
       }
     }
 
@@ -1237,8 +1232,8 @@ mod port {
     }
 
     /// `draining`: the handles are read until nothing is left, so none rests.
-    fn completed(&mut self, token: usize, result: io::Result<u32>, draining: bool) {
-      let Some(watch) = self.watches.get_mut(&token) else { return };
+    fn completed(&mut self, id: WatchId, result: io::Result<u32>, draining: bool) {
+      let Some(watch) = self.watches.get_mut(&id) else { return };
       watch.pending = false;
       let result = match result {
         Ok(len) => Ok(watch.records(len)),
@@ -1255,14 +1250,14 @@ mod port {
         // later, the handle that took over reports: it was opened before the close. Reading
         // on until nothing is left would not end in a flood.
         if let Ok(records) = result {
-          self.sink.raw(watch.raw(Ok(records)));
+          self.sink.raw(watch.raw(id, Ok(records)));
           let before = mem::replace(&mut watch.closing, Closing::LastRead);
           if before == Closing::Asked && watch.read().is_ok() {
             watch.cancel();
             return;
           }
         }
-        self.watches.remove(&token);
+        self.watches.remove(&id);
         self.answer_closed();
         return;
       }
@@ -1276,30 +1271,30 @@ mod port {
               return;
             }
           }
-          self.died(token, error);
+          self.died(id, error);
           return;
         }
       };
       watch.empty_reads = if records.is_empty() { watch.empty_reads + 1 } else { 0 };
       let len = records.len();
-      self.sink.raw(watch.raw(Ok(records)));
+      self.sink.raw(watch.raw(id, Ok(records)));
       if watch.empty_reads >= MAX_EMPTY_READS {
-        self.died(token, io::Error::other("every read of the handle comes back with no bytes"));
+        self.died(id, io::Error::other("every read of the handle comes back with no bytes"));
         return;
       }
       // A read that came back nearly full, or with a loss (no bytes), is queued again at once.
       if len == 0 || len >= BATCH_BYTES || draining {
         if let Err(error) = watch.read() {
-          self.died(token, error);
+          self.died(id, error);
         }
       } else {
         watch.rest_until = Some(Instant::now() + REARM_DELAY);
       }
     }
 
-    fn died(&mut self, token: usize, error: io::Error) {
-      if let Some(watch) = self.watches.remove(&token) {
-        self.sink.raw(watch.raw(Err(error)));
+    fn died(&mut self, id: WatchId, error: io::Error) {
+      if let Some(watch) = self.watches.remove(&id) {
+        self.sink.raw(watch.raw(id, Err(error)));
       }
     }
 
@@ -1308,8 +1303,8 @@ mod port {
       self.watches.retain(|_, watch| watch.pending);
       while !self.watches.is_empty() {
         match self.iocp.wait(STOP_WAIT_MS) {
-          Packet::Completed { token, .. } => {
-            if let Some(mut watch) = self.watches.remove(&token) {
+          Packet::Completed { id, .. } => {
+            if let Some(mut watch) = self.watches.remove(&id) {
               watch.pending = false;
             }
           }
@@ -1321,7 +1316,6 @@ mod port {
   }
 
   struct Watch {
-    id: WatchId,
     dir: File,
     path: Arc<Path>,
     overlapped: Box<OVERLAPPED>,
@@ -1346,9 +1340,8 @@ mod port {
   }
 
   impl Watch {
-    fn new(id: WatchId, dir: File, path: Arc<Path>, extended: bool) -> Self {
+    fn new(dir: File, path: Arc<Path>, extended: bool) -> Self {
       Self {
-        id,
         dir,
         path,
         overlapped: Box::default(),
@@ -1389,8 +1382,8 @@ mod port {
       Ok(())
     }
 
-    fn raw(&self, result: io::Result<Vec<u8>>) -> Raw {
-      Raw::Read { watch: self.id, dir: Arc::clone(&self.path), extended: self.extended, result }
+    fn raw(&self, id: WatchId, result: io::Result<Vec<u8>>) -> Raw {
+      Raw::Read { watch: id, dir: Arc::clone(&self.path), extended: self.extended, result }
     }
 
     /// The first `len` bytes of the buffer.
@@ -1434,10 +1427,10 @@ mod port {
       Ok(Self(unsafe { OwnedHandle::from_raw_handle(port) }))
     }
 
-    fn attach(&self, dir: &File, token: usize) -> io::Result<()> {
+    fn attach(&self, dir: &File, id: WatchId) -> io::Result<()> {
       // SAFETY: both handles are open, and the call reads no memory of ours.
       let port =
-        unsafe { CreateIoCompletionPort(dir.as_raw_handle(), self.0.as_raw_handle(), token, 0) };
+        unsafe { CreateIoCompletionPort(dir.as_raw_handle(), self.0.as_raw_handle(), id.0, 0) };
       if port.is_null() { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
 
@@ -1463,7 +1456,7 @@ mod port {
       };
       let result = if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(bytes) };
       match (overlapped.is_null(), result) {
-        (false, result) => Packet::Completed { token: key, result },
+        (false, result) => Packet::Completed { id: WatchId(key), result },
         (true, Ok(_)) => Packet::Wake,
         (true, Err(error)) if error.raw_os_error() == Some(WAIT_TIMEOUT.cast_signed()) => {
           Packet::Timeout
@@ -1476,7 +1469,7 @@ mod port {
   enum Packet {
     Wake,
     Completed {
-      token: usize,
+      id: WatchId,
       result: io::Result<u32>,
     },
     /// The time given to the wait is over.

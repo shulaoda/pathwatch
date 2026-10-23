@@ -119,30 +119,21 @@ impl Watcher {
   where
     H: FnMut(Result<Vec<Event>, Error>) + Send + 'static,
   {
-    let poll = config.clone().into_options(true);
-    if config.polling() {
-      return Self::start(poll.clone(), poll, handler, PollBackend::new);
-    }
     // Which target has which native backend: the one place that says it. Any other target polls.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-      use crate::backend::inotify::InotifyBackend;
-      Self::start(config.into_options(false), poll, handler, InotifyBackend::new)
-    }
     #[cfg(target_os = "macos")]
-    {
-      use crate::backend::fsevents::FsEventsBackend;
-      Self::start(config.into_options(false), poll, handler, FsEventsBackend::new)
-    }
+    use crate::backend::fsevents::FsEventsBackend as Native;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use crate::backend::inotify::InotifyBackend as Native;
     #[cfg(windows)]
-    {
-      use crate::backend::windows::WindowsBackend;
-      Self::start(config.into_options(false), poll, handler, WindowsBackend::new)
+    use crate::backend::windows::WindowsBackend as Native;
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", windows))]
+    if !config.polling {
+      let poll = config.clone().into_options(true);
+      return Self::start(config.into_options(false), poll, handler, Native::new);
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
-    {
-      Self::start(config.into_options(true), poll, handler, PollBackend::new)
-    }
+    let poll = config.into_options(true);
+    Self::start(poll.clone(), poll, handler, |_| Ok(PollBackend))
   }
 
   /// Watches paths, in one step: each a file, a directory with everything below it, or a path
@@ -199,21 +190,20 @@ impl Watcher {
   /// thread was ended by the OS already, and nothing is waited for.
   pub fn close(&self) {
     self.stop.store(true, Ordering::Release);
-    if self.on_its_thread() {
-      // Wakes the thread up: it reads the flag when the handler has returned.
-      let _ = (self.send)(Command::Stop);
-      return;
-    }
     // When the process exits, Windows ends every other thread and then runs the destructors
-    // of the thread-locals and the detach code of DLLs on the exiting one. The watcher thread
-    // is gone then: it can hold the lock of the queue, and `join` would panic for it. Nothing
-    // is sent to it, and nothing is waited for.
+    // of the thread-locals and the detach code of DLLs on the exiting one. A thread that it
+    // ended can hold the lock of the queue then, and `join` would panic for the watcher thread.
+    // Nothing is sent, and nothing is waited for.
     #[cfg(windows)]
     if process_is_exiting() {
       return;
     }
-    // Wakes the thread up. It fails only when the thread is gone already.
+    // Wakes the thread up: it reads the flag at once, or when the handler has returned. It
+    // fails only when the thread is gone already.
     let _ = (self.send)(Command::Stop);
+    if self.on_its_thread() {
+      return;
+    }
     // The lock is held while this thread waits: a `close` on another thread returns only
     // when the watcher thread is gone too.
     let mut thread = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
@@ -418,9 +408,6 @@ struct Inbox<R> {
   timer: inbox::Timer,
 }
 
-/// Every `Post` is gone.
-struct Closed;
-
 impl<R> Inbox<R> {
   #[cfg_attr(
     not(windows),
@@ -438,31 +425,33 @@ impl<R> Inbox<R> {
     Ok((Post { sender }, Self { receiver }))
   }
 
-  /// The next message, or `None` when `deadline` came first.
+  /// The next message, or `None` when `deadline` came first. A `Stop` when every `Post` is gone:
+  /// the watcher was dropped.
   #[cfg(windows)]
-  fn take(&self, deadline: Option<Instant>) -> Result<Option<Message<R>>, Closed> {
+  fn take(&self, deadline: Option<Instant>) -> Option<Message<R>> {
     loop {
       match self.receiver.try_recv() {
-        Ok(message) => return Ok(Some(message)),
-        Err(mpsc::TryRecvError::Disconnected) => return Err(Closed),
+        Ok(message) => return Some(message),
+        Err(mpsc::TryRecvError::Disconnected) => return Some(Message::Command(Command::Stop)),
         Err(mpsc::TryRecvError::Empty) => {}
       }
       if !self.timer.wait(&self.wake, deadline) {
-        return Ok(None);
+        return None;
       }
     }
   }
 
-  /// The next message, or `None` when `deadline` came first.
+  /// The next message, or `None` when `deadline` came first. A `Stop` when every `Post` is gone:
+  /// the watcher was dropped.
   #[cfg(not(windows))]
-  fn take(&self, deadline: Option<Instant>) -> Result<Option<Message<R>>, Closed> {
+  fn take(&self, deadline: Option<Instant>) -> Option<Message<R>> {
     let Some(deadline) = deadline else {
-      return self.receiver.recv().map(Some).map_err(|mpsc::RecvError| Closed);
+      return Some(self.receiver.recv().unwrap_or(Message::Command(Command::Stop)));
     };
     match self.receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-      Ok(message) => Ok(Some(message)),
-      Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-      Err(mpsc::RecvTimeoutError::Disconnected) => Err(Closed),
+      Ok(message) => Some(message),
+      Err(mpsc::RecvTimeoutError::Timeout) => None,
+      Err(mpsc::RecvTimeoutError::Disconnected) => Some(Message::Command(Command::Stop)),
     }
   }
 }
@@ -608,11 +597,7 @@ fn run<B: Backend>(
 ) {
   let mut out = Output::default();
   loop {
-    let mut next = match inbox.take(engine.deadline()) {
-      Ok(message) => message,
-      // The senders are gone: the watcher was dropped, and the thread ends like after `Stop`.
-      Err(Closed) => return,
-    };
+    let mut next = inbox.take(engine.deadline());
 
     let mut taken = 0;
     while let Some(message) = next {
@@ -754,7 +739,7 @@ mod tests {
       let start = Instant::now();
       let taken = inbox.take(Some(start + Duration::from_millis(deadline)));
       let waited = start.elapsed();
-      assert!(matches!(taken, Ok(None)));
+      assert!(taken.is_none());
       assert!(waited >= Duration::from_millis(deadline), "{waited:?} for {deadline} ms");
       assert!(waited < Duration::from_millis(at_most), "{waited:?} for {deadline} ms");
     }
@@ -770,7 +755,7 @@ mod tests {
     });
     let start = Instant::now();
     let taken = inbox.take(Some(start + Duration::from_secs(5)));
-    assert!(matches!(taken, Ok(Some(Message::Wake))));
+    assert!(matches!(taken, Some(Message::Wake)));
     assert!(start.elapsed() < Duration::from_millis(100), "{:?}", start.elapsed());
     drop(sender.join().unwrap());
   }

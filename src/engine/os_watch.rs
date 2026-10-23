@@ -3,11 +3,11 @@
 
 use std::{
   collections::BinaryHeap,
-  io,
+  io, mem,
   path::{Path, PathBuf},
 };
 
-use super::{Engine, Once};
+use super::Engine;
 use crate::{
   backend::{Backend, Committed, Coverage, DirKey, Want, is_watch_limit},
   config::EntryKind,
@@ -25,7 +25,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.backend.is_none() {
       return self.set_state(key, Watch::Polled);
     }
-    if asked.is_none() && self.is_covered_from_above(key) {
+    // A watch for a tree above reports the directory: not through a link.
+    if asked.is_none()
+      && self.tree.link(key).is_none()
+      && self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().covers_below())
+    {
       return self.set_state(key, Watch::FromAbove);
     }
     // The want only goes up (backend rule 5): with the contents asked, the disk is not read.
@@ -36,12 +40,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.ask(key, path, want);
   }
 
-  /// Whether a watch for a tree above reports the directory: not through a link.
-  fn is_covered_from_above(&self, key: DirKey) -> bool {
-    self.tree.link(key).is_none()
-      && self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().covers_below())
-  }
-
   /// Asks the backend to watch the directory with `want`, and queues the scan.
   pub(super) fn ask(&mut self, key: DirKey, path: &Path, want: Want) {
     if let Some(dir) = self.tree[key].dir_mut() {
@@ -50,19 +48,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let answer = self.watch_dir(key, path, want);
     self.set_watch(key, answer, path);
     self.tree.queue_scan(key, Depth::Shallow);
-  }
-
-  /// An OS watch reports only what changes on this machine: on a disk that other machines change
-  /// too, the handler is told once for the disk.
-  fn tell_remote_disk(&mut self, key: DirKey, path: &Path) {
-    let Some(volume) = self.tree[key].dir().map(|dir| dir.id.volume) else { return };
-    if !self.once.insert(Once::AskedDisk(volume)) {
-      return;
-    }
-    if let Some(kind) = self.fs.remote_disk(path) {
-      let what = format!("a disk of {kind}: polling finds those changes (`with_polling`)");
-      self.report(ErrorKind::RemoteDisk, path, io::Error::other(what));
-    }
   }
 
   /// After `unwatch` the directory may want names only: its watch for the contents is given back
@@ -178,7 +163,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// Stores what the backend answered for the directory.
   fn set_watch(&mut self, key: DirKey, answer: Coverage, path: &Path) {
     let Some(dir) = self.tree[key].dir_mut() else { return };
-    let old = dir.watch;
+    let (old, volume) = (dir.watch, dir.id.volume);
     let mut to_report = None;
     let new = match answer {
       Coverage::Watched => Watch::Watched,
@@ -195,8 +180,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     };
     dir.watch = new;
     self.tree.list_if_polled(key);
-    if matches!(new, Watch::Watched | Watch::WatchedTree) {
-      self.tell_remote_disk(key, path);
+    // An OS watch reports only what changes on this machine: on a disk that other machines
+    // change too, the handler is told once for the disk.
+    if matches!(new, Watch::Watched | Watch::WatchedTree)
+      && self.asked_disks.insert(volume)
+      && let Some(kind) = self.fs.remote_disk(path)
+    {
+      let what = format!("a disk of {kind}: polling finds those changes (`with_polling`)");
+      self.report(ErrorKind::RemoteDisk, path, io::Error::other(what));
     }
     if let Some(error) = to_report {
       let kind = match error.kind() {
@@ -205,7 +196,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         _ => ErrorKind::Io,
       };
       // A tree past the limit finds no room for one directory after the other.
-      if kind != ErrorKind::WatchLimit || self.once.insert(Once::ToldWatchLimit) {
+      if kind != ErrorKind::WatchLimit || !mem::replace(&mut self.told_watch_limit, true) {
         self.report(kind, path, error);
       }
     }

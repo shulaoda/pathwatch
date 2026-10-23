@@ -7,8 +7,8 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::fixtures::{
-  Driver, Mode, NONE, RECURSIVE, caught_up, on_a_small_stack, on_all, on_modes, settled, taken,
-  window,
+  Driver, Mode, NONE, RECURSIVE, Sim, caught_up, on_a_small_stack, on_all, on_modes, settled,
+  taken, window,
 };
 use pathwatch::engine::{Ignored, Options};
 
@@ -174,7 +174,7 @@ fn a_strict_disk_costs_one_look() {
   d.fs.mkdir_all("/p/src").unwrap();
   d.fs.write("/p/src/app.js", "1").unwrap();
   d.watch(&["/p/src/App.js"]);
-  assert_eq!(crate::fixtures::known(&d), NONE);
+  assert_eq!(d.known(), NONE);
 
   let before = d.fs.calls();
   d.fs.write("/p/src/other.js", "1").unwrap();
@@ -387,7 +387,7 @@ fn the_hint_for_the_old_spelling_comes_late() {
       events.append(&mut taken(&mut d));
     }
     assert_eq!(events, ["C /p/R/App.js", "D /p/R/app.js"], "{mode:?}");
-    assert_eq!(crate::fixtures::known(&d), ["/p/R/App.js"], "{mode:?}");
+    assert_eq!(d.known(), ["/p/R/App.js"], "{mode:?}");
     caught_up(&mut d);
   }
 }

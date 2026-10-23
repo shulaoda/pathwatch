@@ -25,7 +25,7 @@ use pathwatch::{
 
 // ---- counting memory ----
 
-use crate::counting::{allocations, live};
+use crate::counting::{live, requests};
 
 // ---- telling the engine from the simulation ----
 
@@ -43,11 +43,11 @@ fn nanos(time: Duration) -> u64 {
 
 /// Runs one call into the simulation with the stopwatch on.
 fn timed<T>(outside: &Outside, call: impl FnOnce() -> T) -> T {
-  let allocated = allocations();
+  let allocated = requests();
   let start = Instant::now();
   let result = call();
   outside.nanos.fetch_add(nanos(start.elapsed()), Ordering::Relaxed);
-  outside.allocations.fetch_add(allocations() - allocated, Ordering::Relaxed);
+  outside.allocations.fetch_add(requests() - allocated, Ordering::Relaxed);
   outside.calls.fetch_add(1, Ordering::Relaxed);
   result
 }
@@ -309,11 +309,11 @@ impl<B: Backend> Run<B> {
 
   /// Runs some calls of the engine with the stopwatch on.
   fn call<T>(&mut self, call: impl FnOnce(&mut Engine<Timed<B>, Timed<SimFs>>, Instant) -> T) -> T {
-    let allocated = allocations();
+    let allocated = requests();
     let start = Instant::now();
     let result = call(&mut self.engine, self.now);
     self.total += start.elapsed();
-    self.allocations += allocations() - allocated;
+    self.allocations += requests() - allocated;
     self.stopwatches += 1;
     result
   }
@@ -553,11 +553,11 @@ fn c_hints_for_names_that_nobody_watches() {
       assert_eq!(hints.len(), HINTS as usize);
       let hints = Arc::new(hints);
 
-      let allocated = allocations();
+      let allocated = requests();
       let start = Instant::now();
       engine.signal(Signal::Raw(Arc::clone(&hints)), now);
       let total = start.elapsed();
-      let allocations = allocations() - allocated;
+      let allocations = requests() - allocated;
       assert_eq!(engine.deadline(), deadline, "no hint made work");
       [Cost { total, simulation: Duration::ZERO, stopwatches: 0, allocations }]
     });

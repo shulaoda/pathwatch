@@ -5,8 +5,8 @@
 use std::{path::Path, time::Duration};
 
 use crate::fixtures::{
-  Driver, Mode, NONE, RECURSIVE, SimRaw, caught_up, flush, known, on_a_small_stack, on_all,
-  on_modes, settled, sorted, taken, window, window_then_settled,
+  Driver, Mode, NONE, RECURSIVE, Sim, SimRaw, caught_up, flush, on_a_small_stack, on_all, on_modes,
+  settled, sorted, taken, window, window_then_settled,
 };
 use pathwatch::{ErrorKind, engine::Options};
 
@@ -46,7 +46,7 @@ fn a_directory_away_and_back_while_its_tree_is_read() {
         events.iter().all(|event| !event.starts_with('D')),
         "{mode:?}, call {moment}: {events:?}"
       );
-      assert_eq!(known(&d), ["/p/r/a", "/p/r/sub/b", "/p/r/sub/deep/c"], "{mode:?}, call {moment}");
+      assert_eq!(d.known(), ["/p/r/a", "/p/r/sub/b", "/p/r/sub/deep/c"], "{mode:?}, call {moment}");
       caught_up(&mut d);
     }
   }

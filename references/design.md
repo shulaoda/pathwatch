@@ -172,7 +172,7 @@ The words, each for one idea:
 | quiet time | the debounce: how long no hint must come before the disk is checked | `Options::debounce` |
 | rest | the pause after work that no hint asked for by name: a poll, the scans after loss reports | `REST`, `rest_until` |
 | cover | FSEvents only: a directory that the engine watches and a stream reports | `Covers` in `backend/fsevents.rs` |
-| stream path | FSEvents only: a directory that a stream was started for; it reports the whole tree below | `Streams::paths` in `backend/fsevents.rs` |
+| stream path | FSEvents only: a directory that a stream was started for; it reports the whole tree below | `FsEventsBackend::paths` in `backend/fsevents.rs` |
 
 `tree/mod.rs` holds the data, and `engine/` has one file for each job (each file says which in its first lines).
 
@@ -755,16 +755,17 @@ Two guards:
    with `Hint::Delivered`, behind every record it read (rule 13, 7.1, 7.3); and the engine
    forgets the `Pending` of every file that was old by then (`forget_delivered`). Not while
    work that earlier hints gave waits (a mark, a scan, a loss report, a hold), which may count
-   such a file as written, and not below a directory that was away, whose scan counts it. A
-   doubt lasts the youth and the time to the answer: a millisecond or so under inotify, up to
-   a tick of the clock (15.6 ms) under Windows. A file far ahead of the clock keeps it until a
-   look reports it, and so does every file of a backend that never answers: FSEvents and the
-   poll have no `written_hints`, and the default of the trait never answers. (Before, the
-   first look that found the file old ended the doubt, which missed the write of that seed;
-   and a file that no look found old kept its doubt for good, so a loss report or a directory
-   away and back long after gave it an `Update`: 1,000 untouched files, 1,000 `Update`s at a
-   loss report an hour later, `a_file_whose_records_all_came_is_not_counted_as_written_later`,
-   and the story `a_directory_is_moved_away_changed_and_moved_back` on Linux since 4e1026c.)
+   such a file as written; a directory that was away is such work, since its scan, or a mark or
+   a hold above it, waits. A doubt lasts the youth and the time to the answer: a millisecond or
+   so under inotify, up to a tick of the clock (15.6 ms) under Windows. A file far ahead of the
+   clock keeps it until a look reports it, and so does every file of a backend that never
+   answers: FSEvents and the poll have no `written_hints`, and the default of the trait never
+   answers. (Before, the first look that found the file old ended the doubt, which missed the
+   write of that seed; and a file that no look found old kept its doubt for good, so a loss
+   report or a directory away and back long after gave it an `Update`: 1,000 untouched files,
+   1,000 `Update`s at a loss report an hour later,
+   `a_file_whose_records_all_came_is_not_counted_as_written_later`, and the story
+   `a_directory_is_moved_away_changed_and_moved_back` on Linux since 4e1026c.)
 
    The read this saves is the one that waits for the virus
    scanner on Windows (5 to 12 ms after a write, measured 2026-10-20; 2 ms, and 14 ms for one
@@ -980,8 +981,8 @@ the parent checks it first.
 
 ### 5.11 The ignore filter
 
-`ignored(path, kind)` with `kind` = `File` or `Dir`. The engine asks (`engine/filter.rs`); a
-backend never sees the filter, so the result is the same on every backend.
+`ignored(path, kind)` with `kind` = `File` or `Dir`. The engine asks (`engine/watched_paths.rs`);
+a backend never sees the filter, so the result is the same on every backend.
 
 **The contract of a filter.** It gives the same answer for the same path and kind. It should
 ignore everything below a directory that it ignores (a **closed** filter). A filter that only
@@ -1185,7 +1186,8 @@ the disk itself. The items of the file have short docs; this section is the one 
 rules.
 
 **The trait `Backend`.** Every backend writes `watch`, `unwatch` and `translate`. A backend
-type has its own `new(sink: Sink<Self::Raw>)`.
+of the OS has its own `new(sink: Sink<Self::Raw>)`; `PollBackend` is a unit struct and needs no
+sink.
 
 | Item | Meaning |
 |---|---|
@@ -1316,17 +1318,17 @@ type has its own `new(sink: Sink<Self::Raw>)`.
   `/proc/self/mountinfo`, where the kernel tells of each mount and unmount of the namespace by a
   priority event (`POLLPRI`; measured: 19 to 27 ms after `mount`, none in idle time, none for a
   mount in another namespace). Then it reads the table again and compares it with the last one by
-  mount id, as a volume mounted over another one at the same point is a change too, and each mount
-  point that came or went becomes a record of its own (`wd` -2) → `Hint::Mount` with the path. The
-  engine checks the node at that path, if it has one, and finds another directory there by its
-  identity (`a_mount_over_a_watched_directory_is_told`,
+  mount id, as a volume mounted over another one at the same point is a change too, and the mount
+  points that came or went are sent together (`Raw::Mounts`) → a `Hint::Mount` with the path of
+  each. The engine checks the node at that path, if it has one, and finds another directory there
+  by its identity (`a_mount_over_a_watched_directory_is_told`,
   `a_volume_mounted_over_a_watched_directory`). The path is real, so a mount that a watched path
   reaches through a link is not found this way. (macOS tells it in its own way, 7.2.)
 - **A delivery** (rule 13, `forward`). The reader also waits on an eventfd for a question of the
   engine, and on the time it names. Then it reads the queue empty, past `READ_INTERVAL` and one
   read for each turn of its loop, so that a flood that keeps the queue from being empty does not
-  keep it from a stop, and sends a record of its own behind what it read (`wd` -3, the time the
-  last read began in digits as its name) → `Hint::Delivered`. The kernel queues an event in the
+  keep it from a stop, and sends `Raw::Delivered` behind what it read, with the time the last read
+  began → `Hint::Delivered`. The kernel queues an event in the
   call that made the change, before it returns (`fsnotify` from `vfs_write`, and from `__fput`
   for the close), and a full queue gets one overflow event at its end (`fsnotify_insert_event`):
   measured on Linux 6.6, ext4 and tmpfs, 40,000 writes from the same and from another thread,

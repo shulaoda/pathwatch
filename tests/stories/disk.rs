@@ -4,7 +4,7 @@
 
 use std::{
   collections::{BTreeMap, BTreeSet},
-  env, fmt, fs, io,
+  env, fs, io,
   path::{Component, Path, PathBuf},
   sync::{
     Arc, OnceLock, Weak,
@@ -143,12 +143,6 @@ fn unknown(known: &Files, on_disk: &Files) -> String {
     other(on_disk, known),
     other(known, on_disk)
   )
-}
-
-impl fmt::Debug for Disk {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("Disk").field("backend", &self.backend).finish_non_exhaustive()
-  }
 }
 
 impl Disk {

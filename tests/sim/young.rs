@@ -6,8 +6,7 @@
 use std::{path::Path, time::Duration};
 
 use crate::fixtures::{
-  Deliver, Driver, Mode, NONE, Sim, SimBackend, caught_up, known, on_all, settled, show, taken,
-  window,
+  Deliver, Driver, Mode, NONE, Sim, SimBackend, caught_up, on_all, settled, show, taken, window,
 };
 use pathwatch::{backend::poll::PollBackend, engine::Options};
 
@@ -68,7 +67,7 @@ fn only_regular_files_are_opened() {
   d.fs.symlink("/p/r", "/p/r/loop").unwrap();
   d.watch(&["/p/r"]);
   // A link inside a watched directory is a file entry of its own and is not followed.
-  assert_eq!(known(&d), ["/p/r/file", "/p/r/link", "/p/r/loop"]);
+  assert_eq!(d.known(), ["/p/r/file", "/p/r/link", "/p/r/loop"]);
   assert_eq!(d.fs.calls().hash, 1);
   assert_eq!(show(&d.events), NONE);
   caught_up(&mut d);

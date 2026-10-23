@@ -3,7 +3,6 @@
 
 mod check;
 mod events;
-mod filter;
 mod os_watch;
 mod scan;
 mod test_hooks;
@@ -124,6 +123,7 @@ pub struct Output {
 }
 
 /// Watches paths through a [`Backend`] and a disk ([`Fs`]), and turns hints into file events.
+#[expect(clippy::struct_excessive_bools, reason = "each one is a state of the engine")]
 pub struct Engine<B: Backend, F: Fs> {
   /// `None`: no backend (it did not start, or it died); every node is polled.
   backend: Option<B>,
@@ -192,17 +192,11 @@ pub struct Engine<B: Backend, F: Fs> {
 
   /// The errors for the next output, one of each kind (`report`).
   errors: Vec<Error>,
-  /// What happens once for the life of the engine.
-  once: FxHashSet<Once>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Once {
   /// `WatchLimit` was reported: not again for each directory that finds no room.
-  ToldWatchLimit,
-  /// A disk, by its device, that an OS watch was given on was asked whether other machines
-  /// change it too.
-  AskedDisk(u64),
+  told_watch_limit: bool,
+  /// The disks, by device, that an OS watch was given on: each was asked once whether other
+  /// machines change it too.
+  asked_disks: FxHashSet<u64>,
 }
 
 impl<B: Backend, F: Fs> fmt::Debug for Engine<B, F> {
@@ -250,7 +244,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       scans: Vec::new(),
       names: Vec::new(),
       errors: Vec::new(),
-      once: FxHashSet::default(),
+      told_watch_limit: false,
+      asked_disks: FxHashSet::default(),
     }
   }
 
@@ -308,12 +303,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         let tree = &mut self.tree;
         let mut delivered = None;
         if let Some(backend) = &mut self.backend {
-          tree.hint_time = Some(now);
+          let first = tree.marked.len();
           backend.translate(raw, &mut |hint| match hint {
             Hint::Delivered { before } => delivered = Some(before),
             hint => left_work |= tree.hint(hint),
           });
-          tree.hint_time = None;
+          // Only `Tree::hint` added to the list meanwhile, with no time: these are the marks of
+          // this signal, and a `Delete` counts its delay from their time.
+          for (_, since) in &mut tree.marked[first..] {
+            *since = Some(now);
+          }
         }
         // No young file that was old by then can hide a write any more (5.8).
         if let Some(before) = delivered {
@@ -345,7 +344,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// The next time [`Engine::tick`] has work.
   pub fn deadline(&self) -> Option<Instant> {
-    [self.next_flush(), self.next_hold(), self.poll_at].into_iter().flatten().min()
+    let next_hold = self.hold_queue.peek().map(|Reverse((until, _))| *until);
+    [self.next_flush(), next_hold, self.poll_at].into_iter().flatten().min()
   }
 
   /// Does what is due at `now`.
@@ -466,9 +466,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut marks = mem::take(&mut self.marks);
     self.tree.take_marked(&mut marks);
     let mut loss_checks_ran = false;
-    // The directories above the held nodes whose second look is due: a hint for one of them
-    // decides for the held node, and does not wait.
-    let above = if hints_due { Vec::new() } else { self.above_due_holds() };
+    // The directories above the held nodes whose second look is due, sorted: a hint for one of
+    // them decides for the held node, and does not wait.
+    let mut above = Vec::new();
+    if !hints_due {
+      above.extend(self.due_holds.iter().flat_map(|&held| self.tree.ancestors(held)));
+      above.sort_unstable();
+      above.dedup();
+    }
     // The path of one directory is built once for all of its marks.
     let mut path_of = None;
     for &(_, _, parent, key, since) in &marks {
@@ -504,15 +509,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     loss_checks_ran
   }
 
-  /// The nodes above the held nodes whose second look is due, sorted.
-  fn above_due_holds(&self) -> Vec<DirKey> {
-    let mut above: Vec<DirKey> =
-      self.due_holds.iter().flat_map(|&held| self.tree.ancestors(held)).collect();
-    above.sort_unstable();
-    above.dedup();
-    above
-  }
-
   /// One round: commit, then the scans queued before it. Watch, commit, then scan, for every
   /// directory.
   fn round(&mut self, path: &mut PathBuf, names: &mut Vec<ScanEntry>) {
@@ -541,7 +537,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Keeps one error of each kind for the next output, but every `RemoteDisk`: each is about
-  /// another disk, and each disk is told once (`tell_remote_disk`).
+  /// another disk, and each disk is told once (`asked_disks`).
   fn report(&mut self, kind: ErrorKind, path: &Path, source: io::Error) {
     let kept =
       kind != ErrorKind::RemoteDisk && self.errors.iter().any(|error| error.kind() == kind);

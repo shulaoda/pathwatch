@@ -10,7 +10,7 @@ use std::{
     fd::{AsRawFd, RawFd},
     unix::ffi::OsStrExt,
   },
-  path::Path,
+  path::{Path, PathBuf},
   sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -37,12 +37,6 @@ const READ_BUFFER_LEN: usize = 64 * 1024;
 const READ_INTERVAL: Duration = Duration::from_millis(1);
 /// The kernel tells of each mount and unmount of the namespace by a priority event on it.
 const MOUNTS: &str = "/proc/self/mountinfo";
-/// The record of a mount point that the reader makes: no watch has this number, and an
-/// overflow has -1.
-const MOUNT_WD: i32 = -2;
-/// The record the reader makes once it read the queue empty: every event of a change before the
-/// time in its name (nanoseconds since the epoch, in digits) came before it.
-const DELIVERED_WD: i32 = -3;
 
 const ERROR_WATCH_LIMIT: &str =
   "inotify has no watch left for this user (raise fs.inotify.max_user_watches)";
@@ -55,6 +49,18 @@ pub struct InotifyBackend {
   reader: Option<JoinHandle<()>>,
   keys_by_wd: FxHashMap<i32, Keys>,
   wd_by_key: FxHashMap<DirKey, i32>,
+}
+
+/// What the reader thread sends.
+#[derive(Debug)]
+pub enum Raw {
+  /// What one read of the queue gave.
+  Events(Vec<u8>),
+  /// The mount points that came or went in one wake-up: inotify says nothing of them.
+  Mounts(Vec<PathBuf>),
+  /// The queue was read empty: every event of a change before this time came before. The
+  /// answer to `ask_delivered`.
+  Delivered(SystemTime),
 }
 
 #[derive(Debug)]
@@ -83,7 +89,7 @@ struct Fds {
 }
 
 impl InotifyBackend {
-  pub fn new(sink: Sink<Vec<u8>>) -> io::Result<Self> {
+  pub fn new(sink: Sink<Raw>) -> io::Result<Self> {
     let no_room = |error: io::Error| match error.raw_os_error() {
       Some(libc::EMFILE | libc::ENFILE) => watch_limit(ERROR_INSTANCE_LIMIT),
       _ => error,
@@ -113,10 +119,6 @@ impl InotifyBackend {
     self.wd_by_key.get(&key).copied()
   }
 
-  pub fn keys(&self, wd: i32) -> Vec<DirKey> {
-    self.keys_by_wd.get(&wd).into_iter().flat_map(Keys::iter).collect()
-  }
-
   pub fn watch_count(&self) -> usize {
     self.keys_by_wd.len()
   }
@@ -129,7 +131,7 @@ impl InotifyBackend {
 }
 
 impl Backend for InotifyBackend {
-  type Raw = Vec<u8>;
+  type Raw = Raw;
 
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
     let events = match want {
@@ -170,20 +172,14 @@ impl Backend for InotifyBackend {
   }
 
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
+    let raw = match raw {
+      Raw::Events(raw) => raw,
+      Raw::Mounts(points) => return points.iter().for_each(|path| hint(Hint::Mount { path })),
+      Raw::Delivered(before) => return hint(Hint::Delivered { before }),
+    };
     let mut rest = raw.as_slice();
     while let Some((event, tail)) = split_event(rest) {
       rest = tail;
-      if event.wd == DELIVERED_WD {
-        let nanos = str::from_utf8(event.name).ok().and_then(|digits| digits.parse().ok());
-        if let Some(nanos) = nanos {
-          hint(Hint::Delivered { before: SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos) });
-        }
-        continue;
-      }
-      if event.wd == MOUNT_WD {
-        hint(Hint::Mount { path: Path::new(OsStr::from_bytes(event.name)) });
-        continue;
-      }
       if event.mask & libc::IN_Q_OVERFLOW != 0 {
         hint(Hint::Lost);
         continue;
@@ -220,7 +216,11 @@ impl Backend for InotifyBackend {
   }
 
   fn raw_bytes(raw: &Self::Raw) -> usize {
-    raw.len()
+    match raw {
+      Raw::Events(bytes) => bytes.len(),
+      Raw::Mounts(points) => points.iter().map(|point| size_of_val(point) + point.capacity()).sum(),
+      Raw::Delivered(_) => 0,
+    }
   }
 
   fn ask_delivered(&mut self, after: SystemTime) {
@@ -238,7 +238,7 @@ impl Drop for InotifyBackend {
 }
 
 /// `known`: the mounts when the backend started.
-fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>) {
+fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Raw>) {
   let mut buffer = vec![0; READ_BUFFER_LEN];
   let mut next_read = Instant::now();
   let error = loop {
@@ -262,15 +262,15 @@ fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>)
     // so, as the wait that sees a change of the mounts takes the word, which comes once; and
     // before an answer below, which is about every change before its time.
     if mounted && let Some(mounts) = fds.mounts.as_ref().and_then(read_mounts) {
-      let raw = mount_records(&known, &mounts);
+      let points = mount_points(&known, &mounts);
       known = mounts;
-      if !raw.is_empty() {
-        sink.raw(raw);
+      if !points.is_empty() {
+        sink.raw(Raw::Mounts(points));
       }
     }
-    // Its time came: the queue is read empty, and a record with the time the read that found
-    // it empty began says so. The kernel queues an event before the call that made the change
-    // returns, the loss report too, so every event of a change before that time is sent
+    // Its time came: the queue is read empty, and `Raw::Delivered`, with the time the read that
+    // found it empty began, says so. The kernel queues an event before the call that made the
+    // change returns, the loss report too, so every event of a change before that time is sent
     // (design.md 7.1). One read a turn: a flood can keep the queue from being empty for long,
     // and the reader still sees a stop. A later question stays.
     let began = if asked == 0 { 0 } else { nanos(SystemTime::now()) };
@@ -282,16 +282,15 @@ fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Vec<u8>>)
     }
     match (&fds.inotify).read(&mut buffer) {
       Ok(0) => break io::ErrorKind::UnexpectedEof.into(),
-      Ok(len) if answers => sink.raw(buffer[..len].to_vec()),
       Ok(len) => {
-        sink.raw(buffer[..len].to_vec());
-        let is_behind = len > READ_BUFFER_LEN / 2;
-        next_read = Instant::now() + if is_behind { Duration::ZERO } else { READ_INTERVAL };
+        sink.raw(Raw::Events(buffer[..len].to_vec()));
+        if !answers {
+          let is_behind = len > READ_BUFFER_LEN / 2;
+          next_read = Instant::now() + if is_behind { Duration::ZERO } else { READ_INTERVAL };
+        }
       }
       Err(error) if answers && error.kind() == io::ErrorKind::WouldBlock => {
-        let mut raw = Vec::new();
-        push_record(&mut raw, DELIVERED_WD, began.to_string().as_bytes());
-        sink.raw(raw);
+        sink.raw(Raw::Delivered(SystemTime::UNIX_EPOCH + Duration::from_nanos(began)));
         let _ = fds.asked.compare_exchange(asked, 0, Ordering::Relaxed, Ordering::Relaxed);
       }
       Err(error)
@@ -338,26 +337,12 @@ fn unescape(mut field: &[u8]) -> Vec<u8> {
   }
 }
 
-/// One record for each mount point that came or went, laid out as the kernel lays out an event.
-fn mount_records(old: &BTreeSet<(u64, Vec<u8>)>, new: &BTreeSet<(u64, Vec<u8>)>) -> Vec<u8> {
+/// Each mount point that came or went, once: a volume mounted over another one at the same
+/// point is one.
+fn mount_points(old: &BTreeSet<(u64, Vec<u8>)>, new: &BTreeSet<(u64, Vec<u8>)>) -> Vec<PathBuf> {
   let points: BTreeSet<&[u8]> =
     old.symmetric_difference(new).map(|(_, point)| point.as_slice()).collect();
-  let mut raw = Vec::new();
-  for point in points {
-    push_record(&mut raw, MOUNT_WD, point);
-  }
-  raw
-}
-
-/// A record of the reader, laid out as the kernel lays out an event: a number that no watch has,
-/// and a name.
-fn push_record(raw: &mut Vec<u8>, wd: i32, name: &[u8]) {
-  let name_len = u32::try_from(name.len() + 1).unwrap_or(u32::MAX);
-  for field in [wd.to_ne_bytes(), [0; 4], [0; 4], name_len.to_ne_bytes()] {
-    raw.extend_from_slice(&field);
-  }
-  raw.extend_from_slice(name);
-  raw.push(0);
+  points.into_iter().map(|point| PathBuf::from(OsStr::from_bytes(point))).collect()
 }
 
 struct Event<'a> {
@@ -451,7 +436,6 @@ mod tests {
   use std::{
     collections::BTreeSet,
     fs::File,
-    os::{fd::OwnedFd, unix::net::UnixStream},
     sync::{
       atomic::AtomicU64,
       mpsc::{self, TryRecvError},
@@ -464,9 +448,8 @@ mod tests {
   #[test]
   fn read_error_is_reported_and_ends_the_reader() {
     let dir = tempfile::tempdir().unwrap();
-    let (stop, _peer) = UnixStream::pair().unwrap();
     let inotify = File::open(dir.path()).unwrap();
-    let (stop, ask) = (File::from(OwnedFd::from(stop)), ffi::eventfd().unwrap());
+    let (stop, ask) = (ffi::eventfd().unwrap(), ffi::eventfd().unwrap());
     let fds = Fds { inotify, stop, mounts: None, ask, asked: AtomicU64::new(0) };
     let (sender, signals) = mpsc::channel();
     let sink = Sink::new(move |signal| {

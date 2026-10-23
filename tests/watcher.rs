@@ -49,26 +49,25 @@ struct Watch {
   events: Vec<Event>,
 }
 
-fn watch() -> Watch {
+/// A handler that passes each result on, and the receiver of them.
+fn passed_on() -> (impl FnMut(Result<Vec<Event>, Error>) + Send + 'static, Results) {
   let (sender, results) = mpsc::channel();
-  let watcher = Watcher::with_backend(
-    quick(),
-    move |result| {
-      let _ = sender.send(result);
-    },
-    PollBackend::new,
-  )
-  .unwrap();
+  let handler = move |result| {
+    let _ = sender.send(result);
+  };
+  (handler, results)
+}
+
+fn watch() -> Watch {
+  let (handler, results) = passed_on();
+  let watcher = Watcher::with_backend(quick(), handler, |_| Ok(PollBackend)).unwrap();
   Watch { watcher, results, dir: tempfile::tempdir().unwrap(), events: Vec::new() }
 }
 
 /// As the public API makes it.
 fn watch_with(config: Config) -> Watch {
-  let (sender, results) = mpsc::channel();
-  let watcher = Watcher::with_config(config, move |result| {
-    let _ = sender.send(result);
-  })
-  .unwrap();
+  let (handler, results) = passed_on();
+  let watcher = Watcher::with_config(config, handler).unwrap();
   Watch { watcher, results, dir: tempfile::tempdir().unwrap(), events: Vec::new() }
 }
 
@@ -79,20 +78,13 @@ impl Watch {
 
   /// Waits for the event, and drops the ones before it.
   fn expect(&mut self, kind: EventKind, rel: &str) {
-    self.expect_all(kind, &[rel]);
-  }
-
-  /// Waits until each of `rels` had the event, in any order and any batches.
-  fn expect_all(&mut self, kind: EventKind, rels: &[&str]) {
-    let paths: Vec<PathBuf> = rels.iter().map(|rel| self.path(rel)).collect();
+    let path = self.path(rel);
     let end = Instant::now() + PATIENCE;
     loop {
-      let found: Vec<Option<usize>> = paths
-        .iter()
-        .map(|path| self.events.iter().position(|event| event.kind == kind && &event.path == path))
-        .collect();
-      if let Some(last) = found.iter().copied().collect::<Option<Vec<usize>>>() {
-        self.events.drain(..=last.into_iter().max().unwrap_or(0));
+      if let Some(at) =
+        self.events.iter().position(|event| event.kind == kind && event.path == path)
+      {
+        self.events.drain(..=at);
         return;
       }
       match self.results.recv_timeout(end.saturating_duration_since(Instant::now())) {
@@ -108,7 +100,7 @@ impl Watch {
         }
         Ok(Err(error)) => panic!("the watcher reported: {error}"),
         Err(timeout) => {
-          panic!("no {kind:?} for each of {rels:?}: {timeout}; left over: {:?}", self.events)
+          panic!("no {kind:?} for {rel}: {timeout}; left over: {:?}", self.events)
         }
       }
     }
@@ -256,6 +248,36 @@ impl Backend for Silent {
   }
 }
 
+/// A watcher with the `Silent` backend, and what a test needs to drive it.
+struct Held {
+  /// Lets the held thread go. Dropped first: a failed test ends the held thread instead of
+  /// waiting for it.
+  open: Sender<()>,
+  watcher: Watcher,
+  results: Results,
+  sink: Sink<Vec<u8>>,
+  /// The thread took a notification of one byte and waits for `open`.
+  enter: Receiver<()>,
+  translated: Arc<AtomicUsize>,
+}
+
+impl Held {
+  fn new(options: Options, polled: bool) -> Self {
+    let (entered, enter) = mpsc::channel();
+    let (open, gate) = mpsc::channel();
+    let (sink_out, sink_in) = mpsc::channel();
+    let translated = Arc::default();
+    let backend = Silent { polled, translated: Arc::clone(&translated), entered, gate };
+    let (handler, results) = passed_on();
+    let make = move |sink| {
+      sink_out.send(sink).unwrap();
+      Ok(backend)
+    };
+    let watcher = Watcher::with_backend(options, handler, make).unwrap();
+    Self { open, watcher, results, sink: sink_in.recv().unwrap(), enter, translated }
+  }
+}
+
 #[test]
 fn drop_waits_for_the_thread() {
   let w = watch();
@@ -325,7 +347,7 @@ fn close_inside_the_handler() {
 fn watch_fails_when_the_thread_is_gone() {
   let dir = tempfile::tempdir().unwrap();
   let handler = |_result| panic!("the handler of this test panics");
-  let watcher = Watcher::with_backend(quick(), handler, PollBackend::new).unwrap();
+  let watcher = Watcher::with_backend(quick(), handler, |_| Ok(PollBackend)).unwrap();
   watcher.watch(&[dir.path().join("a.txt")]).unwrap();
   fs::write(dir.path().join("a.txt"), "1").unwrap();
 
@@ -366,15 +388,9 @@ fn a_backend_that_cannot_start_is_replaced_by_polling() {
   ];
   for (error, kind, text) in cases {
     let dir = tempfile::tempdir().unwrap();
-    let (sender, results) = mpsc::channel();
-    let watcher = Watcher::with_backend(
-      quick(),
-      move |result| {
-        let _ = sender.send(result);
-      },
-      |_sink| Err::<PollBackend, _>(error),
-    )
-    .unwrap();
+    let (handler, results) = passed_on();
+    let watcher =
+      Watcher::with_backend(quick(), handler, |_sink| Err::<PollBackend, _>(error)).unwrap();
     let told = results.recv_timeout(PATIENCE).expect("the handler is told").unwrap_err();
     assert_eq!((told.kind(), told.path()), (kind, None));
     assert_eq!(told.to_string(), text);
@@ -393,10 +409,7 @@ fn a_watcher_shared_by_two_threads() {
   shared::<Watcher>();
 
   let dir = tempfile::tempdir().unwrap();
-  let (sender, results) = mpsc::channel();
-  let handler = move |result: Result<Vec<Event>, Error>| {
-    let _ = sender.send(result);
-  };
+  let (handler, results) = passed_on();
   let watcher = Arc::new(Watcher::with_config(quick_config(), handler).unwrap());
   let work = |thread: usize| {
     let (watcher, dir) = (Arc::clone(&watcher), dir.path().to_path_buf());
@@ -437,11 +450,8 @@ fn a_poll_interval_of_zero() {
   assert!(shown.contains("poll_interval: 1ms"), "{shown}");
 
   let dir = tempfile::tempdir().unwrap();
-  let (sender, results) = mpsc::channel();
-  let watcher = Watcher::with_config(config, move |result| {
-    let _ = sender.send(result);
-  })
-  .unwrap();
+  let (handler, results) = passed_on();
+  let watcher = Watcher::with_config(config, handler).unwrap();
   let path = dir.path().join("a.txt");
   watcher.watch(&[&path]).unwrap();
   fs::write(&path, "1").unwrap();
@@ -456,43 +466,26 @@ fn the_queue_is_bounded_by_bytes() {
   const MIB: usize = 1 << 20;
 
   let dir = tempfile::tempdir().unwrap();
-  let translated = Arc::new(AtomicUsize::new(0));
-  let (entered, enter) = mpsc::channel();
-  let (open, gate) = mpsc::channel::<()>();
-  let (sender, results) = mpsc::channel();
-  let (sink_out, sink_in) = mpsc::channel::<Sink<Vec<u8>>>();
-  let backend = Silent { polled: false, translated: Arc::clone(&translated), entered, gate };
-  let watcher = Watcher::with_backend(
-    quick(),
-    move |result: Result<Vec<Event>, Error>| {
-      let _ = sender.send(result);
-    },
-    move |sink| {
-      sink_out.send(sink).unwrap();
-      Ok(backend)
-    },
-  )
-  .unwrap();
-  let sink = sink_in.recv().unwrap();
-  watcher.watch(&[dir.path()]).unwrap();
+  let h = Held::new(quick(), false);
+  h.watcher.watch(&[dir.path()]).unwrap();
   // Holds the watcher thread, lets `while_held` run, then lets the thread go.
   let hold = |while_held: &dyn Fn()| {
-    sink.raw(vec![1]);
-    enter.recv_timeout(PATIENCE).expect("the watcher thread took the empty notification");
+    h.sink.raw(vec![1]);
+    h.enter.recv_timeout(PATIENCE).expect("the watcher thread took the empty notification");
     while_held();
-    open.send(()).unwrap();
+    h.open.send(()).unwrap();
   };
   let wait_for = |count: usize| {
     let end = Instant::now() + PATIENCE;
-    while translated.load(Ordering::Relaxed) < count {
-      assert!(Instant::now() < end, "{} of {count}", translated.load(Ordering::Relaxed));
+    while h.translated.load(Ordering::Relaxed) < count {
+      assert!(Instant::now() < end, "{} of {count}", h.translated.load(Ordering::Relaxed));
       thread::yield_now();
     }
   };
 
   let flood = |count: usize, bytes: usize| {
     for _ in 0..count {
-      sink.raw(vec![0; bytes]);
+      h.sink.raw(vec![0; bytes]);
     }
   };
 
@@ -507,12 +500,12 @@ fn the_queue_is_bounded_by_bytes() {
     flood(20, MIB);
   });
   let created = [Event { path: dir.path().join("a.txt"), kind: EventKind::Create }];
-  while results.recv_timeout(PATIENCE).expect("the scan finds the file").ok().as_deref()
+  while h.results.recv_timeout(PATIENCE).expect("the scan finds the file").ok().as_deref()
     != Some(&created)
   {}
   // 15 of them fit, with the few bytes that a message takes itself.
   wait_for(100_015);
-  assert_eq!(translated.load(Ordering::Relaxed), 100_015);
+  assert_eq!(h.translated.load(Ordering::Relaxed), 100_015);
 
   // The queue is filled to the last byte: a message with no bytes of its own fits as long as
   // any message does. The word that the backend died still passes, behind every message that
@@ -520,10 +513,10 @@ fn the_queue_is_bounded_by_bytes() {
   hold(&|| {
     flood(20, MIB);
     flood(100_000, 0);
-    sink.failed(io::Error::other("the backend thread stopped"));
+    h.sink.failed(io::Error::other("the backend thread stopped"));
   });
   loop {
-    match results.recv_timeout(PATIENCE).expect("the error comes") {
+    match h.results.recv_timeout(PATIENCE).expect("the error comes") {
       Err(error) if error.kind() == ErrorKind::Io => {
         assert!(error.to_string().contains("the backend thread stopped"), "{error}");
         break;
@@ -532,9 +525,9 @@ fn the_queue_is_bounded_by_bytes() {
     }
   }
   // The backend held the other end of this channel.
-  assert_eq!(enter.recv_timeout(PATIENCE), Err(RecvTimeoutError::Disconnected));
-  assert!(translated.load(Ordering::Relaxed) > 100_030);
-  drop(watcher);
+  assert_eq!(h.enter.recv_timeout(PATIENCE), Err(RecvTimeoutError::Disconnected));
+  assert!(h.translated.load(Ordering::Relaxed) > 100_030);
+  drop(h.watcher);
 }
 
 /// A flood of notifications does not starve the engine: after 512 messages the thread does what
@@ -545,47 +538,29 @@ fn a_turn_takes_at_most_512_messages() {
   const FLOOD: usize = 600;
 
   let dir = tempfile::tempdir().unwrap();
-  let (entered, enter) = mpsc::channel();
-  let (open, gate) = mpsc::channel::<()>();
-  let (sender, results) = mpsc::channel();
-  let (sink_out, sink_in) = mpsc::channel::<Sink<Vec<u8>>>();
-  let backend = Silent { polled: true, translated: Arc::default(), entered, gate };
-  let watcher = Watcher::with_backend(
-    quick(),
-    move |result: Result<Vec<Event>, Error>| {
-      let _ = sender.send(result);
-    },
-    move |sink| {
-      sink_out.send(sink).unwrap();
-      Ok(backend)
-    },
-  )
-  .unwrap();
-  // Dropped before the watcher: a failed test ends the held thread instead of waiting for it.
-  let open = open;
-  let sink = sink_in.recv().unwrap();
-  watcher.watch(&[dir.path()]).unwrap();
+  let h = Held::new(quick(), true);
+  h.watcher.watch(&[dir.path()]).unwrap();
 
   // Each one holds the thread until the test lets it go on.
   for _ in 0..FLOOD {
-    sink.raw(vec![1]);
+    h.sink.raw(vec![1]);
   }
   let pass = || {
-    enter.recv_timeout(PATIENCE).expect("the watcher thread took the next notification");
-    open.send(()).unwrap();
+    h.enter.recv_timeout(PATIENCE).expect("the watcher thread took the next notification");
+    h.open.send(()).unwrap();
   };
   // Nothing hints at this file: the poll finds it, which comes due while the first
   // notification holds the thread.
   let path = dir.path().join("a.txt");
   fs::write(&path, "1").unwrap();
-  enter.recv_timeout(PATIENCE).expect("the watcher thread took the first notification");
+  h.enter.recv_timeout(PATIENCE).expect("the watcher thread took the first notification");
   thread::sleep(quick().poll_interval * 4);
-  open.send(()).unwrap();
+  h.open.send(()).unwrap();
   for _ in 1..TURN {
     pass();
   }
   // The next notification waits: the poll runs first.
-  let batch = results.recv_timeout(PATIENCE).expect("the poll runs between two turns");
+  let batch = h.results.recv_timeout(PATIENCE).expect("the poll runs between two turns");
   assert_eq!(batch.unwrap(), [Event { path, kind: EventKind::Create }]);
   for _ in TURN..FLOOD {
     pass();
@@ -595,32 +570,16 @@ fn a_turn_takes_at_most_512_messages() {
 #[test]
 fn a_dropped_signal_wakes_the_thread() {
   let dir = tempfile::tempdir().unwrap();
-  let (entered, _enter) = mpsc::channel();
-  let (_open, gate) = mpsc::channel::<()>();
-  let (sender, results) = mpsc::channel();
-  let (sink_out, sink_in) = mpsc::channel::<Sink<Vec<u8>>>();
-  let backend = Silent { polled: false, translated: Arc::default(), entered, gate };
-  let watcher = Watcher::with_backend(
-    // Nothing else wakes the thread: the next poll is an hour away.
-    Options { poll_interval: Duration::from_secs(3600), ..quick() },
-    move |result: Result<Vec<Event>, Error>| {
-      let _ = sender.send(result);
-    },
-    move |sink| {
-      sink_out.send(sink).unwrap();
-      Ok(backend)
-    },
-  )
-  .unwrap();
-  let sink = sink_in.recv().unwrap();
-  watcher.watch(&[dir.path()]).unwrap();
+  // Nothing else wakes the thread: the next poll is an hour away.
+  let h = Held::new(Options { poll_interval: Duration::from_secs(3600), ..quick() }, false);
+  h.watcher.watch(&[dir.path()]).unwrap();
 
   // Nothing will ever hint at this file: only the scan after the overflow finds it.
   let path = dir.path().join("a.txt");
   fs::write(&path, "1").unwrap();
   // One notification that is bigger than the whole queue: it is dropped.
-  sink.raw(vec![0; (16 << 20) + 1]);
-  let batch = results.recv_timeout(PATIENCE).expect("the thread wakes up and scans");
+  h.sink.raw(vec![0; (16 << 20) + 1]);
+  let batch = h.results.recv_timeout(PATIENCE).expect("the thread wakes up and scans");
   assert_eq!(batch.unwrap(), [Event { path, kind: EventKind::Create }]);
 }
 
@@ -631,23 +590,9 @@ fn a_dropped_signal_wakes_the_thread() {
 #[test]
 fn a_delivery_behind_a_dropped_signal_does_not_end_the_doubt() {
   let dir = tempfile::tempdir().unwrap();
-  let (entered, enter) = mpsc::channel();
-  let (open, gate) = mpsc::channel::<()>();
-  let (sender, results) = mpsc::channel();
-  let (sink_out, sink_in) = mpsc::channel::<Sink<Vec<u8>>>();
-  let backend = Silent { polled: false, translated: Arc::default(), entered, gate };
-  let watcher = Watcher::with_backend(
-    Options { written_hints: true, poll_interval: Duration::from_secs(3600), ..quick() },
-    move |result: Result<Vec<Event>, Error>| {
-      let _ = sender.send(result);
-    },
-    move |sink| {
-      sink_out.send(sink).unwrap();
-      Ok(backend)
-    },
-  )
-  .unwrap();
-  let sink = sink_in.recv().unwrap();
+  let options =
+    Options { written_hints: true, poll_interval: Duration::from_secs(3600), ..quick() };
+  let h = Held::new(options, false);
 
   // Young at the look of `watch` however slow the machine: its time is a second ahead.
   let path = dir.path().join("a.txt");
@@ -655,7 +600,7 @@ fn a_delivery_behind_a_dropped_signal_does_not_end_the_doubt() {
   let modified = SystemTime::now() + Duration::from_secs(1);
   let set_time = || fs::File::options().write(true).open(&path).unwrap().set_modified(modified);
   set_time().unwrap();
-  watcher.watch(&[dir.path()]).unwrap();
+  h.watcher.watch(&[dir.path()]).unwrap();
   // Written again with the same fingerprint, and nothing hints at it: the hint was dropped.
   fs::write(&path, "2").unwrap();
   set_time().unwrap();
@@ -665,17 +610,17 @@ fn a_delivery_behind_a_dropped_signal_does_not_end_the_doubt() {
 
   // In one turn of the thread: the dropped signal, then a delivery of every record until long
   // after the file is old.
-  sink.raw(vec![1]);
-  enter.recv_timeout(PATIENCE).expect("the watcher thread took the notification");
-  sink.raw(vec![0; (16 << 20) + 1]);
+  h.sink.raw(vec![1]);
+  h.enter.recv_timeout(PATIENCE).expect("the watcher thread took the notification");
+  h.sink.raw(vec![0; (16 << 20) + 1]);
   let later = modified + Duration::from_secs(3600);
   let nanos = later.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
   let mut delivery = vec![2];
   delivery.extend_from_slice(&u64::try_from(nanos).unwrap().to_ne_bytes());
-  sink.raw(delivery);
-  open.send(()).unwrap();
+  h.sink.raw(delivery);
+  h.open.send(()).unwrap();
 
-  let mut batch = results.recv_timeout(PATIENCE).expect("the scan after the overflow").unwrap();
+  let mut batch = h.results.recv_timeout(PATIENCE).expect("the scan after the overflow").unwrap();
   batch.sort_by(|a, b| a.path.cmp(&b.path));
   let expected =
     [Event { path, kind: EventKind::Update }, Event { path: other, kind: EventKind::Create }];
@@ -772,7 +717,7 @@ fn each_call_inside_the_handler_is_a_batch_of_its_own() {
         }
         let _ = sender.send(events);
       },
-      PollBackend::new,
+      |_| Ok(PollBackend),
     )
     .unwrap()
   };

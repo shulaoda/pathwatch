@@ -6,8 +6,8 @@
 use std::{io, time::Duration};
 
 use crate::fixtures::{
-  Deliver, Driver, Mode, NONE, Sim, SimFs, caught_up, flush, ignore_node_modules, known, makes,
-  on_all, settled, taken,
+  Deliver, Driver, Mode, NONE, Sim, SimFs, caught_up, flush, ignore_node_modules, makes, on_all,
+  settled, taken,
 };
 use pathwatch::engine::Options;
 
@@ -272,7 +272,7 @@ fn due_at_every_moment<B: Deliver>(make: impl Fn() -> Driver<B>, story: &Due, on
     let told = events.iter().filter(|event| *event == story.event).count();
     assert!(told == 1 || (told > 1 && story.event.starts_with('U')), "{on}");
     assert!(events.iter().all(|event| !event.starts_with('D')), "{on}");
-    assert_eq!(known(&d), story.known, "{on}");
+    assert_eq!(d.known(), story.known, "{on}");
     caught_up(&mut d);
   }
 }

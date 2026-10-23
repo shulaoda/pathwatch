@@ -146,18 +146,21 @@ fn push_names(
 ) -> Option<()> {
   let top = clean.len();
   for name in text.split(|&byte| separator(byte)) {
-    match part_of(name, is_name) {
-      Part::Nothing => {}
-      Part::Unusable => return None,
-      // Above the top directory there is nothing to take away.
-      Part::Parent => {
+    match name {
+      // Nothing, or `.`: the clean form leaves it out.
+      [] | [b'.'] => {}
+      // `..` takes the name before it away. Above the top directory there is nothing to take.
+      [b'.', b'.'] => {
         if clean.len() == top {
           return None;
         }
         let last = clean[top..].iter().rposition(|&byte| byte == join).unwrap_or(0);
         clean.truncate(top + last);
       }
-      Part::Name => {
+      // A name with a NUL, one that is too long, or one that the system does not take as it is:
+      // the path cannot be used.
+      _ if name.contains(&0) || name.len() > MAX_NAME || !is_name(name) => return None,
+      _ => {
         if clean.len() > top {
           clean.push(join);
         }
@@ -166,27 +169,6 @@ fn push_names(
     }
   }
   (clean.len() > top).then_some(())
-}
-
-/// What the text between two separators is.
-enum Part {
-  /// Nothing, or `.`: the clean form leaves it out.
-  Nothing,
-  /// `..`: it takes the name before it away.
-  Parent,
-  /// A name with a NUL, one that is too long, or one that the system does not take as it is:
-  /// the path cannot be used.
-  Unusable,
-  Name,
-}
-
-fn part_of(name: &[u8], is_name: fn(&[u8]) -> bool) -> Part {
-  match name {
-    [] | [b'.'] => Part::Nothing,
-    [b'.', b'.'] => Part::Parent,
-    _ if name.contains(&0) || name.len() > MAX_NAME || !is_name(name) => Part::Unusable,
-    _ => Part::Name,
-  }
 }
 
 #[cfg(test)]

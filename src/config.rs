@@ -18,7 +18,7 @@ pub struct Config {
   ignored: Option<Ignored>,
   debounce: Duration,
   delete_delay: Duration,
-  polling: bool,
+  pub(crate) polling: bool,
   poll_interval: Duration,
 }
 
@@ -132,10 +132,6 @@ impl Config {
   pub fn with_poll_interval(mut self, interval: Duration) -> Self {
     self.poll_interval = interval.clamp(SHORTEST_POLL_INTERVAL, LONGEST_SETTING);
     self
-  }
-
-  pub(crate) fn polling(&self) -> bool {
-    self.polling
   }
 
   /// The settings of the engine. `polling`: the watcher polls everything.

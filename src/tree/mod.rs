@@ -297,8 +297,6 @@ pub struct Tree {
   /// The nodes with a mark, each with the time of the hint that made it, if a hint did: the
   /// delete delay counts from it. A key can be stale.
   pub marked: Vec<(DirKey, Option<Instant>)>,
-  /// The time of the hints that are being turned into marks: the engine sets it meanwhile.
-  pub hint_time: Option<Instant>,
   /// The nodes that are queued for a scan. A key can be stale or be there twice.
   pub to_scan: Vec<DirKey>,
   /// The directories the timer looks at ([`Dir::is_polled`]); the root is always on it. Before
@@ -336,7 +334,6 @@ impl Tree {
       ahead: FxHashMap::default(),
       not_plain: FxHashMap::default(),
       marked: Vec::new(),
-      hint_time: None,
       to_scan: Vec::new(),
       polled: vec![Self::ROOT],
       lost: false,
@@ -946,12 +943,10 @@ impl Tree {
     found
   }
 
-  /// Adds a mark to a node. Two marks for one node become one. The time of the mark is the one
-  /// it carries, else the time of the hint that is being turned into marks, if one is.
+  /// Adds a mark to a node. Two marks for one node become one, with the time of the first.
   pub fn mark(&mut self, key: DirKey, mark: Mark) {
-    let since = mark.since.or(self.hint_time);
     if self[key].add_mark(mark) {
-      self.marked.push((key, since));
+      self.marked.push((key, mark.since));
     }
   }
 
@@ -1105,11 +1100,6 @@ impl Tree {
     alike.filter(|&child| any_child || linked(&self.slots, child).is_registered()).collect()
   }
 
-  /// Whether the name of the node `key` is plain: the table finds every other spelling of it.
-  pub fn is_plain(&self, key: DirKey) -> bool {
-    is_plain(self.name(key))
-  }
-
   /// Whether the name of the node `key` has more than one spelling at all: it has an ASCII
   /// letter, or it is not plain.
   pub fn has_spellings(&self, key: DirKey) -> bool {
@@ -1151,7 +1141,7 @@ impl Tree {
 /// Whether every other spelling of `name` is known: only ASCII and Han ideographs, which have no
 /// case and no second form. The few characters that a disk folds to plain ones (`ß`, the Kelvin
 /// sign, ligatures, compatibility ideographs) are not covered: design.md 9.
-fn is_plain(name: &OsStr) -> bool {
+pub(crate) fn is_plain(name: &OsStr) -> bool {
   let is_plain = |letter: char| {
     letter.is_ascii()
       || matches!(letter, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}')

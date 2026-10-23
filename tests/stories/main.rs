@@ -32,7 +32,6 @@ mod sim;
 
 use std::{
   collections::BTreeMap,
-  fmt,
   path::{Path, PathBuf},
   sync::Arc,
   time::Duration,
@@ -40,11 +39,11 @@ use std::{
 
 use pathwatch::{EntryKind, Event, EventKind, engine::Ignored};
 
-pub use crate::disk::{Disk, Inside};
+use crate::disk::{Disk, Inside};
 
 /// The words of a story. Every path is relative to the root of the world, with `/` between
 /// the names.
-pub trait World {
+trait World {
   /// The absolute path of `rel` in this world.
   fn path(&self, rel: &str) -> PathBuf;
   /// Whether the world polls the disk in place of an OS watch.
@@ -82,7 +81,7 @@ pub trait World {
 
 /// What a story asks of the watcher and of the disk. `None`: the default.
 #[derive(Clone, Default)]
-pub struct Settings {
+struct Settings {
   pub debounce: Option<Duration>,
   /// A story that sets it is about the delete delay: it skips polling, which has none.
   pub delete_delay: Option<Duration>,
@@ -90,16 +89,6 @@ pub struct Settings {
   /// The story needs a disk that takes two spellings of a name for one. The simulated disk
   /// is made so; the real disk is probed, and the story is skipped where it is not so.
   pub loose_disk: bool,
-}
-
-impl fmt::Debug for Settings {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("Settings")
-      .field("debounce", &self.debounce)
-      .field("delete_delay", &self.delete_delay)
-      .field("loose_disk", &self.loose_disk)
-      .finish_non_exhaustive()
-  }
 }
 
 impl Settings {
@@ -125,46 +114,46 @@ impl Settings {
 }
 
 /// Runs the story in every world, with the default settings.
-pub fn everywhere(story: impl Fn(&mut dyn World) + Sync) {
+fn everywhere(story: impl Fn(&mut dyn World) + Sync) {
   everywhere_with(&Settings::default(), story);
 }
 
 /// Runs the story in every world: on the simulated disk first (it takes no time), then on the
 /// real disk.
-pub fn everywhere_with(settings: &Settings, story: impl Fn(&mut dyn World) + Sync) {
+fn everywhere_with(settings: &Settings, story: impl Fn(&mut dyn World) + Sync) {
   #[cfg(unix)]
   sim::each_backend(settings, &story);
   disk::each_backend(settings, None, |disk| story(disk));
 }
 
 /// Runs the story on the real disk alone, with the watch API of this OS and with polling.
-pub fn on_disk(story: impl Fn(&mut Disk) + Sync) {
+fn on_disk(story: impl Fn(&mut Disk) + Sync) {
   disk::each_backend(&Settings::default(), None, story);
 }
 
-pub fn on_disk_with(settings: &Settings, story: impl Fn(&mut Disk) + Sync) {
+fn on_disk_with(settings: &Settings, story: impl Fn(&mut Disk) + Sync) {
   disk::each_backend(settings, None, story);
 }
 
 /// `on_disk`, with `inside` run inside the handler for each batch, before the story gets it.
-pub fn on_disk_inside(inside: Inside, story: impl Fn(&mut Disk) + Sync) {
+fn on_disk_inside(inside: Inside, story: impl Fn(&mut Disk) + Sync) {
   disk::each_backend(&Settings::default(), Some(inside), story);
 }
 
 /// Says on stderr that the running story skips a world, and why: a skipped world is never
 /// silent. The name of the story is the name of its thread.
 #[expect(clippy::print_stderr, reason = "a skipped world must be seen")]
-pub fn skipped(why: &str) {
+fn skipped(why: &str) {
   let thread = std::thread::current();
   eprintln!("skipped: {}: {why}", thread.name().unwrap_or("a story"));
 }
 
 /// The events of each path, in the order in which they came.
-pub type History = BTreeMap<PathBuf, Vec<EventKind>>;
+type History = BTreeMap<PathBuf, Vec<EventKind>>;
 
 /// The history of these events. An `Update` right after a `Create` or an `Update` of the same
 /// path is left out, and a path of `passing` that only came and went is left out.
-pub fn history_of(events: &[Event], passing: &[PathBuf]) -> History {
+fn history_of(events: &[Event], passing: &[PathBuf]) -> History {
   let mut history = History::new();
   for event in events {
     let kinds = history.entry(event.path.clone()).or_default();
@@ -183,7 +172,7 @@ pub fn history_of(events: &[Event], passing: &[PathBuf]) -> History {
 }
 
 /// The history that a story expects, with its paths made absolute by `path`.
-pub fn expected_history(expected: &[(EventKind, &str)], path: impl Fn(&str) -> PathBuf) -> History {
+fn expected_history(expected: &[(EventKind, &str)], path: impl Fn(&str) -> PathBuf) -> History {
   let mut history = History::new();
   for &(kind, rel) in expected {
     history.entry(path(rel)).or_default().push(kind);
@@ -191,7 +180,7 @@ pub fn expected_history(expected: &[(EventKind, &str)], path: impl Fn(&str) -> P
   history
 }
 
-pub fn differences(expected: &History, got: &History) -> String {
+fn differences(expected: &History, got: &History) -> String {
   let none = Vec::new();
   let lines: Vec<String> = expected
     .keys()
@@ -208,6 +197,6 @@ pub fn differences(expected: &History, got: &History) -> String {
 }
 
 /// One event of `kind` for each path.
-pub fn each(kind: EventKind, paths: &[String]) -> Vec<(EventKind, &str)> {
+fn each(kind: EventKind, paths: &[String]) -> Vec<(EventKind, &str)> {
   paths.iter().map(|path| (kind, path.as_str())).collect()
 }

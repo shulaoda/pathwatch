@@ -6,7 +6,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use crate::fixtures::{
-  Deliver, Driver, Mode, NONE, RECURSIVE, SimFs, asked, at, caught_up, ignore_node_modules, known,
+  Deliver, Driver, Mode, NONE, RECURSIVE, Sim, SimFs, asked, at, caught_up, ignore_node_modules,
   on_a_small_stack, on_all, on_modes, os_watches, settled, sorted, taken, window,
 };
 use pathwatch::{
@@ -141,7 +141,7 @@ fn unwatch_opens_no_gap_for_what_stays() {
       events.append(&mut settled(&mut d));
       assert!(!events.is_empty(), "{mode:?}: the write before call {moment} was lost");
       assert!(events.iter().all(|event| event == "U /p/R/lib/a.js"), "{mode:?}: {events:?}");
-      assert_eq!(known(&d), ["/p/R/lib/a.js"], "{mode:?}, call {moment}");
+      assert_eq!(d.known(), ["/p/R/lib/a.js"], "{mode:?}, call {moment}");
       // The end of the story compares the stored fingerprint with the disk.
       caught_up(&mut d);
     }
@@ -350,7 +350,7 @@ fn a_hint_for_a_path_that_was_taken_back() {
     d.fs.remove_all("/p/R/sub").unwrap();
     d.unwatch(&["/p/R"]);
     assert_eq!(taken(&mut d), NONE, "{mode:?}");
-    assert_eq!(known(&d), ["/p/keep.js"], "{mode:?}");
+    assert_eq!(d.known(), ["/p/keep.js"], "{mode:?}");
     d.advance(Duration::from_millis(500));
     assert_eq!(settled(&mut d), NONE, "{mode:?}");
 

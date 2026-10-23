@@ -14,7 +14,7 @@ use std::{
 
 use pathwatch::{
   ErrorKind, Event, EventKind,
-  backend::{Signal, Sink, poll::PollBackend},
+  backend::{Signal, poll::PollBackend},
   engine::{Engine, Options, Output},
   fs::{Entry, Fs, Meta, StdFs},
 };
@@ -106,9 +106,8 @@ impl Polled {
       loose_spelling: cfg!(any(target_vendor = "apple", windows)),
       ..Options::default()
     };
-    let backend = PollBackend::new(Sink::new(|_| {})).unwrap();
     let disk = Disk { reads: Rc::clone(&reads), listing, read, ticks: Cell::new(Duration::ZERO) };
-    let mut engine = Engine::new(backend, disk, options);
+    let mut engine = Engine::new(PollBackend, disk, options);
     let (now, mut out) = (Instant::now(), Output::default());
     engine.watch(vec![dir.to_owned()], now, &mut out);
     assert!(out.events.is_empty() && out.errors.is_empty(), "{out:?}");
@@ -236,8 +235,7 @@ fn a_stopped_backend_is_polled_as_a_watcher_that_only_polls() {
     loose_spelling: cfg!(any(target_vendor = "apple", windows)),
     ..Options::default()
   };
-  let backend = PollBackend::new(Sink::new(|_| {})).unwrap();
-  let mut engine = Engine::new(backend, StdFs, options.clone());
+  let mut engine = Engine::new(PollBackend, StdFs, options.clone());
   engine.fall_back_to(Options { poll_interval: INTERVAL, delete_delay: Duration::ZERO, ..options });
   let (start, mut out) = (Instant::now(), Output::default());
   engine.watch(vec![pathwatch::path::normalize(dir.path()).unwrap()], start, &mut out);

@@ -246,7 +246,7 @@ impl Harness {
 
   fn translate(&mut self, raw: Raw) -> Vec<Seen> {
     self.records.extend(raw.records().map(|(path, flags)| (path.to_owned(), flags)));
-    self.lost.extend_from_slice(raw.lost());
+    self.lost.extend_from_slice(&raw.lost);
     let mut seen = Vec::new();
     self.backend.translate(raw, &mut |hint| {
       seen.push(match hint {

@@ -1,18 +1,12 @@
 //! The backend that watches nothing: the engine polls every directory.
 
-use std::{convert::Infallible, io, path::Path};
+use std::{convert::Infallible, path::Path};
 
-use crate::backend::{Backend, Coverage, DirKey, Hint, Sink, Want};
+use crate::backend::{Backend, Coverage, DirKey, Hint, Want};
 
 /// Watches nothing.
 #[derive(Debug)]
 pub struct PollBackend;
-
-impl PollBackend {
-  pub fn new(_sink: Sink<Infallible>) -> io::Result<Self> {
-    Ok(Self)
-  }
-}
 
 impl Backend for PollBackend {
   type Raw = Infallible;

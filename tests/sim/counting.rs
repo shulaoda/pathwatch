@@ -1,16 +1,14 @@
-//! The system allocator with counters: how often memory was asked for, by the process and by
-//! this thread, and the bytes that are allocated now. `cost` reads the first and the last,
-//! `allocations` the one of its thread.
+//! The system allocator with counters: how often this thread asked for memory, and the bytes
+//! that are allocated now. `allocations` reads the first, `cost` both.
 
 use std::{
   alloc::{GlobalAlloc, Layout, System},
   cell::Cell,
-  sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+  sync::atomic::{AtomicUsize, Ordering},
 };
 
 struct Counting;
 
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
@@ -40,7 +38,6 @@ unsafe impl GlobalAlloc for Counting {
 }
 
 fn count(added: usize, freed: usize) {
-  ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
   LIVE.fetch_add(added, Ordering::Relaxed);
   LIVE.fetch_sub(freed, Ordering::Relaxed);
   REQUESTS.set(REQUESTS.get() + 1);
@@ -48,11 +45,6 @@ fn count(added: usize, freed: usize) {
 
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
-
-/// How often the process asked for memory.
-pub fn allocations() -> u64 {
-  ALLOCATIONS.load(Ordering::Relaxed)
-}
 
 /// The bytes that are allocated now.
 pub fn live() -> usize {

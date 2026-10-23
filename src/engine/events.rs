@@ -96,11 +96,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.touched.push(key);
   }
 
-  /// The time of the next second look.
-  pub(super) fn next_hold(&self) -> Option<Instant> {
-    self.hold_queue.peek().map(|Reverse((until, _))| *until)
-  }
-
   /// Marks each held node whose time is over. `true`: a flush has to run.
   pub(super) fn mark_due_holds(&mut self, now: Instant) -> bool {
     while let Some(&Reverse((until, key))) = self.hold_queue.peek()

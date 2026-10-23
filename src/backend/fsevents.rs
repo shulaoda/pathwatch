@@ -11,7 +11,7 @@ use std::{
     ffi::OsStrExt,
     fs::{MetadataExt, OpenOptionsExt},
   },
-  path::{Component, Path, PathBuf},
+  path::{Path, PathBuf},
   slice,
   sync::{
     Arc,
@@ -66,24 +66,39 @@ pub mod flag {
 #[derive(Debug)]
 pub struct FsEventsBackend {
   covers: Covers,
-  streams: Streams,
+  sink: Arc<Sink<Raw>>,
+  queue: Queue,
+  running: Vec<Running>,
+  /// The stream paths that are trusted. `distrust` takes a path out while its stream runs on,
+  /// so these are not always all the paths of `running`.
+  paths: Dirs<()>,
+  pending: Dirs<()>,
+  path_limit: usize,
+  guard: Guard,
+  /// The stream paths or the named directories changed since the guard was last made to fit.
+  guard_is_stale: bool,
   /// The keys asked for names of a directory that no stream reports, at its real path: its
   /// guard tells about it.
   named: FxHashMap<DirKey, PathBuf>,
-  last_parent: Option<RealParent>,
-}
-
-#[derive(Debug)]
-struct RealParent {
-  asked: PathBuf,
-  real: PathBuf,
+  /// The parent that `real_path` asked last, and its real path: kept until the commit.
+  last_parent: Option<(PathBuf, PathBuf)>,
 }
 
 impl FsEventsBackend {
   pub fn new(sink: Sink<Raw>) -> io::Result<Self> {
+    let sink = Arc::new(sink);
+    let queue = Queue::new()?;
+    let notices = Notices::new(&queue, &sink)?;
     Ok(Self {
       covers: Covers::default(),
-      streams: Streams::new(sink)?,
+      sink,
+      queue,
+      running: Vec::new(),
+      paths: Dirs::default(),
+      pending: Dirs::default(),
+      path_limit: MAX_STREAM_PATHS,
+      guard: Guard { notices, dirs: FxHashMap::default(), last_id: ffi::VOLUMES },
+      guard_is_stale: false,
       named: FxHashMap::default(),
       last_parent: None,
     })
@@ -106,12 +121,12 @@ impl Backend for FsEventsBackend {
     {
       // The key was at another real path, and nothing else said so. A stream that was to start
       // for it there is not needed.
-      if self.streams.paths.holds(old) {
-        self.streams.sink.raw(Raw { lost: vec![key], ..Raw::default() });
+      if self.paths.holds(old) {
+        self.sink.raw(Raw { lost: vec![key], ..Raw::default() });
       }
       self.unwatch(key);
     }
-    let has_stream = self.streams.paths.holds(&real) || self.streams.pending.holds(&real);
+    let has_stream = self.paths.holds(&real) || self.pending.holds(&real);
     if !has_stream {
       // A directory on the way: names come and go in it only when one of them is renamed or
       // removed, which the guard of that one tells, as its own does for this one.
@@ -119,7 +134,7 @@ impl Backend for FsEventsBackend {
         if self.named.get(&key) != Some(&real) {
           self.unwatch(key);
           self.named.insert(key, real);
-          self.streams.guard_is_stale = true;
+          self.guard_is_stale = true;
         }
         return Coverage::Watched;
       }
@@ -127,10 +142,10 @@ impl Backend for FsEventsBackend {
         self.unwatch(key);
         return Coverage::NotWatched;
       }
-      self.streams.pending.insert(real.clone(), ());
+      self.pending.insert(real.clone(), ());
     }
     if self.named.remove(&key).is_some() {
-      self.streams.guard_is_stale = true;
+      self.guard_is_stale = true;
     }
     self.covers.insert(key, real);
     Coverage::WatchedTree
@@ -139,17 +154,17 @@ impl Backend for FsEventsBackend {
   fn unwatch(&mut self, key: DirKey) {
     if self.named.remove(&key).is_some() {
       give_room_back(&mut self.named);
-      self.streams.guard_is_stale = true;
+      self.guard_is_stale = true;
     }
     // The stream that was to start here is not needed: a cover below it, which counted on
     // that stream, asks for one of its own.
     if let Some(dir) = self.covers.remove(key)
-      && self.streams.pending.contains(&dir)
+      && self.pending.contains(&dir)
     {
-      self.streams.pending.remove(&dir);
+      self.pending.remove(&dir);
       for (below, _) in self.covers.by_dir.below(&[&dir]) {
-        if !self.streams.paths.holds(below) {
-          self.streams.pending.insert(below.to_owned(), ());
+        if !self.paths.holds(below) {
+          self.pending.insert(below.to_owned(), ());
         }
       }
     }
@@ -160,21 +175,19 @@ impl Backend for FsEventsBackend {
     // then, hears of their keys with the report at the end (a guard that told is closed, so the
     // commit goes on to fit the guard again).
     let mut lost = self.told();
-    self.streams.stop_idle(&self.covers);
+    self.stop_idle();
     self.last_parent = None;
     let mut committed = Committed::default();
-    if self.streams.pending.is_empty() && !self.streams.guard_is_stale {
+    if self.pending.is_empty() && !self.guard_is_stale {
       return committed;
     }
-    let Started { fresh, unguarded, failed } =
-      self.streams.start_pending(&self.covers, &self.named);
+    let Started { fresh, unguarded, failed } = self.start_pending();
     if !unguarded.is_empty() || failed.is_some() {
       // The keys at and below a directory with no guard, and the covers with no stream, go back
       // to the engine: an error is reported and polled, a directory that was away is checked.
       let why = |dir: &Path| unguarded.holders(dir).next().map(|(why, _)| why.as_ref());
-      let streamed = &self.streams.paths;
       let named = self.named.iter().map(|(&key, dir)| (key, why(dir)));
-      let covered = self.covers.dir_of.iter().filter(|(_, dir)| !streamed.holds(dir));
+      let covered = self.covers.dir_of.iter().filter(|(_, dir)| !self.paths.holds(dir));
       let covered = covered.map(|(&key, dir)| (key, why(dir).or(failed.as_ref().map(Some))));
       let taken: Vec<_> = named.chain(covered).filter_map(|(key, why)| Some((key, why?))).collect();
       for (key, why) in taken {
@@ -186,11 +199,11 @@ impl Backend for FsEventsBackend {
         }
       }
     }
-    lost.extend(self.streams.moved_since_asked(&fresh, &self.covers));
+    lost.extend(self.moved_since_asked(&fresh));
     if !lost.is_empty() {
-      self.streams.sink.raw(Raw { lost, ..Raw::default() });
+      self.sink.raw(Raw { lost, ..Raw::default() });
     }
-    self.streams.fit_guard(&self.named);
+    self.fit_guard();
     committed
   }
 
@@ -246,10 +259,10 @@ impl FsEventsBackend {
     let real = match (dir.parent(), dir.file_name()) {
       (Some(parent), Some(name)) => {
         let last = match self.last_parent.take() {
-          Some(last) if last.asked == parent => last,
-          _ => RealParent { asked: parent.to_owned(), real: short_way(fs::canonicalize(parent)?) },
+          Some(last) if last.0 == parent => last,
+          _ => (parent.to_owned(), short_way(fs::canonicalize(parent)?)),
         };
-        let real_parent = &self.last_parent.insert(last).real;
+        let real_parent = &self.last_parent.insert(last).1;
         // A link, or a name that differs by more than ASCII case, goes the slow way, by the OS.
         match name_and_kind(dir)? {
           (on_disk, kind) if kind != FileType::Symlink && on_disk.eq_ignore_ascii_case(name) => {
@@ -273,22 +286,201 @@ impl FsEventsBackend {
   /// was another one, also when the path is back by now. The stream paths at and below these
   /// directories are trusted no more (`references/design.md` 7.2).
   fn told(&mut self) -> Vec<DirKey> {
-    let moved = self.streams.guard.take();
+    let moved = self.guard.take();
     if moved.is_empty() {
       return Vec::new();
     }
-    self.streams.guard_is_stale = true;
-    self.streams.distrust(&moved);
+    self.guard_is_stale = true;
+    self.distrust(&moved);
     let is_below = |dir: &Path| moved.iter().any(|moved| dir.starts_with(moved));
     let named = self.named.iter().filter(|(_, dir)| is_below(dir)).map(|(&key, _)| key);
     named.chain(self.covers.keys_at_or_below(&moved)).collect()
+  }
+
+  /// Starts the streams for the pending paths, after the guard of the directories at and above
+  /// them, and of the `named` ones: a directory renamed between the guard and the start is told
+  /// too. A pending path below a directory that got no guard gets no stream.
+  fn start_pending(&mut self) -> Started {
+    let new = top_most(self.pending.drain().collect());
+    let replace = !new.is_empty()
+      && (self.running.len() >= MAX_STREAMS
+        || self.paths.len() + new.len() > self.path_limit
+        || self.paths.below(&new).next().is_some());
+    let (mut paths, keep) = if replace {
+      // With room for the paths of the next few commits: a few new directories must not
+      // replace every stream again.
+      let covered = self.covers.by_dir.keys().map(Path::to_owned).collect();
+      let placed = place(covered, MAX_STREAM_PATHS - MAX_NEW_STREAMS);
+      let keep = self.keep(&placed);
+      (placed, keep)
+    } else {
+      (new, Vec::new())
+    };
+    let placed = paths.len();
+    let kept = self.running.iter().zip(&keep).filter(|(_, keep)| **keep);
+    let kept: FxHashSet<&Path> =
+      kept.flat_map(|(running, _)| &running.paths).map(PathBuf::as_path).collect();
+    paths.retain(|path| !kept.contains(path.as_path()));
+    let unguarded = self
+      .guard
+      .open(paths.iter().map(PathBuf::as_path), self.named.values().map(PathBuf::as_path));
+    paths.retain(|path| !unguarded.holds(path));
+    if paths.is_empty() {
+      return Started { fresh: Vec::new(), unguarded, failed: None };
+    }
+    let stream_count =
+      MAX_NEW_STREAMS.min(paths.len()).max(paths.len().div_ceil(MAX_PATHS_PER_STREAM));
+    let start = |first: usize| -> io::Result<Running> {
+      let every_nth = || paths.iter().skip(first).step_by(stream_count);
+      let stream = Stream::start(&self.queue, &self.sink, every_nth())?;
+      Ok(Running { _stream: stream, paths: every_nth().cloned().collect() })
+    };
+    let streams = match (0..stream_count).map(start).collect::<io::Result<Vec<Running>>>() {
+      Ok(streams) => streams,
+      Err(error) => return Started { fresh: Vec::new(), unguarded, failed: Some(error) },
+    };
+    let fresh = paths.iter().filter(|path| !self.paths.contains(path)).cloned().collect();
+    // The new streams run before the old ones stop: nothing is missed in between.
+    if replace {
+      let mut keep = keep.into_iter();
+      let replaced: Vec<Running> =
+        self.running.extract_if(.., |_| keep.next() == Some(false)).collect();
+      if !replaced.is_empty() {
+        self.stop(replaced);
+      }
+      self.paths = Dirs::default();
+      for path in self.running.iter().flat_map(|running| &running.paths) {
+        self.paths.insert(path.clone(), ());
+      }
+      // Paths that must stay apart raise the limit: not every commit replaces the streams.
+      self.path_limit = if placed > MAX_STREAM_PATHS { 2 * placed } else { MAX_STREAM_PATHS };
+    }
+    self.running.extend(streams);
+    for path in paths {
+      self.paths.insert(path, ());
+    }
+    Started { fresh, unguarded, failed: None }
+  }
+
+  /// Which running streams a replacement keeps: each whose paths are all placed again and still
+  /// trusted, so that it goes on with no gap, the newest of two on one path. When the streams
+  /// are too many, only the ones with the most covers, so that the next commits have room.
+  fn keep(&self, placed: &[PathBuf]) -> Vec<bool> {
+    let mut placed: FxHashSet<&Path> = placed.iter().map(PathBuf::as_path).collect();
+    let mut kept = Vec::new();
+    for (index, running) in self.running.iter().enumerate().rev() {
+      let stays = |path: &PathBuf| placed.contains(path.as_path()) && self.paths.contains(path);
+      if running.paths.iter().all(stays) {
+        for path in &running.paths {
+          placed.remove(path.as_path());
+        }
+        let covers_at =
+          |path: &PathBuf| self.covers.by_dir.below(slice::from_ref(path)).count() + 1;
+        kept.push((running.paths.iter().map(covers_at).sum::<usize>(), index));
+      }
+    }
+    let room = if self.running.len() >= MAX_STREAMS { MAX_STREAMS / 2 } else { MAX_STREAMS };
+    kept.sort_unstable_by(|a, b| b.cmp(a));
+    kept.truncate(room - MAX_NEW_STREAMS);
+    let mut keep = vec![false; self.running.len()];
+    for (_, index) in kept {
+      keep[index] = true;
+    }
+    keep
+  }
+
+  /// Closes the guards that no stream path and none of `named` needs. Only after the start: the
+  /// old stream paths keep theirs until new streams stand, or for good if none could start.
+  fn fit_guard(&mut self) {
+    let wanted = wanted(self.paths.keys(), self.named.values().map(PathBuf::as_path));
+    self.guard.dirs.retain(|dir, _| wanted.binary_search(&dir.as_path()).is_ok());
+    give_room_back(&mut self.guard.dirs);
+    self.guard_is_stale = false;
+  }
+
+  /// The stream paths at and below `dirs` are trusted no more.
+  fn distrust(&mut self, dirs: &[PathBuf]) {
+    let below: Vec<PathBuf> = self.paths.below(dirs).map(|(path, ())| path.to_owned()).collect();
+    for path in dirs.iter().chain(&below) {
+      self.paths.remove(path);
+    }
+  }
+
+  /// The check after the start (`references/design.md` 7.2): a stream path, or a name between it
+  /// and a cover, can have changed between `watch` and the start of the stream.
+  fn moved_since_asked(&mut self, started: &[PathBuf]) -> Vec<DirKey> {
+    let mut moved = Vec::new();
+    for path in started {
+      let is_there = fs::canonicalize(path).is_ok_and(|real| real == *path);
+      if !is_there {
+        self.distrust(slice::from_ref(path));
+        moved.extend(self.covers.keys_at_or_below(slice::from_ref(path)));
+        continue;
+      }
+      let mut spelled = path.as_path();
+      for (cover, keys) in self.covers.by_dir.below(slice::from_ref(path)) {
+        let is_spelled = |dir: &Path| {
+          name_and_kind(dir).is_ok_and(|(name, kind)| {
+            kind != FileType::Symlink && Some(name.as_os_str()) == dir.file_name()
+          })
+        };
+        if cover.ancestors().take_while(|dir| !spelled.starts_with(dir)).all(is_spelled) {
+          spelled = cover;
+        } else {
+          moved.extend(keys);
+        }
+      }
+    }
+    moved
+  }
+
+  /// Stops the streams that no cover needs any more: their records would reach no key, so
+  /// nothing is lost with them.
+  fn stop_idle(&mut self) {
+    let needed = |path: &PathBuf| {
+      self.paths.contains(path)
+        && self.covers.keys_at_or_below(slice::from_ref(path)).next().is_some()
+    };
+    let idle: Vec<Running> =
+      self.running.extract_if(.., |running| !running.paths.iter().any(needed)).collect();
+    if idle.is_empty() {
+      return;
+    }
+    for path in idle.iter().flat_map(|running| &running.paths) {
+      self.paths.remove(path);
+    }
+    self.guard_is_stale = true;
+    self.queue.run(move || drop(idle));
+  }
+
+  /// Stops the replaced streams, with a loss report for the covers at and below their paths: a
+  /// stream that stops takes what it has not delivered. A cover above them has a stream of its
+  /// own: trusted stream paths never lie one below another.
+  fn stop(&self, stopped: Vec<Running>) {
+    let paths = top_most(stopped.iter().flat_map(|old| &old.paths).cloned().collect());
+    let lost = self.covers.keys_at_or_below(&paths).collect();
+    let sink = Arc::clone(&self.sink);
+    self.queue.run(move || {
+      drop(stopped);
+      sink.raw(Raw { lost, ..Raw::default() });
+    });
+  }
+}
+
+impl Drop for FsEventsBackend {
+  fn drop(&mut self) {
+    // No notice is read once this returns, and the streams stop on their queue after the stops
+    // that wait there: no report of theirs comes after this.
+    self.guard.notices.cancel();
+    let streams = mem::take(&mut self.running);
+    self.queue.sync(move || drop(streams));
   }
 }
 
 /// What the tests look at.
 impl FsEventsBackend {
   pub fn stream_count(&self) -> usize {
-    self.streams.running.len()
+    self.running.len()
   }
 
   pub fn covers(&self) -> Vec<&Path> {
@@ -300,15 +492,15 @@ impl FsEventsBackend {
   }
 
   pub fn guarded(&self) -> Vec<&Path> {
-    self.streams.guard.dirs.keys().map(PathBuf::as_path).collect()
+    self.guard.dirs.keys().map(PathBuf::as_path).collect()
   }
 
   pub fn streamed(&self) -> Vec<&Path> {
-    self.streams.paths.paths()
+    self.paths.paths()
   }
 
   pub fn pending(&self) -> Vec<&Path> {
-    self.streams.pending.paths()
+    self.pending.paths()
   }
 }
 
@@ -316,18 +508,14 @@ impl FsEventsBackend {
 pub struct Raw {
   paths: Vec<u8>,
   records: Vec<(usize, u32)>,
-  lost: Vec<DirKey>,
+  /// The keys that the backend reports lost by itself, with no record.
+  pub lost: Vec<DirKey>,
 }
 
 impl Raw {
   pub fn push(&mut self, path: &[u8], flags: u32) {
     self.paths.extend_from_slice(path);
     self.records.push((self.paths.len(), flags));
-  }
-
-  /// The keys that the backend reports lost by itself, with no record.
-  pub fn lost(&self) -> &[DirKey] {
-    &self.lost
   }
 
   pub fn records(&self) -> impl Iterator<Item = (&Path, u32)> {
@@ -381,21 +569,6 @@ impl Covers {
   }
 }
 
-#[derive(Debug)]
-struct Streams {
-  sink: Arc<Sink<Raw>>,
-  queue: Queue,
-  running: Vec<Running>,
-  /// The stream paths that are trusted. `distrust` takes a path out while its stream runs on,
-  /// so these are not always all the paths of `running`.
-  paths: Dirs<()>,
-  pending: Dirs<()>,
-  path_limit: usize,
-  guard: Guard,
-  /// The stream paths or the named directories changed since the guard was last made to fit.
-  guard_is_stale: bool,
-}
-
 struct Started {
   /// The paths that got a stream and had none before.
   fresh: Vec<PathBuf>,
@@ -412,200 +585,6 @@ struct Running {
   /// Stops when dropped.
   _stream: Stream,
   paths: Vec<PathBuf>,
-}
-
-impl Streams {
-  fn new(sink: Sink<Raw>) -> io::Result<Self> {
-    let sink = Arc::new(sink);
-    let queue = Queue::new()?;
-    let notices = Notices::new(&queue, &sink)?;
-    Ok(Self {
-      sink,
-      queue,
-      running: Vec::new(),
-      paths: Dirs::default(),
-      pending: Dirs::default(),
-      path_limit: MAX_STREAM_PATHS,
-      guard: Guard { notices, dirs: FxHashMap::default(), last_id: ffi::VOLUMES },
-      guard_is_stale: false,
-    })
-  }
-
-  /// Starts the streams for the pending paths, after the guard of the directories at and above
-  /// them, and of the `named` ones: a directory renamed between the guard and the start is told
-  /// too. A pending path below a directory that got no guard gets no stream.
-  fn start_pending(&mut self, covers: &Covers, named: &FxHashMap<DirKey, PathBuf>) -> Started {
-    let new = top_most(self.pending.drain().collect());
-    let replace = !new.is_empty()
-      && (self.running.len() >= MAX_STREAMS
-        || self.paths.len() + new.len() > self.path_limit
-        || self.paths.below(&new).next().is_some());
-    let (mut paths, keep) = if replace {
-      // With room for the paths of the next few commits: a few new directories must not
-      // replace every stream again.
-      let covered = covers.by_dir.keys().map(Path::to_owned).collect();
-      let placed = place(covered, MAX_STREAM_PATHS - MAX_NEW_STREAMS);
-      let keep = self.keep(&placed, covers);
-      (placed, keep)
-    } else {
-      (new, Vec::new())
-    };
-    let placed = paths.len();
-    let kept = self.running.iter().zip(&keep).filter(|(_, keep)| **keep);
-    let kept: FxHashSet<&Path> =
-      kept.flat_map(|(running, _)| &running.paths).map(PathBuf::as_path).collect();
-    paths.retain(|path| !kept.contains(path.as_path()));
-    let unguarded =
-      self.guard.open(paths.iter().map(PathBuf::as_path), named.values().map(PathBuf::as_path));
-    paths.retain(|path| !unguarded.holds(path));
-    if paths.is_empty() {
-      return Started { fresh: Vec::new(), unguarded, failed: None };
-    }
-    let stream_count =
-      MAX_NEW_STREAMS.min(paths.len()).max(paths.len().div_ceil(MAX_PATHS_PER_STREAM));
-    let start = |first: usize| -> io::Result<Running> {
-      let every_nth = || paths.iter().skip(first).step_by(stream_count);
-      let stream = Stream::start(&self.queue, &self.sink, every_nth())?;
-      Ok(Running { _stream: stream, paths: every_nth().cloned().collect() })
-    };
-    let streams = match (0..stream_count).map(start).collect::<io::Result<Vec<Running>>>() {
-      Ok(streams) => streams,
-      Err(error) => return Started { fresh: Vec::new(), unguarded, failed: Some(error) },
-    };
-    let fresh = paths.iter().filter(|path| !self.paths.contains(path)).cloned().collect();
-    // The new streams run before the old ones stop: nothing is missed in between.
-    if replace {
-      let mut keep = keep.into_iter();
-      let replaced: Vec<Running> =
-        self.running.extract_if(.., |_| keep.next() == Some(false)).collect();
-      if !replaced.is_empty() {
-        self.stop(replaced, covers);
-      }
-      self.paths = Dirs::default();
-      for path in self.running.iter().flat_map(|running| &running.paths) {
-        self.paths.insert(path.clone(), ());
-      }
-      // Paths that must stay apart raise the limit: not every commit replaces the streams.
-      self.path_limit = if placed > MAX_STREAM_PATHS { 2 * placed } else { MAX_STREAM_PATHS };
-    }
-    self.running.extend(streams);
-    for path in paths {
-      self.paths.insert(path, ());
-    }
-    Started { fresh, unguarded, failed: None }
-  }
-
-  /// Which running streams a replacement keeps: each whose paths are all placed again and still
-  /// trusted, so that it goes on with no gap, the newest of two on one path. When the streams
-  /// are too many, only the ones with the most covers, so that the next commits have room.
-  fn keep(&self, placed: &[PathBuf], covers: &Covers) -> Vec<bool> {
-    let mut placed: FxHashSet<&Path> = placed.iter().map(PathBuf::as_path).collect();
-    let mut kept = Vec::new();
-    for (index, running) in self.running.iter().enumerate().rev() {
-      let stays = |path: &PathBuf| placed.contains(path.as_path()) && self.paths.contains(path);
-      if running.paths.iter().all(stays) {
-        for path in &running.paths {
-          placed.remove(path.as_path());
-        }
-        let covers_at = |path: &PathBuf| covers.by_dir.below(slice::from_ref(path)).count() + 1;
-        kept.push((running.paths.iter().map(covers_at).sum::<usize>(), index));
-      }
-    }
-    let room = if self.running.len() >= MAX_STREAMS { MAX_STREAMS / 2 } else { MAX_STREAMS };
-    kept.sort_unstable_by(|a, b| b.cmp(a));
-    kept.truncate(room - MAX_NEW_STREAMS);
-    let mut keep = vec![false; self.running.len()];
-    for (_, index) in kept {
-      keep[index] = true;
-    }
-    keep
-  }
-
-  /// Closes the guards that no stream path and none of `named` needs. Only after the start: the
-  /// old stream paths keep theirs until new streams stand, or for good if none could start.
-  fn fit_guard(&mut self, named: &FxHashMap<DirKey, PathBuf>) {
-    let wanted = wanted(self.paths.keys(), named.values().map(PathBuf::as_path));
-    self.guard.dirs.retain(|dir, _| wanted.binary_search(&dir.as_path()).is_ok());
-    give_room_back(&mut self.guard.dirs);
-    self.guard_is_stale = false;
-  }
-
-  /// The stream paths at and below `dirs` are trusted no more.
-  fn distrust(&mut self, dirs: &[PathBuf]) {
-    let below: Vec<PathBuf> = self.paths.below(dirs).map(|(path, ())| path.to_owned()).collect();
-    for path in dirs.iter().chain(&below) {
-      self.paths.remove(path);
-    }
-  }
-
-  /// The check after the start (`references/design.md` 7.2): a stream path, or a name between it
-  /// and a cover, can have changed between `watch` and the start of the stream.
-  fn moved_since_asked(&mut self, started: &[PathBuf], covers: &Covers) -> Vec<DirKey> {
-    let mut moved = Vec::new();
-    for path in started {
-      let is_there = fs::canonicalize(path).is_ok_and(|real| real == *path);
-      if !is_there {
-        self.distrust(slice::from_ref(path));
-        moved.extend(covers.keys_at_or_below(slice::from_ref(path)));
-        continue;
-      }
-      let mut spelled = path.as_path();
-      for (cover, keys) in covers.by_dir.below(slice::from_ref(path)) {
-        let is_spelled = |dir: &Path| {
-          name_and_kind(dir).is_ok_and(|(name, kind)| {
-            kind != FileType::Symlink && Some(name.as_os_str()) == dir.file_name()
-          })
-        };
-        if cover.ancestors().take_while(|dir| !spelled.starts_with(dir)).all(is_spelled) {
-          spelled = cover;
-        } else {
-          moved.extend(keys);
-        }
-      }
-    }
-    moved
-  }
-
-  /// Stops the streams that no cover needs any more: their records would reach no key, so
-  /// nothing is lost with them.
-  fn stop_idle(&mut self, covers: &Covers) {
-    let needed = |path: &PathBuf| {
-      self.paths.contains(path) && covers.keys_at_or_below(slice::from_ref(path)).next().is_some()
-    };
-    let idle: Vec<Running> =
-      self.running.extract_if(.., |running| !running.paths.iter().any(needed)).collect();
-    if idle.is_empty() {
-      return;
-    }
-    for path in idle.iter().flat_map(|running| &running.paths) {
-      self.paths.remove(path);
-    }
-    self.guard_is_stale = true;
-    self.queue.run(move || drop(idle));
-  }
-
-  /// Stops the replaced streams, with a loss report for the covers at and below their paths: a
-  /// stream that stops takes what it has not delivered. A cover above them has a stream of its
-  /// own: trusted stream paths never lie one below another.
-  fn stop(&self, stopped: Vec<Running>, covers: &Covers) {
-    let paths = top_most(stopped.iter().flat_map(|old| &old.paths).cloned().collect());
-    let lost = covers.keys_at_or_below(&paths).collect();
-    let sink = Arc::clone(&self.sink);
-    self.queue.run(move || {
-      drop(stopped);
-      sink.raw(Raw { lost, ..Raw::default() });
-    });
-  }
-}
-
-impl Drop for Streams {
-  fn drop(&mut self) {
-    // No notice is read once this returns, and the streams stop on their queue after the stops
-    // that wait there: no report of theirs comes after this.
-    self.guard.notices.cancel();
-    let streams = mem::take(&mut self.running);
-    self.queue.sync(move || drop(streams));
-  }
 }
 
 /// The open files of the guards of every watcher in the process: at most half of what the
@@ -736,20 +715,13 @@ fn short_way(real: PathBuf) -> PathBuf {
 /// Whether a stream path there would report far more than the covers: `/`, a directory in
 /// it, one more name down, and the temporary directory of the user with the names above it.
 pub fn is_too_high(dir: &Path) -> bool {
-  let names: Vec<&[u8]> = names_of(dir).collect();
+  let dir = dir.strip_prefix(DATA_VOLUME).unwrap_or(dir);
+  let names: Vec<&[u8]> = dir.iter().filter(|&name| name != "/").map(OsStrExt::as_bytes).collect();
   match names.as_slice() {
     [] | [_] | [_, _] => true,
     [b"private", b"var", b"folders", below @ ..] => below.len() <= 3,
     _ => false,
   }
-}
-
-fn names_of(dir: &Path) -> impl Iterator<Item = &[u8]> {
-  let dir = dir.strip_prefix(DATA_VOLUME).unwrap_or(dir);
-  dir.components().filter_map(|part| match part {
-    Component::Normal(name) => Some(name.as_bytes()),
-    _ => None,
-  })
 }
 
 /// At most `max` stream paths for the covers: paths go up to directories that covers have in
@@ -1180,7 +1152,7 @@ mod ffi {
   }
 
   extern "C" fn retain(info: *const c_void) -> *const c_void {
-    // SAFETY: `info` came from `Arc::as_ptr` on the `Arc<Sink<Raw>>` that `Streams` holds.
+    // SAFETY: `info` came from `Arc::as_ptr` on the `Arc<Sink<Raw>>` that `FsEventsBackend` holds.
     unsafe { Arc::increment_strong_count(info.cast::<Sink<Raw>>()) };
     info
   }

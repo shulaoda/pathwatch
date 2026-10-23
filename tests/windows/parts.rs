@@ -58,11 +58,6 @@ fn key(index: u32) -> DirKey {
   DirKey::new(index, 0)
 }
 
-/// The number that `key` made the key from.
-fn index(of: DirKey) -> u32 {
-  (0..10_000).find(|&index| key(index) == of).expect("a key that the test did not make")
-}
-
 /// An absolute path, from text with `/`.
 fn dir(path: &str) -> PathBuf {
   format!("C:{}", path.replace('/', "\\")).into()
@@ -72,11 +67,12 @@ mod place {
   use std::path::PathBuf;
 
   use pathwatch::backend::{
+    DirKey,
     Want::{self, Contents, Names},
     windows::{MAX_HANDLES, place},
   };
 
-  use super::{dir, index, key};
+  use super::{dir, key};
 
   /// The placement of these directories; the key of each one is its position in the list.
   fn placed(wanted: &[(&str, Want)], max: usize) -> Vec<(PathBuf, Vec<u32>)> {
@@ -96,7 +92,7 @@ mod place {
     let places = place(&wanted, max, &mut |path| links.iter().any(|link| link == path));
     places
       .into_iter()
-      .map(|place| (place.dir, place.keys.into_iter().map(index).collect()))
+      .map(|place| (place.dir, place.keys.into_iter().map(DirKey::index).collect()))
       .collect()
   }
 
@@ -295,11 +291,11 @@ mod handles {
   };
 
   use pathwatch::backend::{
-    Coverage, Want, is_watch_limit,
+    Coverage, DirKey, Want, is_watch_limit,
     windows::{Handles, MAX_HANDLES, System, Told, WatchId, place},
   };
 
-  use super::{dir, index, key};
+  use super::{dir, key};
 
   #[derive(Debug, PartialEq, Eq)]
   enum Answer {
@@ -406,8 +402,8 @@ mod handles {
 
     /// Keeps what a call told, and checks what holds after it.
     fn told(&mut self, told: Told) {
-      self.lost.extend(told.lost.into_iter().map(index));
-      self.covered.extend(told.covered.into_iter().map(index));
+      self.lost.extend(told.lost.into_iter().map(DirKey::index));
+      self.covered.extend(told.covered.into_iter().map(DirKey::index));
       self.check();
     }
 
@@ -437,7 +433,8 @@ mod handles {
     fn died(&mut self, id: WatchId) -> Vec<u32> {
       self.disk.open.retain(|(open, _)| *open != id);
       let died = io::Error::other("the read failed");
-      let mut keys: Vec<u32> = self.handles.closed(id, &died).into_iter().map(index).collect();
+      let mut keys: Vec<u32> =
+        self.handles.closed(id, &died).into_iter().map(DirKey::index).collect();
       keys.sort_unstable();
       keys
     }
@@ -1117,7 +1114,7 @@ mod translate {
     windows::{Handles, Raw, System, WatchId, translate},
   };
 
-  use super::{dir, encode, index, key};
+  use super::{dir, encode, key};
 
   const ADDED: u32 = 1;
   const REMOVED: u32 = 2;
@@ -1204,8 +1201,8 @@ mod translate {
     let mut seen = Vec::new();
     translate(handles, raw, &mut |hint| {
       seen.push(match hint {
-        Hint::Changed { dir, rel } => Seen::Changed(index(dir), rel.to_owned()),
-        Hint::Written { dir, rel, .. } => Seen::Written(index(dir), rel.to_owned()),
+        Hint::Changed { dir, rel } => Seen::Changed(dir.index(), rel.to_owned()),
+        Hint::Written { dir, rel, .. } => Seen::Written(dir.index(), rel.to_owned()),
         Hint::Lost => Seen::Lost,
         Hint::Mount { .. } => panic!("only inotify tells of a mount by its path"),
         Hint::Delivered { .. } => panic!("no test of the parts asks for a delivery"),

@@ -286,6 +286,22 @@ pub(crate) fn is_missing(error: &io::Error) -> bool {
   matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }
 
+/// Whether the error is a link loop. Its kind (`FilesystemLoop`) is not stable yet, so the
+/// number of the OS is read where it is known; elsewhere a loop is an error like any other.
+pub(crate) fn is_link_loop(error: &io::Error) -> bool {
+  #[cfg(all(unix, not(target_vendor = "apple")))]
+  const LINK_LOOP: Option<i32> = Some(libc::ELOOP);
+  #[cfg(target_vendor = "apple")]
+  const LINK_LOOP: Option<i32> = Some(62);
+  #[cfg(windows)]
+  const LINK_LOOP: Option<i32> =
+    Some(windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME.cast_signed());
+  #[cfg(not(any(unix, windows)))]
+  const LINK_LOOP: Option<i32> = None;
+
+  LINK_LOOP.is_some_and(|code| error.raw_os_error() == Some(code))
+}
+
 /// Whether the error says that the entry is being deleted (Windows): its name goes when the
 /// last handle on it is closed, unless the holder takes the deletion back.
 #[cfg(not(windows))]

@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 use crate::fixtures::{
-  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, SimFs, asked, at, caught_up, known, makes,
-  on_all, os_watches, settled, sorted, window, window_then_settled,
+  Driver, Mode, NONE, RECURSIVE, Sim, SimBackend, SimFs, asked, at, caught_up, makes, on_all,
+  os_watches, settled, sorted, window, window_then_settled,
 };
 use pathwatch::{
   backend::Want::{Contents, Names},
@@ -224,7 +224,7 @@ fn a_directory_comes_at_a_watched_path() {
     // Where one watch covers a tree, the watch on `/p` covers the new directory too.
     let own_watch = u64::from(mode == Mode::Inode);
     assert_eq!(d.fs.calls().watch, watches + own_watch, "{mode:?}");
-    assert_eq!(known(&d), ["/p/R/a.js"], "{mode:?}");
+    assert_eq!(d.known(), ["/p/R/a.js"], "{mode:?}");
     caught_up(&mut d);
   }
 }
@@ -378,7 +378,7 @@ fn a_file_on_the_way_to_a_watched_path() {
     d.fs.write("/p/gen", "a file").unwrap();
     d.watch(&["/p/gen/out/x.json"]);
     assert!(os_watches(&d.fs).contains(&at("/p", Contents)), "{mode:?}");
-    assert_eq!(known(&d), NONE, "{mode:?}");
+    assert_eq!(d.known(), NONE, "{mode:?}");
 
     let start = d.now;
     d.fs.write("/p/gen", "written").unwrap();

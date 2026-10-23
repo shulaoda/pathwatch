@@ -16,7 +16,7 @@ use crate::{
   backend::{Backend, DirKey, Want},
   config::EntryKind,
   error::ErrorKind,
-  fs::{DirId, Entry, FileType, Fs, is_delete_pending, is_missing},
+  fs::{DirId, Entry, FileType, Fs, is_delete_pending, is_link_loop, is_missing},
   tree::{
     Added, Content, Depth, Dir, Fingerprint, Kind, Mark, Watch, nanos, nanos_of, push_name,
     room_to_keep,
@@ -197,12 +197,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
 
       (Found::Dir { id, complete, relinked, young }, had @ (Kind::Missing | Kind::File(_))) => {
-        let baseline = self.is_baseline_dir(key, relinked);
         if let Kind::File(_) = had {
           // A change of kind is never an `Update`: the file is gone.
           self.forget_file(key);
         }
-        self.appear(key, path, id, complete, baseline);
+        self.appear(key, path, id, complete, relinked);
         self.look_again_at_a_new_dir(key, young);
       }
       (
@@ -263,14 +262,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// The partial node tracks every entry of its directory from now on.
-  fn make_complete(&mut self, key: DirKey, relinked: bool) {
+  pub(super) fn make_complete(&mut self, key: DirKey, relinked: bool) {
     let baseline = self.is_baseline_dir(key, relinked);
     let node = &mut self.tree[key];
     node.set_baseline(baseline);
     if let Some(dir) = node.dir_mut() {
       dir.complete = true;
     }
-    self.touched.push(key);
+    if baseline {
+      self.touched.push(key);
+    }
     self.tree.queue_scan(key, Depth::Shallow);
   }
 
@@ -571,8 +572,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// Forgets the `Pending` content of the files that got old before `delivered`: every record of
   /// the time they were young came, so no hint of a write that left the fingerprint as it is can
   /// come any more (5.8). Not while work that earlier hints gave waits (a mark, a scan, a loss
-  /// report, a hold): it may count such a file as written. A file below a directory that was away
-  /// keeps it too: the scan of that directory counts it.
+  /// report, a hold): it may count such a file as written. A directory that was away is such work:
+  /// its scan, or a mark or a hold above it, waits (`check_invariants`).
   pub(super) fn forget_delivered(&mut self) {
     let waits = self.tree.has_work() || self.tree.lost || self.loss.waits;
     if waits || self.tree.hold_count() > 0 {
@@ -584,7 +585,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     {
       self.pending.pop();
       let Some(Kind::File(file)) = self.tree.get(key).map(|node| node.kind) else { continue };
-      if self.tree.content(key) != Some(Content::Pending) || self.below_away(key) {
+      if self.tree.content(key) != Some(Content::Pending) {
         continue;
       }
       // The time is worked out again: the file may be polled now, which makes it young for longer.
@@ -636,13 +637,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       || self.away_scan
       || self.loss.scanning
       || self.loss.waits
-      || self.below_away(key)
-  }
-
-  /// Whether a directory above the node can have been away and back (`Dir::away`): its scan is
-  /// queued.
-  fn below_away(&self, key: DirKey) -> bool {
-    self.tree.ancestors(key).any(|dir| self.tree[dir].dir().is_some_and(|dir| dir.away))
+      || self.tree.ancestors(key).any(|dir| self.tree[dir].dir().is_some_and(|dir| dir.away))
   }
 
   /// A hash of the content of a regular file, or of the target of a link. `None`: nothing to
@@ -706,22 +701,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let heard = self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().is_heard());
     !heard || self.tree.link(key).is_some()
   }
-}
-
-/// Whether the error is a link loop. Its kind (`FilesystemLoop`) is not stable yet, so the
-/// number of the OS is read where it is known; elsewhere a loop is an error like any other.
-fn is_link_loop(error: &io::Error) -> bool {
-  #[cfg(all(unix, not(target_vendor = "apple")))]
-  const LINK_LOOP: Option<i32> = Some(libc::ELOOP);
-  #[cfg(target_vendor = "apple")]
-  const LINK_LOOP: Option<i32> = Some(62);
-  #[cfg(windows)]
-  const LINK_LOOP: Option<i32> =
-    Some(windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME.cast_signed());
-  #[cfg(not(any(unix, windows)))]
-  const LINK_LOOP: Option<i32> = None;
-
-  LINK_LOOP.is_some_and(|code| error.raw_os_error() == Some(code))
 }
 
 /// A directory made in the last moments: by its modification time, which its making sets,

@@ -283,6 +283,7 @@ pub trait Sim {
   fn settled(&mut self) -> Vec<String>;
   /// See [`caught_up`].
   fn caught_up(&mut self);
+  /// The files the handler knows.
   fn known(&self) -> Vec<String>;
   /// How many deletes are pending.
   fn pending_deletes(&self) -> usize;
@@ -327,7 +328,7 @@ impl<B: Deliver> Sim for Driver<B> {
   }
 
   fn known(&self) -> Vec<String> {
-    known(self).into_iter().map(str::to_owned).collect()
+    self.known.iter().map(|path| path.to_str().unwrap().to_owned()).collect()
   }
 
   fn pending_deletes(&self) -> usize {
@@ -445,11 +446,6 @@ pub fn window_then_settled(driver: &mut dyn Sim) -> Vec<String> {
 pub fn sorted<T: Ord>(mut list: Vec<T>) -> Vec<T> {
   list.sort();
   list
-}
-
-/// The files the handler knows.
-pub fn known<B: Deliver>(driver: &Driver<B>) -> Vec<&str> {
-  driver.known.iter().map(|path| path.to_str().unwrap()).collect()
 }
 
 /// The directory and the want of each `watch` and `unwatch` call that the engine made to the

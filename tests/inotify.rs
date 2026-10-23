@@ -25,7 +25,9 @@ use std::{
 
 use gate::Gate;
 use pathwatch::backend::{
-  Backend, Coverage, DirKey, Hint, Signal, Sink, Want, inotify::InotifyBackend, is_watch_limit,
+  Backend, Coverage, DirKey, Hint, Signal, Sink, Want,
+  inotify::{InotifyBackend, Raw},
+  is_watch_limit,
 };
 use tempfile::TempDir;
 
@@ -75,7 +77,7 @@ fn event(wd: i32, mask: u32, name: &str) -> Vec<u8> {
 
 struct Harness {
   backend: InotifyBackend,
-  signals: Receiver<Signal<Vec<u8>>>,
+  signals: Receiver<Signal<Raw>>,
   gate: Arc<Gate>,
   dir: TempDir,
   /// Watched by the harness itself, for `hints`.
@@ -155,6 +157,10 @@ impl Harness {
   }
 
   fn translate(&mut self, raw: Vec<u8>) -> Vec<Seen> {
+    self.translate_raw(Raw::Events(raw))
+  }
+
+  fn translate_raw(&mut self, raw: Raw) -> Vec<Seen> {
     let mut seen = Vec::new();
     self.backend.translate(raw, &mut |hint| {
       seen.push(match hint {
@@ -175,7 +181,7 @@ impl Harness {
     while !seen.contains(last) {
       let left = deadline.saturating_duration_since(Instant::now());
       match self.signals.recv_timeout(left) {
-        Ok(Signal::Raw(raw)) => seen.extend(self.translate(raw)),
+        Ok(Signal::Raw(raw)) => seen.extend(self.translate_raw(raw)),
         Ok(Signal::Failed(error)) => panic!("the backend failed: {error}"),
         Err(error) => panic!("no {last:?} ({error}), only {seen:?}"),
       }
@@ -196,7 +202,7 @@ impl Harness {
       }
       let left = deadline.saturating_duration_since(Instant::now());
       match self.signals.recv_timeout(left) {
-        Ok(Signal::Raw(raw)) => seen.extend(self.translate(raw)),
+        Ok(Signal::Raw(raw)) => seen.extend(self.translate_raw(raw)),
         Ok(Signal::Failed(error)) => panic!("the backend failed: {error}"),
         Err(error) => panic!("no answer ({error}), only {seen:?}"),
       }
@@ -259,7 +265,7 @@ fn watch_does_not_reach_below_its_directory() {
   assert_eq!(set(h.hints()), written_and_closed(key, "a"));
 }
 
-/// Asked about a time, the reader reads the queue empty then, and sends a record of it after
+/// Asked about a time, the reader reads the queue empty then, and sends word of it after
 /// every event it read: the events of every change before that time are in front of the answer
 /// (design.md 7.1), also the ones still in the queue of the kernel when the question came. A
 /// question about a time to come waits for it.
@@ -391,7 +397,9 @@ fn want_of_a_key_goes_up_and_stays_up() {
   fs::write(h.path("a"), "4").unwrap();
   assert_eq!(set(h.hints()), written_and_closed(key, "a"));
   assert_eq!(h.watches(), 1);
-  assert_eq!(h.backend.keys(h.wd(key).unwrap()), [key]);
+  // The key is on its watch once: one hint for an event.
+  let wd = h.wd(key).unwrap();
+  assert_eq!(h.translate(event(wd, libc::IN_CREATE, "n")), [written(key, "n")]);
 }
 
 #[test]
@@ -722,9 +730,9 @@ fn masks_map_to_hints() {
   for mask in [libc::IN_MOVE_SELF, libc::IN_MOVE_SELF | libc::IN_ISDIR] {
     assert_eq!(h.translate(event(wd, mask, "")), [changed(key, "")], "{mask:#x}");
   }
-  // A mount point that the reader found: a record of its own, under no watch.
-  let mount = event(-2, 0, "/mnt/a b");
-  assert_eq!(h.translate(mount), [Seen::Mount(PathBuf::from("/mnt/a b"))]);
+  // The mount points that the reader found: a notification of their own, under no watch.
+  let mount = PathBuf::from("/mnt/a b");
+  assert_eq!(h.translate_raw(Raw::Mounts(vec![mount.clone()])), [Seen::Mount(mount)]);
   assert_eq!(h.wd(key), Some(wd));
   for (index, mask) in [(1, libc::IN_DELETE_SELF), (2, libc::IN_UNMOUNT)] {
     // The kernel watch is still there: the second key gets it, after the first forgot it.
