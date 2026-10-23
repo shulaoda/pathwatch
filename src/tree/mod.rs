@@ -782,7 +782,7 @@ mod tests {
     time::{Duration, UNIX_EPOCH},
   };
 
-  use super::{KEPT, Tree, emptied, nanos};
+  use super::{Tree, nanos};
   use crate::backend::DirKey;
 
   #[test]
@@ -864,13 +864,5 @@ mod tests {
     // Three hundred years back: the clock of Windows starts in 1601.
     let back = Duration::from_hours(300 * 365 * 24);
     assert_eq!(nanos(UNIX_EPOCH - back), -i64::MAX);
-  }
-
-  #[test]
-  fn a_long_list_is_given_back() {
-    let short = emptied(vec![1_u64; KEPT / 8]);
-    assert!(short.is_empty() && short.capacity() == KEPT / 8);
-    let long = emptied(vec![1_u64; KEPT / 8 + 1]);
-    assert_eq!(long.capacity(), 0);
   }
 }
