@@ -54,6 +54,8 @@ jobs:
       - uses: actions/checkout@v5
       - run: rustup toolchain install
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The crate as a user builds it: without the hooks of the tests.
+      - run: cargo clippy -p pathwatch --lib -- -D warnings
       # The backend of each OS has docs of its own.
       - run: cargo doc -p pathwatch --no-deps
       - run: cargo test --workspace --no-fail-fast --locked
@@ -90,3 +92,4 @@ jobs:
       - run: rustup toolchain install
       - run: rustup target add ${{ matrix.target }}
       - run: cargo clippy -p pathwatch --all-targets --target ${{ matrix.target }} -- -D warnings
+      - run: cargo clippy -p pathwatch --lib --target ${{ matrix.target }} -- -D warnings

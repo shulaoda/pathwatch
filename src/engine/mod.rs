@@ -5,6 +5,7 @@ mod check;
 mod events;
 mod os_watch;
 mod scan;
+#[cfg(feature = "test-hooks")]
 mod test_hooks;
 mod watched_paths;
 

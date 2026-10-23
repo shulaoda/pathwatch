@@ -1,15 +1,14 @@
 //! The inotify backend: one kernel watch for each directory. See `references/design.md` 7.1.
 
+#[cfg(feature = "test-hooks")]
+use std::os::fd::{AsRawFd, RawFd};
 use std::{
   collections::{BTreeSet, hash_map::Entry},
   ffi::OsStr,
   fs::File,
   io::{self, Read, Seek, SeekFrom, Write},
   iter,
-  os::{
-    fd::{AsRawFd, RawFd},
-    unix::ffi::OsStrExt,
-  },
+  os::unix::ffi::OsStrExt,
   path::{Path, PathBuf},
   sync::{
     Arc,
@@ -109,18 +108,6 @@ impl InotifyBackend {
       keys_by_wd: FxHashMap::default(),
       wd_by_key: FxHashMap::default(),
     })
-  }
-
-  pub fn inotify_fd(&self) -> RawFd {
-    self.fds.inotify.as_raw_fd()
-  }
-
-  pub fn wd(&self, key: DirKey) -> Option<i32> {
-    self.wd_by_key.get(&key).copied()
-  }
-
-  pub fn watch_count(&self) -> usize {
-    self.keys_by_wd.len()
   }
 
   /// The two tables are given back when most of their keys are gone.
@@ -234,6 +221,22 @@ impl Drop for InotifyBackend {
     let Some(reader) = self.reader.take() else { return };
     let _ = (&self.fds.stop).write_all(&1_u64.to_ne_bytes());
     let _ = reader.join();
+  }
+}
+
+/// What the tests look at.
+#[cfg(feature = "test-hooks")]
+impl InotifyBackend {
+  pub fn inotify_fd(&self) -> RawFd {
+    self.fds.inotify.as_raw_fd()
+  }
+
+  pub fn wd(&self, key: DirKey) -> Option<i32> {
+    self.wd_by_key.get(&key).copied()
+  }
+
+  pub fn watch_count(&self) -> usize {
+    self.keys_by_wd.len()
   }
 }
 

@@ -126,8 +126,13 @@ The table is these rules in examples. `R` is a watched path.
 | `engine/`, `tree`, `fs`, `path` | The engine, the tree, the disk as the engine sees it (`Fs`), path cleaning. No thread, no clock, no OS watch API. |
 | `backend/` | The `Backend` trait and its types (`mod.rs`), and the backends below it: `inotify`, `fsevents`, `windows`, `poll`, one in each file. Of the crate they use `backend`, and the calls of the system in `fs` that the engine makes too. |
 
-The modules that are not the API are `pub` but hidden from the docs: the tests need them. The
-tests of the engine on a simulated disk, and their fixtures, are in `tests/sim` (section 8).
+The modules that are not the API are `pub` but hidden from the docs: the tests need them. What
+only the tests call (`engine/test_hooks.rs`, `Tree::check_links` and `Tree::content_room`, what
+the inotify, FSEvents and Windows backends show of themselves, the names that only the tests of
+the Windows backend use, and `Watcher::with_backend`) is built with the feature `test-hooks`,
+which the tests turn on through a dev-dependency of the crate on itself: a build for a user has
+none of it. The tests of the engine on a simulated disk, and their fixtures, are in `tests/sim`
+(section 8).
 
 - A **backend** sets up OS watches when the engine asks, and its thread copies raw OS
   notifications into the queue. On the watcher thread the backend turns a raw notification into

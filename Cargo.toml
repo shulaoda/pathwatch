@@ -25,7 +25,14 @@ libc = "0.2.183"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
 
+[features]
+# What only the tests of the repository call: the hooks of the engine, the checks of the tree,
+# what the backends show of themselves, and `Watcher::with_backend`. Not part of the API.
+test-hooks = []
+
 [dev-dependencies]
+# The tests build the crate with its hooks.
+pathwatch = { path = ".", features = ["test-hooks"] }
 tempfile = "3.26.0"
 
 [lints.rust]

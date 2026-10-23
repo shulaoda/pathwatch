@@ -229,6 +229,7 @@ impl Watcher {
   ///
   /// The watcher thread, or the queue into it, could not be made.
   #[doc(hidden)]
+  #[cfg(feature = "test-hooks")]
   pub fn with_backend<B, H>(
     options: Options,
     handler: H,

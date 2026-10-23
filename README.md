@@ -392,7 +392,8 @@ bench/                       the comparison with other watchers: a workspace of 
 
 `pathwatch` shows seven names: `Watcher`, `Config`, `Event`, `EventKind`, `EntryKind`, `Error`,
 `ErrorKind`. Its other public modules are hidden from the docs. They are there for the tests and
-can change in any release.
+can change in any release. What only the tests call is built with the feature `test-hooks`,
+which the tests turn on themselves.
 
 ## Tests
 

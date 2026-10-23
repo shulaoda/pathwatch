@@ -652,6 +652,7 @@ impl Tree {
   }
 
   /// The room of the table of what is kept to compare.
+  #[cfg(feature = "test-hooks")]
   pub fn content_room(&self) -> usize {
     self.contents.capacity()
   }
@@ -702,6 +703,7 @@ impl Tree {
   }
 
   /// For the tests: checks the links, the table and the counts.
+  #[cfg(feature = "test-hooks")]
   pub fn check_links(&self) -> Result<(), String> {
     let mut reached = 1;
     for (key, node) in self.nodes() {

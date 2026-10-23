@@ -291,6 +291,7 @@ impl Drop for FsEventsBackend {
 }
 
 /// What the tests look at.
+#[cfg(feature = "test-hooks")]
 impl FsEventsBackend {
   pub fn stream_count(&self) -> usize {
     self.running.len()
@@ -839,6 +840,7 @@ impl<T> Dirs<T> {
     self.by_path.keys().map(Path::new)
   }
 
+  #[cfg(feature = "test-hooks")]
   fn paths(&self) -> Vec<&Path> {
     let mut paths: Vec<&Path> = self.keys().collect();
     paths.sort_unstable();

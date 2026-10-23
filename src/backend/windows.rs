@@ -3,9 +3,13 @@
 
 use std::{io, mem, path::Path, sync::Arc, time::SystemTime};
 
+#[cfg(feature = "test-hooks")]
 pub use self::{
-  handles::{Handles, MAX_HANDLES, System, Told, WatchId},
+  handles::MAX_HANDLES,
   place::{Place, place},
+};
+pub use self::{
+  handles::{Handles, System, Told, WatchId},
   records::{Malformed, Record, Records},
 };
 use self::{port::Port, records::FILE_ACTION_MODIFIED};
@@ -42,6 +46,7 @@ impl WindowsBackend {
     Ok(Self { handles: Handles::default(), port, sink, covered: Vec::new() })
   }
 
+  #[cfg(feature = "test-hooks")]
   pub fn serves(&self, key: DirKey) -> bool {
     self.handles.serves(key)
   }
