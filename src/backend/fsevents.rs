@@ -659,9 +659,9 @@ impl Guard {
   fn open_one(&mut self, dir: &Path) -> io::Result<Guarded> {
     let ticket = Ticket::take()?;
     let mut options = OpenOptions::new();
-    let file = options.read(true).custom_flags(ffi::O_EVTONLY | ffi::O_SEARCH).open(dir);
+    let file = options.read(true).custom_flags(libc::O_EVTONLY | libc::O_SEARCH).open(dir);
     let file = file.map_err(|error| match error.raw_os_error() {
-      Some(ffi::EMFILE | ffi::ENFILE) => watch_limit(ERROR_NO_GUARD),
+      Some(libc::EMFILE | libc::ENFILE) => watch_limit(ERROR_NO_GUARD),
       _ => error,
     })?;
     self.last_id += 1;
@@ -882,16 +882,14 @@ mod ffi {
     sync::{Arc, Mutex, PoisonError},
   };
 
+  use libc::{EV_ADD, EV_CLEAR, EVFILT_FS, EVFILT_VNODE, NOTE_DELETE, NOTE_RENAME, NOTE_REVOKE};
+
   use super::{
     ERROR_QUEUE_CREATE, ERROR_SOURCE_CREATE, ERROR_STREAM_CREATE, ERROR_STREAM_START,
     EXPECTED_PATH_BYTES, Raw,
   };
   use crate::backend::{Sink, watch_limit};
 
-  pub(super) const O_EVTONLY: i32 = 0x8000;
-  pub(super) const O_SEARCH: i32 = 0x4010_0000;
-  pub(super) const ENFILE: i32 = 23;
-  pub(super) const EMFILE: i32 = 24;
   /// The notice of a volume that came or went: the ids of the guards come after it.
   pub(super) const VOLUMES: usize = 0;
 
@@ -925,7 +923,7 @@ mod ffi {
   impl Notices {
     pub(super) fn new(queue: &Queue, sink: &Arc<Sink<Raw>>) -> io::Result<Self> {
       // SAFETY: the call takes no memory of ours.
-      let fd = unsafe { kqueue() };
+      let fd = unsafe { libc::kqueue() };
       let ident = usize::try_from(fd).map_err(|_| io::Error::last_os_error())?;
       // SAFETY: `fd` was just opened, and nothing else owns it.
       let queue_fd = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -970,10 +968,10 @@ mod ffi {
     /// Asks for the notice `id` of `filter` with `fflags` on `ident`.
     fn add(&self, ident: usize, filter: i16, fflags: u32, id: usize) -> io::Result<()> {
       let udata = ptr::without_provenance_mut(id);
-      let change = KEvent { ident, filter, flags: EV_ADD | EV_CLEAR, fflags, data: 0, udata };
+      let change = libc::kevent { ident, filter, flags: EV_ADD | EV_CLEAR, fflags, data: 0, udata };
       // SAFETY: `change` is one whole `kevent`; the call reads it, writes none, and does not wait.
       let done =
-        unsafe { kevent(self.queue, &raw const change, 1, ptr::null_mut(), 0, ptr::null()) };
+        unsafe { libc::kevent(self.queue, &raw const change, 1, ptr::null_mut(), 0, ptr::null()) };
       if done < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
   }
@@ -997,10 +995,11 @@ mod ffi {
     let reader = unsafe { &*context.cast::<Reader>() };
     let mut events = [NO_EVENT; 64];
     let room = i32::try_from(events.len()).unwrap_or(0);
-    let now = Timespec { seconds: 0, nanos: 0 };
+    let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let queue = reader.queue.as_raw_fd();
     // SAFETY: `events` holds `room` `kevent`, which the call may write; it does not wait.
-    let count = unsafe { kevent(queue, ptr::null(), 0, events.as_mut_ptr(), room, &raw const now) };
+    let count =
+      unsafe { libc::kevent(queue, ptr::null(), 0, events.as_mut_ptr(), room, &raw const now) };
     let Ok(count) = usize::try_from(count) else { return };
     if count > 0 {
       // Each id once: a directory renamed away and back again and again while the engine is
@@ -1206,33 +1205,11 @@ mod ffi {
   const CREATE_FILE_EVENTS: u32 = 0x10;
   const SINCE_NOW: u64 = u64::MAX;
   const ENCODING_UTF8: u32 = 0x0800_0100;
-  const EVFILT_VNODE: i16 = -4;
-  const EVFILT_FS: i16 = -9;
-  const EV_ADD: u16 = 0x1;
-  const EV_CLEAR: u16 = 0x20;
-  const NOTE_DELETE: u32 = 0x1;
-  const NOTE_RENAME: u32 = 0x20;
-  const NOTE_REVOKE: u32 = 0x40;
+  // Not in `libc`.
   const VQ_MOUNT: u32 = 0x8;
   const VQ_UNMOUNT: u32 = 0x10;
-  const NO_EVENT: KEvent =
-    KEvent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: ptr::null_mut() };
-
-  #[repr(C)]
-  struct KEvent {
-    ident: usize,
-    filter: i16,
-    flags: u16,
-    fflags: u32,
-    data: isize,
-    udata: *mut c_void,
-  }
-
-  #[repr(C)]
-  struct Timespec {
-    seconds: i64,
-    nanos: i64,
-  }
+  const NO_EVENT: libc::kevent =
+    libc::kevent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: ptr::null_mut() };
 
   type CFTypeRef = *const c_void;
   type FSEventStreamRef = *mut c_void;
@@ -1326,16 +1303,8 @@ mod ffi {
     );
     fn dispatch_resume(object: *mut c_void);
     fn dispatch_source_cancel(source: *mut c_void);
+    // Not in `libc`.
     fn getdtablesize() -> i32;
-    fn kqueue() -> i32;
-    fn kevent(
-      queue: i32,
-      changes: *const KEvent,
-      change_count: i32,
-      events: *mut KEvent,
-      event_count: i32,
-      timeout: *const Timespec,
-    ) -> i32;
   }
 }
 

@@ -17,16 +17,15 @@ use std::{
   time::{Duration, Instant, SystemTime},
 };
 
-// The numbers differ between systems (`0x0100` is `O_CREAT` on illumos); `apple.rs` has the
-// ones of macOS written out.
-#[cfg(all(unix, not(target_vendor = "apple")))]
+// The numbers differ between systems (`0x0100` is `O_CREAT` on illumos).
+#[cfg(unix)]
 use libc::{ELOOP, O_NOFOLLOW, O_NONBLOCK};
 use rustc_hash::FxHasher;
 
 #[cfg(target_vendor = "apple")]
 pub(crate) use self::apple::name_and_kind;
 #[cfg(target_vendor = "apple")]
-use self::apple::{ELOOP, O_NOFOLLOW, O_NONBLOCK, name_on_disk, remote_disk};
+use self::apple::{name_on_disk, remote_disk};
 #[cfg(windows)]
 pub(crate) use self::windows::{SHARE_ALL, is_delete_pending, kernel32, literal, wide_name};
 #[cfg(windows)]

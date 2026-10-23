@@ -3,7 +3,7 @@
 //! listing on APFS only (`references/design.md` 5.4).
 
 use std::{
-  ffi::{CString, OsStr, OsString, c_char, c_void},
+  ffi::{CString, OsStr, OsString, c_char},
   fs::OpenOptions,
   io, mem,
   os::{
@@ -14,90 +14,64 @@ use std::{
   time::{Duration, SystemTime},
 };
 
+use libc::{
+  ATTR_BIT_MAP_COUNT, ATTR_CMN_CRTIME, ATTR_CMN_DEVID, ATTR_CMN_FILEID, ATTR_CMN_FLAGS,
+  ATTR_CMN_MODTIME, ATTR_CMN_NAME, ATTR_CMN_OBJTYPE, ATTR_CMN_RETURNED_ATTRS, ATTR_DIR_MOUNTSTATUS,
+  ATTR_FILE_DATALENGTH, FSOPT_NOFOLLOW, MNT_LOCAL, O_DIRECTORY,
+};
+
 use super::{DirId, Entry, FileType, nanos};
 
-/// `struct attrlist`.
-#[repr(C)]
-struct AttrList {
-  bitmap_count: u16,
-  reserved: u16,
-  common: u32,
-  volume: u32,
-  dir: u32,
-  file: u32,
-  fork: u32,
-}
-impl AttrList {
-  fn new(common: u32, dir: u32, file: u32) -> Self {
-    Self { bitmap_count: ATTR_BIT_MAP_COUNT, reserved: 0, common, volume: 0, dir, file, fork: 0 }
-  }
-}
-/// `struct statfs`. Only the device, the flags and the name of the file system are read.
-#[repr(C)]
-struct StatFs {
-  sizes_and_counts: [u64; 6],
-  id: [i32; 2],
-  owner_type_flags_subtype: [u32; 4],
-  type_name: [u8; 16],
-  rest: [u8; 2 * 1024 + 4 + 7 * 4],
-}
-const ATTR_BIT_MAP_COUNT: u16 = 5;
-const ATTR_CMN_NAME: u32 = 0x1;
-const ATTR_CMN_DEVID: u32 = 0x2;
-const ATTR_CMN_OBJTYPE: u32 = 0x8;
-const ATTR_CMN_CRTIME: u32 = 0x200;
-const ATTR_CMN_MODTIME: u32 = 0x400;
-const ATTR_CMN_FLAGS: u32 = 0x4_0000;
-const ATTR_CMN_FILEID: u32 = 0x0200_0000;
-const ATTR_CMN_ERROR: u32 = 0x2000_0000;
-const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
-const ATTR_DIR_MOUNTSTATUS: u32 = 0x4;
-const ATTR_FILE_DATALENGTH: u32 = 0x200;
 /// What a look at a regular file or a directory reads, in the common attributes: the birth time
 /// is in the identity of a directory.
 const LOOK: u32 =
   ATTR_CMN_DEVID | ATTR_CMN_CRTIME | ATTR_CMN_MODTIME | ATTR_CMN_FLAGS | ATTR_CMN_FILEID;
+// Not in `libc`.
+const ATTR_CMN_ERROR: u32 = 0x2000_0000;
 /// The content of the file is in a cloud, not on this disk.
 const SF_DATALESS: u32 = 0x4000_0000;
-const O_DIRECTORY: i32 = 0x0010_0000;
-// For `open_regular` and `is_link_loop`: the other systems take these from `libc`.
-pub(super) const O_NOFOLLOW: i32 = 0x0100;
-pub(super) const O_NONBLOCK: i32 = 0x0004;
-pub(super) const ELOOP: i32 = 62;
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
 const VLNK: u32 = 5;
-unsafe extern "C" {
-  #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), link_name = "statfs$INODE64")]
-  fn statfs(path: *const c_char, answer: *mut StatFs) -> i32;
-  fn getattrlistbulk(
-    dir: i32,
-    wanted: *const AttrList,
-    answer: *mut c_void,
-    size: usize,
-    options: u64,
-  ) -> i32;
+
+/// The attributes to ask for, in the common group and the groups of a directory and a file.
+fn attr_list(common: u32, dir: u32, file: u32) -> libc::attrlist {
+  libc::attrlist {
+    bitmapcount: ATTR_BIT_MAP_COUNT,
+    reserved: 0,
+    commonattr: common,
+    volattr: 0,
+    dirattr: dir,
+    fileattr: file,
+    forkattr: 0,
+  }
 }
 
-fn stat_fs(dir: &Path) -> Option<StatFs> {
+fn stat_fs(dir: &Path) -> Option<libc::statfs> {
   let c_path = CString::new(dir.as_os_str().as_bytes()).ok()?;
   // SAFETY: all zeros is a valid value of this plain struct of numbers.
-  let mut answer: StatFs = unsafe { mem::zeroed() };
+  let mut answer: libc::statfs = unsafe { mem::zeroed() };
   // SAFETY: `c_path` ends with a NUL, and the call writes one whole `struct statfs`.
-  let result = unsafe { statfs(c_path.as_ptr(), &raw mut answer) };
+  let result = unsafe { libc::statfs(c_path.as_ptr(), &raw mut answer) };
   (result == 0).then_some(answer)
 }
 
 /// The device number of the disk under `dir`, if it is an APFS disk.
 fn apfs_volume(dir: &Path) -> Option<i32> {
-  stat_fs(dir).filter(|answer| answer.type_name.starts_with(b"apfs\0")).map(|answer| answer.id[0])
+  let answer = stat_fs(dir)?;
+  if !answer.f_fstypename.map(c_char::cast_unsigned).starts_with(b"apfs\0") {
+    return None;
+  }
+  // SAFETY: a `fsid_t` is two numbers, the device first; `libc` keeps them private.
+  let [device, _] = unsafe { mem::transmute::<libc::fsid_t, [i32; 2]>(answer.f_fsid) };
+  Some(device)
 }
 
 /// The name of the file system under `dir` (`nfs`, `smbfs`), if it is not on this machine.
 pub fn remote_disk(dir: &Path) -> Option<String> {
-  const MNT_LOCAL: u32 = 0x1000;
-  let answer = stat_fs(dir).filter(|answer| answer.owner_type_flags_subtype[2] & MNT_LOCAL == 0)?;
-  let name = answer.type_name.split(|&byte| byte == 0).next().unwrap_or_default();
+  let answer = stat_fs(dir).filter(|answer| answer.f_flags & MNT_LOCAL.cast_unsigned() == 0)?;
+  let name = answer.f_fstypename.map(c_char::cast_unsigned);
+  let name = name.split(|&byte| byte == 0).next().unwrap_or_default();
   Some(String::from_utf8_lossy(name).into_owned())
 }
 
@@ -109,16 +83,16 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
   // Not a pipe, which would wait for its writer.
   let dir = OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(dir)?;
   let common = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | LOOK;
-  let wanted = AttrList::new(common, ATTR_DIR_MOUNTSTATUS, ATTR_FILE_DATALENGTH);
+  let wanted = attr_list(common, ATTR_DIR_MOUNTSTATUS, ATTR_FILE_DATALENGTH);
   // An entry takes less than 1 KiB.
   let mut buffer = [0_u8; 16 * 1024];
   loop {
-    // SAFETY: `dir` is open, `wanted` is a whole `attrlist`, and the call writes at most
-    // `buffer.len()` bytes into `buffer`.
+    // SAFETY: `dir` is open, `wanted` is a whole `attrlist` that the call only reads, and the
+    // call writes at most `buffer.len()` bytes into `buffer`.
     let count = unsafe {
-      getattrlistbulk(
+      libc::getattrlistbulk(
         dir.as_raw_fd(),
-        &raw const wanted,
+        (&raw const wanted).cast_mut().cast(),
         buffer.as_mut_ptr().cast(),
         buffer.len(),
         0,
@@ -238,26 +212,15 @@ fn file_type(object_type: u32) -> FileType {
 /// The name that the directory holds for the entry at `path`, and the kind of the entry, in
 /// one `getattrlist` call. A link at the end is not followed.
 pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
-  const FSOPT_NOFOLLOW: u32 = 0x1;
-  unsafe extern "C" {
-    fn getattrlist(
-      path: *const c_char,
-      wanted: *mut c_void,
-      answer: *mut c_void,
-      size: usize,
-      options: u32,
-    ) -> i32;
-  }
-
   let c_path = CString::new(path.as_os_str().as_bytes())?;
-  let wanted = AttrList::new(ATTR_CMN_NAME | ATTR_CMN_OBJTYPE, 0, 0);
+  let wanted = attr_list(ATTR_CMN_NAME | ATTR_CMN_OBJTYPE, 0, 0);
   // The length, the name as an `attrreference_t`, the object type, then the name: at most 255
   // UTF-16 units of at most three bytes here, and a NUL.
   let mut answer = [0_u8; 4 * size_of::<u32>() + 255 * 3 + 1];
   // SAFETY: `c_path` ends with a NUL, `wanted` is a whole `attrlist` that the call only reads,
   // and the call writes at most `answer.len()` bytes into `answer`.
   let result = unsafe {
-    getattrlist(
+    libc::getattrlist(
       c_path.as_ptr(),
       (&raw const wanted).cast_mut().cast(),
       answer.as_mut_ptr().cast(),
