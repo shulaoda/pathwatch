@@ -17,9 +17,9 @@ use crate::{
   config::EntryKind,
   error::ErrorKind,
   fs::{DirId, Entry, FileType, Fs, is_delete_pending, is_link_loop, is_missing},
+  path::push_name,
   tree::{
-    Added, Content, Depth, Dir, Fingerprint, Kind, Mark, Watch, nanos, nanos_of, push_name,
-    room_to_keep,
+    Added, Content, Depth, Dir, Fingerprint, Kind, Mark, Watch, nanos, nanos_of, room_to_keep,
   },
 };
 

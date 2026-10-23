@@ -1,34 +1,48 @@
 //! The data of the engine: a tree of the paths that matter, and the work that waits in it.
-//! Nothing here reads the disk. One node is one name. All nodes live in one arena, with a table
-//! that finds a child by its name; the names are in blocks of 64 KiB (`names.rs`), and the
-//! small facts of a node are bits (`flags.rs`).
+//! Nothing here reads the disk. One node is one name. All nodes live in one arena (`slots.rs`),
+//! with a table that finds a child by its name; the names are in blocks of 64 KiB (`names.rs`),
+//! and the small facts of a node are bits (`flags.rs`). The way from a hint to a mark, and the
+//! work that waits, are in `marks.rs`; the names that the OS can take for one another, in
+//! `spellings.rs`.
 
 mod flags;
+mod marks;
 mod names;
 mod slots;
+mod spellings;
 
 use std::{
   ffi::OsStr,
-  iter,
-  iter::Peekable,
-  mem,
+  iter, mem,
   ops::{Index, IndexMut},
-  path::{Component, Components, MAIN_SEPARATOR_STR, Path, PathBuf, is_separator},
+  path::PathBuf,
   time::{Duration, Instant, SystemTime},
 };
 
 use hashbrown::HashTable;
 use rustc_hash::FxHashMap;
 
-use self::{flags::Flags, names::Names, slots::Slots};
+pub use self::marks::{Mark, Marked};
+pub(crate) use self::spellings::is_plain;
+use self::{
+  flags::Flags,
+  names::Names,
+  slots::{Slot, Slots},
+  spellings::child_hash,
+};
 use crate::{
-  backend::{DirKey, Hint, Want, give_room_back},
+  backend::{DirKey, Want, give_room_back},
   fs::{DirId, Meta},
-  path::split_top,
+  path::push_name,
 };
 
 /// In a link between nodes: there is no such node.
 const NONE: u32 = u32::MAX;
+
+/// The slot that a link points to. `None` for `NONE`.
+fn slot(link: u32) -> Option<u32> {
+  (link != NONE).then_some(link)
+}
 
 /// One name the tree knows. It stays while it is registered, something is at its path, a mark
 /// waits on it, or a `Delete` is still to be told; [`Tree::prune`] frees it otherwise.
@@ -116,28 +130,6 @@ impl Node {
   pub fn is_entry(&self) -> bool {
     !matches!(self.kind, Kind::Missing) && !self.is_held() && !self.is_unlisted()
   }
-
-  /// Adds a mark to the node. Two marks for one node become one. `true`: it had none.
-  fn add_mark(&mut self, mark: Mark) -> bool {
-    let old = self.mark();
-    // The writes in a directory whose watch lost records can have gone unheard (5.8), also when
-    // another hint for it takes `lost` off the mark below: its next scan is away. Under inotify
-    // the parent reports a removed directory as its watch ends, and one made again at once can
-    // have the same identity.
-    if mark.lost
-      && let Some(dir) = self.dir_mut()
-    {
-      dir.away = true;
-    }
-    self.set_mark(Some(old.map_or(mark, |old| Mark {
-      deep: old.deep || mark.deep,
-      written: old.written || mark.written,
-      // A check that anything else asked for does not wait with the loss reports.
-      lost: old.lost && mark.lost,
-      since: None,
-    })));
-    old.is_none()
-  }
 }
 
 /// What the tree has at a path.
@@ -162,19 +154,6 @@ impl Fingerprint {
   pub fn of(meta: &Meta) -> Self {
     Self { modified: nanos(meta.modified), size: meta.size, id: meta.file_id }
   }
-}
-
-/// Nanoseconds since 1970. A time that does not fit (before 1678, after 2262) becomes the nearest.
-pub(crate) fn nanos(time: SystemTime) -> i64 {
-  match time.duration_since(SystemTime::UNIX_EPOCH) {
-    Ok(after) => nanos_of(after),
-    Err(before) => -nanos_of(before.duration()),
-  }
-}
-
-/// A duration in nanoseconds, or the longest that fits.
-pub(crate) fn nanos_of(time: Duration) -> i64 {
-  i64::try_from(time.as_nanos()).unwrap_or(i64::MAX)
 }
 
 /// What the tree keeps for a directory that is on disk. All of it goes away with the directory.
@@ -268,6 +247,20 @@ pub enum Added {
   Registered,
 }
 
+/// What is kept for a file whose fingerprint is not trusted at its next check.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Content {
+  /// This hash of the content decides.
+  Hash(u64),
+  /// No hash (the file is too big or unreadable): an equal fingerprint counts as a change.
+  Unknown,
+  /// No hash was read, as every write gives a hint (`Options::written_hints`): an equal
+  /// fingerprint is a change when the hint says so, or when a loss report may have taken it.
+  /// It stays until a look reports the file, or until every record of the time it was young
+  /// came (`Hint::Delivered`).
+  Pending,
+}
+
 /// The arena of the nodes, the table that finds a child by its name, and the work that waits.
 #[derive(Debug)]
 pub struct Tree {
@@ -318,12 +311,10 @@ impl Tree {
     let mut names = Names::default();
     let mut root = Node::new(0, NONE, names.add(OsStr::new("")));
     root.kind = Kind::Dir(Dir { watch: Watch::Polled, ..Dir::new(DirId::default(), false) });
+    let mut slots = Slots::default();
+    slots.push(Slot::Live(root));
     Self {
-      slots: {
-        let mut slots = Slots::default();
-        slots.push(Slot::Live(root));
-        slots
-      },
+      slots,
       free: Vec::new(),
       first_generation: 0,
       names,
@@ -367,8 +358,7 @@ impl Tree {
 
   /// The node above. `None` for the root.
   pub fn parent(&self, key: DirKey) -> Option<DirKey> {
-    let parent = self.get(key)?.parent;
-    (parent != NONE).then(|| self.key(parent))
+    slot(self.get(key)?.parent).map(|parent| self.key(parent))
   }
 
   /// The directories above the node, from its parent up to the root.
@@ -378,9 +368,8 @@ impl Tree {
 
   /// The slots above the node, from its parent up to the root. None for a key that names no node.
   fn above(&self, key: DirKey) -> impl Iterator<Item = u32> {
-    let up = |at: u32| (at != NONE).then_some(at);
-    let first = self.get(key).and_then(|node| up(node.parent));
-    iter::successors(first, move |&at| up(linked(&self.slots, at).parent))
+    let first = self.get(key).and_then(|node| slot(node.parent));
+    iter::successors(first, move |&at| slot(self.slots.linked(at).parent))
   }
 
   pub fn child(&self, parent: DirKey, name: &OsStr) -> Option<DirKey> {
@@ -390,17 +379,15 @@ impl Tree {
 
   /// The children of a node, the newest first.
   pub fn children(&self, key: DirKey) -> impl Iterator<Item = DirKey> + '_ {
-    let at = |index: u32| (index != NONE).then_some(index);
-    let first = self.get(key).and_then(|node| at(node.first_child));
-    iter::successors(first, move |&index| at(linked(&self.slots, index).next))
+    let first = self.get(key).and_then(|node| slot(node.first_child));
+    iter::successors(first, move |&index| slot(self.slots.linked(index).next))
       .map(|index| self.key(index))
   }
 
   /// The next child in the list of the parent: a loop can change the tree on the way, as long as it
   /// frees no node but the one it is at, after it read the next.
   pub fn next_sibling(&self, child: DirKey) -> Option<DirKey> {
-    let next = self.get(child)?.next;
-    (next != NONE).then(|| self.key(next))
+    slot(self.get(child)?.next).map(|next| self.key(next))
   }
 
   /// Adds a child `name` to `parent`. The caller has checked with [`Tree::child`] that there is
@@ -422,10 +409,10 @@ impl Tree {
       index
     };
 
-    let first = mem::replace(&mut self.linked_mut(parent).first_child, index);
-    self.linked_mut(index).next = first;
+    let first = mem::replace(&mut self.slots.linked_mut(parent).first_child, index);
+    self.slots.linked_mut(index).next = first;
     if first != NONE {
-      self.linked_mut(first).prev = index;
+      self.slots.linked_mut(first).prev = index;
     }
 
     let Self { slots, names, index: table, .. } = self;
@@ -498,17 +485,13 @@ impl Tree {
 
   /// The key of the live node in the slot `index`.
   fn key(&self, index: u32) -> DirKey {
-    DirKey::new(index, linked(&self.slots, index).generation)
-  }
-
-  fn linked_mut(&mut self, index: u32) -> &mut Node {
-    self.slots[index as usize].node_mut().expect("a link points to a live node")
+    DirKey::new(index, self.slots.linked(index).generation)
   }
 
   /// The slot of the child `name` of the live node in the slot `parent`.
   fn find(&self, parent: u32, name: &OsStr) -> Option<u32> {
     let is_it = |&index: &u32| {
-      let node = linked(&self.slots, index);
+      let node = self.slots.linked(index);
       node.parent == parent && name_of(&self.names, node) == name
     };
     self.index.find(child_hash(parent, name), is_it).copied()
@@ -522,12 +505,12 @@ impl Tree {
     self.free.push(key.index());
 
     if node.prev == NONE {
-      self.linked_mut(node.parent).first_child = node.next;
+      self.slots.linked_mut(node.parent).first_child = node.next;
     } else {
-      self.linked_mut(node.prev).next = node.next;
+      self.slots.linked_mut(node.prev).next = node.next;
     }
     if node.next != NONE {
-      self.linked_mut(node.next).prev = node.prev;
+      self.slots.linked_mut(node.next).prev = node.prev;
     }
 
     let hash = child_hash(node.parent, name_of(&self.names, &node));
@@ -575,21 +558,17 @@ impl Tree {
     let mut far = Vec::new();
     let mut count = 0;
     let mut at = index;
-    loop {
-      let node = linked(&self.slots, at);
-      if node.parent == NONE {
-        break;
-      }
+    while let Some(parent) = slot(self.slots.linked(at).parent) {
       match near.get_mut(count) {
-        Some(slot) => *slot = at,
+        Some(place) => *place = at,
         None => far.push(at),
       }
       count += 1;
-      at = node.parent;
+      at = parent;
     }
     let near = &near[..count.min(near.len())];
     for &at in far.iter().rev().chain(near.iter().rev()) {
-      push_name(path, name_of(&self.names, linked(&self.slots, at)));
+      push_name(path, name_of(&self.names, self.slots.linked(at)));
     }
   }
 
@@ -599,11 +578,8 @@ impl Tree {
   fn count_registered(&mut self, mut child: u32, registered: bool) {
     loop {
       self.list_not_plain(child, registered);
-      let parent = linked(&self.slots, child).parent;
-      if parent == NONE {
-        return;
-      }
-      let node = self.linked_mut(parent);
+      let Some(parent) = slot(self.slots.linked(child).parent) else { return };
+      let node = self.slots.linked_mut(parent);
       let was_registered = node.is_registered();
       if registered {
         node.registered_children += 1;
@@ -620,7 +596,7 @@ impl Tree {
 
   /// Puts the node in slot `child` on the `not_plain` list of its parent, or takes it off.
   fn list_not_plain(&mut self, child: u32, registered: bool) {
-    let node = linked(&self.slots, child);
+    let node = self.slots.linked(child);
     if is_plain(name_of(&self.names, node)) {
       return;
     }
@@ -634,534 +610,6 @@ impl Tree {
       }
     }
   }
-}
-
-impl Default for Tree {
-  fn default() -> Self {
-    Self::new()
-  }
-}
-
-impl Index<DirKey> for Tree {
-  type Output = Node;
-
-  fn index(&self, key: DirKey) -> &Node {
-    self.get(key).expect("the key names a live node")
-  }
-}
-
-impl IndexMut<DirKey> for Tree {
-  fn index_mut(&mut self, key: DirKey) -> &mut Node {
-    self.get_mut(key).expect("the key names a live node")
-  }
-}
-
-/// One place in the arena.
-#[derive(Debug)]
-enum Slot {
-  Live(Node),
-  /// The node that was here is gone. The next one gets this generation, one above the old, so an
-  /// old key never names it.
-  Free {
-    generation: u32,
-  },
-}
-
-impl Slot {
-  fn node(&self) -> Option<&Node> {
-    match self {
-      Self::Live(node) => Some(node),
-      Self::Free { .. } => None,
-    }
-  }
-
-  fn node_mut(&mut self) -> Option<&mut Node> {
-    match self {
-      Self::Live(node) => Some(node),
-      Self::Free { .. } => None,
-    }
-  }
-}
-
-/// The node in a slot that a link or the table points to.
-fn linked(slots: &Slots, index: u32) -> &Node {
-  slots[index as usize].node().expect("a link points to a live node")
-}
-
-fn name_of<'a>(names: &'a Names, node: &Node) -> &'a OsStr {
-  names.get(node.name_at, node.name_len)
-}
-
-/// The hash under which the table files the live node in the slot `index`.
-fn hash_of(slots: &Slots, names: &Names, index: u32) -> u64 {
-  let node = linked(slots, index);
-  child_hash(node.parent, name_of(names, node))
-}
-
-/// The hash under which the table files the child `name` of `parent`. The case of ASCII letters
-/// is left out, so that names that differ only there share a hash and [`Tree::spellings`] finds
-/// them in one walk. No ready hasher does that without a copy of the name, so the bytes are
-/// mixed here, 16 at a time.
-///
-/// Only the letters are folded: names that differ in any other byte have other hashes, also
-/// when a directory holds very many of them (a listing of names that share a hash costs the
-/// square of their number).
-#[expect(clippy::cast_possible_truncation, reason = "the two halves of a product are taken")]
-fn child_hash(parent: u32, name: &OsStr) -> u64 {
-  // Digits of pi: two numbers with no pattern.
-  const SEEDS: [u64; 2] = [0x243f_6a88_85a3_08d3, 0x1319_8a2e_0370_7344];
-  let mix = |a: u64, b: u64| {
-    let product = u128::from(a) * u128::from(b);
-    (product as u64) ^ ((product >> 64) as u64)
-  };
-  let word = |bytes: &[u8]| small(u64::from_ne_bytes(*bytes.first_chunk().expect("eight bytes")));
-  let half =
-    |bytes: &[u8]| small(u64::from(u32::from_ne_bytes(*bytes.first_chunk().expect("four bytes"))));
-
-  let mut rest = name.as_encoded_bytes();
-  let mut hash = SEEDS[0] ^ u64::from(parent) ^ ((rest.len() as u64) << 32);
-  while rest.len() > 16 {
-    hash = mix(hash ^ word(rest), SEEDS[1] ^ word(&rest[8..]));
-    rest = &rest[16..];
-  }
-  // What is left, 16 bytes at most, as two numbers. With fewer bytes the two overlap.
-  let (first, last) = match *rest {
-    [] => (0, 0),
-    [one] => (small(u64::from(one)), 0),
-    [one, two] => (small(u64::from(one)), small(u64::from(two))),
-    [one, two, three] => {
-      (small(u64::from(one)), small(u64::from(u16::from_ne_bytes([two, three]))))
-    }
-    _ if rest.len() < 8 => (half(rest), half(&rest[rest.len() - 4..])),
-    _ => (word(rest), word(&rest[rest.len() - 8..])),
-  };
-  mix(hash ^ first, SEEDS[1] ^ last)
-}
-
-/// The eight bytes with each ASCII capital made small, all at once; every other byte stays.
-fn small(bytes: u64) -> u64 {
-  const ONES: u64 = u64::from_ne_bytes([1; 8]);
-  const HIGH: u64 = ONES * 0x80;
-  // The low seven bits of each byte, plus a number that carries into the high bit of the byte
-  // from `A` on, and from the byte after `Z` on. No sum leaves its byte.
-  let low = bytes & !HIGH;
-  let from_a = low + ONES * (0x80 - u64::from(b'A'));
-  let after_z = low + ONES * (0x80 - u64::from(b'Z') - 1);
-  let capital = from_a & !after_z & !bytes & HIGH;
-  // The high bit of a capital, moved to the bit that tells `a` from `A`.
-  bytes | (capital >> 2)
-}
-
-/// The most bytes of a list that are kept between two uses.
-pub(crate) const KEPT: usize = 16 * 1024;
-
-/// Appends `name` to `path` as one more name, by its text: `PathBuf::push` would start the path
-/// anew for a name that reads as a drive or a root (`C:`, `\\a`), which a disk that another system
-/// filled can list on Windows. `pop` takes such a name off again; a name with a separator in it
-/// never reaches the tree (`fs::read_dir` leaves it out).
-pub(crate) fn push_name(path: &mut PathBuf, name: &OsStr) {
-  let text = path.as_mut_os_string();
-  let last = text.as_encoded_bytes().last().copied();
-  if !text.is_empty() && !last.is_some_and(|byte| byte.is_ascii() && is_separator(char::from(byte)))
-  {
-    text.push(MAIN_SEPARATOR_STR);
-  }
-  text.push(name);
-}
-
-/// The room to keep for a list that shrank: `None` while more than half of it is in use, or
-/// while it is small. Not for a hash table, which rounds its room up to a power of two: that
-/// one waits for a quarter, or an eighth, so that it does not rehash at every step.
-pub(crate) fn room_to_keep(len: usize, capacity: usize) -> Option<usize> {
-  (capacity > 2 * len + 16).then(|| len + len / 8 + 16)
-}
-
-/// Empties a list for its next use and keeps its memory, unless it is long: a `watch` of 20,000
-/// paths must not leave its lists behind for ever.
-pub(crate) fn emptied<T>(mut list: Vec<T>) -> Vec<T> {
-  list.clear();
-  if list.capacity() * size_of::<T>() > KEPT { Vec::new() } else { list }
-}
-
-/// What a hint says of the last name of its path.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Said {
-  /// Something changed there.
-  Changed,
-  /// The file was written: an `Update`, also with an equal fingerprint.
-  Written,
-  /// A file was created or moved in, which inotify says "written" for too: other content than
-  /// the name had before, also with an equal fingerprint. A twin of the name is the same file
-  /// after a rename that changes only the case, so its look decides.
-  New,
-}
-
-/// A marked node as a flush takes it (`Tree::take_marked`): its level, the order of its key
-/// from the newest, its directory, the node, and the time of its hint.
-pub type Marked = (usize, usize, DirKey, DirKey, Option<Instant>);
-
-/// "Check this name at the next flush."
-#[derive(Clone, Copy, Default, Debug)]
-pub struct Mark {
-  /// This very path changed: a directory that is still the same one is watched again and scanned
-  /// deep, since it can have been away and back.
-  pub deep: bool,
-  /// The backend saw a write to the file: it is an `Update`, also with an equal fingerprint.
-  pub written: bool,
-  /// Only a loss report asked for this check. The engine paces such checks.
-  pub lost: bool,
-  /// The time of the hint that asked for the check: a `Delete` counts its delay from it. `None`:
-  /// the engine itself asked, and the delay counts from the look.
-  pub since: Option<Instant>,
-}
-
-impl Mark {
-  /// Something said that this very path changed.
-  pub const DEEP: Self = Self { deep: true, written: false, lost: false, since: None };
-  /// The backend lost notifications of the directory at the path, or its watch.
-  pub const LOST: Self = Self { deep: true, written: false, lost: true, since: None };
-}
-
-/// The work for the next flush: marks and queued scans, and the way from a hint to a mark.
-impl Tree {
-  /// Turns a hint into work for the next flush. `false`: no watched path can see the change.
-  pub fn hint(&mut self, hint: Hint<'_>) -> bool {
-    match hint {
-      Hint::Changed { dir, rel } => self.mark_below(dir, rel, Said::Changed),
-      Hint::Written { dir, rel, new: false } => self.mark_below(dir, rel, Said::Written),
-      Hint::Written { dir, rel, new: true } => self.mark_below(dir, rel, Said::New),
-      Hint::Lost => {
-        self.lost = true;
-        true
-      }
-      // A node at the path checks it, and finds another directory there by its identity.
-      Hint::Mount { path } => {
-        let Some((top, rest)) = split_top(path) else { return false };
-        self.child(Self::ROOT, top).is_some_and(|top| self.mark_below(top, rest, Said::Changed))
-      }
-      // No work for the tree: the engine takes it before.
-      Hint::Delivered { .. } => false,
-    }
-  }
-
-  /// Marks the place to check for a change at `rel` below `dir`: the name itself, or the highest
-  /// name on the way that the tree does not know as a directory. `false`: nothing to do.
-  fn mark_below(&mut self, dir: DirKey, rel: &Path, said: Said) -> bool {
-    let Some(node) = self.get(dir) else { return false };
-    if !node.is_dir() {
-      return self.mark_from_above(dir);
-    }
-    if rel.as_os_str().is_empty() {
-      // The directory itself: a loss report. Its parent checks it; nothing checks the root.
-      let has_parent = node.parent != NONE;
-      if has_parent {
-        self.mark(dir, Mark::LOST);
-      }
-      return has_parent;
-    }
-    self.mark_path(dir.index(), rel.components().peekable(), said)
-  }
-
-  /// The walk of `mark_below`, by slots since it runs for every hint. A name of the hint means the
-  /// child with that name and every child the OS can take for the same name (design.md 5.2).
-  fn mark_path(&mut self, mut at: u32, mut parts: Peekable<Components<'_>>, said: Said) -> bool {
-    let mut found = false;
-    while let Some(part) = parts.next() {
-      let Component::Normal(name) = part else { return found };
-      let (child, has_other) = self.spellings(at, name);
-      let below = child.map(|child| linked(&self.slots, child));
-      let is_dir = below.is_some_and(Node::is_dir);
-      let parent = linked(&self.slots, at);
-      let is_complete = parent.is_complete();
-      let is_seen = below.is_some_and(Node::is_registered) || is_complete;
-      // The table finds the other spellings of a plain name only; the registered ones that are not
-      // plain are on a list, and a listing shows the rest.
-      let is_new = is_complete && !below.is_some_and(Node::is_entry);
-      if self.loose_spelling && is_new && !is_plain(name) {
-        self.queue_scan(self.key(at), Depth::Names);
-      }
-      if has_other || (self.loose_spelling && !self.not_plain.is_empty() && !is_plain(name)) {
-        found |= self.mark_others(at, name, child, &parts, said);
-      }
-      if !is_seen {
-        return found;
-      }
-      let last = parts.peek().is_none();
-      if !last
-        && let Some(child) = child
-        && is_dir
-      {
-        at = child;
-        continue;
-      }
-      let child = match child {
-        Some(child) => self.key(child),
-        None => self.insert_child(self.key(at), name),
-      };
-      // A record that names a young file that was not read (`Content::Pending`) is a rename or
-      // a removal, as every write is a `Written`: the content can have changed under the other
-      // name (5.8). Under inotify also a `chmod` of such a file, which costs one `Update`.
-      let written =
-        last && (said != Said::Changed || self.content(child) == Some(Content::Pending));
-      self.mark(child, Mark { deep: !written, written, lost: false, since: None });
-      return true;
-    }
-    found
-  }
-
-  /// The walk of `mark_path` for the other children that `name` can mean. When every disk is
-  /// loose, a twin of the name (a registered name that differs in the case of ASCII letters
-  /// only) is the entry that was written: its mark says `written` as the hint does. Not for a
-  /// file that was created or moved in (`Said::New`): a rename that changes only the case is
-  /// the same file. Every other child is a guess (a name that is not plain). Their looks decide.
-  #[cold]
-  fn mark_others(
-    &mut self,
-    at: u32,
-    name: &OsStr,
-    exact: Option<u32>,
-    rest: &Peekable<Components<'_>>,
-    said: Said,
-  ) -> bool {
-    let last = rest.clone().peek().is_none();
-    let mut found = false;
-    let one_entry = said == Said::Written && self.loose_spelling;
-    for other in self.others_meant(at, name, exact) {
-      let node = linked(&self.slots, other);
-      let is_dir = node.is_dir();
-      let written = one_entry && name_of(&self.names, node).eq_ignore_ascii_case(name);
-      if !last && is_dir {
-        // Below a guess, the names are guesses too.
-        let said = if written { said } else { Said::Changed };
-        found |= self.mark_path(other, rest.clone(), said);
-      } else {
-        let written = written && last;
-        self.mark(self.key(other), Mark { deep: !written, written, lost: false, since: None });
-        found = true;
-      }
-    }
-    found
-  }
-
-  /// Adds a mark to a node. Two marks for one node become one, with the time of the first.
-  pub fn mark(&mut self, key: DirKey, mark: Mark) {
-    if self[key].add_mark(mark) {
-      self.marked.push((key, mark.since));
-    }
-  }
-
-  /// Takes the mark off a node. `None`: it has none, or the key names no node.
-  pub fn take_mark(&mut self, key: DirKey) -> Option<Mark> {
-    let node = self.get_mut(key)?;
-    let mark = node.mark();
-    node.set_mark(None);
-    mark
-  }
-
-  /// Queues a scan of the directory `key`: once, with the deepest depth asked for.
-  pub fn queue_scan(&mut self, key: DirKey, depth: Depth) {
-    let Some(dir) = self[key].dir_mut() else { return };
-    let queued = dir.scan.is_some();
-    dir.scan = Some(dir.scan.map_or(depth, |old| old.max(depth)));
-    if !queued {
-      self.to_scan.push(key);
-    }
-  }
-
-  /// Takes the queue into `scans`: every queued node, with its depth and whether it was away.
-  pub fn take_scans(&mut self, scans: &mut Vec<(DirKey, Depth, bool)>) {
-    scans.clear();
-    let mut queue = mem::take(&mut self.to_scan);
-    let scan = |key| {
-      let dir = self.get_mut(key)?.dir_mut()?;
-      Some((key, dir.scan.take()?, mem::take(&mut dir.away)))
-    };
-    scans.extend(queue.drain(..).filter_map(scan));
-    self.to_scan = emptied(queue);
-  }
-
-  /// Takes the marked nodes into `marks`, from the top down and one directory after the other.
-  /// The marks stay on the nodes.
-  ///
-  /// A check takes the mark of its node and leaves the key in the list, and a node that is
-  /// marked again is listed once more. So a key whose node has no mark is left out, and of the
-  /// keys of one node only the newest is taken: its time is the time of the mark the node has.
-  pub fn take_marked(&mut self, marks: &mut Vec<Marked>) {
-    marks.clear();
-    let mut marked = mem::take(&mut self.marked);
-    for (newer, (key, since)) in marked.drain(..).rev().enumerate() {
-      if let Some(parent) = self.parent(key)
-        && self[key].is_marked()
-      {
-        marks.push((self.above(key).count(), newer, parent, key, since));
-      }
-    }
-    self.marked = emptied(marked);
-    marks.sort_unstable_by_key(|&(level, newer, parent, key, _)| {
-      (level, parent.index(), key.index(), newer)
-    });
-    marks.dedup_by_key(|&mut (.., key, _)| key);
-  }
-
-  /// Drops the keys of the nodes that have no mark any more (a check or a scan took it, or the
-  /// node went): what is left is work.
-  pub fn tidy_marked(&mut self) {
-    let mut marked = mem::take(&mut self.marked);
-    marked.retain(|&(key, _)| self.get(key).is_some_and(Node::is_marked));
-    self.marked = marked;
-  }
-
-  pub fn has_work(&self) -> bool {
-    !self.marked.is_empty() || !self.to_scan.is_empty()
-  }
-
-  /// Puts the directory on the list of the timer if it has to be polled now. Also while held.
-  /// A directory is listed more than once (its watch state is set, a look in it failed), and a
-  /// stale key stays until a tidy: the list is tidied when it outgrows the arena twice over, so
-  /// a `watch` and `unwatch` of ever new paths cannot grow it without bound.
-  pub fn list_if_polled(&mut self, key: DirKey) {
-    if matches!(self[key].kind, Kind::Dir(dir) if dir.is_polled()) {
-      self.polled.push(key);
-      if self.polled.len() > 2 * self.slots.len() + 16 {
-        self.tidy_polled();
-      }
-    }
-  }
-
-  /// The backend is gone: no directory has an OS watch any more, and the timer looks at all.
-  pub fn poll_all(&mut self) {
-    for slot in self.slots.iter_mut() {
-      if let Some(Node { kind: Kind::Dir(dir), .. }) = slot.node_mut() {
-        (dir.watch, dir.asked) = (Watch::Polled, None);
-      }
-    }
-    let dirs = self.nodes().filter(|(_, node)| matches!(node.kind, Kind::Dir(_)));
-    self.polled = dirs.map(|(key, _)| key).collect();
-  }
-
-  /// Puts the list of the timer in order: each polled directory once, and nothing else. A long
-  /// list that shrank gives its memory back.
-  pub fn tidy_polled(&mut self) {
-    let mut polled = mem::take(&mut self.polled);
-    polled.sort_unstable();
-    polled.dedup();
-    let is_polled = |node: &Node| matches!(node.kind, Kind::Dir(dir) if dir.is_polled());
-    polled.retain(|&key| self.get(key).is_some_and(is_polled));
-    if let Some(room) = room_to_keep(polled.len(), polled.capacity()) {
-      polled.shrink_to(room);
-    }
-    self.polled = polled;
-  }
-
-  /// No directory is at `dir`: the nearest directory above checks the name on the way to it.
-  fn mark_from_above(&mut self, dir: DirKey) -> bool {
-    let mut child = dir;
-    while let Some(parent) = self.parent(child) {
-      if self[parent].is_dir() {
-        self.mark(child, Mark::DEEP);
-        return true;
-      }
-      child = parent;
-    }
-    false
-  }
-
-  /// The child `name` of slot `parent`, and whether another child differs from it only in the case
-  /// of ASCII letters: one walk of the table finds both, since such names share a hash.
-  fn spellings(&self, parent: u32, name: &OsStr) -> (Option<u32>, bool) {
-    let (mut child, mut has_other) = (None, false);
-    for &index in self.index.iter_hash(child_hash(parent, name)) {
-      let node = linked(&self.slots, index);
-      if node.parent != parent {
-        continue;
-      }
-      let other = name_of(&self.names, node);
-      if other == name {
-        child = Some(index);
-      } else {
-        has_other |= other.eq_ignore_ascii_case(name);
-      }
-    }
-    (child, has_other)
-  }
-
-  /// The other children of slot `at` that a hint for `name` can mean, besides `exact`: a registered
-  /// child that can be the same name, and in a complete node any child that differs only in the
-  /// case of ASCII letters. Why: design.md 5.2.
-  fn others_meant(&self, at: u32, name: &OsStr, exact: Option<u32>) -> Vec<u32> {
-    // Where every disk is loose, a name that is not plain can be any registered name that is
-    // not plain either; a listing shows the other children (`mark_path`).
-    if self.loose_spelling && !is_plain(name) {
-      let listed = self.not_plain.get(&at).map_or(&[][..], Vec::as_slice);
-      return listed.iter().copied().filter(|&child| Some(child) != exact).collect();
-    }
-    let any_child = linked(&self.slots, at).is_complete();
-    let alike = self.alike(at, name, exact);
-    alike.filter(|&child| any_child || linked(&self.slots, child).is_registered()).collect()
-  }
-
-  /// Whether the name of the node `key` has more than one spelling at all: it has an ASCII
-  /// letter, or it is not plain.
-  pub fn has_spellings(&self, key: DirKey) -> bool {
-    let name = self.name(key);
-    !is_plain(name) || name.as_encoded_bytes().iter().any(u8::is_ascii_alphabetic)
-  }
-
-  /// Whether the tree cannot say that the node has its name as the disk spells it: another node of
-  /// the directory can be the same name, or the name is not plain.
-  pub fn has_other_spelling(&self, key: DirKey) -> bool {
-    !is_plain(self.name(key)) || self.twins(key).next().is_some()
-  }
-
-  /// The twins of the node `key` that have a mark.
-  pub fn marked_twins(&self, key: DirKey) -> Vec<DirKey> {
-    let marked = self.twins(key).filter(|&twin| linked(&self.slots, twin).is_marked());
-    marked.map(|twin| self.key(twin)).collect()
-  }
-
-  /// The other nodes of the directory whose names differ from the name of `key` only in the case
-  /// of ASCII letters.
-  fn twins(&self, key: DirKey) -> impl Iterator<Item = u32> + '_ {
-    let node = &self[key];
-    self.alike(node.parent, name_of(&self.names, node), Some(key.index()))
-  }
-
-  /// The children of slot `parent` but `except` whose names differ from `name` in the case of
-  /// ASCII letters at most: the table files them under one hash.
-  fn alike(&self, parent: u32, name: &OsStr, except: Option<u32>) -> impl Iterator<Item = u32> {
-    self.index.iter_hash(child_hash(parent, name)).copied().filter(move |&index| {
-      let node = linked(&self.slots, index);
-      Some(index) != except
-        && node.parent == parent
-        && name_of(&self.names, node).eq_ignore_ascii_case(name)
-    })
-  }
-}
-
-/// Whether every other spelling of `name` is known: only ASCII and Han ideographs, which have no
-/// case and no second form. The few characters that a disk folds to plain ones (`ß`, the Kelvin
-/// sign, ligatures, compatibility ideographs) are not covered: design.md 9.
-pub(crate) fn is_plain(name: &OsStr) -> bool {
-  let is_plain = |letter: char| {
-    letter.is_ascii()
-      || matches!(letter, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}')
-      || matches!(letter, '\u{20000}'..='\u{2F7FF}' | '\u{30000}'..='\u{3FFFF}')
-  };
-  name.is_ascii() || name.to_str().is_some_and(|name| name.chars().all(is_plain))
-}
-
-/// What is kept for a file whose fingerprint is not trusted at its next check.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Content {
-  /// This hash of the content decides.
-  Hash(u64),
-  /// No hash (the file is too big or unreadable): an equal fingerprint counts as a change.
-  Unknown,
-  /// No hash was read, as every write gives a hint (`Options::written_hints`): an equal
-  /// fingerprint is a change when the hint says so, or when a loss report may have taken it.
-  /// It stays until a look reports the file, or until every record of the time it was young
-  /// came (`Hint::Delivered`).
-  Pending,
 }
 
 /// What only a few nodes have, kept beside the arena: links, contents, holds, and the times of
@@ -1250,7 +698,7 @@ impl Tree {
 
   /// Whether a node above is held: then nothing is done here before its second look.
   pub fn frozen(&self, key: DirKey) -> bool {
-    !self.holds.is_empty() && self.above(key).any(|at| linked(&self.slots, at).is_held())
+    !self.holds.is_empty() && self.above(key).any(|at| self.slots.linked(at).is_held())
   }
 
   /// For the tests: checks the links, the table and the counts.
@@ -1321,6 +769,66 @@ impl Tree {
   }
 }
 
+impl Default for Tree {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl Index<DirKey> for Tree {
+  type Output = Node;
+
+  fn index(&self, key: DirKey) -> &Node {
+    self.get(key).expect("the key names a live node")
+  }
+}
+
+impl IndexMut<DirKey> for Tree {
+  fn index_mut(&mut self, key: DirKey) -> &mut Node {
+    self.get_mut(key).expect("the key names a live node")
+  }
+}
+
+fn name_of<'a>(names: &'a Names, node: &Node) -> &'a OsStr {
+  names.get(node.name_at, node.name_len)
+}
+
+/// The hash under which the table files the live node in the slot `index`.
+fn hash_of(slots: &Slots, names: &Names, index: u32) -> u64 {
+  let node = slots.linked(index);
+  child_hash(node.parent, name_of(names, node))
+}
+
+/// Nanoseconds since 1970. A time that does not fit (before 1678, after 2262) becomes the nearest.
+pub(crate) fn nanos(time: SystemTime) -> i64 {
+  match time.duration_since(SystemTime::UNIX_EPOCH) {
+    Ok(after) => nanos_of(after),
+    Err(before) => -nanos_of(before.duration()),
+  }
+}
+
+/// A duration in nanoseconds, or the longest that fits.
+pub(crate) fn nanos_of(time: Duration) -> i64 {
+  i64::try_from(time.as_nanos()).unwrap_or(i64::MAX)
+}
+
+/// The most bytes of a list that are kept between two uses.
+pub(crate) const KEPT: usize = 16 * 1024;
+
+/// The room to keep for a list that shrank: `None` while more than half of it is in use, or
+/// while it is small. Not for a hash table, which rounds its room up to a power of two: that
+/// one waits for a quarter, or an eighth, so that it does not rehash at every step.
+pub(crate) fn room_to_keep(len: usize, capacity: usize) -> Option<usize> {
+  (capacity > 2 * len + 16).then(|| len + len / 8 + 16)
+}
+
+/// Empties a list for its next use and keeps its memory, unless it is long: a `watch` of 20,000
+/// paths must not leave its lists behind for ever.
+pub(crate) fn emptied<T>(mut list: Vec<T>) -> Vec<T> {
+  list.clear();
+  if list.capacity() * size_of::<T>() > KEPT { Vec::new() } else { list }
+}
+
 #[cfg(test)]
 mod tests {
   use std::{
@@ -1329,7 +837,7 @@ mod tests {
     time::{Duration, UNIX_EPOCH},
   };
 
-  use super::{KEPT, Tree, child_hash, emptied, is_plain, nanos};
+  use super::{KEPT, Tree, emptied, nanos};
   use crate::backend::DirKey;
 
   /// After a pack, every node that stays has its name and is found by it.
@@ -1399,47 +907,6 @@ mod tests {
     assert_eq!(new.index(), keys[0].index());
     assert!(keys.iter().all(|key| tree.get(*key).is_none()));
     tree.check_links().unwrap();
-  }
-
-  /// The table finds a name under every case of its letters, whatever its length.
-  #[test]
-  fn the_case_of_letters_is_left_out_of_the_hash() {
-    let name = "aBcDeFgHiJkLmNoPqRsTuVwXyZ-0123456789.Js";
-    let mut hashes = Vec::new();
-    for len in 0..=name.len() {
-      let (lower, upper) = (name[..len].to_ascii_lowercase(), name[..len].to_ascii_uppercase());
-      let hash = child_hash(7, OsStr::new(&lower));
-      assert_eq!(hash, child_hash(7, OsStr::new(&upper)), "{len} bytes");
-      hashes.extend([hash, child_hash(8, OsStr::new(&lower))]);
-    }
-    // Another name, or another parent, is another hash.
-    hashes.sort_unstable();
-    hashes.dedup();
-    assert_eq!(hashes.len(), 2 * (name.len() + 1));
-  }
-
-  /// Only letters are folded: names that differ in the same bit of another byte, which a
-  /// directory can hold in any number, have other hashes.
-  #[test]
-  fn only_the_case_of_letters_is_left_out_of_the_hash() {
-    let hash = |name: &str| child_hash(1, OsStr::new(name));
-    for byte in 0..0x80_u8 {
-      for len in [1, 2, 3, 5, 8, 13, 16, 17] {
-        let [one, two] = [byte, byte ^ 0x20].map(|byte| String::from(char::from(byte)).repeat(len));
-        let is_letter = byte.is_ascii_alphabetic();
-        assert_eq!(hash(&one) == hash(&two), is_letter, "byte {byte:#x}, {len} bytes");
-      }
-    }
-    // Bytes of other letters that differ in the same bit: `é` and `É`, `Р` and `Ѐ`.
-    assert_ne!(hash("café"), hash("cafÉ"));
-    assert_ne!(hash("Р"), hash("Ѐ"));
-  }
-
-  #[test]
-  fn names_that_are_plain() {
-    assert!(is_plain(OsStr::new("App.js")) && is_plain(OsStr::new("\u{4e2d}\u{6587}.js")));
-    // An ideograph is plain, a compatibility ideograph is not.
-    assert!(!is_plain(OsStr::new("caf\u{e9}.js")) && !is_plain(OsStr::new("\u{f967}.js")));
   }
 
   /// A time that does not fit becomes the nearest one that does.

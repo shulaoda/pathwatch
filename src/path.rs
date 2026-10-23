@@ -1,9 +1,10 @@
 //! Cleans a path given to `watch`, by text only: `.` is dropped, `..` takes the name before it
-//! away, and no link is resolved. The disk is never asked.
+//! away, and no link is resolved. The disk is never asked. Also the rules of text that the
+//! engine and the tree share: where the top directory ends, and how a name goes on a path.
 
 use std::{
   ffi::{OsStr, OsString},
-  path::{Path, PathBuf},
+  path::{MAIN_SEPARATOR_STR, Path, PathBuf, is_separator},
 };
 
 /// The registered form of `path`: absolute, no `.` or `..`, no repeated or trailing separator.
@@ -41,6 +42,20 @@ pub(crate) fn split_top(path: &Path) -> Option<(&OsStr, &Path)> {
   let top = path.ancestors().last()?;
   let rest = path.strip_prefix(top).ok()?;
   Some((top.as_os_str(), rest))
+}
+
+/// Appends `name` to `path` as one more name, by its text: `PathBuf::push` would start the path
+/// anew for a name that reads as a drive or a root (`C:`, `\\a`), which a disk that another system
+/// filled can list on Windows. `pop` takes such a name off again; a name with a separator in it
+/// never reaches the tree (`fs::read_dir` leaves it out).
+pub(crate) fn push_name(path: &mut PathBuf, name: &OsStr) {
+  let text = path.as_mut_os_string();
+  let last = text.as_encoded_bytes().last().copied();
+  if !text.is_empty() && !last.is_some_and(|byte| byte.is_ascii() && is_separator(char::from(byte)))
+  {
+    text.push(MAIN_SEPARATOR_STR);
+  }
+  text.push(name);
 }
 
 /// The Unix rules: the path starts with `/`, and only `/` separates.

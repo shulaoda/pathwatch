@@ -12,8 +12,8 @@ use crate::{
   backend::{Backend, DirKey, Want},
   config::EntryKind,
   fs::Fs,
-  path::split_top,
-  tree::{Added, Depth, Kind, Mark, Tree, emptied, push_name},
+  path::{push_name, split_top},
+  tree::{Added, Depth, Kind, Mark, Tree, emptied},
 };
 
 /// The baseline: what a `watch` call finds is known without an event, unless an older watched

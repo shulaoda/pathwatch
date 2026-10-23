@@ -174,7 +174,7 @@ The words, each for one idea:
 | cover | FSEvents only: a directory that the engine watches and a stream reports | `Covers` in `backend/fsevents.rs` |
 | stream path | FSEvents only: a directory that a stream was started for; it reports the whole tree below | `FsEventsBackend::paths` in `backend/fsevents.rs` |
 
-`tree/mod.rs` holds the data, and `engine/` has one file for each job (each file says which in its first lines).
+`tree/` holds the data and `engine/` the work, each with one file for each job (each file says which in its first lines).
 
 ### 5.1 The tree
 
@@ -194,7 +194,7 @@ There is a node for
 
 A node that is none of these is freed (`Tree::prune`).
 
-How it is stored (only `tree/mod.rs` knows it): all nodes live in one arena. A key is an index and a
+How it is stored (only `tree/` knows it): all nodes live in one arena. A key is an index and a
 generation, so an old key never names a new node. The arena and the names are kept in blocks of
 64 KiB, and a full block never moves: they grow with no copy of what is there. (Grown as one block
 each, they were held twice for a moment at each growth, and macOS keeps the pages that are freed:
@@ -1838,7 +1838,8 @@ The test files of the simulator:
 **The other tests** (`tests/`, and the `mod tests` of `src/`):
 
 - Private functions (a `mod tests` at the end of the file): `tree/mod.rs`, `tree/names.rs`,
-  `path.rs`, `fs/apple.rs`, `fs/windows.rs`, `engine/events.rs`, and helpers of the backends.
+  `tree/spellings.rs`, `path.rs`, `fs/apple.rs`, `fs/windows.rs`, `engine/events.rs`, and helpers of
+  the backends.
 - The tree alone (`tests/tree.rs`): the arena, the table, and the way from a hint to a mark.
 - The engine on a real directory with the poll backend and a clock that the test moves
   (`tests/poll.rs`): a file whose time is ahead of the clock (5.8; it counts the reads), the

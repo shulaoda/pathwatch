@@ -3,7 +3,7 @@
 
 use std::ops::{Index, IndexMut};
 
-use super::{Slot, room_to_keep};
+use super::{Node, room_to_keep};
 
 /// Slots in a block: 64 KiB.
 const BLOCK: usize = 1024;
@@ -30,6 +30,15 @@ impl Slots {
 
   pub fn get_mut(&mut self, index: usize) -> Option<&mut Slot> {
     self.blocks.get_mut(index / BLOCK)?.get_mut(index % BLOCK)
+  }
+
+  /// The node in a slot that a link or the table points to.
+  pub fn linked(&self, index: u32) -> &Node {
+    self[index as usize].node().expect("a link points to a live node")
+  }
+
+  pub fn linked_mut(&mut self, index: u32) -> &mut Node {
+    self[index as usize].node_mut().expect("a link points to a live node")
   }
 
   pub fn last(&self) -> Option<&Slot> {
@@ -81,5 +90,32 @@ impl Index<usize> for Slots {
 impl IndexMut<usize> for Slots {
   fn index_mut(&mut self, index: usize) -> &mut Slot {
     &mut self.blocks[index / BLOCK][index % BLOCK]
+  }
+}
+
+/// One place in the arena.
+#[derive(Debug)]
+pub(super) enum Slot {
+  Live(Node),
+  /// The node that was here is gone. The next one gets this generation, one above the old, so an
+  /// old key never names it.
+  Free {
+    generation: u32,
+  },
+}
+
+impl Slot {
+  pub fn node(&self) -> Option<&Node> {
+    match self {
+      Self::Live(node) => Some(node),
+      Self::Free { .. } => None,
+    }
+  }
+
+  pub fn node_mut(&mut self) -> Option<&mut Node> {
+    match self {
+      Self::Live(node) => Some(node),
+      Self::Free { .. } => None,
+    }
   }
 }

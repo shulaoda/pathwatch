@@ -13,7 +13,8 @@ use crate::{
   config::EntryKind,
   error::{Error, ErrorKind},
   fs::{FileType, Fs, is_missing},
-  tree::{Depth, Kind, Mark, Node, Tree, Watch, push_name},
+  path::push_name,
+  tree::{Depth, Kind, Mark, Node, Tree, Watch},
 };
 
 /// Watch, commit, then scan: every ask queues a scan for after the next commit.
