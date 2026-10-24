@@ -1,0 +1,23 @@
+Cargo.toml
+  s_0070b6318eca36::t_4a99489b843e74 65-66,68
+references/design.md
+  s_0070b6318eca36::t_381386ffeb590c 1099
+src/watcher.rs
+  s_0070b6318eca36::t_56c6ad8f534b1c 149,308,335,337,340,342,490,494-495,497-506,508-512,516-658
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a314548a42d4e4b09250146cf40d65b470fdf8d5",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
