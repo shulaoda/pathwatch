@@ -1,0 +1,19 @@
+references/behavior.md
+  s_0070b6318eca36::t_bb12d1b4f240c3 3-22,26,29-45,49,53-55,57-58,60-63,65-67,71,73-79,81-104,108-182,184-196,200-211,213-276,278-303,305-316,320-345,347-359,363-395
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d773a1af858f516434ef6e83255ad850b464b1bb",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
