@@ -53,7 +53,6 @@ pub struct Node {
   flags: Flags,
 }
 
-// A node stays 64 bytes, with no padding: there is one for each path the tree knows.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Node>() == 64 && size_of::<Slot>() == 64);
 
@@ -92,27 +91,22 @@ impl Node {
     }
   }
 
-  /// Whether the node tracks every entry of its directory.
   pub fn is_complete(&self) -> bool {
     self.dir().is_some_and(|dir| dir.complete)
   }
 
-  /// `Watch::None` for a node that is no directory.
   pub fn watch(&self) -> Watch {
     self.dir().map_or(Watch::None, |dir| dir.watch)
   }
 
-  /// Whether a watched path lies below the path.
   pub fn is_ancestor(&self) -> bool {
     self.registered_children > 0
   }
 
-  /// Whether the path is a watched path or leads to one.
   pub fn is_registered(&self) -> bool {
     self.is_path() || self.is_ancestor()
   }
 
-  /// Whether the directory has this entry, as far as the tree knows.
   pub fn is_entry(&self) -> bool {
     !matches!(self.kind, Kind::Missing) && !self.is_held() && !self.is_unlisted()
   }
@@ -141,60 +135,42 @@ impl Fingerprint {
 #[derive(Clone, Copy, Debug, Default)]
 #[expect(clippy::struct_excessive_bools, reason = "each one is a state of the directory")]
 pub struct Dir {
-  /// Tells this directory from another one at the same path.
   pub id: DirId,
-  /// The node tracks every entry that is not ignored; a partial one, only its registered children.
   pub complete: bool,
-  /// The last want given to the backend. `None`: the backend has no watch for this node.
   pub asked: Option<Want>,
   pub watch: Watch,
-  /// A scan or the watch failed, and was reported once: every poll scans the node until it is over.
   pub has_error: bool,
-  /// Queued for a scan of this depth.
   pub scan: Option<Depth>,
-  /// The writes in it can have gone unheard: at its next scan, a young file that was not read
-  /// counts as written (5.8).
   pub away: bool,
-  /// A listed entry was not there when it was looked at: the next check lists the directory again.
   pub relist: bool,
 }
 
 impl Dir {
-  /// A directory that was just found.
   pub fn new(id: DirId, complete: bool) -> Self {
     Self { id, complete, ..Self::default() }
   }
 
-  /// Whether the timer looks at the directory: no OS watch does, or it had an error.
   pub fn is_polled(&self) -> bool {
     matches!(self.watch, Watch::Polled | Watch::Failed) || self.has_error
   }
 }
 
-/// How changes in a directory are heard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Watch {
   #[default]
   None,
-  /// The backend watches this directory.
   Watched,
-  /// The backend watches this directory and every real directory below it.
   WatchedTree,
-  /// A `WatchedTree` above covers it; the backend was not asked for it.
   FromAbove,
-  /// No OS watch covers it: the timer scans it.
   Polled,
-  /// The backend could not watch it: it is polled, and the backend is asked again at each poll.
   Failed,
 }
 
 impl Watch {
-  /// Whether an OS watch reports the directory: its own, or one for a tree above.
   pub fn is_heard(self) -> bool {
     matches!(self, Self::Watched | Self::WatchedTree | Self::FromAbove)
   }
 
-  /// Whether an OS watch for a tree reports the directories below too.
   pub fn covers_below(self) -> bool {
     matches!(self, Self::WatchedTree | Self::FromAbove)
   }
@@ -202,69 +178,41 @@ impl Watch {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Depth {
-  /// Only the names are compared with a listing; without a listing, a shallow scan.
   Names,
-  /// Every name is checked; a directory below that is still the same one is left as it is.
   Shallow,
-  /// Also every directory below is watched again and scanned deep.
   Deep,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Added {
-  /// Nothing, or no call is running.
   No,
-  /// It led to a watched path, and the call made it one.
   Path,
-  /// It was no watched path and led to none, and the call registered it.
   Registered,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Content {
-  /// This hash of the content decides.
   Hash(u64),
-  /// No hash (the file is too big or unreadable): an equal fingerprint counts as a change.
   Unknown,
-  /// Not read, as every write gives a hint (`Options::written_hints`): an equal fingerprint is a
-  /// change when a hint says so, or when the hint may have been lost (5.8).
   Pending,
 }
 
 #[derive(Debug)]
 pub struct Tree {
-  /// The arena. Its last slot is never free ([`Tree::give_back`]).
   slots: Slots,
-  /// The free slots. An index past the end of the arena is stale.
   free: Vec<u32>,
-  /// The generation of a node in a new slot: above every slot that was cut off, so that an old
-  /// key never names a node again.
   first_generation: u32,
   names: Names,
-  /// Every node but the root, filed under its parent and its name.
   index: HashTable<u32>,
-  /// The registered nodes that were links at their last check, with a hash of the real path.
   links: FxHashMap<NodeKey, u64>,
-  /// The files whose fingerprint is not trusted at their next check.
   contents: FxHashMap<NodeKey, Content>,
-  /// The held nodes, each with the time of its second look.
   holds: FxHashMap<NodeKey, Instant>,
-  /// The files whose time is far ahead of the clock, with the first look that found their
-  /// fingerprint.
   ahead: FxHashMap<NodeKey, Instant>,
-  /// The registered nodes whose names are not plain, by the slot of their parent: the table does
-  /// not find their other spellings ([`Tree::others_meant`]).
   not_plain: FxHashMap<u32, Vec<u32>>,
-  /// The marked nodes, with the time of the hint that marked each. A key can be stale.
   pub marked: Vec<(NodeKey, Option<Instant>)>,
-  /// The nodes queued for a scan. A key can be stale or there twice.
   pub to_scan: Vec<NodeKey>,
-  /// The directories the timer looks at, the root always. A key can be stale or there twice
-  /// until [`Tree::tidy_polled`].
   pub polled: Vec<NodeKey>,
-  /// Notifications were lost: everything is scanned, when the engine says.
   pub lost: bool,
-  /// Every disk takes two spellings of a name for one (`Options::loose_spelling`).
   pub loose_spelling: bool,
 }
 
@@ -306,12 +254,10 @@ impl Tree {
     (node.generation == key.generation()).then_some(node)
   }
 
-  /// The key of the live node in the slot `index`.
   fn key(&self, index: u32) -> NodeKey {
     NodeKey::new(index, self.slots.linked(index).generation)
   }
 
-  /// Every node with its key, the root first.
   pub fn nodes(&self) -> impl Iterator<Item = (NodeKey, &Node)> + '_ {
     (0..).zip(self.slots.iter()).filter_map(|(index, slot)| {
       let node = slot.node()?;
@@ -319,22 +265,18 @@ impl Tree {
     })
   }
 
-  /// The name of a node. Empty for the root.
   pub fn name(&self, key: NodeKey) -> &OsStr {
     name_of(&self.names, &self[key])
   }
 
-  /// The node above. `None` for the root.
   pub fn parent(&self, key: NodeKey) -> Option<NodeKey> {
     slot(self.get(key)?.parent).map(|parent| self.key(parent))
   }
 
-  /// The directories above the node, from its parent up to the root.
   pub fn ancestors(&self, key: NodeKey) -> impl Iterator<Item = NodeKey> {
     self.ancestor_slots(key).map(|at| self.key(at))
   }
 
-  /// [`Tree::ancestors`], by slot.
   fn ancestor_slots(&self, key: NodeKey) -> impl Iterator<Item = u32> {
     let first = self.get(key).and_then(|node| slot(node.parent));
     iter::successors(first, move |&at| slot(self.slots.linked(at).parent))
@@ -345,7 +287,6 @@ impl Tree {
     self.child_slot(parent.index(), name).map(|index| self.key(index))
   }
 
-  /// The slot of the child `name` of the slot `parent`.
   fn child_slot(&self, parent: u32, name: &OsStr) -> Option<u32> {
     self
       .index
@@ -356,19 +297,16 @@ impl Tree {
       .copied()
   }
 
-  /// The children of a node, the newest first.
   pub fn children(&self, key: NodeKey) -> impl Iterator<Item = NodeKey> + '_ {
     let first = self.get(key).and_then(|node| slot(node.first_child));
     iter::successors(first, move |&index| slot(self.slots.linked(index).next))
       .map(|index| self.key(index))
   }
 
-  /// The next child of the parent. A loop may free the node it is at once it read the next.
   pub fn next_sibling(&self, child: NodeKey) -> Option<NodeKey> {
     slot(self.get(child)?.next).map(|next| self.key(next))
   }
 
-  /// Adds the child `name`, which `parent` must not have yet.
   pub fn insert_child(&mut self, parent: NodeKey, name: &OsStr) -> NodeKey {
     let parent = parent.index();
     debug_assert!(self.child_slot(parent, name).is_none(), "the child is there already");
@@ -397,18 +335,15 @@ impl Tree {
     self.key(index)
   }
 
-  /// Frees the node if nothing needs it: nothing at its path, not registered, no mark, not told.
   pub fn prune(&mut self, key: NodeKey) {
     let Some(node) = self.get(key) else { return };
     let nothing = matches!(node.kind, Kind::Missing);
     let needed = !nothing || node.is_registered() || node.is_marked() || node.told();
-    // It has no children then: the check only guards against a bug elsewhere.
     if !needed && node.first_child == NONE {
       self.remove(key);
     }
   }
 
-  /// Takes a node without children out of the tree. Its key never names a node again.
   fn remove(&mut self, key: NodeKey) {
     let slot = &mut self.slots[key.index() as usize];
     let Some(generation) = slot.node().map(|node| node.generation.wrapping_add(1)) else { return };
@@ -441,7 +376,6 @@ impl Tree {
     }
   }
 
-  /// Gives memory back after nodes went.
   fn give_back(&mut self) {
     while let Some(&Slot::Free(generation)) = self.slots.last() {
       self.first_generation = self.first_generation.max(generation);
@@ -449,7 +383,6 @@ impl Tree {
     }
     self.slots.shrink();
     let slots = self.slots.len();
-    // More than half of the list is stale then.
     if self.free.len() > 2 * slots + 16 {
       self.free.retain(|&index| (index as usize) < slots);
       self.free.shrink_to(slots);
@@ -466,7 +399,6 @@ impl Tree {
     path
   }
 
-  /// Writes the path of the node into `path`: empty for the root.
   pub fn path_into(&self, key: NodeKey, path: &mut PathBuf) {
     path.clear();
     if self.get(key).is_some() {
@@ -493,7 +425,6 @@ impl Tree {
     }
   }
 
-  /// Makes the node a watched path, or takes that back. `false`: it was so already.
   pub fn set_path(&mut self, key: NodeKey, is_path: bool) -> bool {
     let node = &mut self[key];
     if node.is_path() == is_path {
@@ -507,8 +438,6 @@ impl Tree {
     true
   }
 
-  /// The node in slot `child` was registered, or is no more: the counts above follow, up to a
-  /// node that stays as it was.
   fn count_registered(&mut self, mut child: u32, registered: bool) {
     loop {
       self.list_not_plain(child, registered);
@@ -527,7 +456,6 @@ impl Tree {
     }
   }
 
-  /// Puts the node in slot `child` on the `not_plain` list of its parent, or takes it off.
   fn list_not_plain(&mut self, child: u32, registered: bool) {
     let node = self.slots.linked(child);
     if is_plain(name_of(&self.names, node)) {
@@ -544,8 +472,6 @@ impl Tree {
     }
   }
 
-  /// What to ask of the backend for the directory: `Contents` when the node is complete or a
-  /// registered child is a file, `Names` when each is a directory, `None` when one has nothing.
   pub fn want(&self, key: NodeKey) -> Option<Want> {
     if self[key].is_complete() {
       return Some(Want::Contents);
@@ -554,18 +480,15 @@ impl Tree {
     for child in self.children(key) {
       let child = &self[child];
       match child.kind {
-        // Kept for a mark only.
         _ if !child.is_registered() => {}
         Kind::Dir(_) if !child.is_held() => {}
         Kind::Missing => unknown = true,
-        // A file, or a held directory.
         Kind::File(_) | Kind::Dir(_) => return Some(Want::Contents),
       }
     }
     if unknown { None } else { Some(Want::Names) }
   }
 
-  /// A hash of the real path, if the node was a link at its last check.
   pub fn link(&self, key: NodeKey) -> Option<u64> {
     self.links.get(&key).copied()
   }
@@ -581,7 +504,6 @@ impl Tree {
     self.links.keys().copied()
   }
 
-  /// What is kept to compare at the next check. `None`: an equal fingerprint means unchanged.
   pub fn content(&self, key: NodeKey) -> Option<Content> {
     self.contents.get(&key).copied()
   }
@@ -594,12 +516,10 @@ impl Tree {
     if let Some(content) = content {
       self.contents.insert(key, content);
     } else if !self.contents.is_empty() && self.contents.remove(&key).is_some() {
-      // Thousands of young files at once must not keep their room for ever.
       give_room_back(&mut self.contents);
     }
   }
 
-  /// For a file far ahead of the clock: when a look first found its fingerprint.
   pub fn ahead_since(&self, key: NodeKey) -> Option<Instant> {
     self.ahead.get(&key).copied()
   }
@@ -612,7 +532,6 @@ impl Tree {
     }
   }
 
-  /// A look found nothing at the node: it and everything below stay until the second look.
   pub fn hold(&mut self, key: NodeKey, until: Instant) {
     self[key].set_held(true);
     self.holds.insert(key, until);
@@ -624,7 +543,6 @@ impl Tree {
     {
       node.set_held(false);
       self.holds.remove(&key);
-      // Many holds at once (a tree removed file by file) must not keep their room.
       give_room_back(&mut self.holds);
     }
   }
@@ -637,7 +555,6 @@ impl Tree {
     self.holds.len()
   }
 
-  /// Whether a node above is held: then nothing is done here before its second look.
   pub fn frozen(&self, key: NodeKey) -> bool {
     !self.holds.is_empty() && self.ancestor_slots(key).any(|at| self.slots.linked(at).is_held())
   }
@@ -647,7 +564,6 @@ impl Tree {
     self.contents.capacity()
   }
 
-  /// Checks the links, the table and the counts.
   #[cfg(feature = "test-hooks")]
   pub fn check_links(&self) -> Result<(), String> {
     let mut reached = 1;
@@ -691,7 +607,6 @@ impl Tree {
     if reached != live || self.index.len() + 1 != live {
       return Err("a node is in no list of children, or not in the table".to_owned());
     }
-    // The names on the list: the registered ones that are not plain.
     let registered = |node: &Node| node.is_registered() && !is_plain(name_of(&self.names, node));
     let listed = |(parent, children): (&u32, &Vec<u32>)| {
       !children.is_empty()
@@ -740,13 +655,11 @@ fn name_of<'a>(names: &'a Names, node: &Node) -> &'a OsStr {
   names.get(node.name_at, node.name_len)
 }
 
-/// The hash under which the table files the live node in the slot `index`.
 fn hash_of(slots: &Slots, names: &Names, index: u32) -> u64 {
   let node = slots.linked(index);
   child_hash(node.parent, name_of(names, node))
 }
 
-/// Nanoseconds since 1970. A time that does not fit (before 1678, after 2262) becomes the nearest.
 pub(crate) fn nanos(time: SystemTime) -> i64 {
   match time.duration_since(SystemTime::UNIX_EPOCH) {
     Ok(after) => nanos_of(after),
@@ -754,21 +667,16 @@ pub(crate) fn nanos(time: SystemTime) -> i64 {
   }
 }
 
-/// A duration in nanoseconds, or the longest that fits.
 pub(crate) fn nanos_of(time: Duration) -> i64 {
   i64::try_from(time.as_nanos()).unwrap_or(i64::MAX)
 }
 
-/// The most bytes of a list that are kept between two uses.
 pub(crate) const KEPT: usize = 16 * 1024;
 
-/// The room to keep for a list that shrank: `None` while over half of it is in use, or it is
-/// small. A table waits longer (`give_room_back`), since it rehashes.
 pub(crate) fn room_to_keep(len: usize, capacity: usize) -> Option<usize> {
   (capacity > 2 * len + 16).then(|| len + len / 8 + 16)
 }
 
-/// Empties a list for its next use, and keeps its memory unless that is above `KEPT`.
 pub(crate) fn emptied<T>(mut list: Vec<T>) -> Vec<T> {
   list.clear();
   if list.capacity() * size_of::<T>() > KEPT { Vec::new() } else { list }
@@ -795,7 +703,6 @@ mod tests {
     let full = tree.names.len();
     assert_eq!(full, 1 + 1000 * name(0).len());
 
-    // Three of four nodes go.
     let stays = |i: usize| i.is_multiple_of(4);
     for (i, key) in keys.iter().enumerate() {
       if !stays(i) {
@@ -815,7 +722,6 @@ mod tests {
       }
     }
 
-    // New names go on behind the packed ones.
     let new = tree.insert_child(top, OsStr::new("new.js"));
     assert_eq!(tree.name(new), OsStr::new("new.js"));
     assert_eq!(tree.name(top), OsStr::new("/"));
@@ -831,7 +737,6 @@ mod tests {
     let (last, others) = keys.split_last().unwrap();
     let table = tree.index.capacity();
 
-    // The last node stays: no slot is cut off, and each free one is listed.
     for key in others {
       tree.prune(*key);
     }
@@ -839,13 +744,11 @@ mod tests {
     assert!(tree.index.capacity() < table / 100);
     tree.check_links().unwrap();
 
-    // Now the end is free down to the top directory.
     tree.prune(*last);
     assert_eq!((tree.slots.len(), tree.free.len()), (2, 0));
     assert!(tree.slots.capacity() < 100 && tree.free.capacity() < 100);
     tree.check_links().unwrap();
 
-    // A new node takes the first slot again, under a new generation.
     let new = tree.insert_child(top, OsStr::new("new"));
     assert_eq!(new.index(), keys[0].index());
     assert!(keys.iter().all(|key| tree.get(*key).is_none()));
@@ -855,13 +758,10 @@ mod tests {
   #[test]
   fn a_time_as_one_number() {
     assert_eq!(nanos(UNIX_EPOCH), 0);
-    // A multiple of 100 ns: the clock of Windows counts in those.
     assert_eq!(nanos(UNIX_EPOCH + Duration::new(2, 300)), 2_000_000_300);
     assert_eq!(nanos(UNIX_EPOCH - Duration::new(2, 300)), -2_000_000_300);
-    // The year 2262 is the last one that fits, and 1677 the first.
     let far = Duration::from_hours(400 * 365 * 24);
     assert_eq!(nanos(UNIX_EPOCH + far), i64::MAX);
-    // Three hundred years back: the clock of Windows starts in 1601.
     let back = Duration::from_hours(300 * 365 * 24);
     assert_eq!(nanos(UNIX_EPOCH - back), -i64::MAX);
   }

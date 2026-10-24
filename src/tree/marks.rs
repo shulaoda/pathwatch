@@ -14,7 +14,6 @@ use crate::{
   path::split_top,
 };
 
-/// What a hint says of the last name of its path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Said {
   Changed,
@@ -22,34 +21,22 @@ enum Said {
   New,
 }
 
-/// A marked node as a flush takes it (`Tree::take_marked`): its level, the order of its key
-/// from the newest, its directory, the node, and the time of its hint.
 pub type Marked = (usize, usize, NodeKey, NodeKey, Option<Instant>);
 
-/// "Check this name at the next flush."
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Mark {
-  /// This very path changed: a directory that is still the same one is watched again and scanned
-  /// deep, since it can have been away and back.
   pub deep: bool,
-  /// The backend saw a write to the file: it is an `Update`, also with an equal fingerprint.
   pub written: bool,
-  /// Only a loss report asked for this check. The engine paces such checks.
   pub lost: bool,
-  /// The time of the hint that asked for the check: a `Delete` counts its delay from it. `None`:
-  /// the engine itself asked, and the delay counts from the look.
   pub since: Option<Instant>,
 }
 
 impl Mark {
-  /// Something said that this very path changed.
   pub const DEEP: Self = Self { deep: true, written: false, lost: false, since: None };
-  /// The backend lost notifications of the directory at the path, or its watch.
   pub const LOST: Self = Self { deep: true, written: false, lost: true, since: None };
 }
 
 impl Node {
-  /// Adds a mark to the node. Two marks for one node become one.
   fn add_mark(&mut self, mark: Mark) -> bool {
     if mark.lost
       && let Some(dir) = self.dir_mut()
@@ -68,7 +55,6 @@ impl Node {
 }
 
 impl Tree {
-  /// Turns a hint into work for the next flush.
   pub fn hint(&mut self, hint: Hint<'_>) -> bool {
     match hint {
       Hint::Changed { dir, rel } => self.mark_below(dir, rel, Said::Changed),
@@ -86,7 +72,6 @@ impl Tree {
     }
   }
 
-  /// Marks the place to check for a change at `rel` below `dir`.
   fn mark_below(&mut self, dir: NodeKey, rel: &Path, said: Said) -> bool {
     let Some(node) = self.get(dir) else { return false };
     if !node.is_dir() {
@@ -110,7 +95,6 @@ impl Tree {
     self.mark_path(dir.index(), rel.components().peekable(), said)
   }
 
-  /// The walk of `mark_below`, by slots since it runs for every hint.
   fn mark_path(&mut self, mut at: u32, mut parts: Peekable<Components<'_>>, said: Said) -> bool {
     let mut found = false;
     while let Some(part) = parts.next() {
@@ -151,7 +135,6 @@ impl Tree {
     found
   }
 
-  /// The walk of `mark_path` for the other children that `name` can mean.
   #[cold]
   fn mark_others(
     &mut self,
@@ -168,7 +151,6 @@ impl Tree {
       let node = self.slots.linked(other);
       let written = one_entry && name_of(&self.names, node).eq_ignore_ascii_case(name);
       if !last && node.is_dir() {
-        // Below a guess, the names are guesses too.
         let said = if written { said } else { Said::Changed };
         found |= self.mark_path(other, rest.clone(), said);
       } else {
@@ -180,14 +162,12 @@ impl Tree {
     found
   }
 
-  /// Adds a mark to a node.
   pub fn mark(&mut self, key: NodeKey, mark: Mark) {
     if self[key].add_mark(mark) {
       self.marked.push((key, mark.since));
     }
   }
 
-  /// Takes the mark off a node.
   pub fn take_mark(&mut self, key: NodeKey) -> Option<Mark> {
     let node = self.get_mut(key)?;
     let mark = node.mark();
@@ -195,7 +175,6 @@ impl Tree {
     mark
   }
 
-  /// Queues a scan of the directory `key`: once, with the deepest depth asked for.
   pub fn queue_scan(&mut self, key: NodeKey, depth: Depth) {
     let Some(dir) = self[key].dir_mut() else { return };
     if let Some(old) = dir.scan {
@@ -206,7 +185,6 @@ impl Tree {
     }
   }
 
-  /// Takes the queue into `scans`: every queued node, with its depth and whether it was away.
   pub fn take_scans(&mut self, scans: &mut Vec<(NodeKey, Depth, bool)>) {
     scans.clear();
     let mut queue = mem::take(&mut self.to_scan);
@@ -217,7 +195,6 @@ impl Tree {
     self.to_scan = emptied(queue);
   }
 
-  /// Takes the marked nodes into `marks`, from the top down and one directory after the other.
   pub fn take_marked(&mut self, marks: &mut Vec<Marked>) {
     marks.clear();
     let mut marked = mem::take(&mut self.marked);
@@ -235,7 +212,6 @@ impl Tree {
     marks.dedup_by_key(|&mut (.., key, _)| key);
   }
 
-  /// Drops the keys of the nodes that have no mark any more.
   pub fn tidy_marked(&mut self) {
     let mut marked = mem::take(&mut self.marked);
     marked.retain(|&(key, _)| self.get(key).is_some_and(Node::is_marked));
@@ -246,7 +222,6 @@ impl Tree {
     !self.marked.is_empty() || !self.to_scan.is_empty()
   }
 
-  /// Puts the directory on the list of the timer if it has to be polled now.
   pub fn list_if_polled(&mut self, key: NodeKey) {
     if matches!(self[key].kind, Kind::Dir(dir) if dir.is_polled()) {
       self.polled.push(key);
@@ -256,7 +231,6 @@ impl Tree {
     }
   }
 
-  /// The backend is gone: no directory has an OS watch any more, and the timer looks at all.
   pub fn poll_all(&mut self) {
     for slot in self.slots.iter_mut() {
       if let Some(Node { kind: Kind::Dir(dir), .. }) = slot.node_mut() {
@@ -267,7 +241,6 @@ impl Tree {
     self.polled = dirs.map(|(key, _)| key).collect();
   }
 
-  /// Puts the list of the timer in order: each polled directory once, and nothing else.
   pub fn tidy_polled(&mut self) {
     let mut polled = mem::take(&mut self.polled);
     polled.sort_unstable();
