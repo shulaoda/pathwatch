@@ -3,20 +3,16 @@ name = "pathwatch"
 description = "A path-based file event watcher"
 version = "0.0.0"
 edition = "2024"
-# The toolchain of `rust-toolchain.toml`: the only one that the tests run on.
-rust-version = "1.99"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/shulaoda/pathwatch"
 keywords = ["watch", "watcher", "filesystem", "events"]
 categories = ["filesystem"]
-# What a published package holds, next to this file and the README. The tests stay in the
-# repository.
 include = ["src/**/*.rs", "examples/**/*.rs", "LICENSE"]
 
 [dependencies]
 bitflags = { version = "2.13.2", default-features = false }
-hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
+hashbrown = { version = "0.17.1", default-features = false }
 rustc-hash = "2.1.2"
 
 [target.'cfg(unix)'.dependencies]
@@ -26,14 +22,14 @@ libc = "0.2.183"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
 
 [features]
-# What only the tests of the repository call: the hooks of the engine, the checks of the tree,
-# what the backends show of themselves, and `Watcher::with_backend`. Not part of the API.
 test-hooks = []
 
 [dev-dependencies]
-# The tests build the crate with its hooks.
 pathwatch = { path = ".", features = ["test-hooks"] }
 tempfile = "3.26.0"
+
+[profile.release]
+debug = "line-tables-only"
 
 [lints.rust]
 missing_debug_implementations = "deny"
@@ -114,5 +110,3 @@ infinite_loop = "deny"
 unseparated_literal_suffix = "deny"
 redundant_type_annotations = "deny"
 unwrap_in_result = "deny"
-[profile.release]
-debug = "line-tables-only"
