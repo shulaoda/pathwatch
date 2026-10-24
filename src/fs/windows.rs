@@ -39,6 +39,7 @@ use super::{DirId, Entry, FileType, Meta, meta};
 pub(crate) const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 const TO_1970: u64 = 116_444_736_000_000_000;
 const NAME_SURROGATE: u32 = 0x2000_0000;
+const SEPARATOR: u16 = b'\\' as u16;
 
 fn time(since_1601: u64) -> SystemTime {
   let steps = since_1601.saturating_sub(TO_1970);
@@ -126,17 +127,19 @@ pub(crate) fn literal(path: &Path) -> Cow<'_, Path> {
   if !is_odd(path) {
     return Cow::Borrowed(path);
   }
-  Cow::Owned(PathBuf::from(OsString::from_wide(&verbatim(path, true))))
+  Cow::Owned(PathBuf::from(OsString::from_wide(&verbatim(wide(path)))))
 }
 
-fn verbatim(path: &Path, always: bool) -> Vec<u16> {
-  const SEPARATOR: u16 = b'\\' as u16;
+fn wide(path: &Path) -> Vec<u16> {
   let units = path.as_os_str().encode_wide();
-  let units: Vec<u16> =
-    units.map(|unit| if unit == u16::from(b'/') { SEPARATOR } else { unit }).collect();
-  let is_verbatim = units.starts_with(&[SEPARATOR, SEPARATOR, u16::from(b'?'), SEPARATOR]);
+  units.map(|unit| if unit == u16::from(b'/') { SEPARATOR } else { unit }).collect()
+}
+
+fn verbatim(units: Vec<u16>) -> Vec<u16> {
+  if units.starts_with(&[SEPARATOR, SEPARATOR, u16::from(b'?'), SEPARATOR]) {
+    return units;
+  }
   let (prefix, rest) = match units.as_slice() {
-    units if is_verbatim || (!always && units.len() < MAX_PATH as usize - 12) => ("", units),
     [SEPARATOR, rest @ ..] if rest.first() == Some(&SEPARATOR) => (r"\\?\UNC", rest),
     units => (r"\\?\", units),
   };
@@ -317,11 +320,11 @@ pub(super) fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::R
     let mut rest = &records.0[..];
     loop {
       let read = record(rest, u64::from(serial));
-      let (next, name, told) = read.ok_or_else(|| io::Error::other("a listing gave no entry"))?;
+      let (next, name, listed) = read.ok_or_else(|| io::Error::other("a listing gave no entry"))?;
       let units = name.as_chunks().0.iter().map(|&unit| u16::from_ne_bytes(unit));
       let name = wide_name(units, &mut text);
       if !matches!(name.as_encoded_bytes(), b"." | b"..") && !has_separator(&name) {
-        each(&name, told);
+        each(&name, listed);
       }
       match next {
         0 => break,
@@ -341,7 +344,7 @@ fn record(bytes: &[u8], volume: u64) -> Option<(usize, &[u8], Entry)> {
   }
   let (attributes, index) = (u32_at(ATTRIBUTES)?, u64_at(INDEX)?);
   let plain = attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
-  let told = match kind(attributes, u32_at(TAG)?) {
+  let listed = match kind(attributes, u32_at(TAG)?) {
     FileType::File if plain => {
       Entry::File { modified: time(u64_at(WRITTEN)?), size: u64_at(SIZE)?, file_id: index }
     }
@@ -351,7 +354,7 @@ fn record(bytes: &[u8], volume: u64) -> Option<(usize, &[u8], Entry)> {
     },
     kind => Entry::Kind(kind),
   };
-  Some((next, name_bytes, told))
+  Some((next, name_bytes, listed))
 }
 
 pub(crate) fn wide_name(
@@ -391,27 +394,27 @@ pub(super) fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
 }
 
 pub(super) fn name_on_disk(path: &Path) -> io::Result<OsString> {
-  let mut wide = verbatim(path, is_odd(path));
-  wide.push(0);
+  let mut units = wide(path);
+  if is_odd(path) || units.len() >= MAX_PATH as usize - 12 {
+    units = verbatim(units);
+  }
+  units.push(0);
   // SAFETY: all zeros is a valid value of this plain struct of numbers.
   let mut found: WIN32_FIND_DATAW = unsafe { mem::zeroed() };
-  // SAFETY: `wide` ends with a NUL, and the call writes one whole struct into `found`. The
+  // SAFETY: `units` ends with a NUL, and the call writes one whole struct into `found`. The
   // basic answer leaves the short name out, which the disk would have to make.
   let search = unsafe {
     let (basic, by_name, no_filter) = (FindExInfoBasic, FindExSearchNameMatch, std::ptr::null());
-    FindFirstFileExW(wide.as_ptr(), basic, (&raw mut found).cast(), by_name, no_filter, 0)
+    FindFirstFileExW(units.as_ptr(), basic, (&raw mut found).cast(), by_name, no_filter, 0)
   };
   if search == INVALID_HANDLE_VALUE {
-    let error = io::Error::last_os_error();
+    let error = classify(io::Error::last_os_error());
     return match error.raw_os_error().map(i32::cast_unsigned) {
       Some(ERROR_NO_MORE_FILES) => Err(io::ErrorKind::NotFound.into()),
-      Some(ERROR_ACCESS_DENIED) => match classify(error) {
-        error if error.kind() == io::ErrorKind::NotFound => Err(error),
-        _ => {
-          path.file_name().map(OsStr::to_owned).ok_or_else(|| io::ErrorKind::InvalidInput.into())
-        }
-      },
-      _ => Err(classify(error)),
+      Some(ERROR_ACCESS_DENIED) => {
+        path.file_name().map(OsStr::to_owned).ok_or_else(|| io::ErrorKind::InvalidInput.into())
+      }
+      _ => Err(error),
     };
   }
   // SAFETY: `search` is the open handle that the call above gave, closed once.

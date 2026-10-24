@@ -6,7 +6,7 @@ pub use self::{
   place::{Place, place},
 };
 pub use self::{
-  handles::{Handles, System, Told, WatchId},
+  handles::{Handles, Report, System, WatchId},
   records::{Malformed, Record, Records},
 };
 use self::{port::Port, records::FILE_ACTION_MODIFIED};
@@ -38,10 +38,10 @@ impl WindowsBackend {
     self.handles.serves(key)
   }
 
-  fn finish_call(&mut self, told: Told) {
-    self.covered.extend(told.covered);
-    if !told.lost.is_empty() {
-      self.sink.raw(Raw::Lost(told.lost));
+  fn finish_call(&mut self, report: Report) {
+    self.covered.extend(report.covered);
+    if !report.lost.is_empty() {
+      self.sink.raw(Raw::Lost(report.lost));
     }
     self.port.wait_for_closes();
   }
@@ -51,8 +51,8 @@ impl Backend for WindowsBackend {
   type Raw = Raw;
 
   fn watch(&mut self, key: NodeKey, dir: &Path, want: Want) -> Coverage {
-    let (coverage, told) = self.handles.watch(key, dir, want, &mut self.port);
-    self.finish_call(told);
+    let (coverage, report) = self.handles.watch(key, dir, want, &mut self.port);
+    self.finish_call(report);
     coverage
   }
 
@@ -62,8 +62,8 @@ impl Backend for WindowsBackend {
   }
 
   fn commit(&mut self) -> Committed {
-    let told = self.handles.commit(&mut self.port);
-    self.finish_call(told);
+    let report = self.handles.commit(&mut self.port);
+    self.finish_call(report);
     Committed { now_watched: mem::take(&mut self.covered), failed: Vec::new() }
   }
 
@@ -103,7 +103,7 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
   handles.delivered(watch);
   let records = if extended { Records::extended(&bytes) } else { Records::new(&bytes) };
   let mut route = handles.route_below(&dir);
-  let mut told_lost = false;
+  let mut reported_lost = false;
   for record in records {
     let Ok(record) = record else {
       hint(Hint::Lost);
@@ -111,18 +111,18 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
     };
     let written = record.action == FILE_ACTION_MODIFIED;
     if record.is_unnamed() {
-      if !mem::replace(&mut told_lost, true) {
+      if !mem::replace(&mut reported_lost, true) {
         handles.below(&dir).into_iter().for_each(|key| hint(lost(key)));
       }
       continue;
     }
-    if written && record.is_dir == Some(true) || !route.take(record.name()) {
+    if written && record.is_dir == Some(true) || !route.follow(record.name()) {
       continue;
     }
     if written && route.is_at_a_key() {
       continue;
     }
-    route.keys(&mut |key, rel| {
+    route.each_key(&mut |key, rel| {
       hint(if written {
         Hint::Written { dir: key, rel, new: false }
       } else {
@@ -150,15 +150,26 @@ mod place {
   ) -> Vec<Place> {
     let mut wanted = wanted.to_vec();
     wanted.sort_by(|a, b| a.1.cmp(b.1));
+    let dirs = merged(&tops(&wanted), max, is_link);
+    let mut places: Vec<Place> =
+      dirs.into_iter().map(|dir| Place { dir, keys: Vec::new() }).collect();
+    serve(&mut places, &wanted);
+    places.truncate(max);
+    places
+  }
 
+  fn tops<'a>(wanted: &[(NodeKey, &'a Path, Want)]) -> Vec<&'a Path> {
     let mut tops: Vec<&Path> = Vec::new();
-    for &(_, dir, want) in &wanted {
+    for &(_, dir, want) in wanted {
       let below_a_top = tops.last().is_some_and(|top| dir.starts_with(top));
       if want == Want::Contents && !below_a_top && may_watch_a_tree(dir) {
         tops.push(dir);
       }
     }
+    tops
+  }
 
+  fn merged(tops: &[&Path], max: usize, is_link: &mut dyn FnMut(&Path) -> bool) -> Vec<PathBuf> {
     let shared: Vec<usize> = tops.windows(2).map(|pair| common_parts(pair[0], pair[1])).collect();
     let mut group: Vec<usize> = (0..tops.len()).collect();
     let mut count = tops.len();
@@ -200,14 +211,17 @@ mod place {
     for (top, &first) in group.iter().enumerate() {
       last[first] = top;
     }
-    let mut places = Vec::with_capacity(count);
+    let mut dirs = Vec::with_capacity(count);
     for (first, &top) in tops.iter().enumerate().filter(|&(top, _)| group[top] == top) {
-      let dir = first_parts(top, common_parts(top, tops[last[first]]));
-      places.push(Place { dir, keys: Vec::new() });
+      dirs.push(first_parts(top, common_parts(top, tops[last[first]])));
     }
-    places.sort_by(|a, b| a.dir.cmp(&b.dir));
+    dirs.sort_unstable();
+    dirs
+  }
+
+  fn serve(places: &mut [Place], wanted: &[(NodeKey, &Path, Want)]) {
     let (mut at, mut above) = (0, Vec::new());
-    for &(key, dir, _) in &wanted {
+    for &(key, dir, _) in wanted {
       while places.get(at).is_some_and(|place| place.dir.as_path() <= dir) {
         while above.last().is_some_and(|&top: &usize| !places[at].dir.starts_with(&places[top].dir))
         {
@@ -223,8 +237,6 @@ mod place {
         places[top].keys.push(key);
       }
     }
-    places.truncate(max);
-    places
   }
 
   fn common_parts(a: &Path, b: &Path) -> usize {
@@ -244,6 +256,7 @@ mod place {
 mod handles {
   use std::{
     borrow::Cow,
+    collections::hash_map,
     ffi::OsStr,
     io, mem,
     path::{Component, Path, PathBuf},
@@ -251,7 +264,7 @@ mod handles {
 
   use rustc_hash::{FxHashMap, FxHashSet};
 
-  use super::place::{link_between, place};
+  use super::place::{Place, link_between, place};
   use crate::{
     backend::{Coverage, NodeKey, Want, copy_error, give_room_back, may_watch_a_tree, watch_limit},
     fs::wide_name,
@@ -271,7 +284,7 @@ mod handles {
   }
 
   #[derive(Debug, Default)]
-  pub struct Told {
+  pub struct Report {
     pub lost: Vec<NodeKey>,
     pub covered: Vec<NodeKey>,
   }
@@ -279,7 +292,7 @@ mod handles {
   #[derive(Debug, Default)]
   pub struct Handles {
     keys: FxHashMap<NodeKey, Served>,
-    at: FxHashMap<PathBuf, Vec<NodeKey>>,
+    keys_at: FxHashMap<PathBuf, Vec<NodeKey>>,
     open: Vec<Handle>,
     next_id: usize,
     unsettled: bool,
@@ -315,53 +328,53 @@ mod handles {
       dir: &Path,
       want: Want,
       system: &mut dyn System,
-    ) -> (Coverage, Told) {
-      let mut told = Told::default();
+    ) -> (Coverage, Report) {
+      let mut report = Report::default();
       let waited = self.waiting.remove(&key).is_some();
       let refused = self.refused.remove(&key);
+      let told_to_ask = waited || refused;
 
-      let above = self.open.iter().enumerate().filter(|(_, handle)| dir.starts_with(&handle.dir));
-      if let Some((at, _)) = above.max_by_key(|(_, handle)| handle.dir.as_os_str().len()) {
+      if let Some(at) = self.handle_above(dir) {
         if link_between(&self.open[at].dir, dir, |path| system.is_link(path)) {
           self.drop_key(key, system);
-          return (Coverage::NotWatched, told);
+          return (Coverage::NotWatched, report);
         }
-        if !(waited || refused)
+        if !told_to_ask
           && self.open[at].dir == dir
           && let Err(error) = self.reopen(at, system)
         {
           self.drop_key(key, system);
-          return (Coverage::Failed(error), told);
+          return (Coverage::Failed(error), report);
         }
         self.remember(key, dir, want, Some(self.open[at].id));
         let coverage =
           if want == Want::Contents { Coverage::WatchedTree } else { Coverage::Watched };
-        return (coverage, told);
+        return (coverage, report);
       }
       if want == Want::Names || !may_watch_a_tree(dir) {
         self.waiting.insert(key, dir.to_owned());
-        return (Coverage::NotWatched, told);
+        return (Coverage::NotWatched, report);
       }
-      if self.dead.get(&key).is_some_and(|death| death.again)
-        && let Some(death) = self.dead.remove(&key)
+      if let hash_map::Entry::Occupied(death) = self.dead.entry(key)
+        && death.get().again
       {
-        return (Coverage::Failed(death.error), told);
+        return (Coverage::Failed(death.remove().error), report);
       }
 
       self.remember(key, dir, want, None);
       if !refused {
         self.unsettled = true;
-        return (Coverage::WatchedTree, told);
+        return (Coverage::WatchedTree, report);
       }
-      let settled = self.settle(system, &mut told);
-      told.lost.retain(|&lost| lost != key);
+      let settled = self.settle(system, &mut report);
+      report.lost.retain(|&lost| lost != key);
       let coverage = match settled {
         Ok(()) if self.serves(key) => Coverage::WatchedTree,
         Ok(()) if !self.refused.contains(&key) => Coverage::NotWatched,
         Ok(()) => Coverage::Failed(watch_limit("the limit of open directory handles is reached")),
         Err(error) => Coverage::Failed(error),
       };
-      (coverage, told)
+      (coverage, report)
     }
 
     pub fn unwatch(&mut self, key: NodeKey, system: &mut dyn System) {
@@ -371,12 +384,12 @@ mod handles {
       self.drop_key(key, system);
     }
 
-    pub fn commit(&mut self, system: &mut dyn System) -> Told {
-      let mut told = Told::default();
+    pub fn commit(&mut self, system: &mut dyn System) -> Report {
+      let mut report = Report::default();
       if self.unsettled {
-        let _ = self.settle(system, &mut told);
+        let _ = self.settle(system, &mut report);
       }
-      told
+      report
     }
 
     pub fn closed(&mut self, id: WatchId, error: &io::Error) -> Vec<NodeKey> {
@@ -405,6 +418,31 @@ mod handles {
         self.dead.remove(key);
       }
     }
+
+    pub(super) fn route_below(&self, dir: &Path) -> Route<'_> {
+      let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
+      let lower_dir = lowered(dir);
+      let mut path = dir.as_os_str().as_encoded_bytes().to_vec();
+      let mut lower = lower_dir.as_os_str().as_encoded_bytes().to_vec();
+      path.push(b'\\');
+      lower.push(b'\\');
+      let above = dir.ancestors().zip(lower_dir.ancestors()).filter_map(|(up, lower_up)| {
+        let keys = self.keys_at.get(lower_up)?.as_slice();
+        let end = up.as_os_str().len();
+        let rel_from = end + path[end..].iter().take_while(|byte| is_separator(byte)).count();
+        Some(Above { keys, rel_from })
+      });
+      let above = above.collect();
+      let base = Lengths { path: path.len(), lower: lower.len() };
+      let (ends, text, name) = (Vec::new(), String::new(), String::new());
+      Route { keys_at: &self.keys_at, above, path, lower, base, ends, text, name }
+    }
+
+    pub(super) fn below(&self, dir: &Path) -> Vec<NodeKey> {
+      let dir = lowered(dir);
+      let below = self.keys_at.iter().filter(|(lower, _)| lower.starts_with(&dir));
+      below.flat_map(|(_, keys)| keys).copied().collect()
+    }
   }
 
   impl Handles {
@@ -421,60 +459,23 @@ mod handles {
       }
     }
 
-    fn settle(&mut self, system: &mut dyn System, told: &mut Told) -> io::Result<()> {
+    fn settle(&mut self, system: &mut dyn System, report: &mut Report) -> io::Result<()> {
       self.unsettled = false;
-      let moved = self.move_handles(system, told);
+      let moved = self.move_handles(system, report);
       let left = self.keys.iter().filter(|(_, served)| served.handle.is_none());
       let left: Vec<NodeKey> = left.map(|(&key, _)| key).collect();
       for key in left {
         self.forget(key);
         self.refused.insert(key);
-        told.lost.push(key);
+        report.lost.push(key);
       }
       moved
     }
 
-    fn move_handles(&mut self, system: &mut dyn System, told: &mut Told) -> io::Result<()> {
-      let wanted: Vec<(NodeKey, &Path, Want)> =
-        self.keys.iter().map(|(&key, served)| (key, &*served.dir, served.want)).collect();
+    fn move_handles(&mut self, system: &mut dyn System, report: &mut Report) -> io::Result<()> {
       let mut looked: FxHashMap<PathBuf, bool> = FxHashMap::default();
-      let (places, behind_a_link) = loop {
-        let known = looked.values().filter(|&&is| is).count();
-        let places = place(&wanted, MAX_HANDLES, &mut |path| looked.get(path) == Some(&true));
-        let mut behind = Vec::new();
-        for place in &places {
-          let id = self.handle_on(&place.dir);
-          for &key in &place.keys {
-            let served = &self.keys[&key];
-            if id.is_some() && id == served.handle {
-              continue;
-            }
-            if link_between(&place.dir, &served.dir, |path| is_link(&mut looked, system, path)) {
-              behind.push(key);
-            }
-          }
-        }
-        if looked.values().filter(|&&is| is).count() == known {
-          break (places, behind);
-        }
-      };
-
-      let mut new = Vec::new();
-      for place in &places {
-        if self.handle_on(&place.dir).is_some() {
-          continue;
-        }
-        let id = self.next_id();
-        match system.open(id, &place.dir) {
-          Ok(()) => new.push(Handle { id, dir: place.dir.clone(), delivered: false }),
-          Err(error) => {
-            for handle in &new {
-              system.close(handle.id);
-            }
-            return Err(error);
-          }
-        }
-      }
+      let (places, behind_a_link) = self.placement(&mut looked, system);
+      let new = self.open_new(&places, system)?;
       let is_placed = |handle: &Handle| places.iter().any(|place| place.dir == handle.dir);
       let (kept, gone): (Vec<_>, Vec<_>) =
         mem::take(&mut self.open).into_iter().partition(is_placed);
@@ -487,7 +488,7 @@ mod handles {
         let covered = waiting.filter(|(_, dir)| {
           !link_between(&handle.dir, dir, |path| is_link(&mut looked, system, path))
         });
-        told.covered.extend(covered.map(|(&key, _)| key));
+        report.covered.extend(covered.map(|(&key, _)| key));
       }
       self.open.extend(new);
 
@@ -504,9 +505,63 @@ mod handles {
       }
       for key in behind_a_link {
         self.forget(key);
-        told.lost.push(key);
+        report.lost.push(key);
       }
       Ok(())
+    }
+
+    fn placement(
+      &self,
+      looked: &mut FxHashMap<PathBuf, bool>,
+      system: &mut dyn System,
+    ) -> (Vec<Place>, Vec<NodeKey>) {
+      let wanted: Vec<(NodeKey, &Path, Want)> =
+        self.keys.iter().map(|(&key, served)| (key, &*served.dir, served.want)).collect();
+      loop {
+        let links_known = looked.values().filter(|&&is| is).count();
+        let places = place(&wanted, MAX_HANDLES, &mut |path| looked.get(path) == Some(&true));
+        let mut behind_a_link = Vec::new();
+        for place in &places {
+          let id = self.handle_on(&place.dir);
+          for &key in &place.keys {
+            let served = &self.keys[&key];
+            if id.is_some() && id == served.handle {
+              continue;
+            }
+            if link_between(&place.dir, &served.dir, |path| is_link(looked, system, path)) {
+              behind_a_link.push(key);
+            }
+          }
+        }
+        if looked.values().filter(|&&is| is).count() == links_known {
+          return (places, behind_a_link);
+        }
+      }
+    }
+
+    fn open_new(&mut self, places: &[Place], system: &mut dyn System) -> io::Result<Vec<Handle>> {
+      let mut new = Vec::new();
+      for place in places {
+        if self.handle_on(&place.dir).is_some() {
+          continue;
+        }
+        let id = self.next_id();
+        match system.open(id, &place.dir) {
+          Ok(()) => new.push(Handle { id, dir: place.dir.clone(), delivered: false }),
+          Err(error) => {
+            for handle in &new {
+              system.close(handle.id);
+            }
+            return Err(error);
+          }
+        }
+      }
+      Ok(new)
+    }
+
+    fn handle_above(&self, dir: &Path) -> Option<usize> {
+      let above = self.open.iter().enumerate().filter(|(_, handle)| dir.starts_with(&handle.dir));
+      above.max_by_key(|(_, handle)| handle.dir.as_os_str().len()).map(|(at, _)| at)
     }
 
     fn handle_on(&self, dir: &Path) -> Option<WatchId> {
@@ -534,21 +589,21 @@ mod handles {
 
     fn remember(&mut self, key: NodeKey, dir: &Path, want: Want, handle: Option<WatchId>) {
       self.forget(key);
-      self.at.entry(lowered(dir)).or_default().push(key);
+      self.keys_at.entry(lowered(dir)).or_default().push(key);
       self.keys.insert(key, Served { dir: dir.to_owned(), want, handle });
     }
 
     fn forget(&mut self, key: NodeKey) -> Option<Served> {
       let gone = self.keys.remove(&key)?;
       let lower = lowered(&gone.dir);
-      if let Some(keys) = self.at.get_mut(&lower) {
+      if let Some(keys) = self.keys_at.get_mut(&lower) {
         keys.retain(|&other| other != key);
         if keys.is_empty() {
-          self.at.remove(&lower);
+          self.keys_at.remove(&lower);
         }
       }
       give_room_back(&mut self.keys);
-      give_room_back(&mut self.at);
+      give_room_back(&mut self.keys_at);
       Some(gone)
     }
   }
@@ -575,52 +630,33 @@ mod handles {
     Cow::Borrowed(OsStr::new(text.as_str()))
   }
 
-  impl Handles {
-    pub(super) fn route_below(&self, dir: &Path) -> Route<'_> {
-      let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
-      let lower_dir = lowered(dir);
-      let mut path = dir.as_os_str().as_encoded_bytes().to_vec();
-      let mut lower = lower_dir.as_os_str().as_encoded_bytes().to_vec();
-      path.push(b'\\');
-      lower.push(b'\\');
-      let above = dir.ancestors().zip(lower_dir.ancestors()).filter_map(|(up, lower_up)| {
-        let keys = self.at.get(lower_up)?;
-        let end = up.as_os_str().len();
-        Some((
-          keys.as_slice(),
-          end + path[end..].iter().take_while(|byte| is_separator(byte)).count(),
-        ))
-      });
-      let above = above.collect();
-      let base = (path.len(), lower.len());
-      let (ends, text, name) = (Vec::new(), String::new(), String::new());
-      Route { at: &self.at, above, path, lower, base, ends, text, name }
-    }
-
-    pub(super) fn below(&self, dir: &Path) -> Vec<NodeKey> {
-      let dir = lowered(dir);
-      let below = self.at.iter().filter(|(lower, _)| lower.starts_with(&dir));
-      below.flat_map(|(_, keys)| keys).copied().collect()
-    }
-  }
-
   pub(super) struct Route<'a> {
-    at: &'a FxHashMap<PathBuf, Vec<NodeKey>>,
-    above: Vec<(&'a [NodeKey], usize)>,
+    keys_at: &'a FxHashMap<PathBuf, Vec<NodeKey>>,
+    above: Vec<Above<'a>>,
     path: Vec<u8>,
     lower: Vec<u8>,
-    base: (usize, usize),
-    ends: Vec<(usize, usize)>,
+    base: Lengths,
+    ends: Vec<Lengths>,
     text: String,
     name: String,
   }
 
+  struct Above<'a> {
+    keys: &'a [NodeKey],
+    rel_from: usize,
+  }
+
+  struct Lengths {
+    path: usize,
+    lower: usize,
+  }
+
   impl Route<'_> {
-    pub(super) fn take(&mut self, units: impl Iterator<Item = u16> + Clone) -> bool {
+    pub(super) fn follow(&mut self, units: impl Iterator<Item = u16> + Clone) -> bool {
       let Self { path, lower, base, ends, text, name, .. } = self;
       let given = wide_name(units, text);
-      path.truncate(base.0);
-      lower.truncate(base.1);
+      path.truncate(base.path);
+      lower.truncate(base.lower);
       ends.clear();
       let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
       let bytes = given.as_encoded_bytes();
@@ -640,27 +676,27 @@ mod handles {
         // encoded text may be cut there (`OsStr::from_encoded_bytes_unchecked`).
         let part = unsafe { OsStr::from_encoded_bytes_unchecked(part) };
         lower.extend_from_slice(lower_name(part, name).as_encoded_bytes());
-        ends.push((path.len(), lower.len()));
+        ends.push(Lengths { path: path.len(), lower: lower.len() });
       }
       !ends.is_empty()
     }
 
     pub(super) fn is_at_a_key(&self) -> bool {
-      self.at.contains_key(cut(&self.lower, 0, self.lower.len()))
+      self.keys_at.contains_key(cut(&self.lower, 0, self.lower.len()))
     }
 
-    pub(super) fn keys(&self, found: &mut dyn FnMut(NodeKey, &Path)) {
+    pub(super) fn each_key(&self, found: &mut dyn FnMut(NodeKey, &Path)) {
       let len = self.path.len();
-      for &(end, lower_end) in self.ends.iter().rev() {
-        let Some(keys) = self.at.get(cut(&self.lower, 0, lower_end)) else { continue };
-        let rel = cut(&self.path, (end + 1).min(len), len);
+      for end in self.ends.iter().rev() {
+        let Some(keys) = self.keys_at.get(cut(&self.lower, 0, end.lower)) else { continue };
+        let rel = cut(&self.path, (end.path + 1).min(len), len);
         for &key in keys {
           found(key, rel);
         }
       }
-      for &(keys, below) in &self.above {
-        let rel = cut(&self.path, below, len);
-        for &key in keys {
+      for above in &self.above {
+        let rel = cut(&self.path, above.rel_from, len);
+        for &key in above.keys {
           found(key, rel);
         }
       }
@@ -941,29 +977,7 @@ mod port {
           }
           continue;
         }
-        let packet = match self.next_rest() {
-          None => match self.deliver_after {
-            None => self.iocp.wait(INFINITE),
-            Some(after) => {
-              let wait = after.duration_since(SystemTime::now()).unwrap_or(Duration::ZERO);
-              self.iocp.wait(u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1))
-            }
-          },
-          Some(at) => {
-            let now = Instant::now();
-            if at <= now {
-              self.rearm(Some(now));
-              continue;
-            }
-            match self.iocp.wait(0) {
-              Packet::Timeout => {
-                thread::sleep(at.saturating_duration_since(now));
-                continue;
-              }
-              packet => packet,
-            }
-          }
-        };
+        let Some(packet) = self.next_packet() else { continue };
         match packet {
           Packet::Wake => {
             if !self.run_commands() {
@@ -972,7 +986,7 @@ mod port {
           }
           Packet::Completed { id, result } => self.completed(id, result, false),
           Packet::Timeout => {}
-          Packet::Nothing(error) => {
+          Packet::Failed(error) => {
             self.sink.failed(error);
             break;
           }
@@ -981,12 +995,36 @@ mod port {
       self.stop();
     }
 
+    fn next_packet(&mut self) -> Option<Packet> {
+      let Some(at) = self.next_rest() else {
+        return Some(match self.deliver_after {
+          None => self.iocp.wait(INFINITE),
+          Some(after) => {
+            let wait = after.duration_since(SystemTime::now()).unwrap_or(Duration::ZERO);
+            self.iocp.wait(u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1))
+          }
+        });
+      };
+      let now = Instant::now();
+      if at <= now {
+        self.rearm(|rest| rest <= now);
+        return None;
+      }
+      match self.iocp.wait(0) {
+        Packet::Timeout => {
+          thread::sleep(at.saturating_duration_since(now));
+          None
+        }
+        packet => Some(packet),
+      }
+    }
+
     fn next_rest(&self) -> Option<Instant> {
       self.watches.values().filter_map(|watch| watch.rest_until).min()
     }
 
     fn read_empty(&mut self) -> bool {
-      self.rearm(None);
+      self.rearm(|_| true);
       loop {
         let began = SystemTime::now();
         match self.iocp.wait(0) {
@@ -1003,7 +1041,7 @@ mod port {
               return false;
             }
           }
-          Packet::Nothing(error) => {
+          Packet::Failed(error) => {
             self.sink.failed(error);
             return false;
           }
@@ -1011,8 +1049,8 @@ mod port {
       }
     }
 
-    fn rearm(&mut self, now: Option<Instant>) {
-      let over = |watch: &Watch| watch.rest_until.is_some_and(|at| now.is_none_or(|now| at <= now));
+    fn rearm(&mut self, is_due: impl Fn(Instant) -> bool) {
+      let over = |watch: &Watch| watch.rest_until.is_some_and(&is_due);
       let due: Vec<WatchId> =
         self.watches.iter().filter(|(_, w)| over(w)).map(|(&id, _)| id).collect();
       for id in due {
@@ -1064,8 +1102,10 @@ mod port {
     fn close(&mut self, id: WatchId) {
       let Some(watch) = self.watches.get_mut(&id) else { return };
       let resting = watch.rest_until.take().is_some();
-      watch.closing =
-        if resting && watch.read().is_ok() { Closing::LastRead } else { Closing::Asked };
+      if resting && watch.last_read() {
+        return;
+      }
+      watch.closing = Closing::Asked;
       if watch.pending {
         watch.cancel();
       } else {
@@ -1095,9 +1135,7 @@ mod port {
       if watch.closing != Closing::No {
         if let Ok(records) = result {
           self.sink.raw(watch.raw(id, Ok(records)));
-          let before = mem::replace(&mut watch.closing, Closing::LastRead);
-          if before == Closing::Asked && watch.read().is_ok() {
-            watch.cancel();
+          if watch.closing == Closing::Asked && watch.last_read() {
             return;
           }
         }
@@ -1151,7 +1189,7 @@ mod port {
             }
           }
           Packet::Wake => {}
-          Packet::Timeout | Packet::Nothing(_) => break,
+          Packet::Timeout | Packet::Failed(_) => break,
         }
       }
     }
@@ -1233,6 +1271,15 @@ mod port {
         unsafe { CancelIoEx(self.dir.as_raw_handle(), &raw const *self.overlapped) };
       }
     }
+
+    fn last_read(&mut self) -> bool {
+      self.closing = Closing::LastRead;
+      let queued = self.read().is_ok();
+      if queued {
+        self.cancel();
+      }
+      queued
+    }
   }
 
   impl Drop for Watch {
@@ -1292,7 +1339,7 @@ mod port {
         (true, Err(error)) if error.raw_os_error() == Some(WAIT_TIMEOUT.cast_signed()) => {
           Packet::Timeout
         }
-        (true, Err(error)) => Packet::Nothing(error),
+        (true, Err(error)) => Packet::Failed(error),
       }
     }
   }
@@ -1301,7 +1348,7 @@ mod port {
     Wake,
     Completed { id: WatchId, result: io::Result<u32> },
     Timeout,
-    Nothing(io::Error),
+    Failed(io::Error),
   }
 
   type ReadExtended = unsafe extern "system" fn(

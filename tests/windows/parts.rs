@@ -292,7 +292,7 @@ mod handles {
 
   use pathwatch::backend::{
     Coverage, NodeKey, Want, is_watch_limit,
-    windows::{Handles, MAX_HANDLES, System, Told, WatchId, place},
+    windows::{Handles, MAX_HANDLES, Report, System, WatchId, place},
   };
 
   use super::{dir, key};
@@ -401,9 +401,9 @@ mod handles {
     }
 
     /// Keeps what a call told, and checks what holds after it.
-    fn told(&mut self, told: Told) {
-      self.lost.extend(told.lost.into_iter().map(NodeKey::index));
-      self.covered.extend(told.covered.into_iter().map(NodeKey::index));
+    fn told(&mut self, report: Report) {
+      self.lost.extend(report.lost.into_iter().map(NodeKey::index));
+      self.covered.extend(report.covered.into_iter().map(NodeKey::index));
       self.check();
     }
 
