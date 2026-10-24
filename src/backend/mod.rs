@@ -56,7 +56,7 @@ pub struct Committed {
   pub failed: Vec<(NodeKey, io::Error)>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Want {
   Names,
   Contents,

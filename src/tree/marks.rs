@@ -14,7 +14,7 @@ use crate::{
   path::split_top,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq)]
 enum Said {
   Changed,
   Written,
@@ -102,8 +102,7 @@ impl Tree {
       let (child, has_other) = self.spellings(at, name);
       let below = child.map(|child| self.slots.linked(child));
       let is_dir = below.is_some_and(Node::is_dir);
-      let parent = self.slots.linked(at);
-      let is_complete = parent.is_complete();
+      let is_complete = self.slots.linked(at).is_complete();
       let is_seen = below.is_some_and(Node::is_registered) || is_complete;
       if self.loose_spelling && is_complete && !below.is_some_and(Node::is_entry) && !is_plain(name)
       {
@@ -177,10 +176,7 @@ impl Tree {
 
   pub fn queue_scan(&mut self, key: NodeKey, depth: Depth) {
     let Some(dir) = self[key].dir_mut() else { return };
-    if let Some(old) = dir.scan {
-      dir.scan = Some(old.max(depth));
-    } else {
-      dir.scan = Some(depth);
+    if dir.scan.replace(dir.scan.map_or(depth, |old| old.max(depth))).is_none() {
       self.to_scan.push(key);
     }
   }
@@ -246,9 +242,7 @@ impl Tree {
     polled.sort_unstable();
     polled.dedup();
     polled.retain(|&key| {
-      self
-        .get(key)
-        .is_some_and(|node: &Node| matches!(node.kind, Kind::Dir(dir) if dir.is_polled()))
+      self.get(key).is_some_and(|node| matches!(node.kind, Kind::Dir(dir) if dir.is_polled()))
     });
     if let Some(room) = room_to_keep(polled.len(), polled.capacity()) {
       polled.shrink_to(room);

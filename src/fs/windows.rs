@@ -334,8 +334,8 @@ pub(super) fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::R
 fn record(bytes: &[u8], volume: u64) -> Option<(usize, &[u8], Entry)> {
   let u32_at = |at: usize| Some(u32::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
   let u64_at = |at: usize| Some(u64::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
-  let next = usize::try_from(u32_at(NEXT)?).ok()?;
-  let name_bytes = bytes.get(NAME..)?.get(..usize::try_from(u32_at(NAME_BYTES)?).ok()?)?;
+  let next = u32_at(NEXT)? as usize;
+  let name_bytes = bytes.get(NAME..)?.get(..u32_at(NAME_BYTES)? as usize)?;
   if next != 0 && (next < NAME + name_bytes.len() || next >= bytes.len()) {
     return None;
   }

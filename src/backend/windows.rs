@@ -148,14 +148,13 @@ mod place {
     max: usize,
     is_link: &mut dyn FnMut(&Path) -> bool,
   ) -> Vec<Place> {
-    let mut wanted: Vec<_> =
-      wanted.iter().copied().filter(|&(_, dir, _)| may_watch_a_tree(dir)).collect();
+    let mut wanted = wanted.to_vec();
     wanted.sort_by(|a, b| a.1.cmp(b.1));
 
     let mut tops: Vec<&Path> = Vec::new();
     for &(_, dir, want) in &wanted {
       let below_a_top = tops.last().is_some_and(|top| dir.starts_with(top));
-      if want == Want::Contents && !below_a_top {
+      if want == Want::Contents && !below_a_top && may_watch_a_tree(dir) {
         tops.push(dir);
       }
     }
@@ -271,7 +270,7 @@ mod handles {
     fn is_link(&mut self, path: &Path) -> bool;
   }
 
-  #[derive(Debug, Default, PartialEq, Eq)]
+  #[derive(Debug, Default)]
   pub struct Told {
     pub lost: Vec<NodeKey>,
     pub covered: Vec<NodeKey>,
@@ -764,16 +763,16 @@ mod records {
   fn split_first(bytes: &[u8], layout: Layout) -> Option<(Record<'_>, Option<&[u8]>)> {
     let next = field(bytes, NEXT_ENTRY_OFFSET)?;
     let action = field(bytes, ACTION)?;
-    let name_len = usize::try_from(field(bytes, layout.name_length)?).ok()?;
+    let name_len = field(bytes, layout.name_length)? as usize;
     let name = bytes.get(layout.name..)?.get(..name_len)?;
     let is_dir = match layout.attributes {
       Some(at) => Some(field(bytes, at)? & FILE_ATTRIBUTE_DIRECTORY != 0),
       None => None,
     };
-    if name_len % 2 != 0 {
+    if !name_len.is_multiple_of(2) {
       return None;
     }
-    let rest = match usize::try_from(next).ok()? {
+    let rest = match next as usize {
       0 => None,
       next if next >= layout.name + name_len => Some(bytes.get(next..)?),
       _ => return None,
@@ -1170,7 +1169,7 @@ mod port {
     rest_until: Option<Instant>,
   }
 
-  #[derive(Clone, Copy, PartialEq, Eq)]
+  #[derive(PartialEq)]
   enum Closing {
     No,
     Asked,

@@ -481,10 +481,10 @@ struct Running {
 
 pub fn is_too_high(dir: &Path) -> bool {
   let dir = dir.strip_prefix(DATA_VOLUME).unwrap_or(dir);
-  let names: Vec<&[u8]> = dir.iter().filter(|&name| name != "/").map(OsStrExt::as_bytes).collect();
-  match names.as_slice() {
-    [] | [_] | [_, _] => true,
-    [b"private", b"var", b"folders", below @ ..] => below.len() <= 3,
+  let mut names = dir.iter().filter(|&name| name != "/").map(OsStrExt::as_bytes);
+  match [names.next(), names.next(), names.next()] {
+    [_, _, None] => true,
+    [Some(b"private"), Some(b"var"), Some(b"folders")] => names.count() <= 3,
     _ => false,
   }
 }

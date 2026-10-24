@@ -119,7 +119,7 @@ pub enum Kind {
   Dir(Dir),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Fingerprint {
   pub modified: i64,
   pub size: u64,
@@ -155,7 +155,7 @@ impl Dir {
   }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum Watch {
   #[default]
   None,
@@ -183,14 +183,14 @@ pub enum Depth {
   Deep,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Added {
   No,
   Path,
   Registered,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Content {
   Hash(u64),
   Unknown,
@@ -319,7 +319,7 @@ impl Tree {
       *slot = Slot::Live(Node::new(generation, parent, name_at));
       index
     } else {
-      let index = u32::try_from(self.slots.len()).expect("the arena holds fewer than 2^32 nodes");
+      let index = u32::try_from(slots).expect("the arena holds fewer than 2^32 nodes");
       self.slots.push(Slot::Live(Node::new(self.first_generation, parent, name_at)));
       index
     };

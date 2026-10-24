@@ -379,8 +379,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       _ => None,
     };
     let same = old == Some(fingerprint);
-    let young = kind != FileType::Other && self.is_young(key, fingerprint.modified, same);
     let only_polled = self.only_polled(key);
+    let young =
+      kind != FileType::Other && self.is_young(key, fingerprint.modified, same, only_polled);
     let trusts_hints = self.options.written_hints && !only_polled;
     let kept = if same { self.tree.content(key) } else { None };
     let hash = if matches!(kept, Some(Content::Hash(_))) || (young && !trusts_hints) {
@@ -417,7 +418,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       node.set_changed(true);
     }
     node.kind = Kind::File(fingerprint);
-    if node.changed() || old.is_none() {
+    if changed || old.is_none() {
       self.touched.push(key);
     }
     self.tree.unhold(key);
@@ -428,7 +429,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     };
     self.tree.set_content(key, content);
     if young && trusts_hints {
-      self.await_delivery(key, fingerprint.modified);
+      self.await_delivery(key, fingerprint.modified, only_polled);
     }
   }
 
@@ -462,7 +463,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  fn is_young(&mut self, key: NodeKey, modified: i64, same: bool) -> bool {
+  fn is_young(&mut self, key: NodeKey, modified: i64, same: bool, only_polled: bool) -> bool {
     if self.is_ahead(modified) {
       let now = self.now.expect("a check runs inside a flush");
       let since = self.tree.ahead_since(key).filter(|_| same).unwrap_or(now);
@@ -470,20 +471,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       return now.saturating_duration_since(since) < YOUNG_COARSE;
     }
     self.tree.set_ahead_since(key, None);
-    self.flush_time.saturating_sub(modified) < nanos_of(self.youth(key, modified))
+    self.flush_time.saturating_sub(modified) < nanos_of(youth(modified, only_polled))
   }
 
   fn is_ahead(&self, modified: i64) -> bool {
     modified.saturating_sub(self.flush_time) >= nanos_of(YOUNG_COARSE)
-  }
-
-  fn youth(&self, key: NodeKey, modified: i64) -> Duration {
-    if (modified >= 0 && modified % nanos_of(Duration::from_secs(1)) == 0) || self.only_polled(key)
-    {
-      YOUNG_COARSE
-    } else {
-      YOUNG
-    }
   }
 
   fn only_polled(&self, key: NodeKey) -> bool {
@@ -491,8 +483,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       || self.tree.link(key).is_some()
   }
 
-  fn await_delivery(&mut self, key: NodeKey, modified: i64) {
-    if let Some(old_at) = self.old_at(key, modified) {
+  fn await_delivery(&mut self, key: NodeKey, modified: i64, only_polled: bool) {
+    if let Some(old_at) = self.old_at(modified, only_polled) {
       self.pending.push(Reverse((old_at, key)));
     }
     if self.pending.len() > 2 * self.tree.content_count() + 64 {
@@ -502,12 +494,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.ask_delivered();
   }
 
-  fn old_at(&self, key: NodeKey, modified: i64) -> Option<i64> {
-    if self.is_ahead(modified) {
-      None
-    } else {
-      Some(modified.saturating_add(nanos_of(self.youth(key, modified))))
-    }
+  fn old_at(&self, modified: i64, only_polled: bool) -> Option<i64> {
+    let youth = nanos_of(youth(modified, only_polled));
+    (!self.is_ahead(modified)).then(|| modified.saturating_add(youth))
   }
 
   pub(super) fn forget_delivered(&mut self) {
@@ -523,7 +512,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if self.tree.content(key) != Some(Content::Pending) {
         continue;
       }
-      match self.old_at(key, file.modified) {
+      match self.old_at(file.modified, self.only_polled(key)) {
         Some(old_at) if old_at <= self.delivered => self.tree.set_content(key, None),
         Some(old_at) => later.push(Reverse((old_at, key))),
         None => {}
@@ -549,6 +538,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       backend.ask_delivered(at);
     }
   }
+}
+
+fn youth(modified: i64, only_polled: bool) -> Duration {
+  let whole_second = modified >= 0 && modified % nanos_of(Duration::from_secs(1)) == 0;
+  if whole_second || only_polled { YOUNG_COARSE } else { YOUNG }
 }
 
 fn young_dir(flush_time: i64, modified: i64) -> bool {

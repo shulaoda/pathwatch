@@ -75,10 +75,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   fn set_watch(&mut self, key: NodeKey, watch: Watch) {
-    if let Some(dir) = self.tree[key].dir_mut() {
-      dir.watch = watch;
+    if let Some(dir) = self.tree[key].dir_mut()
+      && mem::replace(&mut dir.watch, watch) != watch
+    {
+      self.tree.list_if_polled(key);
     }
-    self.tree.list_if_polled(key);
   }
 
   fn store_answer(&mut self, key: NodeKey, answer: Coverage, path: &Path) {

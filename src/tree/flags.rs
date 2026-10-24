@@ -4,7 +4,7 @@ use super::{Added, Mark, Node};
 use crate::config::EntryKind;
 
 bitflags! {
-  #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+  #[derive(Debug)]
   pub(super) struct Flags: u16 {
     const HELD = 1 << 0;
     const TOLD = 1 << 1;
