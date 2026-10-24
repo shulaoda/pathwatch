@@ -36,7 +36,7 @@ use windows_sys::Win32::{
 
 use super::{DirId, Entry, FileType, Meta, meta};
 
-pub const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+pub(crate) const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 const TO_1970: u64 = 116_444_736_000_000_000;
 const NAME_SURROGATE: u32 = 0x2000_0000;
 
@@ -60,7 +60,7 @@ fn meta_of(kind: FileType, written: u64, size: u64, dir_id: DirId) -> Meta {
   Meta { kind, modified, size, file_id: dir_id.inode, dir_id }
 }
 
-pub fn classify(error: io::Error) -> io::Error {
+pub(super) fn classify(error: io::Error) -> io::Error {
   #[link(name = "ntdll")]
   unsafe extern "system" {
     safe fn RtlGetLastNtStatus() -> NTSTATUS;
@@ -95,11 +95,55 @@ impl fmt::Display for DeletePending {
 
 impl Error for DeletePending {}
 
-pub fn is_delete_pending(error: &io::Error) -> bool {
+pub(crate) fn is_delete_pending(error: &io::Error) -> bool {
   error.get_ref().is_some_and(<dyn Error + Send + Sync>::is::<DeletePending>)
 }
 
-pub fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
+fn is_odd(path: &Path) -> bool {
+  let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
+  let mut names = path.as_os_str().as_encoded_bytes().split(is_separator);
+  names.any(|name| {
+    let cut_off = matches!(name.last(), Some(b'.' | b' ')) && name != b"." && name != b"..";
+    cut_off || is_device(name)
+  })
+}
+
+fn is_device(name: &[u8]) -> bool {
+  let end = name.iter().position(|byte| matches!(byte, b'.' | b':')).unwrap_or(name.len());
+  let stem = name[..end].trim_ascii_end();
+  let is = |device: &[u8]| stem.eq_ignore_ascii_case(device);
+  let is_port =
+    |port: &[u8]| port.eq_ignore_ascii_case(b"COM") || port.eq_ignore_ascii_case(b"LPT");
+  match stem {
+    [_, _, _] => is(b"CON") || is(b"PRN") || is(b"AUX") || is(b"NUL"),
+    [port @ .., digit] if port.len() == 3 && digit.is_ascii_digit() => is_port(port),
+    [port @ .., 0xC2, 0xB2 | 0xB3 | 0xB9] if port.len() == 3 => is_port(port),
+    _ => is(b"CONIN$") || is(b"CONOUT$"),
+  }
+}
+
+pub(crate) fn literal(path: &Path) -> Cow<'_, Path> {
+  if !is_odd(path) {
+    return Cow::Borrowed(path);
+  }
+  Cow::Owned(PathBuf::from(OsString::from_wide(&verbatim(path, true))))
+}
+
+fn verbatim(path: &Path, always: bool) -> Vec<u16> {
+  const SEPARATOR: u16 = b'\\' as u16;
+  let units = path.as_os_str().encode_wide();
+  let units: Vec<u16> =
+    units.map(|unit| if unit == u16::from(b'/') { SEPARATOR } else { unit }).collect();
+  let is_verbatim = units.starts_with(&[SEPARATOR, SEPARATOR, u16::from(b'?'), SEPARATOR]);
+  let (prefix, rest) = match units.as_slice() {
+    units if is_verbatim || (!always && units.len() < MAX_PATH as usize - 12) => ("", units),
+    [SEPARATOR, rest @ ..] if rest.first() == Some(&SEPARATOR) => (r"\\?\UNC", rest),
+    units => (r"\\?\", units),
+  };
+  prefix.encode_utf16().chain(rest.iter().copied()).collect()
+}
+
+pub(super) fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
   match by_name(path) {
     Some(Ok(found)) if follow && found.kind == FileType::Symlink => {}
     Some(result) => return result,
@@ -131,7 +175,7 @@ struct StatBasic {
 type ByName = unsafe extern "system" fn(*const u16, i32, *mut c_void, u32) -> i32;
 const STAT_BASIC: i32 = 3;
 
-pub fn kernel32(name: &CStr) -> FARPROC {
+pub(crate) fn kernel32(name: &CStr) -> FARPROC {
   // SAFETY: both names end with a NUL. `kernel32.dll` is loaded in every process and is
   // never unloaded, so the address stays good.
   unsafe { GetProcAddress(GetModuleHandleW(windows_sys::w!("kernel32.dll")), name.as_ptr().cast()) }
@@ -235,7 +279,7 @@ const TAG: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, EaSize);
 const INDEX: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileId);
 const NAME: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
 
-pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<bool> {
+pub(super) fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<bool> {
   let dir = OpenOptions::new()
     .access_mode(FILE_LIST_DIRECTORY)
     .share_mode(SHARE_ALL)
@@ -314,51 +358,23 @@ fn record(bytes: &[u8], volume: u64) -> Option<(usize, &[u8], Entry)> {
   Some((next, name_bytes, told))
 }
 
-fn is_odd(path: &Path) -> bool {
-  let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
-  let mut names = path.as_os_str().as_encoded_bytes().split(is_separator);
-  names.any(|name| {
-    let cut_off = matches!(name.last(), Some(b'.' | b' ')) && name != b"." && name != b"..";
-    cut_off || is_device(name)
-  })
-}
-
-fn is_device(name: &[u8]) -> bool {
-  let end = name.iter().position(|byte| matches!(byte, b'.' | b':')).unwrap_or(name.len());
-  let stem = name[..end].trim_ascii_end();
-  let is = |device: &[u8]| stem.eq_ignore_ascii_case(device);
-  let is_port =
-    |port: &[u8]| port.eq_ignore_ascii_case(b"COM") || port.eq_ignore_ascii_case(b"LPT");
-  match stem {
-    [_, _, _] => is(b"CON") || is(b"PRN") || is(b"AUX") || is(b"NUL"),
-    [port @ .., digit] if port.len() == 3 && digit.is_ascii_digit() => is_port(port),
-    [port @ .., 0xC2, 0xB2 | 0xB3 | 0xB9] if port.len() == 3 => is_port(port),
-    _ => is(b"CONIN$") || is(b"CONOUT$"),
+pub(crate) fn wide_name(
+  units: impl Iterator<Item = u16> + Clone,
+  text: &mut String,
+) -> Cow<'_, OsStr> {
+  text.clear();
+  let decoded = char::decode_utf16(units.clone()).try_for_each(|unit| unit.map(|c| text.push(c)));
+  match decoded {
+    Ok(()) => Cow::Borrowed(OsStr::new(text.as_str())),
+    Err(_) => Cow::Owned(OsString::from_wide(&units.collect::<Vec<u16>>())),
   }
 }
 
-pub(crate) fn literal(path: &Path) -> Cow<'_, Path> {
-  if !is_odd(path) {
-    return Cow::Borrowed(path);
-  }
-  Cow::Owned(PathBuf::from(OsString::from_wide(&verbatim(path, true))))
+pub(super) fn has_separator(name: &OsStr) -> bool {
+  name.as_encoded_bytes().iter().any(|&byte| matches!(byte, b'\\' | b'/'))
 }
 
-fn verbatim(path: &Path, always: bool) -> Vec<u16> {
-  const SEPARATOR: u16 = b'\\' as u16;
-  let units = path.as_os_str().encode_wide();
-  let units: Vec<u16> =
-    units.map(|unit| if unit == u16::from(b'/') { SEPARATOR } else { unit }).collect();
-  let is_verbatim = units.starts_with(&[SEPARATOR, SEPARATOR, u16::from(b'?'), SEPARATOR]);
-  let (prefix, rest) = match units.as_slice() {
-    units if is_verbatim || (!always && units.len() < MAX_PATH as usize - 12) => ("", units),
-    [SEPARATOR, rest @ ..] if rest.first() == Some(&SEPARATOR) => (r"\\?\UNC", rest),
-    units => (r"\\?\", units),
-  };
-  prefix.encode_utf16().chain(rest.iter().copied()).collect()
-}
-
-pub fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
+pub(super) fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
   let path = &*literal(path);
   let opened = OpenOptions::new()
     .read(true)
@@ -378,23 +394,7 @@ pub fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
   Ok(file.metadata()?.is_file().then_some(file))
 }
 
-pub(super) fn has_separator(name: &OsStr) -> bool {
-  name.as_encoded_bytes().iter().any(|&byte| matches!(byte, b'\\' | b'/'))
-}
-
-pub(crate) fn wide_name(
-  units: impl Iterator<Item = u16> + Clone,
-  text: &mut String,
-) -> Cow<'_, OsStr> {
-  text.clear();
-  let decoded = char::decode_utf16(units.clone()).try_for_each(|unit| unit.map(|c| text.push(c)));
-  match decoded {
-    Ok(()) => Cow::Borrowed(OsStr::new(text.as_str())),
-    Err(_) => Cow::Owned(OsString::from_wide(&units.collect::<Vec<u16>>())),
-  }
-}
-
-pub fn name_on_disk(path: &Path) -> io::Result<OsString> {
+pub(super) fn name_on_disk(path: &Path) -> io::Result<OsString> {
   let mut wide = verbatim(path, is_odd(path));
   wide.push(0);
   // SAFETY: all zeros is a valid value of this plain struct of numbers.
@@ -448,126 +448,6 @@ mod tests {
     read_dir, stat,
   };
   use crate::fs::{Entry, FileType, Fs, StdFs};
-
-  fn junction(link: &Path, target: &Path) {
-    let made = Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output();
-    assert!(made.is_ok_and(|output| output.status.success()), "mklink /J failed");
-  }
-
-  #[test]
-  fn the_call_by_name_tells_what_the_handle_tells() {
-    let top = tempfile::tempdir().unwrap();
-    let (file, dir, link) =
-      (top.path().join("file"), top.path().join("dir"), top.path().join("link"));
-    fs::write(&file, "written").unwrap();
-    fs::create_dir(&dir).unwrap();
-    junction(&link, &dir);
-    if by_name(&file).is_none() {
-      return;
-    }
-    for (path, kind) in [(&file, FileType::File), (&dir, FileType::Dir), (&link, FileType::Symlink)]
-    {
-      let named = by_name(path).unwrap().unwrap();
-      let opened = by_handle(path, false).unwrap();
-      assert_eq!(named, opened, "{}", path.display());
-      assert_eq!(named.kind, kind);
-    }
-    assert_eq!(stat(&link, true).unwrap().dir_id, stat(&dir, false).unwrap().dir_id);
-    for missing in [top.path().join("none"), file.join("below a file")] {
-      assert_eq!(stat(&missing, false).unwrap_err().kind(), io::ErrorKind::NotFound);
-    }
-  }
-
-  #[test]
-  fn the_listing_tells_of_a_file_what_lstat_tells() {
-    let top = tempfile::tempdir().unwrap();
-    fs::create_dir(top.path().join("dir")).unwrap();
-    junction(&top.path().join("link"), &top.path().join("dir"));
-    fs::write(top.path().join("file"), "written").unwrap();
-    let list = || {
-      let mut seen = Vec::new();
-      let listed = read_dir(top.path(), &mut |name, entry| seen.push((name.to_owned(), entry)));
-      seen.sort_by(|a, b| a.0.cmp(&b.0));
-      listed.unwrap().then_some(seen)
-    };
-    let Some(seen) = list() else { return };
-    let [
-      (_, Entry::Dir { id, modified: dir_modified }),
-      (_, Entry::File { modified, size, file_id }),
-      (_, Entry::Kind(FileType::Symlink)),
-    ] = seen[..]
-    else {
-      panic!("{seen:?}");
-    };
-    let meta = stat(&top.path().join("file"), false).unwrap();
-    assert_eq!((modified, size, file_id), (meta.modified, meta.size, meta.file_id));
-    let dir = top.path().join("dir");
-    let dir_meta = stat(&dir, false).unwrap();
-    assert_eq!((id, dir_modified), (dir_meta.dir_id, dir_meta.modified));
-    assert_eq!(id, by_handle(&dir, false).unwrap().dir_id);
-
-    assert!(!read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap());
-    let error = StdFs.read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::NotADirectory, "{error:?}");
-
-    let mut writer = fs::OpenOptions::new().append(true).open(top.path().join("file")).unwrap();
-    writer.write_all(b" and more").unwrap();
-    let size = || match list().as_deref() {
-      Some([_, (_, Entry::File { size, .. }), _]) => *size,
-      seen => panic!("{seen:?}"),
-    };
-    assert_eq!(size(), 7, "the listing knows the new size before the writer closed the file");
-    drop(writer);
-    assert_eq!(size(), 16);
-  }
-
-  #[test]
-  fn the_name_on_disk() {
-    let top = tempfile::tempdir().unwrap();
-    let mut dir = top.path().to_owned();
-    for _ in 0..3 {
-      dir.push("d".repeat(100));
-      assert_eq!(name_on_disk(&dir.join("ReadMe.md")).unwrap_err().kind(), io::ErrorKind::NotFound);
-      fs::create_dir(&dir).unwrap();
-      fs::write(dir.join("ReadMe.md"), "1").unwrap();
-      for spelled in ["ReadMe.md", "README.MD", "readme.md"] {
-        assert_eq!(name_on_disk(&dir.join(spelled)).unwrap(), "ReadMe.md", "{}", dir.display());
-      }
-    }
-  }
-
-  struct Unlisted(PathBuf);
-
-  impl Unlisted {
-    fn new(dir: &Path) -> Self {
-      let user = env::var("USERNAME").unwrap();
-      let denied =
-        Command::new("icacls").arg(dir).args(["/deny", &format!("{user}:(RD)")]).output();
-      assert!(denied.is_ok_and(|output| output.status.success()), "icacls /deny failed");
-      Self(dir.to_owned())
-    }
-  }
-
-  impl Drop for Unlisted {
-    fn drop(&mut self) {
-      let user = env::var("USERNAME").unwrap();
-      let _ = Command::new("icacls").arg(&self.0).args(["/remove:d", &user]).output();
-    }
-  }
-
-  #[test]
-  fn the_name_on_disk_in_a_directory_that_may_not_be_listed() {
-    let top = tempfile::tempdir().unwrap();
-    let dir = top.path().join("closed");
-    fs::create_dir(&dir).unwrap();
-    fs::write(dir.join("ReadMe.md"), "1").unwrap();
-    let _unlisted = Unlisted::new(&dir);
-    assert!(fs::read_dir(&dir).is_err(), "the directory can still be listed");
-    assert_eq!(stat(&dir.join("readme.md"), false).unwrap().kind, FileType::File);
-    assert_eq!(name_on_disk(&dir.join("readme.md")).unwrap(), "readme.md");
-    assert_eq!(name_on_disk(&dir.join("gone.md")).unwrap(), "gone.md");
-    assert_eq!(stat(&dir.join("gone.md"), false).unwrap_err().kind(), io::ErrorKind::NotFound);
-  }
 
   fn dispose(holder: &fs::File, delete: bool) {
     let info = FILE_DISPOSITION_INFO { DeleteFile: delete };
@@ -688,6 +568,35 @@ mod tests {
     assert_eq!(stat(&dir.join("x.txt"), false).unwrap().size, 1);
   }
 
+  fn junction(link: &Path, target: &Path) {
+    let made = Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output();
+    assert!(made.is_ok_and(|output| output.status.success()), "mklink /J failed");
+  }
+
+  #[test]
+  fn the_call_by_name_tells_what_the_handle_tells() {
+    let top = tempfile::tempdir().unwrap();
+    let (file, dir, link) =
+      (top.path().join("file"), top.path().join("dir"), top.path().join("link"));
+    fs::write(&file, "written").unwrap();
+    fs::create_dir(&dir).unwrap();
+    junction(&link, &dir);
+    if by_name(&file).is_none() {
+      return;
+    }
+    for (path, kind) in [(&file, FileType::File), (&dir, FileType::Dir), (&link, FileType::Symlink)]
+    {
+      let named = by_name(path).unwrap().unwrap();
+      let opened = by_handle(path, false).unwrap();
+      assert_eq!(named, opened, "{}", path.display());
+      assert_eq!(named.kind, kind);
+    }
+    assert_eq!(stat(&link, true).unwrap().dir_id, stat(&dir, false).unwrap().dir_id);
+    for missing in [top.path().join("none"), file.join("below a file")] {
+      assert_eq!(stat(&missing, false).unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+  }
+
   #[test]
   fn the_time_is_of_now_and_a_file_made_again_is_another_file() {
     let top = tempfile::tempdir().unwrap();
@@ -704,5 +613,96 @@ mod tests {
     let again = stat(&file, false).unwrap();
     assert_ne!(first.file_id, again.file_id);
     assert_eq!(StdFs.lstat(&file).unwrap().file_id, again.file_id);
+  }
+
+  #[test]
+  fn the_listing_tells_of_a_file_what_lstat_tells() {
+    let top = tempfile::tempdir().unwrap();
+    fs::create_dir(top.path().join("dir")).unwrap();
+    junction(&top.path().join("link"), &top.path().join("dir"));
+    fs::write(top.path().join("file"), "written").unwrap();
+    let list = || {
+      let mut seen = Vec::new();
+      let listed = read_dir(top.path(), &mut |name, entry| seen.push((name.to_owned(), entry)));
+      seen.sort_by(|a, b| a.0.cmp(&b.0));
+      listed.unwrap().then_some(seen)
+    };
+    let Some(seen) = list() else { return };
+    let [
+      (_, Entry::Dir { id, modified: dir_modified }),
+      (_, Entry::File { modified, size, file_id }),
+      (_, Entry::Kind(FileType::Symlink)),
+    ] = seen[..]
+    else {
+      panic!("{seen:?}");
+    };
+    let meta = stat(&top.path().join("file"), false).unwrap();
+    assert_eq!((modified, size, file_id), (meta.modified, meta.size, meta.file_id));
+    let dir = top.path().join("dir");
+    let dir_meta = stat(&dir, false).unwrap();
+    assert_eq!((id, dir_modified), (dir_meta.dir_id, dir_meta.modified));
+    assert_eq!(id, by_handle(&dir, false).unwrap().dir_id);
+
+    assert!(!read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap());
+    let error = StdFs.read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotADirectory, "{error:?}");
+
+    let mut writer = fs::OpenOptions::new().append(true).open(top.path().join("file")).unwrap();
+    writer.write_all(b" and more").unwrap();
+    let size = || match list().as_deref() {
+      Some([_, (_, Entry::File { size, .. }), _]) => *size,
+      seen => panic!("{seen:?}"),
+    };
+    assert_eq!(size(), 7, "the listing knows the new size before the writer closed the file");
+    drop(writer);
+    assert_eq!(size(), 16);
+  }
+
+  #[test]
+  fn the_name_on_disk() {
+    let top = tempfile::tempdir().unwrap();
+    let mut dir = top.path().to_owned();
+    for _ in 0..3 {
+      dir.push("d".repeat(100));
+      assert_eq!(name_on_disk(&dir.join("ReadMe.md")).unwrap_err().kind(), io::ErrorKind::NotFound);
+      fs::create_dir(&dir).unwrap();
+      fs::write(dir.join("ReadMe.md"), "1").unwrap();
+      for spelled in ["ReadMe.md", "README.MD", "readme.md"] {
+        assert_eq!(name_on_disk(&dir.join(spelled)).unwrap(), "ReadMe.md", "{}", dir.display());
+      }
+    }
+  }
+
+  struct Unlisted(PathBuf);
+
+  impl Unlisted {
+    fn new(dir: &Path) -> Self {
+      let user = env::var("USERNAME").unwrap();
+      let denied =
+        Command::new("icacls").arg(dir).args(["/deny", &format!("{user}:(RD)")]).output();
+      assert!(denied.is_ok_and(|output| output.status.success()), "icacls /deny failed");
+      Self(dir.to_owned())
+    }
+  }
+
+  impl Drop for Unlisted {
+    fn drop(&mut self) {
+      let user = env::var("USERNAME").unwrap();
+      let _ = Command::new("icacls").arg(&self.0).args(["/remove:d", &user]).output();
+    }
+  }
+
+  #[test]
+  fn the_name_on_disk_in_a_directory_that_may_not_be_listed() {
+    let top = tempfile::tempdir().unwrap();
+    let dir = top.path().join("closed");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("ReadMe.md"), "1").unwrap();
+    let _unlisted = Unlisted::new(&dir);
+    assert!(fs::read_dir(&dir).is_err(), "the directory can still be listed");
+    assert_eq!(stat(&dir.join("readme.md"), false).unwrap().kind, FileType::File);
+    assert_eq!(name_on_disk(&dir.join("readme.md")).unwrap(), "readme.md");
+    assert_eq!(name_on_disk(&dir.join("gone.md")).unwrap(), "gone.md");
+    assert_eq!(stat(&dir.join("gone.md"), false).unwrap_err().kind(), io::ErrorKind::NotFound);
   }
 }

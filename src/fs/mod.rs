@@ -88,6 +88,27 @@ pub struct DirId {
   pub birth: u64,
 }
 
+pub(crate) fn is_missing(error: &io::Error) -> bool {
+  matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+}
+
+pub(crate) fn is_link_loop(error: &io::Error) -> bool {
+  #[cfg(unix)]
+  const LINK_LOOP: Option<i32> = Some(ELOOP);
+  #[cfg(windows)]
+  const LINK_LOOP: Option<i32> =
+    Some(windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME.cast_signed());
+  #[cfg(not(any(unix, windows)))]
+  const LINK_LOOP: Option<i32> = None;
+
+  LINK_LOOP.is_some_and(|code| error.raw_os_error() == Some(code))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_delete_pending(_error: &io::Error) -> bool {
+  false
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StdFs;
 
@@ -183,44 +204,9 @@ impl Fs for StdFs {
   }
 }
 
-fn meta(metadata: &Metadata, (file_id, dir_id): (u64, DirId)) -> Meta {
-  let kind = if metadata.is_dir() {
-    FileType::Dir
-  } else if metadata.is_symlink() {
-    FileType::Symlink
-  } else if metadata.is_file() {
-    FileType::File
-  } else {
-    FileType::Other
-  };
-  let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-  Meta { kind, modified, size: metadata.len(), file_id, dir_id }
-}
-
-pub(crate) fn is_missing(error: &io::Error) -> bool {
-  matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
-}
-
-pub(crate) fn is_link_loop(error: &io::Error) -> bool {
-  #[cfg(unix)]
-  const LINK_LOOP: Option<i32> = Some(ELOOP);
-  #[cfg(windows)]
-  const LINK_LOOP: Option<i32> =
-    Some(windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME.cast_signed());
-  #[cfg(not(any(unix, windows)))]
-  const LINK_LOOP: Option<i32> = None;
-
-  LINK_LOOP.is_some_and(|code| error.raw_os_error() == Some(code))
-}
-
 #[cfg(not(windows))]
 fn classify(error: io::Error) -> io::Error {
   error
-}
-
-#[cfg(not(windows))]
-pub(crate) fn is_delete_pending(_error: &io::Error) -> bool {
-  false
 }
 
 #[cfg(not(windows))]
@@ -243,6 +229,20 @@ fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
     }),
     Err(error) => Err(error),
   }
+}
+
+fn meta(metadata: &Metadata, (file_id, dir_id): (u64, DirId)) -> Meta {
+  let kind = if metadata.is_dir() {
+    FileType::Dir
+  } else if metadata.is_symlink() {
+    FileType::Symlink
+  } else if metadata.is_file() {
+    FileType::File
+  } else {
+    FileType::Other
+  };
+  let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+  Meta { kind, modified, size: metadata.len(), file_id, dir_id }
 }
 
 #[cfg(unix)]

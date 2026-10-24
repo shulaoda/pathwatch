@@ -47,100 +47,6 @@ fn stat_fs(dir: &Path) -> Option<libc::statfs> {
   (result == 0).then_some(answer)
 }
 
-fn apfs_volume(dir: &Path) -> Option<i32> {
-  let answer = stat_fs(dir)?;
-  if !answer.f_fstypename.map(c_char::cast_unsigned).starts_with(b"apfs\0") {
-    return None;
-  }
-  // SAFETY: a `fsid_t` is two numbers, the device first; `libc` keeps them private.
-  let [device, _] = unsafe { mem::transmute::<libc::fsid_t, [i32; 2]>(answer.f_fsid) };
-  Some(device)
-}
-
-pub fn remote_disk(dir: &Path) -> Option<String> {
-  let answer = stat_fs(dir).filter(|answer| answer.f_flags & MNT_LOCAL.cast_unsigned() == 0)?;
-  let name = answer.f_fstypename.map(c_char::cast_unsigned);
-  let name = name.split(|&byte| byte == 0).next().unwrap_or_default();
-  Some(String::from_utf8_lossy(name).into_owned())
-}
-
-pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<bool> {
-  let Some(volume) = apfs_volume(dir) else { return Ok(false) };
-  let dir = OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(dir)?;
-  let common = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | LOOK;
-  let wanted = attr_list(common, ATTR_DIR_MOUNTSTATUS, ATTR_FILE_DATALENGTH);
-  let mut buffer = [0_u8; 16 * 1024];
-  loop {
-    // SAFETY: `dir` is open, `wanted` is a whole `attrlist` that the call only reads, and the
-    // call writes at most `buffer.len()` bytes into `buffer`.
-    let count = unsafe {
-      libc::getattrlistbulk(
-        dir.as_raw_fd(),
-        (&raw const wanted).cast_mut().cast(),
-        buffer.as_mut_ptr().cast(),
-        buffer.len(),
-        0,
-      )
-    };
-    if count < 0 {
-      let error = io::Error::last_os_error();
-      if error.kind() == io::ErrorKind::Interrupted {
-        continue;
-      }
-      return Err(error);
-    }
-    if count == 0 {
-      return Ok(true);
-    }
-    let mut rest = &buffer[..];
-    for _ in 0..count {
-      let entry = Fields { bytes: rest, at: 0 }.u32().and_then(|len| rest.get(..len as usize));
-      let entry = entry.ok_or_else(|| io::Error::other("getattrlistbulk gave no entry"))?;
-      rest = &rest[entry.len()..];
-      if let Some((name, told)) = record(entry, volume) {
-        each(name, told);
-      }
-    }
-  }
-}
-
-fn record(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
-  let mut fields = Fields { bytes: entry, at: size_of::<u32>() };
-  let [common, _, dir, file, _] = [(); 5].map(|()| fields.u32());
-  let (common, dir, file) = (common?, dir?, file?);
-  let has = |attribute: u32| common & attribute != 0;
-  let failed = has(ATTR_CMN_ERROR) && fields.u32()? != 0;
-  if !has(ATTR_CMN_NAME) {
-    return None;
-  }
-  let name = OsStr::from_bytes(fields.reference()?);
-  let device = if has(ATTR_CMN_DEVID) { Some(fields.i32()?) } else { None };
-  let kind = if has(ATTR_CMN_OBJTYPE) { Some(fields.u32()?) } else { None };
-  let Some(kind) = kind.map(file_type) else { return Some((name, Entry::Name)) };
-  let whole = common & LOOK == LOOK
-    && match kind {
-      FileType::File => file & ATTR_FILE_DATALENGTH != 0,
-      FileType::Dir => dir & ATTR_DIR_MOUNTSTATUS != 0,
-      FileType::Symlink | FileType::Other => false,
-    };
-  if failed || !whole || device != Some(volume) {
-    return Some((name, Entry::Kind(kind)));
-  }
-  let (created, modified, flags, file_id) =
-    (fields.time(), fields.time(), fields.u32()?, fields.u64()?);
-  let told = match (kind, created, modified) {
-    (FileType::Dir, Some(created), Some(modified)) if fields.u32()? == 0 => {
-      let volume = i64::from(volume).cast_unsigned();
-      Entry::Dir { id: DirId { volume, inode: file_id, birth: unsigned_nanos(created) }, modified }
-    }
-    (FileType::File, _, Some(modified)) if flags & SF_DATALESS == 0 => {
-      Entry::File { modified, size: fields.u64()?, file_id }
-    }
-    _ => Entry::Kind(kind),
-  };
-  Some((name, told))
-}
-
 struct Fields<'a> {
   bytes: &'a [u8],
   at: usize,
@@ -187,6 +93,93 @@ fn file_type(object_type: u32) -> FileType {
   }
 }
 
+pub(super) fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<bool> {
+  let Some(volume) = apfs_volume(dir) else { return Ok(false) };
+  let dir = OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(dir)?;
+  let common = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | LOOK;
+  let wanted = attr_list(common, ATTR_DIR_MOUNTSTATUS, ATTR_FILE_DATALENGTH);
+  let mut buffer = [0_u8; 16 * 1024];
+  loop {
+    // SAFETY: `dir` is open, `wanted` is a whole `attrlist` that the call only reads, and the
+    // call writes at most `buffer.len()` bytes into `buffer`.
+    let count = unsafe {
+      libc::getattrlistbulk(
+        dir.as_raw_fd(),
+        (&raw const wanted).cast_mut().cast(),
+        buffer.as_mut_ptr().cast(),
+        buffer.len(),
+        0,
+      )
+    };
+    if count < 0 {
+      let error = io::Error::last_os_error();
+      if error.kind() == io::ErrorKind::Interrupted {
+        continue;
+      }
+      return Err(error);
+    }
+    if count == 0 {
+      return Ok(true);
+    }
+    let mut rest = &buffer[..];
+    for _ in 0..count {
+      let entry = Fields { bytes: rest, at: 0 }.u32().and_then(|len| rest.get(..len as usize));
+      let entry = entry.ok_or_else(|| io::Error::other("getattrlistbulk gave no entry"))?;
+      rest = &rest[entry.len()..];
+      if let Some((name, told)) = record(entry, volume) {
+        each(name, told);
+      }
+    }
+  }
+}
+
+fn apfs_volume(dir: &Path) -> Option<i32> {
+  let answer = stat_fs(dir)?;
+  if !answer.f_fstypename.map(c_char::cast_unsigned).starts_with(b"apfs\0") {
+    return None;
+  }
+  // SAFETY: a `fsid_t` is two numbers, the device first; `libc` keeps them private.
+  let [device, _] = unsafe { mem::transmute::<libc::fsid_t, [i32; 2]>(answer.f_fsid) };
+  Some(device)
+}
+
+fn record(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
+  let mut fields = Fields { bytes: entry, at: size_of::<u32>() };
+  let [common, _, dir, file, _] = [(); 5].map(|()| fields.u32());
+  let (common, dir, file) = (common?, dir?, file?);
+  let has = |attribute: u32| common & attribute != 0;
+  let failed = has(ATTR_CMN_ERROR) && fields.u32()? != 0;
+  if !has(ATTR_CMN_NAME) {
+    return None;
+  }
+  let name = OsStr::from_bytes(fields.reference()?);
+  let device = if has(ATTR_CMN_DEVID) { Some(fields.i32()?) } else { None };
+  let kind = if has(ATTR_CMN_OBJTYPE) { Some(fields.u32()?) } else { None };
+  let Some(kind) = kind.map(file_type) else { return Some((name, Entry::Name)) };
+  let whole = common & LOOK == LOOK
+    && match kind {
+      FileType::File => file & ATTR_FILE_DATALENGTH != 0,
+      FileType::Dir => dir & ATTR_DIR_MOUNTSTATUS != 0,
+      FileType::Symlink | FileType::Other => false,
+    };
+  if failed || !whole || device != Some(volume) {
+    return Some((name, Entry::Kind(kind)));
+  }
+  let (created, modified, flags, file_id) =
+    (fields.time(), fields.time(), fields.u32()?, fields.u64()?);
+  let told = match (kind, created, modified) {
+    (FileType::Dir, Some(created), Some(modified)) if fields.u32()? == 0 => {
+      let volume = i64::from(volume).cast_unsigned();
+      Entry::Dir { id: DirId { volume, inode: file_id, birth: unsigned_nanos(created) }, modified }
+    }
+    (FileType::File, _, Some(modified)) if flags & SF_DATALESS == 0 => {
+      Entry::File { modified, size: fields.u64()?, file_id }
+    }
+    _ => Entry::Kind(kind),
+  };
+  Some((name, told))
+}
+
 pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
   let c_path = CString::new(path.as_os_str().as_bytes())?;
   let wanted = attr_list(ATTR_CMN_NAME | ATTR_CMN_OBJTYPE, 0, 0);
@@ -215,6 +208,13 @@ pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
 
 pub(super) fn name_on_disk(path: &Path) -> io::Result<OsString> {
   name_and_kind(path).map(|(name, _)| name)
+}
+
+pub(super) fn remote_disk(dir: &Path) -> Option<String> {
+  let answer = stat_fs(dir).filter(|answer| answer.f_flags & MNT_LOCAL.cast_unsigned() == 0)?;
+  let name = answer.f_fstypename.map(c_char::cast_unsigned);
+  let name = name.split(|&byte| byte == 0).next().unwrap_or_default();
+  Some(String::from_utf8_lossy(name).into_owned())
 }
 
 #[cfg(test)]
