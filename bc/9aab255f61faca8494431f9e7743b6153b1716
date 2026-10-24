@@ -1,0 +1,25 @@
+src/backend/fsevents.rs
+  s_0070b6318eca36::t_a1c0feff3c333d 1330,1340-1341,1343,1346-1348
+src/engine/events.rs
+  s_0070b6318eca36::t_f03f48d430e36c 171-172
+src/fs/windows.rs
+  s_0070b6318eca36::t_0551998f051901 511,514,516,520,625,629,639,680-681,799,801-802
+src/path.rs
+  s_0070b6318eca36::t_f6895ffbba296d 208,269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bc9aab255f61faca8494431f9e7743b6153b1716",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
