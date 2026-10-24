@@ -322,7 +322,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let unsure = in_complete && self.tree.loose_spelling && self.spelling_is_unsure(key, listed);
     let mut meta = match self.fs.lstat(path) {
       Ok(meta) => meta,
-      Err(error) => return self.look_failed(parent, key, path, listed, error),
+      Err(error) => return self.look_error(parent, key, path, listed, error),
     };
     // A registered name is an entry of the directory above only under this very name: asked
     // before a link is followed.
@@ -394,7 +394,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// What an error of the `lstat` at the node means.
-  fn look_failed(
+  fn look_error(
     &mut self,
     parent: DirKey,
     key: DirKey,
@@ -523,7 +523,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     } else {
       // The handler may believe in a file the tree forgot earlier in this flush: nothing says it
       // is the same one.
-      let baseline = !self.reported_before(key);
+      let baseline = !self.watched_before(key);
       let node = &mut self.tree[key];
       node.set_baseline(baseline);
       node.told()

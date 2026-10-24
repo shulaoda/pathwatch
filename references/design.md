@@ -438,12 +438,12 @@ When the disk spells the name in another way, the directory has no entry of this
 - A name that is not registered is gone (`Found::OtherSpelling`): at once and with no hold,
   because a second look would find the entry again.
 - A registered name is still the path of its caller, but the directory above does not cover
-  it: the node says so (`Node::is_unlisted`, read by `Engine::is_inside`). A watched path
-  reports what is at it as before. A name that only leads to a watched path has nothing of
-  its own: a file that the directory reported there is gone at once, and a directory there
-  becomes partial and keeps only what the watched paths below it cover (`uncover`). The same
-  when a partial directory is found under another name for the first time: its entries were
-  covered through this name, and are not any more.
+  it: the node says so (`Node::is_unlisted`, read by `Engine::covered_by_parent`). A
+  watched path reports what is at it as before. A name that only leads to a watched path has
+  nothing of its own: a file that the directory reported there is gone at once, and a
+  directory there becomes partial and keeps only what the watched paths below it cover
+  (`uncover`). The same when a partial directory is found under another name for the first
+  time: its entries were covered through this name, and are not any more.
 
 In both cases the disk gave the name that the entry has. That name is looked at in the same
 flush, with what the hint said of the entry (`written`), whether the tree has a node for it
@@ -470,7 +470,7 @@ What this does not cover is in section 9.
 
 ```
 if notifications were lost and the pacing allows it: queue a deep scan of the root   # 5.13
-check_moved                                          # 5.10
+mark_moved                                          # 5.10
 for each marked node, from the top down:
     if a node above it is held: drop the mark
     if only a loss report asked for the mark, and the pacing does not allow it: keep the mark
@@ -666,7 +666,7 @@ directory) covered nothing, so a path watched below it later reports what it fin
 
 As built: while a `watch` runs, a node says what the call made of it (`Node::added`), and a
 directory says that it became complete in this call (`Node::baseline`). `check` asks at the
-moment of the look whether the node had to be reported before the call (`reported_before`): it
+moment of the look whether the node had to be reported before the call (`watched_before`): it
 was a watched path before, or the directory above was complete before. Where the directory
 above is still partial in the tree, the rule of 5.1 is asked for the watched paths of before
 the call: the look of an older `watch` can still wait for the disk to answer. If not, what the
@@ -977,7 +977,7 @@ directory above into the renamed one, with one `rename` call, moves the same two
 rule that took this for a rename scanned a watched project of 50,000 files again each time a
 directory was moved into it from next to it (250 ms of CPU time).
 
-**`check_moved`.** A mark can come through a watch that moved away with its directory. If the
+**`mark_moved`.** A mark can come through a watch that moved away with its directory. If the
 parent of that directory is only polled, nothing says so in time, and the marks would be
 checked against the wrong directory. So at the start of a flush, for each marked node, the
 nearest directory at or above it whose parent is only polled (or that is reached through a
@@ -1178,7 +1178,7 @@ sleeps, and a flush that the sleep fell into would pause for hours.
 - A watch for a tree does not report what is behind a link. So a node that is reached through a
   link never becomes `FromAbove`: the backend is asked for it.
 - Nothing watches a link itself. Every poll checks each registered name that is a link, and
-  `check_moved` takes a node behind a link like a node with a polled parent.
+  `mark_moved` takes a node behind a link like a node with a polled parent.
 - Baseline: when `watch` puts a watched path at or behind a link that was not followed until
   then, what is behind the link is the baseline of that `watch`. After `unwatch` the link is a
   file entry again (5.7).
@@ -1645,7 +1645,7 @@ As built:
   and is a real path itself. `/home` is the same directory as `/System/Volumes/Data/home`
   too, but it is a link, and a stream at a path that is not real is never trusted (the
   check after the start), so that one stays long. The directory itself is asked, not only
-  its parent: `/System/Volumes/Data/Users` has a parent with no short way, and is `/Users`.
+  its parent: `/System/Volumes/Data/Users` has a parent with no short path, and is `/Users`.
 - **A cover at another real path.** A key that is watched again and whose directory has
   another real path than before is reported lost, if its old path still has a stream that
   is trusted: then a directory on the old path was renamed and the notice of its guard was

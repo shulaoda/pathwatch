@@ -17,7 +17,7 @@ pub(super) fn child_hash(parent: u32, name: &OsStr) -> u64 {
     && let Some((one, more)) = rest.split_first_chunk()
     && let Some((two, more)) = more.split_first_chunk()
   {
-    hash = mix(hash ^ small(u64::from_ne_bytes(*one)), SEEDS[1] ^ small(u64::from_ne_bytes(*two)));
+    hash = mix(hash ^ lower(u64::from_ne_bytes(*one)), SEEDS[1] ^ lower(u64::from_ne_bytes(*two)));
     rest = more;
   }
   let (first, last) = if let Some((one, two)) = rest.first_chunk::<8>().zip(rest.last_chunk()) {
@@ -32,10 +32,10 @@ pub(super) fn child_hash(parent: u32, name: &OsStr) -> u64 {
       _ => (0, 0),
     }
   };
-  mix(hash ^ small(first), SEEDS[1] ^ small(last))
+  mix(hash ^ lower(first), SEEDS[1] ^ lower(last))
 }
 
-fn small(bytes: u64) -> u64 {
+fn lower(bytes: u64) -> u64 {
   const ONES: u64 = u64::from_ne_bytes([1; 8]);
   const HIGH: u64 = ONES * 0x80;
   let low = bytes & !HIGH;

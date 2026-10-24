@@ -29,7 +29,7 @@ use self::apple::{name_on_disk, remote_disk};
 #[cfg(windows)]
 pub(crate) use self::windows::{SHARE_ALL, is_delete_pending, kernel32, literal, wide_name};
 #[cfg(windows)]
-use self::windows::{name_on_disk, open_regular, stat, told};
+use self::windows::{classify, name_on_disk, open_regular, stat};
 
 /// Every call that the engine makes to the disk. `StdFs` is the real one; the tests have one
 /// in memory.
@@ -155,8 +155,8 @@ impl Fs for StdFs {
     if windows::read_dir(dir, each)? {
       return Ok(());
     }
-    for entry in fs::read_dir(literal(dir)).map_err(told)? {
-      let entry = entry.map_err(told)?;
+    for entry in fs::read_dir(literal(dir)).map_err(classify)? {
+      let entry = entry.map_err(classify)?;
       let name = entry.file_name();
       #[cfg(windows)]
       if windows::has_separator(&name) {
@@ -203,11 +203,11 @@ impl Fs for StdFs {
   }
 
   fn link_target(&self, path: &Path) -> io::Result<PathBuf> {
-    fs::read_link(literal(path)).map_err(told)
+    fs::read_link(literal(path)).map_err(classify)
   }
 
   fn real_path(&self, path: &Path) -> io::Result<PathBuf> {
-    fs::canonicalize(literal(path)).map_err(told)
+    fs::canonicalize(literal(path)).map_err(classify)
   }
 
   fn name_on_disk(&self, path: &Path) -> io::Result<OsString> {
@@ -270,7 +270,7 @@ pub(crate) fn is_link_loop(error: &io::Error) -> bool {
 
 /// Only Windows has errors that std does not tell apart.
 #[cfg(not(windows))]
-fn told(error: io::Error) -> io::Error {
+fn classify(error: io::Error) -> io::Error {
   error
 }
 
@@ -313,7 +313,7 @@ fn ids(metadata: &Metadata) -> (u64, DirId) {
 
   // The birth time tells a new directory from a removed one that had the same inode number.
   // Not every libc gives it (musl does not).
-  let birth = metadata.created().map_or(0, nanos);
+  let birth = metadata.created().map_or(0, unsigned_nanos);
   (metadata.ino(), DirId { volume: metadata.dev(), inode: metadata.ino(), birth })
 }
 
@@ -321,12 +321,12 @@ fn ids(metadata: &Metadata) -> (u64, DirId) {
 fn ids(metadata: &Metadata) -> (u64, DirId) {
   // The inode is not in stable std here (WASI), so a directory has no identity: a replaced
   // one is found by the listing. A file is told from the next one at its path by its birth.
-  (metadata.created().map_or(0, nanos), DirId::default())
+  (metadata.created().map_or(0, unsigned_nanos), DirId::default())
 }
 
 /// Nanoseconds since 1970, 0 for a time before.
 #[cfg(not(windows))]
-pub(crate) fn nanos(time: SystemTime) -> u64 {
+pub(crate) fn unsigned_nanos(time: SystemTime) -> u64 {
   time
     .duration_since(SystemTime::UNIX_EPOCH)
     .map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))

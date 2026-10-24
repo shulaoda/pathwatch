@@ -34,13 +34,13 @@ enum Listing {
 /// not know.
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Checks every node of the directory, and what a listing shows on top if the node is complete.
-  /// `path` and `names` are buffers.
+  /// `path` and `entries` are buffers.
   pub(super) fn scan(
     &mut self,
     key: DirKey,
     depth: Depth,
     path: &mut PathBuf,
-    names: &mut Vec<ScanEntry>,
+    entries: &mut Vec<ScanEntry>,
   ) {
     // A node above is held: nothing below it is looked at before its second look.
     if self.tree.frozen(key) {
@@ -48,11 +48,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     self.tree.path_into(key, path);
     self.scan_had_error = false;
-    names.clear();
-    names.extend(self.tree.children(key).map(|child| (child, Listed::NotAsked)));
+    entries.clear();
+    entries.extend(self.tree.children(key).map(|child| (child, Listed::NotAsked)));
     self.listed.clear();
     let listing =
-      if self.tree[key].is_complete() { self.list_new(key, path, names) } else { Listing::None };
+      if self.tree[key].is_complete() { self.list_new(key, path, entries) } else { Listing::None };
     if listing == Listing::Stop {
       return;
     }
@@ -62,7 +62,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let names_only = depth == Depth::Names && names_are_known;
 
     let why = if depth == Depth::Deep { Mark::DEEP } else { Mark::default() };
-    for &(child, listed) in names.iter() {
+    for &(child, listed) in entries.iter() {
       if self.stopped() {
         return;
       }
@@ -96,8 +96,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Lists the directory and adds a node for each entry the tree does not know. With loose
   /// spelling, `listed` gets what the listing said of the known nodes.
-  fn list_new(&mut self, key: DirKey, path: &mut PathBuf, names: &mut Vec<ScanEntry>) -> Listing {
-    let known = names.len();
+  fn list_new(&mut self, key: DirKey, path: &mut PathBuf, entries: &mut Vec<ScanEntry>) -> Listing {
+    let known = entries.len();
     // A listing that lags behind a write is trusted for a file only where an OS watch reports
     // the write.
     let lags = self.fs.listing_lags() && !self.tree[key].watch().is_heard();
@@ -115,7 +115,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
             listed.insert(node, Listed::of(entry, flush_time));
           }
         }
-        None => names.push((tree.insert_child(key, name), Listed::of(entry, flush_time))),
+        None => entries.push((tree.insert_child(key, name), Listed::of(entry, flush_time))),
       }
     });
     // A listing follows a link at the path: one that took the place of the directory since the
@@ -141,7 +141,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     };
 
     // What the listing gave is forgotten.
-    for (new, _) in names.drain(known..) {
+    for (new, _) in entries.drain(known..) {
       self.tree.prune(new);
     }
     let read_again = match error {

@@ -53,7 +53,7 @@ impl WindowsBackend {
 
   /// Keeps what a call of the handles told, and waits for the handles that it closed: a
   /// directory above one of them can be renamed when the call of the backend returns.
-  fn settled(&mut self, told: Told) {
+  fn finish_call(&mut self, told: Told) {
     self.covered.extend(told.covered);
     if !told.lost.is_empty() {
       self.sink.raw(Raw::Lost(told.lost));
@@ -67,7 +67,7 @@ impl Backend for WindowsBackend {
 
   fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
     let (coverage, told) = self.handles.watch(key, dir, want, &mut self.port);
-    self.settled(told);
+    self.finish_call(told);
     coverage
   }
 
@@ -78,7 +78,7 @@ impl Backend for WindowsBackend {
 
   fn commit(&mut self) -> Committed {
     let told = self.handles.commit(&mut self.port);
-    self.settled(told);
+    self.finish_call(told);
     Committed { now_watched: mem::take(&mut self.covered), failed: Vec::new() }
   }
 
@@ -285,7 +285,7 @@ mod handles {
 
   use super::place::{link_between, place};
   use crate::{
-    backend::{Coverage, DirKey, Want, give_room_back, may_watch_a_tree, same, watch_limit},
+    backend::{Coverage, DirKey, Want, copy_error, give_room_back, may_watch_a_tree, watch_limit},
     fs::wide_name,
   };
 
@@ -442,7 +442,7 @@ mod handles {
       for &key in &keys {
         self.forget(key);
         let again = !handle.delivered && self.dead.contains_key(&key);
-        self.dead.insert(key, Death { again, error: same(error) });
+        self.dead.insert(key, Death { again, error: copy_error(error) });
       }
       keys
     }

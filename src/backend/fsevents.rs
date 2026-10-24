@@ -24,8 +24,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use self::ffi::{Notices, Queue, Stream};
 use crate::{
   backend::{
-    Backend, Committed, Coverage, DirKey, Hint, Sink, Want, give_room_back, may_watch_a_tree, same,
-    watch_limit,
+    Backend, Committed, Coverage, DirKey, Hint, Sink, Want, copy_error, give_room_back,
+    may_watch_a_tree, watch_limit,
   },
   fs::{FileType, is_missing, name_and_kind},
 };
@@ -200,7 +200,7 @@ impl Backend for FsEventsBackend {
     // Notices whose wake-up was dropped with a full queue: the engine, which checks everything
     // then, hears of their keys with the report at the end (a guard that told is closed, so the
     // commit goes on to fit the guard again).
-    let mut lost = self.told();
+    let mut lost = self.moved_keys();
     self.stop_idle();
     self.last_parent = None;
     let mut committed = Committed::default();
@@ -220,7 +220,7 @@ impl Backend for FsEventsBackend {
         self.named.remove(&key);
         self.covers.remove(key);
         match why {
-          Some(error) => committed.failed.push((key, same(error))),
+          Some(error) => committed.failed.push((key, copy_error(error))),
           None => lost.push(key),
         }
       }
@@ -234,7 +234,7 @@ impl Backend for FsEventsBackend {
   }
 
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
-    for key in raw.lost.iter().copied().chain(self.told()) {
+    for key in raw.lost.iter().copied().chain(self.moved_keys()) {
       hint(Hint::Changed { dir: key, rel: Path::new("") });
     }
     let covers = &self.covers.by_dir;
@@ -325,7 +325,7 @@ impl FsEventsBackend {
       (Some(parent), Some(name)) => {
         let last = match self.last_parent.take() {
           Some(last) if last.0 == parent => last,
-          _ => (parent.to_owned(), short_way(fs::canonicalize(parent)?)),
+          _ => (parent.to_owned(), short_path(fs::canonicalize(parent)?)),
         };
         let real_parent = &self.last_parent.insert(last).1;
         // A link, or a name that differs by more than ASCII case, goes the slow way, by the OS.
@@ -338,7 +338,7 @@ impl FsEventsBackend {
       }
       _ => fs::canonicalize(dir)?,
     };
-    let real = short_way(real);
+    let real = short_path(real);
     if real.to_str().is_none() {
       return Err(io::Error::new(io::ErrorKind::InvalidData, ERROR_PATH_NOT_UTF8));
     }
@@ -348,7 +348,7 @@ impl FsEventsBackend {
 
 /// `realpath` spells `/Users` as `/System/Volumes/Data/Users`, and FSEvents reports the short
 /// path. The short path is taken when it is the same directory and a real path itself.
-fn short_way(real: PathBuf) -> PathBuf {
+fn short_path(real: PathBuf) -> PathBuf {
   let Ok(below) = real.strip_prefix(DATA_VOLUME) else { return real };
   let short = Path::new("/").join(below);
   let id = |path: &Path| fs::metadata(path).map(|found| (found.dev(), found.ino())).ok();
@@ -605,7 +605,7 @@ impl FsEventsBackend {
   /// its directory, and each cover is read again, as its stream heard nothing while its path
   /// was another one, also when the path is back by now. The stream paths at and below these
   /// directories are trusted no more (`references/design.md` 7.2).
-  fn told(&mut self) -> Vec<DirKey> {
+  fn moved_keys(&mut self) -> Vec<DirKey> {
     let moved = self.guard.take();
     if moved.is_empty() {
       return Vec::new();
@@ -1327,7 +1327,7 @@ mod ffi {
 mod tests {
   use std::path::{Path, PathBuf};
 
-  use super::{DATA_VOLUME, Dirs, is_too_high, place, short_way};
+  use super::{DATA_VOLUME, Dirs, is_too_high, place, short_path};
 
   fn paths(paths: &[&str]) -> Vec<PathBuf> {
     paths.iter().map(PathBuf::from).collect()
@@ -1388,12 +1388,12 @@ mod tests {
     }
   }
 
-  /// The directory itself is asked, not only its parent: `/Users` has a parent with no short way.
+  /// The directory itself is asked, not only its parent: `/Users` has a parent with no short path.
   #[test]
-  fn the_short_way_of_a_directory_whose_parent_has_none() {
+  fn the_short_path_of_a_directory_whose_parent_has_none() {
     let long = Path::new(DATA_VOLUME).join("Users");
     if long.is_dir() {
-      assert_eq!(short_way(long), Path::new("/Users"));
+      assert_eq!(short_path(long), Path::new("/Users"));
     }
   }
 

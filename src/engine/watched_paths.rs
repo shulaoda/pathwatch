@@ -16,8 +16,8 @@ use crate::{
   tree::{Added, Depth, Kind, Mark, Tree, emptied},
 };
 
-/// The baseline: what a `watch` call finds is known without an event, unless an older watched
-/// path covered it already (design.md 5.7).
+/// The way in: `watch` registers the path, and what it finds is the baseline, known without an
+/// event, unless an older watched path covered it already (design.md 5.7).
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Puts the path into the tree, a registered node for each name, and marks where the disk has
   /// to be checked. A path below a directory that the filter ignores, and one that it ignores
@@ -27,8 +27,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if self.is_ignored_above(path) {
       return;
     }
-    let ignored_file = self.ignored(path, EntryKind::File);
-    if ignored_file && self.ignored(path, EntryKind::Dir) {
+    let ignored_file = self.ask_filter(path, EntryKind::File);
+    if ignored_file && self.ask_filter(path, EntryKind::Dir) {
       return;
     }
 
@@ -96,11 +96,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(super) fn is_baseline_dir(&self, key: DirKey, relinked: bool) -> bool {
     // A link that the running call follows for the first time: nobody read its target before.
     let new_link = relinked && self.tree[key].added() == Added::Registered;
-    new_link || !self.reported_before(key)
+    new_link || !self.watched_before(key)
   }
 
-  /// Whether what is at the node had to be reported before the running `watch`.
-  pub(super) fn reported_before(&self, key: DirKey) -> bool {
+  /// Whether the node was watched before the running `watch`: what is at it had to be reported.
+  pub(super) fn watched_before(&self, key: DirKey) -> bool {
     let node = &self.tree[key];
     if node.is_path() && node.added() == Added::No {
       return true;
@@ -123,7 +123,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 /// What a watched path covers: the rule for a complete node (design.md 5.1).
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Whether the directory above covers the node: it tracks every entry, and the node is one.
-  pub(super) fn is_inside(&self, key: DirKey) -> bool {
+  pub(super) fn covered_by_parent(&self, key: DirKey) -> bool {
     !self.tree[key].is_unlisted()
       && self.tree.parent(key).is_some_and(|parent| self.tracks_every_entry(parent))
   }
@@ -160,38 +160,22 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 /// The way back: `unwatch` forgets what only the path covered and reports nothing (design.md
 /// 5.7).
 impl<B: Backend, F: Fs> Engine<B, F> {
-  /// Makes `path` a path like any other again. A path that is not watched is left alone.
+  /// Makes `path` a path like any other again, and the handler hears nothing of what is
+  /// forgotten. A path that is not watched is left alone.
   pub(super) fn unregister(&mut self, path: &Path) {
     let Some((top, rest)) = split_top(path) else { return };
-    let mut at = Tree::ROOT;
+    let mut key = Tree::ROOT;
     for name in iter::once(top).chain(rest.iter()) {
-      let Some(child) = self.tree.child(at, name) else { return };
-      at = child;
+      let Some(child) = self.tree.child(key, name) else { return };
+      key = child;
     }
-    self.forget(at);
-  }
-
-  /// Asks each directory that a `forget` of this call left on the list whether it wants less
-  /// now: once for each, however many paths went out of it.
-  pub(super) fn narrow_all(&mut self) {
-    let mut dirs = std::mem::take(&mut self.narrowing);
-    dirs.sort_unstable();
-    dirs.dedup();
-    for dir in dirs.drain(..) {
-      self.narrow(dir, false);
-    }
-    self.narrowing = emptied(dirs);
-  }
-
-  /// The node is no watched path any more, and the handler hears nothing of what is forgotten.
-  fn forget(&mut self, key: DirKey) {
     if !self.tree.set_path(key, false) {
       return;
     }
     let Some(parent) = self.tree.parent(key) else { return };
     // What is at the path can still count as an entry of a watched directory above: only then it
     // stays.
-    if self.tree[key].is_registered() && !self.is_inside(key) {
+    if self.tree[key].is_registered() && !self.covered_by_parent(key) {
       self.uncover(key, false);
     }
     // With no watched path below, the node is let go, and the nodes above that only led to it.
@@ -205,6 +189,18 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     // The directory that held what went may want less now: the one that stays, at the end of
     // the call (`narrow_all`).
     self.narrowing.push(if at == key { parent } else { at });
+  }
+
+  /// Asks each directory that an `unregister` of this call left on the list whether it wants less
+  /// now: once for each, however many paths went out of it.
+  pub(super) fn narrow_all(&mut self) {
+    let mut dirs = std::mem::take(&mut self.narrowing);
+    dirs.sort_unstable();
+    dirs.dedup();
+    for dir in dirs.drain(..) {
+      self.narrow(dir, false);
+    }
+    self.narrowing = emptied(dirs);
   }
 
   /// Forgets what the tree has at the node and below it, down to each watched path, which stays.
@@ -247,17 +243,17 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// and nothing anywhere else.
   fn let_go(&mut self, key: DirKey) {
     // Asked while the node still says that the directory above lists it under another name.
-    let inside = self.is_inside(key);
+    let covered = self.covered_by_parent(key);
     self.tree[key].set_unlisted(false);
     // Only a registered node is followed: the link itself is the entry now, and a look must see
     // it.
     if self.tree.link(key).is_some() {
       self.tree.set_link(key, None);
-      if inside {
+      if covered {
         self.tree.mark(key, Mark::default());
       }
     }
-    if !inside {
+    if !covered {
       self.uncover(key, false);
     }
     self.tree.prune(key);
@@ -272,7 +268,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if let Some(answer) = self.tree[key].ignored(kind) {
       return answer;
     }
-    let answer = self.ignored(path, kind);
+    let answer = self.ask_filter(path, kind);
     self.tree[key].set_ignored(kind, answer);
     answer
   }
@@ -292,7 +288,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       at = at.and_then(|at| self.tree.child(at, name));
       let ignored = match at {
         Some(at) => self.ignores(at, &dir, EntryKind::Dir),
-        None => self.ignored(&dir, EntryKind::Dir),
+        None => self.ask_filter(&dir, EntryKind::Dir),
       };
       if ignored {
         return true;
@@ -302,7 +298,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Asks the filter, without keeping the answer.
-  fn ignored(&self, path: &Path, kind: EntryKind) -> bool {
+  fn ask_filter(&self, path: &Path, kind: EntryKind) -> bool {
     self.options.ignored.as_ref().is_some_and(|ignored| ignored(path, kind))
   }
 }

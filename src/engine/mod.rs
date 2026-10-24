@@ -178,7 +178,7 @@ pub struct Engine<B: Backend, F: Fs> {
   /// The scans of one round.
   scans: Vec<(DirKey, Depth, bool)>,
   /// The nodes of the directory that is scanned.
-  names: Vec<ScanEntry>,
+  entries: Vec<ScanEntry>,
 
   /// The errors for the next output, one of each kind (`report`).
   errors: Vec<Error>,
@@ -244,7 +244,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       path: PathBuf::new(),
       marks: Vec::new(),
       scans: Vec::new(),
-      names: Vec::new(),
+      entries: Vec::new(),
       errors: Vec::new(),
       told_watch_limit: false,
       asked_disks: FxHashSet::default(),
@@ -448,14 +448,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut path = mem::take(&mut self.path);
     loss_scans_ran |= self.check_marks(&mut path, rest_is_over, hints_due);
     self.due_holds = emptied(mem::take(&mut self.due_holds));
-    let mut names = mem::take(&mut self.names);
+    let mut entries = mem::take(&mut self.entries);
     // A flush that only gave watches back commits too: the backend moves its watches then.
     while (!self.tree.to_scan.is_empty() || self.gave_back) && !self.stopped() {
-      self.round(&mut path, &mut names);
+      self.round(&mut path, &mut entries);
     }
     // The scans took the marks of the nodes they looked at: what is left on the list is work.
     self.tree.tidy_marked();
-    (self.path, self.names) = (path, emptied(names));
+    (self.path, self.entries) = (path, emptied(entries));
     // A big listing is not kept for ever, as `emptied` does for a list.
     self.listed.clear();
     self.listed.shrink_to(KEPT / size_of::<ScanEntry>());
@@ -469,7 +469,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Checks every marked node. `true`: a check that only a loss report asked for ran.
   fn check_marks(&mut self, path: &mut PathBuf, rest_is_over: bool, hints_due: bool) -> bool {
-    self.check_moved(hints_due);
+    self.mark_moved(hints_due);
     // From the top down: a directory is checked before the names in it.
     let mut marks = mem::take(&mut self.marks);
     self.tree.take_marked(&mut marks);
@@ -519,7 +519,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// One round: commit, then the scans queued before it. Watch, commit, then scan, for every
   /// directory.
-  fn round(&mut self, path: &mut PathBuf, names: &mut Vec<ScanEntry>) {
+  fn round(&mut self, path: &mut PathBuf, entries: &mut Vec<ScanEntry>) {
     let now_watched = self.commit();
     self.gave_back = false;
     let mut scans = mem::take(&mut self.scans);
@@ -538,7 +538,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         continue;
       }
       self.away_scan = away;
-      self.scan(key, depth, path, names);
+      self.scan(key, depth, path, entries);
     }
     self.away_scan = false;
     self.scans = emptied(scans);

@@ -20,7 +20,7 @@ use libc::{
   ATTR_FILE_DATALENGTH, FSOPT_NOFOLLOW, MNT_LOCAL, O_DIRECTORY,
 };
 
-use super::{DirId, Entry, FileType, nanos};
+use super::{DirId, Entry, FileType, unsigned_nanos};
 
 /// What a look at a regular file or a directory reads, in the common attributes: the birth time
 /// is in the identity of a directory.
@@ -113,7 +113,7 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
       let entry = Fields { bytes: rest, at: 0 }.u32().and_then(|len| rest.get(..len as usize));
       let entry = entry.ok_or_else(|| io::Error::other("getattrlistbulk gave no entry"))?;
       rest = &rest[entry.len()..];
-      if let Some((name, told)) = read(entry, volume) {
+      if let Some((name, told)) = record(entry, volume) {
         each(name, told);
       }
     }
@@ -122,7 +122,7 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
 
 /// One entry of the answer: its length, the attributes that follow as bits, and then these
 /// attributes in the order of their bits. `None`: it has no name.
-fn read(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
+fn record(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   let mut fields = Fields { bytes: entry, at: size_of::<u32>() };
   let [common, _, dir, file, _] = [(); 5].map(|()| fields.u32());
   let (common, dir, file) = (common?, dir?, file?);
@@ -151,7 +151,7 @@ fn read(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   let told = match (kind, created, modified) {
     (FileType::Dir, Some(created), Some(modified)) if fields.u32()? == 0 => {
       let volume = i64::from(volume).cast_unsigned();
-      Entry::Dir { id: DirId { volume, inode: file_id, birth: nanos(created) }, modified }
+      Entry::Dir { id: DirId { volume, inode: file_id, birth: unsigned_nanos(created) }, modified }
     }
     (FileType::File, _, Some(modified)) if flags & SF_DATALESS == 0 => {
       Entry::File { modified, size: fields.u64()?, file_id }

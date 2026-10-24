@@ -868,7 +868,7 @@ fn a_cover_that_moves_before_the_commit_takes_its_pending_stream_along() {
 
 /// Only where the short path is the same directory and a real path of its own.
 #[test]
-fn the_short_way_out_of_the_data_volume() {
+fn the_short_path_out_of_the_data_volume() {
   let mut h = Harness::new();
   fs::create_dir(h.path("dir")).unwrap();
   let data = Path::new("/System/Volumes/Data");

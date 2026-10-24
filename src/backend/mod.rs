@@ -190,7 +190,7 @@ fn limit(error: &io::Error) -> Option<&'static str> {
 /// A copy of the error, for a backend that tells one error for many keys: an `io::Error` is not
 /// `Clone`.
 #[cfg(any(target_os = "macos", windows))]
-pub(crate) fn same(error: &io::Error) -> io::Error {
+pub(crate) fn copy_error(error: &io::Error) -> io::Error {
   match (limit(error), error.raw_os_error()) {
     (Some(message), _) => watch_limit(message),
     (None, Some(code)) => io::Error::from_raw_os_error(code),

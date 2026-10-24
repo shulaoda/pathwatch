@@ -154,7 +154,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         }
         Kind::File(_) => {
           // 5. A partial node knows a file only if the rule makes it complete.
-          if !node.is_path() && !self.is_inside(key) {
+          if !node.is_path() && !self.covered_by_parent(key) {
             return fail("a partial node knows a file that is no watched path");
           }
         }

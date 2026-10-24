@@ -24,14 +24,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(super) fn arm(&mut self, key: DirKey, path: &mut PathBuf, force: bool) {
     let Some(asked) = self.tree[key].dir().map(|dir| dir.asked) else { return };
     if self.backend.is_none() {
-      return self.set_state(key, Watch::Polled);
+      return self.set_watch(key, Watch::Polled);
     }
     // A watch for a tree above reports the directory: not through a link.
     if asked.is_none()
       && self.tree.link(key).is_none()
       && self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().covers_below())
     {
-      return self.set_state(key, Watch::FromAbove);
+      return self.set_watch(key, Watch::FromAbove);
     }
     // The want only goes up (backend rule 5): with the contents asked, the disk is not read.
     let want = if asked == Some(Want::Contents) { Want::Contents } else { self.want(key, path) };
@@ -47,7 +47,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       dir.asked = Some(want);
     }
     let answer = self.watch_dir(key, path, want);
-    self.set_watch(key, answer, path);
+    self.store_answer(key, answer, path);
     self.tree.queue_scan(key, Depth::Shallow);
   }
 
@@ -71,7 +71,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     if scan_comes {
       // No OS watch covers it until that scan.
-      self.set_state(key, Watch::Polled);
+      self.set_watch(key, Watch::Polled);
     } else {
       let mut path = self.tree.path(key);
       self.arm(key, &mut path, true);
@@ -108,7 +108,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let asked = self.tree.get(key).and_then(Node::dir).is_some_and(|dir| dir.asked.is_some());
       if asked {
         let path = self.tree.path(key);
-        self.set_watch(key, Coverage::Failed(error), &path);
+        self.store_answer(key, Coverage::Failed(error), &path);
       }
     }
     now_watched
@@ -124,7 +124,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if matches!(answer, Coverage::NotWatched) {
         continue;
       }
-      self.set_watch(key, answer, &path);
+      self.store_answer(key, answer, &path);
       self.tree.queue_scan(key, Depth::Shallow);
     }
   }
@@ -154,15 +154,15 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Notes how changes in the directory are heard when the backend was not asked.
-  fn set_state(&mut self, key: DirKey, state: Watch) {
+  fn set_watch(&mut self, key: DirKey, watch: Watch) {
     if let Some(dir) = self.tree[key].dir_mut() {
-      dir.watch = state;
+      dir.watch = watch;
     }
     self.tree.list_if_polled(key);
   }
 
   /// Stores what the backend answered for the directory.
-  fn set_watch(&mut self, key: DirKey, answer: Coverage, path: &Path) {
+  fn store_answer(&mut self, key: DirKey, answer: Coverage, path: &Path) {
     let Some(dir) = self.tree[key].dir_mut() else { return };
     let (old, volume) = (dir.watch, dir.id.volume);
     let mut to_report = None;
@@ -258,7 +258,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// A mark can come through a watch whose directory moved. Where only a poll checks the parent,
   /// the parent checks that directory in this flush too, before the mark (design.md 5.10).
-  pub(super) fn check_moved(&mut self, hints_due: bool) {
+  pub(super) fn mark_moved(&mut self, hints_due: bool) {
     // Only the marks that are there now: the ones that this loop adds are not looked at.
     for index in 0..self.tree.marked.len() {
       let (key, since) = self.tree.marked[index];

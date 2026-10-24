@@ -64,7 +64,7 @@ fn kind(attributes: u32, tag: u32) -> FileType {
   }
 }
 
-fn entry(kind: FileType, written: u64, size: u64, dir_id: DirId) -> Meta {
+fn meta_of(kind: FileType, written: u64, size: u64, dir_id: DirId) -> Meta {
   let modified = time(written);
   Meta { kind, modified, size, file_id: dir_id.inode, dir_id }
 }
@@ -73,7 +73,7 @@ fn entry(kind: FileType, written: u64, size: u64, dir_id: DirId) -> Meta {
 /// directory opened as a file; only the status of the kernel tells these from an entry that
 /// may not be read. Call it right after the failed call, on the same thread. A server that
 /// cannot be reached says nothing about the path, though std calls that "not found".
-pub fn told(error: io::Error) -> io::Error {
+pub fn classify(error: io::Error) -> io::Error {
   #[link(name = "ntdll")]
   unsafe extern "system" {
     safe fn RtlGetLastNtStatus() -> NTSTATUS;
@@ -194,14 +194,14 @@ fn by_name(path: &Path) -> Option<io::Result<Meta>> {
   let size = u32::try_from(size_of::<StatBasic>()).ok()?;
   // SAFETY: `wide` ends with a NUL, and the call writes at most `size` bytes into `info`.
   if unsafe { call(wide.as_ptr(), STAT_BASIC, (&raw mut info).cast(), size) } == 0 {
-    let error = told(io::Error::last_os_error());
+    let error = classify(io::Error::last_os_error());
     return (error.kind() == io::ErrorKind::NotFound).then_some(Err(error));
   }
   // The low half is the number that a handle gives: both ways must name a volume alike.
   let volume = info.volume_serial_number & u64::from(u32::MAX);
   let dir_id = DirId { volume, inode: info.file_id, birth: info.creation_time };
   let kind = kind(info.file_attributes, info.reparse_tag);
-  Some(Ok(entry(kind, info.last_write_time, info.end_of_file, dir_id)))
+  Some(Ok(meta_of(kind, info.last_write_time, info.end_of_file, dir_id)))
 }
 
 fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
@@ -212,7 +212,7 @@ fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
     .share_mode(SHARE_ALL)
     .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | link)
     .open(path);
-  let file = match opened.map_err(told) {
+  let file = match opened.map_err(classify) {
     Ok(file) => file,
     Err(error) => {
       // A system file in use cannot be opened. Its listing still tells of it, without an index.
@@ -222,7 +222,7 @@ fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
         return Err(error);
       }
       let metadata = if follow { fs::metadata(path) } else { fs::symlink_metadata(path) };
-      let metadata = metadata.map_err(told)?;
+      let metadata = metadata.map_err(classify)?;
       let created = metadata.creation_time();
       return Ok(meta(&metadata, (created, DirId { volume: 0, inode: 0, birth: created })));
     }
@@ -233,8 +233,8 @@ fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
   if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) } == 0 {
     return Err(io::Error::last_os_error());
   }
-  let index = wide(info.nFileIndexHigh, info.nFileIndexLow);
-  let birth = wide(info.ftCreationTime.dwHighDateTime, info.ftCreationTime.dwLowDateTime);
+  let index = u64_of(info.nFileIndexHigh, info.nFileIndexLow);
+  let birth = u64_of(info.ftCreationTime.dwHighDateTime, info.ftCreationTime.dwLowDateTime);
   let dir_id = DirId { volume: u64::from(info.dwVolumeSerialNumber), inode: index, birth };
   // Only a reparse point has a tag, and this answer does not hold it.
   let mut tag = FILE_ATTRIBUTE_TAG_INFO { FileAttributes: 0, ReparseTag: 0 };
@@ -249,12 +249,12 @@ fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
       return Err(io::Error::last_os_error());
     }
   }
-  let written = wide(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime);
-  let size = wide(info.nFileSizeHigh, info.nFileSizeLow);
-  Ok(entry(kind(info.dwFileAttributes, tag.ReparseTag), written, size, dir_id))
+  let written = u64_of(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime);
+  let size = u64_of(info.nFileSizeHigh, info.nFileSizeLow);
+  Ok(meta_of(kind(info.dwFileAttributes, tag.ReparseTag), written, size, dir_id))
 }
 
-fn wide(high: u32, low: u32) -> u64 {
+fn u64_of(high: u32, low: u32) -> u64 {
   (u64::from(high) << 32) | u64::from(low)
 }
 
@@ -286,7 +286,7 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
     .share_mode(SHARE_ALL)
     .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
     .open(literal(dir))
-    .map_err(told)?;
+    .map_err(classify)?;
   let handle = dir.as_raw_handle();
   let mut file_system = [0_u16; 8];
   let mut serial = 0_u32;
@@ -322,7 +322,7 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
         // A disk that says "NTFS" and does not know the class (the drive of a Remote Desktop
         // client), or a handle that is open on a file: std lists, and says what is no directory.
         _ if class == FileIdBothDirectoryRestartInfo => Ok(false),
-        _ => Err(told(error)),
+        _ => Err(classify(error)),
       };
     }
     class = FileIdBothDirectoryInfo;
@@ -437,7 +437,7 @@ pub fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
     .share_mode(SHARE_ALL)
     .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
     .open(path);
-  let file = opened.map_err(told)?;
+  let file = opened.map_err(classify)?;
   let meta = file.metadata()?;
   if meta.is_dir() || meta.file_type().is_symlink() {
     return Ok(None);
@@ -446,7 +446,7 @@ pub fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
     return Ok(Some(file));
   }
   drop(file);
-  let file = OpenOptions::new().read(true).share_mode(SHARE_ALL).open(path).map_err(told)?;
+  let file = OpenOptions::new().read(true).share_mode(SHARE_ALL).open(path).map_err(classify)?;
   Ok(file.metadata()?.is_file().then_some(file))
 }
 
@@ -490,13 +490,13 @@ pub fn name_on_disk(path: &Path) -> io::Result<OsString> {
     return match error.raw_os_error().map(i32::cast_unsigned) {
       // What NTFS answers for an entry that went while the directory was searched.
       Some(ERROR_NO_MORE_FILES) => Err(io::ErrorKind::NotFound.into()),
-      Some(ERROR_ACCESS_DENIED) => match told(error) {
+      Some(ERROR_ACCESS_DENIED) => match classify(error) {
         error if error.kind() == io::ErrorKind::NotFound => Err(error),
         _ => {
           path.file_name().map(OsStr::to_owned).ok_or_else(|| io::ErrorKind::InvalidInput.into())
         }
       },
-      _ => Err(told(error)),
+      _ => Err(classify(error)),
     };
   }
   // SAFETY: `search` is the open handle that the call above gave, closed once.
@@ -525,8 +525,8 @@ mod tests {
   };
 
   use super::{
-    SHARE_ALL, by_handle, by_name, is_delete_pending, is_odd, literal, name_on_disk, read_dir,
-    stat, told,
+    SHARE_ALL, by_handle, by_name, classify, is_delete_pending, is_odd, literal, name_on_disk,
+    read_dir, stat,
   };
   use crate::fs::{Entry, FileType, Fs, StdFs};
 
@@ -675,11 +675,11 @@ mod tests {
   /// missing, with the mark that says so.
   #[test]
   fn what_the_errors_of_windows_mean() {
-    let unreachable = told(io::Error::from_raw_os_error(ERROR_BAD_NETPATH.cast_signed()));
+    let unreachable = classify(io::Error::from_raw_os_error(ERROR_BAD_NETPATH.cast_signed()));
     assert_eq!(unreachable.kind(), io::ErrorKind::HostUnreachable, "{unreachable:?}");
-    let missing = told(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND.cast_signed()));
+    let missing = classify(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND.cast_signed()));
     assert_eq!(missing.kind(), io::ErrorKind::NotFound);
-    let busy = told(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION.cast_signed()));
+    let busy = classify(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION.cast_signed()));
     assert_eq!(busy.kind(), io::ErrorKind::ResourceBusy, "{busy:?}");
 
     // A directory that another program holds with no sharing: its listing is no answer, and

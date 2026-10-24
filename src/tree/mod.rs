@@ -331,22 +331,22 @@ impl Tree {
 
   /// The directories above the node, from its parent up to the root.
   pub fn ancestors(&self, key: DirKey) -> impl Iterator<Item = DirKey> {
-    self.above(key).map(|at| self.key(at))
+    self.ancestor_slots(key).map(|at| self.key(at))
   }
 
   /// [`Tree::ancestors`], by slot.
-  fn above(&self, key: DirKey) -> impl Iterator<Item = u32> {
+  fn ancestor_slots(&self, key: DirKey) -> impl Iterator<Item = u32> {
     let first = self.get(key).and_then(|node| slot(node.parent));
     iter::successors(first, move |&at| slot(self.slots.linked(at).parent))
   }
 
   pub fn child(&self, parent: DirKey, name: &OsStr) -> Option<DirKey> {
     self.get(parent)?;
-    self.find(parent.index(), name).map(|index| self.key(index))
+    self.child_slot(parent.index(), name).map(|index| self.key(index))
   }
 
   /// The slot of the child `name` of the slot `parent`.
-  fn find(&self, parent: u32, name: &OsStr) -> Option<u32> {
+  fn child_slot(&self, parent: u32, name: &OsStr) -> Option<u32> {
     self
       .index
       .find(child_hash(parent, name), |&index| {
@@ -371,7 +371,7 @@ impl Tree {
   /// Adds the child `name`, which `parent` must not have yet.
   pub fn insert_child(&mut self, parent: DirKey, name: &OsStr) -> DirKey {
     let parent = parent.index();
-    debug_assert!(self.find(parent, name).is_none(), "the child is there already");
+    debug_assert!(self.child_slot(parent, name).is_none(), "the child is there already");
     let name_at = self.names.add(name);
     let slots = self.slots.len();
     let free = iter::from_fn(|| self.free.pop()).find(|&index| (index as usize) < slots);
@@ -639,7 +639,7 @@ impl Tree {
 
   /// Whether a node above is held: then nothing is done here before its second look.
   pub fn frozen(&self, key: DirKey) -> bool {
-    !self.holds.is_empty() && self.above(key).any(|at| self.slots.linked(at).is_held())
+    !self.holds.is_empty() && self.ancestor_slots(key).any(|at| self.slots.linked(at).is_held())
   }
 
   #[cfg(feature = "test-hooks")]

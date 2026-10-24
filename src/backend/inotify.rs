@@ -22,7 +22,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
   backend::{Backend, Coverage, DirKey, Hint, Sink, Want, give_room_back, watch_limit},
-  fs::nanos,
+  fs::unsigned_nanos,
 };
 
 const ENTRY_EVENTS: u32 =
@@ -211,7 +211,7 @@ impl Backend for InotifyBackend {
   }
 
   fn ask_delivered(&mut self, after: SystemTime) {
-    self.fds.asked.fetch_max(nanos(after).max(1), Ordering::Relaxed);
+    self.fds.asked.fetch_max(unsigned_nanos(after).max(1), Ordering::Relaxed);
     let _ = (&self.fds.ask).write_all(&1_u64.to_ne_bytes());
   }
 }
@@ -247,7 +247,7 @@ fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Raw>) {
   let error = loop {
     // A question of the engine wakes the reader at its time.
     let asked = fds.asked.load(Ordering::Relaxed);
-    let until = (asked != 0).then(|| asked.saturating_sub(nanos(SystemTime::now())));
+    let until = (asked != 0).then(|| asked.saturating_sub(unsigned_nanos(SystemTime::now())));
     let ready = ffi::wait_until_ready(fds, until);
     let mounted = match ready {
       Ok([_, true, _, _]) => return,
@@ -276,7 +276,7 @@ fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Raw>) {
     // change returns, the loss report too, so every event of a change before that time is sent
     // (design.md 7.1). One read a turn: a flood can keep the queue from being empty for long,
     // and the reader still sees a stop. A later question stays.
-    let began = if asked == 0 { 0 } else { nanos(SystemTime::now()) };
+    let began = if asked == 0 { 0 } else { unsigned_nanos(SystemTime::now()) };
     let answers = asked != 0 && began >= asked;
     // At most one read a millisecond, unless the last read filled over half of the buffer:
     // a flood of small writes would wake the reader for each.

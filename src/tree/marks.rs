@@ -225,7 +225,7 @@ impl Tree {
       if let Some(parent) = self.parent(key)
         && self[key].is_marked()
       {
-        marks.push((self.above(key).count(), newer, parent, key, since));
+        marks.push((self.ancestor_slots(key).count(), newer, parent, key, since));
       }
     }
     self.marked = emptied(marked);
