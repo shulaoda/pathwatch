@@ -100,17 +100,17 @@ pub struct Engine<B: Backend, F: Fs> {
   loss: Loss,
   pending: BinaryHeap<Reverse<(i64, NodeKey)>>,
   delivered: i64,
-  asked: i64,
+  asked_until: i64,
 
   now: Option<Instant>,
   flush_time: i64,
   flush_ticks: Duration,
   away_scan: bool,
-  gave_back: bool,
+  unwatched_since_commit: bool,
   touched: Vec<NodeKey>,
   narrowing: Vec<NodeKey>,
   stop: Option<Arc<AtomicBool>>,
-  listed: FxHashMap<NodeKey, Listed>,
+  in_listing: FxHashMap<NodeKey, Listed>,
   scan_had_error: bool,
 
   path: PathBuf,
@@ -158,16 +158,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       loss: Loss::default(),
       pending: BinaryHeap::new(),
       delivered: i64::MIN,
-      asked: i64::MIN,
+      asked_until: i64::MIN,
       now: None,
       flush_time: 0,
       flush_ticks: Duration::ZERO,
       away_scan: false,
-      gave_back: false,
+      unwatched_since_commit: false,
       touched: Vec::new(),
       narrowing: Vec::new(),
       stop: None,
-      listed: FxHashMap::default(),
+      in_listing: FxHashMap::default(),
       scan_had_error: false,
       path: PathBuf::new(),
       marks: Vec::new(),
@@ -249,7 +249,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   pub fn overflow(&mut self, now: Instant) {
     self.tree.lost = true;
-    self.asked = i64::MIN;
+    self.asked_until = i64::MIN;
     self.schedule(now);
   }
 
@@ -326,13 +326,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     loss_scans_ran |= self.check_marks(&mut path, rest_is_over, hints_due);
     self.due_holds = emptied(mem::take(&mut self.due_holds));
     let mut entries = mem::take(&mut self.entries);
-    while (!self.tree.to_scan.is_empty() || self.gave_back) && !self.stopped() {
+    while (!self.tree.to_scan.is_empty() || self.unwatched_since_commit) && !self.stopped() {
       self.round(&mut path, &mut entries);
     }
     self.tree.tidy_marked();
     (self.path, self.entries) = (path, emptied(entries));
-    self.listed.clear();
-    self.listed.shrink_to(KEPT / size_of::<ScanEntry>());
+    self.in_listing.clear();
+    self.in_listing.shrink_to(KEPT / size_of::<ScanEntry>());
 
     let took = self.fs.ticks().saturating_sub(self.flush_ticks).min(LONGEST_FLUSH);
     if loss_scans_ran {
@@ -346,14 +346,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut marks = mem::take(&mut self.marks);
     self.tree.take_marked(&mut marks);
     let mut loss_checks_ran = false;
-    let mut above = Vec::new();
+    let mut above_due_holds = Vec::new();
     if !hints_due {
-      above.extend(self.due_holds.iter().flat_map(|&held| self.tree.ancestors(held)));
-      above.sort_unstable();
-      above.dedup();
+      above_due_holds.extend(self.due_holds.iter().flat_map(|&held| self.tree.ancestors(held)));
+      above_due_holds.sort_unstable();
+      above_due_holds.dedup();
     }
     let mut path_of = None;
-    for &(_, _, parent, key, since) in &marks {
+    for &Marked { parent, key, since, .. } in &marks {
       if self.stopped() {
         break;
       }
@@ -364,7 +364,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         self.tree.prune(key);
         continue;
       }
-      let waits = since.is_some() && !hints_due && above.binary_search(&key).is_err();
+      let waits = since.is_some() && !hints_due && above_due_holds.binary_search(&key).is_err();
       if waits || (mark.lost && !rest_is_over) {
         self.tree.mark(key, mark);
         self.loss.waits |= mark.lost;
@@ -383,7 +383,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   fn round(&mut self, path: &mut PathBuf, entries: &mut Vec<ScanEntry>) {
     let now_watched = self.commit();
-    self.gave_back = false;
+    self.unwatched_since_commit = false;
     let mut scans = mem::take(&mut self.scans);
     self.tree.take_scans(&mut scans);
     self.ask_again(now_watched);
@@ -398,7 +398,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         continue;
       }
       self.away_scan = away;
-      self.scan(key, depth, path, entries);
+      self.scan(key, path, depth, entries);
     }
     self.away_scan = false;
     self.scans = emptied(scans);

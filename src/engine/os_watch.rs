@@ -45,7 +45,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         continue;
       }
       push_name(path, self.tree.name(child));
-      let is_dir = self.is_dir_on_disk(child, path);
+      let is_dir = self.counts_as_dir(child, path);
       path.pop();
       if !is_dir {
         return Want::Contents;
@@ -54,7 +54,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     Want::Names
   }
 
-  pub(super) fn is_dir_on_disk(&mut self, key: NodeKey, path: &Path) -> bool {
+  pub(super) fn counts_as_dir(&mut self, key: NodeKey, path: &Path) -> bool {
     let kind = self.fs.lstat(path).map(|meta| meta.kind);
     let kind = if matches!(kind, Ok(FileType::Symlink)) {
       self.fs.stat(path).map(|meta| meta.kind)
@@ -70,7 +70,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       dir.asked = Some(want);
     }
     let answer = self.watch_dir(key, path, want);
-    self.store_answer(key, answer, path);
+    self.store_answer(key, path, answer);
     self.tree.queue_scan(key, Depth::Shallow);
   }
 
@@ -82,7 +82,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  fn store_answer(&mut self, key: NodeKey, answer: Coverage, path: &Path) {
+  fn store_answer(&mut self, key: NodeKey, path: &Path, answer: Coverage) {
     let Some(dir) = self.tree[key].dir_mut() else { return };
     let (old, volume) = (dir.watch, dir.id.volume);
     let mut to_report = None;
@@ -131,7 +131,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(super) fn unwatch_dir(&mut self, key: NodeKey) {
     if let Some(backend) = &mut self.backend {
       backend.unwatch(key);
-      self.gave_back = true;
+      self.unwatched_since_commit = true;
     }
   }
 
@@ -171,7 +171,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     for (key, error) in failed {
       if self.tree.get(key).and_then(Node::dir).is_some_and(|dir| dir.asked.is_some()) {
         let path = self.tree.path(key);
-        self.store_answer(key, Coverage::Failed(error), &path);
+        self.store_answer(key, &path, Coverage::Failed(error));
       }
     }
     now_watched
@@ -186,7 +186,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if matches!(answer, Coverage::NotWatched) {
         continue;
       }
-      self.store_answer(key, answer, &path);
+      self.store_answer(key, &path, answer);
       self.tree.queue_scan(key, Depth::Shallow);
     }
   }

@@ -79,7 +79,7 @@ fn marks(tree: &Tree) -> Vec<String> {
 fn taken(tree: &mut Tree) -> Vec<(usize, NodeKey, NodeKey, Option<Instant>)> {
   let mut marks = Vec::new();
   tree.take_marked(&mut marks);
-  marks.into_iter().map(|(level, _, parent, key, since)| (level, parent, key, since)).collect()
+  marks.into_iter().map(|mark| (mark.level, mark.parent, mark.key, mark.since)).collect()
 }
 
 /// The path as text, with `/` between the names on every OS.

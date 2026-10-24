@@ -58,8 +58,8 @@ pub(crate) fn is_plain(name: &OsStr) -> bool {
 
 impl Tree {
   pub(super) fn spellings(&self, parent: u32, name: &OsStr) -> (Option<u32>, bool) {
-    let (mut child, mut has_other) = (None, false);
-    for &index in self.index.iter_hash(child_hash(parent, name)) {
+    let (mut child, mut has_twin) = (None, false);
+    for &index in self.table.iter_hash(child_hash(parent, name)) {
       let node = self.slots.linked(index);
       if node.parent != parent {
         continue;
@@ -68,10 +68,10 @@ impl Tree {
       if other == name {
         child = Some(index);
       } else {
-        has_other |= other.eq_ignore_ascii_case(name);
+        has_twin |= other.eq_ignore_ascii_case(name);
       }
     }
-    (child, has_other)
+    (child, has_twin)
   }
 
   pub(super) fn others_meant(&self, at: u32, name: &OsStr, exact: Option<u32>) -> Vec<u32> {
@@ -80,8 +80,8 @@ impl Tree {
       return listed.iter().copied().filter(|&child| Some(child) != exact).collect();
     }
     let any_child = self.slots.linked(at).is_complete();
-    let alike = self.alike(at, name, exact);
-    alike.filter(|&child| any_child || self.slots.linked(child).is_registered()).collect()
+    let twins = self.twins_of(at, name, exact);
+    twins.filter(|&child| any_child || self.slots.linked(child).is_registered()).collect()
   }
 
   pub fn has_spellings(&self, key: NodeKey) -> bool {
@@ -100,11 +100,11 @@ impl Tree {
 
   fn twins(&self, key: NodeKey) -> impl Iterator<Item = u32> + '_ {
     let node = &self[key];
-    self.alike(node.parent, name_of(&self.names, node), Some(key.index()))
+    self.twins_of(node.parent, name_of(&self.names, node), Some(key.index()))
   }
 
-  fn alike(&self, parent: u32, name: &OsStr, except: Option<u32>) -> impl Iterator<Item = u32> {
-    self.index.iter_hash(child_hash(parent, name)).copied().filter(move |&index| {
+  fn twins_of(&self, parent: u32, name: &OsStr, except: Option<u32>) -> impl Iterator<Item = u32> {
+    self.table.iter_hash(child_hash(parent, name)).copied().filter(move |&index| {
       let node = self.slots.linked(index);
       Some(index) != except
         && node.parent == parent

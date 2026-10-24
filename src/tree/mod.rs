@@ -57,7 +57,7 @@ pub struct Node {
 const _: () = assert!(size_of::<Node>() == 64 && size_of::<Slot>() == 64);
 
 impl Node {
-  fn new(generation: u32, parent: u32, (name_at, name_len): (u32, u16)) -> Self {
+  fn new(generation: u32, parent: u32, name_at: u32, name_len: u16) -> Self {
     Self {
       kind: Kind::Missing,
       generation,
@@ -167,7 +167,7 @@ pub enum Watch {
 }
 
 impl Watch {
-  pub fn is_heard(self) -> bool {
+  pub fn is_reported(self) -> bool {
     matches!(self, Self::Watched | Self::WatchedTree | Self::FromAbove)
   }
 
@@ -203,7 +203,7 @@ pub struct Tree {
   free: Vec<u32>,
   first_generation: u32,
   names: Names,
-  index: HashTable<u32>,
+  table: HashTable<u32>,
   links: FxHashMap<NodeKey, u64>,
   contents: FxHashMap<NodeKey, Content>,
   holds: FxHashMap<NodeKey, Instant>,
@@ -221,7 +221,8 @@ impl Tree {
 
   pub fn new() -> Self {
     let mut names = Names::default();
-    let mut root = Node::new(0, NONE, names.add(OsStr::new("")));
+    let (name_at, name_len) = names.add(OsStr::new(""));
+    let mut root = Node::new(0, NONE, name_at, name_len);
     root.kind = Kind::Dir(Dir { watch: Watch::Polled, ..Dir::default() });
     let mut slots = Slots::default();
     slots.push(Slot::Live(root));
@@ -230,7 +231,7 @@ impl Tree {
       free: Vec::new(),
       first_generation: 0,
       names,
-      index: HashTable::new(),
+      table: HashTable::new(),
       links: FxHashMap::default(),
       contents: FxHashMap::default(),
       holds: FxHashMap::default(),
@@ -289,7 +290,7 @@ impl Tree {
 
   fn child_slot(&self, parent: u32, name: &OsStr) -> Option<u32> {
     self
-      .index
+      .table
       .find(child_hash(parent, name), |&index| {
         let node = self.slots.linked(index);
         node.parent == parent && name_of(&self.names, node) == name
@@ -310,17 +311,17 @@ impl Tree {
   pub fn insert_child(&mut self, parent: NodeKey, name: &OsStr) -> NodeKey {
     let parent = parent.index();
     debug_assert!(self.child_slot(parent, name).is_none(), "the child is there already");
-    let name_at = self.names.add(name);
+    let (name_at, name_len) = self.names.add(name);
     let slots = self.slots.len();
     let free = iter::from_fn(|| self.free.pop()).find(|&index| (index as usize) < slots);
     let index = if let Some(index) = free {
       let slot = &mut self.slots[index as usize];
       let Slot::Free(generation) = *slot else { unreachable!("the slot is on the free list") };
-      *slot = Slot::Live(Node::new(generation, parent, name_at));
+      *slot = Slot::Live(Node::new(generation, parent, name_at, name_len));
       index
     } else {
       let index = u32::try_from(slots).expect("the arena holds fewer than 2^32 nodes");
-      self.slots.push(Slot::Live(Node::new(self.first_generation, parent, name_at)));
+      self.slots.push(Slot::Live(Node::new(self.first_generation, parent, name_at, name_len)));
       index
     };
 
@@ -330,7 +331,7 @@ impl Tree {
       self.slots.linked_mut(first).prev = index;
     }
 
-    let Self { slots, names, index: table, .. } = self;
+    let Self { slots, names, table, .. } = self;
     table.insert_unique(child_hash(parent, name), index, |&other| hash_of(slots, names, other));
     self.key(index)
   }
@@ -346,8 +347,11 @@ impl Tree {
 
   fn remove(&mut self, key: NodeKey) {
     let slot = &mut self.slots[key.index() as usize];
-    let Some(generation) = slot.node().map(|node| node.generation.wrapping_add(1)) else { return };
-    let Slot::Live(node) = mem::replace(slot, Slot::Free(generation)) else { return };
+    let Some(node) = slot.node() else { return };
+    let generation = node.generation.wrapping_add(1);
+    let Slot::Live(node) = mem::replace(slot, Slot::Free(generation)) else {
+      unreachable!("the slot is live")
+    };
     self.free.push(key.index());
 
     if node.prev == NONE {
@@ -360,7 +364,7 @@ impl Tree {
     }
 
     let hash = child_hash(node.parent, name_of(&self.names, &node));
-    if let Ok(entry) = self.index.find_entry(hash, |&index| index == key.index()) {
+    if let Ok(entry) = self.table.find_entry(hash, |&index| index == key.index()) {
       entry.remove();
     }
     self.links.remove(&key);
@@ -387,9 +391,9 @@ impl Tree {
       self.free.retain(|&index| (index as usize) < slots);
       self.free.shrink_to(slots);
     }
-    if self.index.capacity() > 8 * self.index.len() + 16 {
-      let Self { slots, names, index, .. } = self;
-      index.shrink_to(2 * index.len(), |&other| hash_of(slots, names, other));
+    if self.table.capacity() > 8 * self.table.len() + 16 {
+      let Self { slots, names, table, .. } = self;
+      table.shrink_to(2 * table.len(), |&other| hash_of(slots, names, other));
     }
   }
 
@@ -559,6 +563,38 @@ impl Tree {
     !self.holds.is_empty() && self.ancestor_slots(key).any(|at| self.slots.linked(at).is_held())
   }
 
+  pub fn list_if_polled(&mut self, key: NodeKey) {
+    if matches!(self[key].kind, Kind::Dir(dir) if dir.is_polled()) {
+      self.polled.push(key);
+      if self.polled.len() > 2 * self.slots.len() + 16 {
+        self.tidy_polled();
+      }
+    }
+  }
+
+  pub fn poll_all(&mut self) {
+    for slot in self.slots.iter_mut() {
+      if let Some(Node { kind: Kind::Dir(dir), .. }) = slot.node_mut() {
+        (dir.watch, dir.asked) = (Watch::Polled, None);
+      }
+    }
+    let dirs = self.nodes().filter(|(_, node)| matches!(node.kind, Kind::Dir(_)));
+    self.polled = dirs.map(|(key, _)| key).collect();
+  }
+
+  pub fn tidy_polled(&mut self) {
+    let mut polled = mem::take(&mut self.polled);
+    polled.sort_unstable();
+    polled.dedup();
+    polled.retain(|&key| {
+      self.get(key).is_some_and(|node| matches!(node.kind, Kind::Dir(dir) if dir.is_polled()))
+    });
+    if let Some(room) = room_to_keep(polled.len(), polled.capacity()) {
+      polled.shrink_to(room);
+    }
+    self.polled = polled;
+  }
+
   #[cfg(feature = "test-hooks")]
   pub fn content_room(&self) -> usize {
     self.contents.capacity()
@@ -604,7 +640,7 @@ impl Tree {
       return Err("the content of a file is kept for a node that has no file".to_owned());
     }
     let live = self.nodes().count();
-    if reached != live || self.index.len() + 1 != live {
+    if reached != live || self.table.len() + 1 != live {
       return Err("a node is in no list of children, or not in the table".to_owned());
     }
     let registered = |node: &Node| node.is_registered() && !is_plain(name_of(&self.names, node));
@@ -735,13 +771,13 @@ mod tests {
     let keys: Vec<NodeKey> =
       (0..10_000).map(|i| tree.insert_child(top, OsStr::new(&i.to_string()))).collect();
     let (last, others) = keys.split_last().unwrap();
-    let table = tree.index.capacity();
+    let table = tree.table.capacity();
 
     for key in others {
       tree.prune(*key);
     }
     assert_eq!((tree.slots.len(), tree.free.len()), (keys.len() + 2, others.len()));
-    assert!(tree.index.capacity() < table / 100);
+    assert!(tree.table.capacity() < table / 100);
     tree.check_links().unwrap();
 
     tree.prune(*last);

@@ -638,7 +638,7 @@ The guards are implemented as follows:
    - The file was held, because it was away itself, or because its hint went into the look that
      found it missing.
 
-   A look that gets no answer (`Found::Unknown`), and a listing that cannot be finished, pass what
+   A look that gets no answer (`Found::NoAnswer`), and a listing that cannot be finished, pass what
    they knew about lost hints to the retried look (`Engine::retry`). Previously, a listing left a
    plain deep mark, and its scan took a rewritten file for untouched (Inode seed 103232).
 

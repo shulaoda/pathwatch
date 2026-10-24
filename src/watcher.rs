@@ -163,7 +163,7 @@ impl Watcher {
   fn command(
     &self,
     paths: &[impl AsRef<Path>],
-    command: fn(Vec<PathBuf>, Done) -> Command,
+    make: fn(Vec<PathBuf>, Done) -> Command,
   ) -> Result<(), Error> {
     let closed = || Error::new(ErrorKind::Closed, None, None);
     if self.stop.load(Ordering::Acquire) {
@@ -178,10 +178,10 @@ impl Watcher {
       }
     }
     let sent = if self.on_its_thread() {
-      self.inside.send(command(usable, None)).is_ok()
+      self.inside.send(make(usable, None)).is_ok()
     } else {
       let (done, wait) = mpsc::sync_channel(1);
-      (self.send)(command(usable, Some(done))) && wait.recv().is_ok()
+      (self.send)(make(usable, Some(done))) && wait.recv().is_ok()
     };
     if !sent {
       return Err(closed());
@@ -192,6 +192,22 @@ impl Watcher {
   fn on_its_thread(&self) -> bool {
     WATCHER_THREAD.get() == self.number
   }
+}
+
+fn clean(path: &Path) -> Result<PathBuf, Option<io::Error>> {
+  if path.as_os_str().is_empty() {
+    return Err(None);
+  }
+  if path.is_absolute()
+    || (cfg!(windows)
+      && matches!(path.as_os_str().as_encoded_bytes(), [b'\\' | b'/', b'\\' | b'/', ..]))
+  {
+    return normalize(path).ok_or(None);
+  }
+  let current = env::current_dir().map_err(Some)?;
+  #[cfg(windows)]
+  let path = windows::rest_of_the_drive(path, &current).ok_or(None)?;
+  normalize(&current.join(path)).ok_or(None)
 }
 
 impl Drop for Watcher {
@@ -209,7 +225,7 @@ impl fmt::Debug for Watcher {
 enum Message<R> {
   Signal(Signal<R>, usize),
   Command(Command),
-  Wake,
+  Overflow,
 }
 
 enum Command {
@@ -292,7 +308,7 @@ fn sink<B: Backend>(post: Post<B::Raw>, queue: Arc<Queue>) -> Sink<B::Raw> {
     }
     queue.bytes.fetch_sub(bytes, Ordering::AcqRel);
     if !queue.overflow.swap(true, Ordering::AcqRel) {
-      post.send(Message::Wake);
+      post.send(Message::Overflow);
     }
   })
 }
@@ -330,7 +346,7 @@ impl<B: Backend, H: FnMut(Result<Vec<Event>, Error>)> Worker<B, H> {
             done
           }
           Message::Command(Command::Stop) => return,
-          Message::Wake => {
+          Message::Overflow => {
             self.queue.overflow.store(false, Ordering::Release);
             self.engine.overflow(Instant::now());
             None
@@ -371,22 +387,6 @@ impl<B: Backend, H: FnMut(Result<Vec<Event>, Error>)> Worker<B, H> {
       }
     }
   }
-}
-
-fn clean(path: &Path) -> Result<PathBuf, Option<io::Error>> {
-  if path.as_os_str().is_empty() {
-    return Err(None);
-  }
-  if path.is_absolute()
-    || (cfg!(windows)
-      && matches!(path.as_os_str().as_encoded_bytes(), [b'\\' | b'/', b'\\' | b'/', ..]))
-  {
-    return normalize(path).ok_or(None);
-  }
-  let current = env::current_dir().map_err(Some)?;
-  #[cfg(windows)]
-  let path = windows::rest_of_the_drive(path, &current).ok_or(None)?;
-  normalize(&current.join(path)).ok_or(None)
 }
 
 #[cfg(windows)]

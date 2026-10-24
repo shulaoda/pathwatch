@@ -50,10 +50,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let looked = now + self.fs.ticks().saturating_sub(self.flush_ticks);
     let delay = self.options.delete_delay;
     let node = &self.tree[key];
-    let unknown_file = matches!(node.kind, Kind::File(_)) && !node.told();
+    let untold_file = matches!(node.kind, Kind::File(_)) && !node.told();
     match self.tree.held_until(key) {
       Some(until) if until > looked => return,
-      None if !delay.is_zero() && !unknown_file => {}
+      None if !delay.is_zero() && !untold_file => {}
       _ => return self.gone(key),
     }
     let until = (since.unwrap_or(looked) + delay).max(looked);

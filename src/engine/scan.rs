@@ -26,8 +26,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(super) fn scan(
     &mut self,
     key: NodeKey,
-    depth: Depth,
     path: &mut PathBuf,
+    depth: Depth,
     entries: &mut Vec<ScanEntry>,
   ) {
     if self.tree.frozen(key) {
@@ -37,7 +37,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.scan_had_error = false;
     entries.clear();
     entries.extend(self.tree.children(key).map(|child| (child, Listed::NotAsked)));
-    self.listed.clear();
+    self.in_listing.clear();
     let listing =
       if self.tree[key].is_complete() { self.list_new(key, path, entries) } else { Listing::None };
     if listing == Listing::Stop {
@@ -53,7 +53,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
       let listed = match listed {
         Listed::NotAsked if names_are_known => {
-          self.listed.get(&child).copied().unwrap_or(Listed::NotNamed)
+          self.in_listing.get(&child).copied().unwrap_or(Listed::NotNamed)
         }
         said => said,
       };
@@ -79,39 +79,35 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     entries: &mut Vec<ScanEntry>,
   ) -> Listing {
     let known = entries.len();
-    let lags = self.fs.listing_lags() && !self.tree[key].watch().is_heard();
+    let lags = self.fs.listing_lags() && !self.tree[key].watch().is_reported();
     let flush_time = self.flush_time;
     let tree = &mut self.tree;
-    let mut listed = tree.loose_spelling.then_some(&mut self.listed);
-    let result = self.fs.read_dir(path, &mut |name, entry| {
+    let mut in_listing = tree.loose_spelling.then_some(&mut self.in_listing);
+    let listed = self.fs.read_dir(path, &mut |name, entry| {
       let entry = match entry {
         Entry::File { .. } if lags => Entry::Kind(FileType::File),
         entry => entry,
       };
       match tree.child(key, name) {
         Some(node) => {
-          if let Some(listed) = &mut listed {
-            listed.insert(node, Listed::of(entry, flush_time));
+          if let Some(in_listing) = &mut in_listing {
+            in_listing.insert(node, Listed::of(entry, flush_time));
           }
         }
         None => entries.push((tree.insert_child(key, name), Listed::of(entry, flush_time))),
       }
     });
-    let error = match result {
-      Ok(()) => {
-        let is_link = self.tree.link(key).is_some();
-        let still = if is_link { self.fs.stat(path) } else { self.fs.lstat(path) };
-        match still {
-          Ok(meta)
-            if meta.kind == FileType::Dir
-              && self.tree[key].dir().is_some_and(|dir| dir.id == meta.dir_id) =>
-          {
-            return Listing::Whole;
-          }
-          Ok(_) => None,
-          Err(error) => Some(error),
-        }
+    let is_link = self.tree.link(key).is_some();
+    let still =
+      listed.and_then(|()| if is_link { self.fs.stat(path) } else { self.fs.lstat(path) });
+    let error = match still {
+      Ok(meta)
+        if meta.kind == FileType::Dir
+          && self.tree[key].dir().is_some_and(|dir| dir.id == meta.dir_id) =>
+      {
+        return Listing::Whole;
       }
+      Ok(_) => None,
       Err(error) => Some(error),
     };
 
@@ -127,7 +123,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         self.tree.get(key).and_then(Node::dir).is_some_and(|dir| dir.scan.is_none())
       }
       Some(error) => match self.disk_error(key, path, error) {
-        Found::Unknown => true,
+        Found::NoAnswer => true,
         _ => return Listing::None,
       },
     };

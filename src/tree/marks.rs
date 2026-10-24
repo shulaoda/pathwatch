@@ -6,9 +6,7 @@ use std::{
   time::Instant,
 };
 
-use super::{
-  Content, Depth, Kind, NONE, Node, Tree, Watch, emptied, is_plain, name_of, room_to_keep,
-};
+use super::{Content, Depth, NONE, Node, Tree, emptied, is_plain, name_of};
 use crate::{
   backend::{Hint, NodeKey},
   path::split_top,
@@ -21,7 +19,14 @@ enum Said {
   New,
 }
 
-pub type Marked = (usize, usize, NodeKey, NodeKey, Option<Instant>);
+#[derive(Clone, Copy, Debug)]
+pub struct Marked {
+  pub level: usize,
+  pub age: usize,
+  pub parent: NodeKey,
+  pub key: NodeKey,
+  pub since: Option<Instant>,
+}
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Mark {
@@ -99,25 +104,27 @@ impl Tree {
     let mut found = false;
     while let Some(part) = parts.next() {
       let Component::Normal(name) = part else { return found };
-      let (child, has_other) = self.spellings(at, name);
-      let below = child.map(|child| self.slots.linked(child));
-      let is_dir = below.is_some_and(Node::is_dir);
-      let is_complete = self.slots.linked(at).is_complete();
-      let is_seen = below.is_some_and(Node::is_registered) || is_complete;
-      if self.loose_spelling && is_complete && !below.is_some_and(Node::is_entry) && !is_plain(name)
+      let (child, has_twin) = self.spellings(at, name);
+      let in_complete = self.slots.linked(at).is_complete();
+      let is_tracked =
+        in_complete || child.is_some_and(|child| self.slots.linked(child).is_registered());
+      if self.loose_spelling
+        && in_complete
+        && !is_plain(name)
+        && !child.is_some_and(|child| self.slots.linked(child).is_entry())
       {
         self.queue_scan(self.key(at), Depth::Names);
       }
-      if has_other || (self.loose_spelling && !self.not_plain.is_empty() && !is_plain(name)) {
+      if has_twin || (self.loose_spelling && !self.not_plain.is_empty() && !is_plain(name)) {
         found |= self.mark_others(at, name, child, &parts, said);
       }
-      if !is_seen {
+      if !is_tracked {
         return found;
       }
       let last = parts.peek().is_none();
       if !last
         && let Some(child) = child
-        && is_dir
+        && self.slots.linked(child).is_dir()
       {
         at = child;
         continue;
@@ -145,15 +152,15 @@ impl Tree {
   ) -> bool {
     let last = rest.clone().peek().is_none();
     let mut found = false;
-    let one_entry = said == Said::Written && self.loose_spelling;
+    let twin_is_the_entry = said == Said::Written && self.loose_spelling;
     for other in self.others_meant(at, name, exact) {
       let node = self.slots.linked(other);
-      let written = one_entry && name_of(&self.names, node).eq_ignore_ascii_case(name);
+      let is_the_entry = twin_is_the_entry && name_of(&self.names, node).eq_ignore_ascii_case(name);
       if !last && node.is_dir() {
-        let said = if written { said } else { Said::Changed };
+        let said = if is_the_entry { said } else { Said::Changed };
         found |= self.mark_path(other, rest.clone(), said);
       } else {
-        let written = written && last;
+        let written = last && is_the_entry;
         self.mark(self.key(other), Mark { deep: !written, written, lost: false, since: None });
         found = true;
       }
@@ -194,18 +201,17 @@ impl Tree {
   pub fn take_marked(&mut self, marks: &mut Vec<Marked>) {
     marks.clear();
     let mut marked = mem::take(&mut self.marked);
-    for (newer, (key, since)) in marked.drain(..).rev().enumerate() {
+    for (age, (key, since)) in marked.drain(..).rev().enumerate() {
       if let Some(parent) = self.parent(key)
         && self[key].is_marked()
       {
-        marks.push((self.ancestor_slots(key).count(), newer, parent, key, since));
+        marks.push(Marked { level: self.ancestor_slots(key).count(), age, parent, key, since });
       }
     }
     self.marked = emptied(marked);
-    marks.sort_unstable_by_key(|&(level, newer, parent, key, _)| {
-      (level, parent.index(), key.index(), newer)
-    });
-    marks.dedup_by_key(|&mut (.., key, _)| key);
+    marks
+      .sort_unstable_by_key(|mark| (mark.level, mark.parent.index(), mark.key.index(), mark.age));
+    marks.dedup_by_key(|mark| mark.key);
   }
 
   pub fn tidy_marked(&mut self) {
@@ -216,37 +222,5 @@ impl Tree {
 
   pub fn has_work(&self) -> bool {
     !self.marked.is_empty() || !self.to_scan.is_empty()
-  }
-
-  pub fn list_if_polled(&mut self, key: NodeKey) {
-    if matches!(self[key].kind, Kind::Dir(dir) if dir.is_polled()) {
-      self.polled.push(key);
-      if self.polled.len() > 2 * self.slots.len() + 16 {
-        self.tidy_polled();
-      }
-    }
-  }
-
-  pub fn poll_all(&mut self) {
-    for slot in self.slots.iter_mut() {
-      if let Some(Node { kind: Kind::Dir(dir), .. }) = slot.node_mut() {
-        (dir.watch, dir.asked) = (Watch::Polled, None);
-      }
-    }
-    let dirs = self.nodes().filter(|(_, node)| matches!(node.kind, Kind::Dir(_)));
-    self.polled = dirs.map(|(key, _)| key).collect();
-  }
-
-  pub fn tidy_polled(&mut self) {
-    let mut polled = mem::take(&mut self.polled);
-    polled.sort_unstable();
-    polled.dedup();
-    polled.retain(|&key| {
-      self.get(key).is_some_and(|node| matches!(node.kind, Kind::Dir(dir) if dir.is_polled()))
-    });
-    if let Some(room) = room_to_keep(polled.len(), polled.capacity()) {
-      polled.shrink_to(room);
-    }
-    self.polled = polled;
   }
 }

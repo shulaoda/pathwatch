@@ -16,12 +16,13 @@ impl Names {
     if self.blocks.last().is_none_or(|block| block.len() + name.len() > BLOCK) {
       self.blocks.push(Vec::new());
     }
-    let full = (self.blocks.len() - 1) * BLOCK;
+    let before = (self.blocks.len() - 1) * BLOCK;
     let block = self.blocks.last_mut().expect("a block");
     if block.capacity() - block.len() < name.len() {
-      block.reserve_exact(name.len().max(block.len() / 8 + 256).min(BLOCK - block.len()));
+      let growth = (block.len() / 8 + 256).max(name.len()).min(BLOCK - block.len());
+      block.reserve_exact(growth);
     }
-    let start = u32::try_from(full + block.len()).expect("all names together are below 4 GiB");
+    let start = u32::try_from(before + block.len()).expect("all names together are below 4 GiB");
     block.extend_from_slice(name);
     self.used += name.len();
     (start, len)

@@ -23,7 +23,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       return;
     }
 
-    let mut anchor = Tree::ROOT;
+    let mut mark_at = Tree::ROOT;
     let mut below_directories = true;
     let mut at = Tree::ROOT;
     for name in iter::once(top).chain(rest.iter()) {
@@ -32,7 +32,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       node.set_ignored(EntryKind::Dir, false);
       at = self.tree.child(at, name).unwrap_or_else(|| self.tree.insert_child(at, name));
       if below_directories {
-        anchor = at;
+        mark_at = at;
       }
       let node = &mut self.tree[at];
       if !node.is_registered() {
@@ -60,17 +60,17 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let Some(parent) = self.tree.parent(at) else { return };
     if below_directories
       && self.tells_names_only(parent)
-      && !self.is_dir_on_disk(at, path)
+      && !self.counts_as_dir(at, path)
       && let Some(parent_path) = path.parent()
     {
       self.ask(parent, parent_path, Want::Contents);
     }
-    if let Some(parent) = self.tree.parent(anchor)
+    if let Some(parent) = self.tree.parent(mark_at)
       && self.tree[parent]
         .dir()
         .is_some_and(|dir| dir.scan.is_none_or(|depth| depth == Depth::Names))
     {
-      self.tree.mark(anchor, Mark::DEEP);
+      self.tree.mark(mark_at, Mark::DEEP);
     }
   }
 

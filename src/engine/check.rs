@@ -27,10 +27,10 @@ const YOUNG_COARSE: Duration = Duration::from_secs(2);
 
 pub(super) enum Found {
   Missing,
-  OtherSpelling(OsString),
+  OtherSpelling,
   File(FileType, Fingerprint),
   Dir { id: DirId, complete: bool, relinked: bool, young: bool },
-  Unknown,
+  NoAnswer,
 }
 
 #[derive(Clone, Copy)]
@@ -38,13 +38,13 @@ pub(super) enum Listed {
   NotAsked,
   Named(Option<FileType>),
   File(Fingerprint),
-  Dir(DirId, bool),
+  Dir { id: DirId, young: bool },
   NotNamed,
 }
 
 impl Listed {
   pub(super) fn is_named(self) -> bool {
-    matches!(self, Self::Named(_) | Self::File(_) | Self::Dir(..))
+    matches!(self, Self::Named(_) | Self::File(_) | Self::Dir { .. })
   }
 
   pub(super) fn of(entry: Entry, flush_time: i64) -> Self {
@@ -54,7 +54,9 @@ impl Listed {
       Entry::File { modified, size, file_id } => {
         Self::File(Fingerprint { modified: nanos(modified), size, id: file_id })
       }
-      Entry::Dir { id, modified } => Self::Dir(id, young_dir(flush_time, nanos(modified))),
+      Entry::Dir { id, modified } => {
+        Self::Dir { id, young: young_dir(flush_time, nanos(modified)) }
+      }
     }
   }
 }
@@ -77,7 +79,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     listed: Listed,
     why: Mark,
     twins: &mut Vec<NodeKey>,
-    followed: bool,
+    named_by_disk: bool,
   ) {
     let why = match self.tree.take_mark(key) {
       Some(pending) => Mark {
@@ -94,12 +96,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let was_unlisted = node.is_unlisted();
 
     push_name(path, self.tree.name(key));
-    let mut listed_as = None;
-    let found = self.read_entry(parent, key, path, listed, &mut listed_as);
-    let on_disk = match &found {
-      Found::OtherSpelling(name) => Some(name.clone()),
-      _ => listed_as,
-    };
+    let (found, on_disk) = self.read_entry(parent, key, path, listed);
     self.apply(key, path, found, was_unlisted, why);
 
     let wants_more = registered && !self.tree[key].is_dir() && self.tells_names_only(parent);
@@ -121,12 +118,201 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let pending = self.tree.take_mark(node).unwrap_or_default();
       let written = why.written || pending.written;
       let mark = Mark { deep: true, written, lost: false, since: why.since };
-      if followed {
+      if named_by_disk {
         self.tree.mark(node, mark);
       } else {
         self.check_one(node, path, Listed::NotAsked, mark, twins, true);
       }
     }
+  }
+
+  fn read_entry(
+    &mut self,
+    parent: NodeKey,
+    key: NodeKey,
+    path: &Path,
+    listed: Listed,
+  ) -> (Found, Option<OsString>) {
+    if self.tree[key].is_registered() {
+      self.read_registered_name(parent, key, path, listed)
+    } else if self.tree[parent].is_complete() {
+      self.read_listed_name(parent, key, path, listed)
+    } else if self.tracks_every_entry(parent) {
+      (Found::NoAnswer, None)
+    } else {
+      (Found::Missing, None)
+    }
+  }
+
+  fn read_registered_name(
+    &mut self,
+    parent: NodeKey,
+    key: NodeKey,
+    path: &Path,
+    listed: Listed,
+  ) -> (Found, Option<OsString>) {
+    let node = &self.tree[key];
+    let (is_ancestor, is_path, was_unlisted) =
+      (node.is_ancestor(), node.is_path(), node.is_unlisted());
+    let in_complete = self.tree[parent].is_complete();
+    let unsure = in_complete && self.tree.loose_spelling && self.spelling_is_unsure(key, listed);
+    let mut meta = match self.fs.lstat(path) {
+      Ok(meta) => meta,
+      Err(error) => return (self.look_error(parent, key, path, listed, error), None),
+    };
+    let other = if unsure {
+      match self.other_spelling(key, path) {
+        Ok(other) => other,
+        Err(error) => return (self.disk_error(parent, path, error), None),
+      }
+    } else {
+      None
+    };
+    self.tree[key].set_unlisted(other.is_some());
+    let link = (meta.kind == FileType::Symlink)
+      .then(|| self.fs.real_path(path).map_or(0, |real| hash_of(&real)));
+    let old = self.tree.link(key);
+    let relinked = old != link;
+    self.tree.set_link(key, link);
+    if link.is_some() {
+      meta = match self.fs.stat(path) {
+        Ok(meta) => meta,
+        Err(error) => {
+          let found = self.disk_error(parent, path, error);
+          if matches!(found, Found::NoAnswer) {
+            self.tree.set_link(key, old);
+            self.tree[key].set_unlisted(was_unlisted);
+          }
+          return match found {
+            Found::Missing if !is_path => respelled(other),
+            found => (found, None),
+          };
+        }
+      };
+    }
+
+    let inside = is_path || (in_complete && other.is_none());
+    let kind = entry_kind(meta.kind);
+    let visible = inside && !self.ignores(key, path, kind);
+    let found = match kind {
+      EntryKind::Dir if is_ancestor || visible => {
+        let young = young_dir(self.flush_time, nanos(meta.modified));
+        Found::Dir { id: meta.dir_id, complete: visible, relinked, young }
+      }
+      EntryKind::File if visible => Found::File(meta.kind, Fingerprint::of(&meta)),
+      _ => return respelled(other),
+    };
+    (found, other.filter(|_| !was_unlisted))
+  }
+
+  fn read_listed_name(
+    &mut self,
+    parent: NodeKey,
+    key: NodeKey,
+    path: &Path,
+    listed: Listed,
+  ) -> (Found, Option<OsString>) {
+    let kind = match listed {
+      Listed::Named(kind) => kind,
+      Listed::File(_) => Some(FileType::File),
+      Listed::Dir { .. } => Some(FileType::Dir),
+      Listed::NotAsked | Listed::NotNamed => None,
+    };
+    if kind.is_some_and(|kind| self.ignores(key, path, entry_kind(kind))) {
+      return (Found::Missing, None);
+    }
+    match listed {
+      Listed::File(file) => return (Found::File(FileType::File, file), None),
+      Listed::Dir { id, young } => {
+        return (Found::Dir { id, complete: true, relinked: false, young }, None);
+      }
+      _ => {}
+    }
+    let unsure = self.tree.loose_spelling && self.spelling_is_unsure(key, listed);
+    let meta = match self.fs.lstat(path) {
+      Ok(meta) => meta,
+      Err(error) => return (self.look_error(parent, key, path, listed, error), None),
+    };
+    let kind = entry_kind(meta.kind);
+    if self.ignores(key, path, kind) {
+      return (Found::Missing, None);
+    }
+    if unsure {
+      match self.other_spelling(key, path) {
+        Ok(None) => {}
+        Ok(Some(name)) => return (Found::OtherSpelling, Some(name)),
+        Err(error) => return (self.disk_error(parent, path, error), None),
+      }
+    }
+    let found = match kind {
+      EntryKind::Dir => {
+        let young = young_dir(self.flush_time, nanos(meta.modified));
+        Found::Dir { id: meta.dir_id, complete: true, relinked: false, young }
+      }
+      EntryKind::File => Found::File(meta.kind, Fingerprint::of(&meta)),
+    };
+    (found, None)
+  }
+
+  fn look_error(
+    &mut self,
+    parent: NodeKey,
+    key: NodeKey,
+    path: &Path,
+    listed: Listed,
+    error: io::Error,
+  ) -> Found {
+    if is_delete_pending(&error) {
+      self.tree.mark(key, Mark::default());
+    } else if listed.is_named()
+      && is_missing(&error)
+      && let Some(dir) = self.tree[parent].dir_mut()
+    {
+      dir.relist = true;
+      self.tree.mark(parent, Mark::default());
+    }
+    self.disk_error(parent, path, error)
+  }
+
+  fn other_spelling(&self, key: NodeKey, path: &Path) -> io::Result<Option<OsString>> {
+    let name = self.fs.name_on_disk(path)?;
+    Ok(Some(name).filter(|name| name != self.tree.name(key)))
+  }
+
+  fn spelling_is_unsure(&self, key: NodeKey, listed: Listed) -> bool {
+    if listed.is_named() {
+      return false;
+    }
+    let node = &self.tree[key];
+    let was_entry =
+      matches!(listed, Listed::NotAsked) && node.is_entry() && node.added() != Added::Registered;
+    self.tree.has_spellings(key) && (!was_entry || self.tree.has_other_spelling(key))
+  }
+
+  pub(super) fn disk_error(&mut self, owner: NodeKey, path: &Path, error: io::Error) -> Found {
+    if is_missing(&error) {
+      return Found::Missing;
+    }
+    let (kind, found) = match error.kind() {
+      io::ErrorKind::PermissionDenied => (Some(ErrorKind::PermissionDenied), Found::Missing),
+      io::ErrorKind::InvalidFilename | io::ErrorKind::InvalidInput => {
+        (Some(ErrorKind::Io), Found::Missing)
+      }
+      _ if is_link_loop(&error) => (Some(ErrorKind::Io), Found::Missing),
+      io::ErrorKind::ResourceBusy => (None, Found::NoAnswer),
+      _ => (Some(ErrorKind::Io), Found::NoAnswer),
+    };
+    self.scan_had_error = true;
+    if let Some(dir) = self.tree[owner].dir_mut()
+      && !dir.has_error
+    {
+      dir.has_error = true;
+      self.tree.list_if_polled(owner);
+      if let Some(kind) = kind {
+        self.report(kind, path, error);
+      }
+    }
+    found
   }
 
   fn apply(
@@ -138,11 +324,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     why: Mark,
   ) {
     match (found, self.tree[key].kind) {
-      (Found::Unknown, _) => self.tree.mark(key, self.retry(why)),
+      (Found::NoAnswer, _) => self.tree.mark(key, self.retry(why)),
 
       (Found::Missing, Kind::Missing) => {}
       (Found::Missing, Kind::File(_) | Kind::Dir(_)) => self.missing(key, why.since),
-      (Found::OtherSpelling(_), _) => self.gone(key),
+      (Found::OtherSpelling, _) => self.gone(key),
 
       (Found::File(kind, file), had) => {
         if let Kind::Dir(_) = had {
@@ -207,163 +393,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.touched.push(key);
     }
     self.tree.queue_scan(key, Depth::Shallow);
-  }
-
-  fn read_entry(
-    &mut self,
-    parent: NodeKey,
-    key: NodeKey,
-    path: &Path,
-    listed: Listed,
-    listed_as: &mut Option<OsString>,
-  ) -> Found {
-    let node = &self.tree[key];
-    let (registered, is_ancestor, is_path) =
-      (node.is_registered(), node.is_ancestor(), node.is_path());
-    let in_complete = self.tree[parent].is_complete();
-
-    if !registered {
-      if !in_complete {
-        return if self.tracks_every_entry(parent) { Found::Unknown } else { Found::Missing };
-      }
-      let kind = match listed {
-        Listed::Named(kind) => kind,
-        Listed::File(_) => Some(FileType::File),
-        Listed::Dir(..) => Some(FileType::Dir),
-        Listed::NotAsked | Listed::NotNamed => None,
-      };
-      if kind.is_some_and(|kind| self.ignores(key, path, entry_kind(kind))) {
-        return Found::Missing;
-      }
-      match listed {
-        Listed::File(file) => return Found::File(FileType::File, file),
-        Listed::Dir(id, young) => return Found::Dir { id, complete: true, relinked: false, young },
-        _ => {}
-      }
-    }
-
-    let unsure = in_complete && self.tree.loose_spelling && self.spelling_is_unsure(key, listed);
-    let mut meta = match self.fs.lstat(path) {
-      Ok(meta) => meta,
-      Err(error) => return self.look_error(parent, key, path, listed, error),
-    };
-    let mut other = None;
-    let mut relinked = false;
-    if registered {
-      if unsure {
-        other = match self.other_spelling(key, path) {
-          Ok(other) => other,
-          Err(error) => return self.disk_error(parent, path, error),
-        };
-      }
-      let was_unlisted = self.tree[key].is_unlisted();
-      self.tree[key].set_unlisted(other.is_some());
-      let link = (meta.kind == FileType::Symlink)
-        .then(|| self.fs.real_path(path).map_or(0, |real| hash_of(&real)));
-      let old = self.tree.link(key);
-      relinked = old != link;
-      self.tree.set_link(key, link);
-      if link.is_some() {
-        meta = match self.fs.stat(path) {
-          Ok(meta) => meta,
-          Err(error) => {
-            let found = self.disk_error(parent, path, error);
-            if matches!(found, Found::Unknown) {
-              self.tree.set_link(key, old);
-              self.tree[key].set_unlisted(was_unlisted);
-            }
-            return match found {
-              Found::Missing if !is_path => other.map_or(Found::Missing, Found::OtherSpelling),
-              found => found,
-            };
-          }
-        };
-      }
-      if !was_unlisted && let Some(name) = &other {
-        *listed_as = Some(name.clone());
-      }
-    }
-
-    let inside = is_path || (in_complete && other.is_none());
-    let kind = entry_kind(meta.kind);
-    let visible = inside && !self.ignores(key, path, kind);
-    let found = match kind {
-      EntryKind::Dir if is_ancestor || visible => {
-        let young = young_dir(self.flush_time, nanos(meta.modified));
-        Found::Dir { id: meta.dir_id, complete: visible, relinked, young }
-      }
-      EntryKind::File if visible => Found::File(meta.kind, Fingerprint::of(&meta)),
-      _ => return other.map_or(Found::Missing, Found::OtherSpelling),
-    };
-    if !registered && unsure {
-      match self.other_spelling(key, path) {
-        Ok(None) => {}
-        Ok(Some(name)) => return Found::OtherSpelling(name),
-        Err(error) => return self.disk_error(parent, path, error),
-      }
-    }
-    found
-  }
-
-  fn look_error(
-    &mut self,
-    parent: NodeKey,
-    key: NodeKey,
-    path: &Path,
-    listed: Listed,
-    error: io::Error,
-  ) -> Found {
-    if is_delete_pending(&error) {
-      self.tree.mark(key, Mark::default());
-    } else if listed.is_named()
-      && is_missing(&error)
-      && let Some(dir) = self.tree[parent].dir_mut()
-    {
-      dir.relist = true;
-      self.tree.mark(parent, Mark::default());
-    }
-    self.disk_error(parent, path, error)
-  }
-
-  fn other_spelling(&self, key: NodeKey, path: &Path) -> io::Result<Option<OsString>> {
-    let name = self.fs.name_on_disk(path)?;
-    Ok(Some(name).filter(|name| name != self.tree.name(key)))
-  }
-
-  fn spelling_is_unsure(&self, key: NodeKey, listed: Listed) -> bool {
-    if listed.is_named() {
-      return false;
-    }
-    let node = &self.tree[key];
-    let was_entry =
-      matches!(listed, Listed::NotAsked) && node.is_entry() && node.added() != Added::Registered;
-    self.tree.has_spellings(key) && (!was_entry || self.tree.has_other_spelling(key))
-  }
-
-  pub(super) fn disk_error(&mut self, owner: NodeKey, path: &Path, error: io::Error) -> Found {
-    if is_missing(&error) {
-      return Found::Missing;
-    }
-    let (kind, found) = match error.kind() {
-      io::ErrorKind::PermissionDenied => (Some(ErrorKind::PermissionDenied), Found::Missing),
-      io::ErrorKind::InvalidFilename | io::ErrorKind::InvalidInput => {
-        (Some(ErrorKind::Io), Found::Missing)
-      }
-      _ if is_link_loop(&error) => (Some(ErrorKind::Io), Found::Missing),
-      io::ErrorKind::ResourceBusy => (None, Found::Unknown),
-      _ => (Some(ErrorKind::Io), Found::Unknown),
-    };
-    self.scan_had_error = true;
-    if let Some(dir) = self.tree[owner].dir_mut()
-      && !dir.has_error
-    {
-      dir.has_error = true;
-      self.tree.list_if_polled(owner);
-      if let Some(kind) = kind {
-        self.report(kind, path, error);
-      }
-    }
-    found
   }
 
   fn store_file(
@@ -479,7 +508,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   fn only_polled(&self, key: NodeKey) -> bool {
-    !self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().is_heard())
+    !self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().is_reported())
       || self.tree.link(key).is_some()
   }
 
@@ -529,15 +558,20 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   fn ask_delivered(&mut self) {
     let Some(&Reverse((old_at, _))) = self.pending.peek() else { return };
-    if old_at <= self.delivered || self.asked >= old_at {
+    if old_at <= self.delivered || self.asked_until >= old_at {
       return;
     }
-    self.asked = old_at;
+    self.asked_until = old_at;
     let at = SystemTime::UNIX_EPOCH + Duration::from_nanos(u64::try_from(old_at).unwrap_or(0));
     if let Some(backend) = &mut self.backend {
       backend.ask_delivered(at);
     }
   }
+}
+
+fn respelled(other: Option<OsString>) -> (Found, Option<OsString>) {
+  let found = if other.is_some() { Found::OtherSpelling } else { Found::Missing };
+  (found, other)
 }
 
 fn youth(modified: i64, only_polled: bool) -> Duration {
