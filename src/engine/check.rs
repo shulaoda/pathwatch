@@ -492,8 +492,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   fn await_delivery(&mut self, key: NodeKey, modified: i64) {
-    let old_at = self.old_at(key, modified);
-    self.pending.push(Reverse((old_at, key)));
+    if let Some(old_at) = self.old_at(key, modified) {
+      self.pending.push(Reverse((old_at, key)));
+    }
     if self.pending.len() > 2 * self.tree.content_count() + 64 {
       let tree = &self.tree;
       self.pending.retain(|&Reverse((_, key))| tree.content(key) == Some(Content::Pending));
@@ -501,11 +502,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.ask_delivered();
   }
 
-  fn old_at(&self, key: NodeKey, modified: i64) -> i64 {
+  fn old_at(&self, key: NodeKey, modified: i64) -> Option<i64> {
     if self.is_ahead(modified) {
-      i64::MAX
+      None
     } else {
-      modified.saturating_add(nanos_of(self.youth(key, modified)))
+      Some(modified.saturating_add(nanos_of(self.youth(key, modified))))
     }
   }
 
@@ -522,11 +523,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if self.tree.content(key) != Some(Content::Pending) {
         continue;
       }
-      let old_at = self.old_at(key, file.modified);
-      if old_at <= self.delivered {
-        self.tree.set_content(key, None);
-      } else {
-        later.push(Reverse((old_at, key)));
+      match self.old_at(key, file.modified) {
+        Some(old_at) if old_at <= self.delivered => self.tree.set_content(key, None),
+        Some(old_at) => later.push(Reverse((old_at, key))),
+        None => {}
       }
     }
     later.sort_unstable();
@@ -540,7 +540,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   fn ask_delivered(&mut self) {
     let Some(&Reverse((old_at, _))) = self.pending.peek() else { return };
-    if old_at <= self.delivered || old_at == i64::MAX || self.asked >= old_at {
+    if old_at <= self.delivered || self.asked >= old_at {
       return;
     }
     self.asked = old_at;

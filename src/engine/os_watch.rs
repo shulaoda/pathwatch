@@ -97,8 +97,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         Watch::Failed
       }
     };
-    dir.watch = new;
-    self.tree.list_if_polled(key);
+    self.set_watch(key, new);
     if matches!(new, Watch::Watched | Watch::WatchedTree)
       && self.asked_disks.insert(volume)
       && let Some(kind) = self.fs.remote_disk(path)
