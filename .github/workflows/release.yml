@@ -1,0 +1,74 @@
+# A tag `vX.Y.Z` on a commit whose Cargo.toml says `version = "X.Y.Z"` releases that version:
+# the checks of CI run once more on every OS, the crate goes to crates.io, and a GitHub release
+# with generated notes follows.
+#
+# The publish uses crates.io trusted publishing: the job presents the GitHub OIDC token of this
+# repository and workflow, and crates.io gives a short-lived token back. No secret is stored.
+# One-time setup, after the first version was published by hand (`cargo publish` with a token):
+# on crates.io, the crate's Settings → Trusted Publishing → GitHub, with the repository owner
+# `shulaoda`, the repository `pathwatch` and the workflow file `release.yml`.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - run: rustup toolchain install
+      - name: Tag matches the version of Cargo.toml
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_V="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          echo "tag=$TAG cargo=$CARGO_V"
+          test "$TAG" = "$CARGO_V"
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo doc -p pathwatch --no-deps
+      - run: cargo test --workspace --no-fail-fast --locked
+      - run: cargo package -p pathwatch --locked
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # crates.io trusted publishing
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - run: rustup toolchain install
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: auth
+      - run: cargo publish -p pathwatch --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
