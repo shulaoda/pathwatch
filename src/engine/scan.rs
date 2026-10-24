@@ -30,8 +30,6 @@ enum Listing {
   Stop,
 }
 
-/// The scan of a directory: a check of every node, and a listing that adds what the tree does
-/// not know.
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Checks every node of the directory, and what a listing shows on top if the node is complete.
   /// `path` and `entries` are buffers.
@@ -176,10 +174,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     Listing::Stop
   }
-}
 
-/// What a directory that appears, is still there, or vanishes, does to the tree.
-impl<B: Backend, F: Fs> Engine<B, F> {
   /// A directory is on disk where the tree had none. `relinked`: as for `is_baseline_dir`.
   pub(super) fn appear(
     &mut self,

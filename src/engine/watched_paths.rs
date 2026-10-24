@@ -16,8 +16,6 @@ use crate::{
   tree::{Added, Depth, Kind, Mark, Tree, emptied},
 };
 
-/// The way in: `watch` registers the path, and what it finds is the baseline, known without an
-/// event, unless an older watched path covered it already (design.md 5.7).
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Puts the path into the tree, a registered node for each name, and marks where the disk has
   /// to be checked. A path below a directory that the filter ignores, and one that it ignores
@@ -118,10 +116,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.is_covered(parent, true)
     }
   }
-}
 
-/// What a watched path covers: the rule for a complete node (design.md 5.1).
-impl<B: Backend, F: Fs> Engine<B, F> {
   /// Whether the directory above covers the node: it tracks every entry, and the node is one.
   pub(super) fn covered_by_parent(&self, key: NodeKey) -> bool {
     !self.tree[key].is_unlisted()
@@ -155,11 +150,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       at = parent;
     }
   }
-}
 
-/// The way back: `unwatch` forgets what only the path covered and reports nothing (design.md
-/// 5.7).
-impl<B: Backend, F: Fs> Engine<B, F> {
   /// Makes `path` a path like any other again, and the handler hears nothing of what is
   /// forgotten. A path that is not watched is left alone.
   pub(super) fn unregister(&mut self, path: &Path) {
@@ -258,11 +249,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     self.tree.prune(key);
   }
-}
 
-/// The questions to the ignore filter (`Options::ignored`): what is asked, when, and what a node
-/// keeps of the answer (design.md 5.11).
-impl<B: Backend, F: Fs> Engine<B, F> {
   /// Asks the filter about the node, and keeps the answer on it.
   pub(super) fn ignores(&mut self, key: NodeKey, path: &Path, kind: EntryKind) -> bool {
     if let Some(answer) = self.tree[key].ignored(kind) {

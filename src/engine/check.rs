@@ -76,7 +76,6 @@ impl Listed {
   }
 }
 
-/// A check: the look at the entry, and what it changes in the tree (design.md 5.4).
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Brings the node in line with the disk. `path` holds the directory of the node and is left so;
   /// `listed` is what a listing of it said.
@@ -269,10 +268,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     self.tree.queue_scan(key, Depth::Shallow);
   }
-}
 
-/// The look: what is at the path, after the rules of what counts.
-impl<B: Backend, F: Fs> Engine<B, F> {
   /// Reads what is at the node and applies what counts: an entry that no watched path covers, or
   /// that the filter ignores, is missing. `listed_as`: the name under which the directory lists
   /// a registered node from this look on, when it listed it under its own name before.
@@ -461,11 +457,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     found
   }
-}
 
-/// A file: what the tree keeps of it, and whether it is young, so that an equal fingerprint
-/// proves nothing at the next check (5.8).
-impl<B: Backend, F: Fs> Engine<B, F> {
   /// Stores the file that is at the node `key`, and notes what that means for the handler.
   fn store_file(
     &mut self,
@@ -625,11 +617,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     !self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().is_heard())
       || self.tree.link(key).is_some()
   }
-}
 
-/// The young files that were not read (`Content::Pending`), and the question to the backend
-/// when every record of the time they were young came (5.8).
-impl<B: Backend, F: Fs> Engine<B, F> {
   /// Keeps the `Pending` file to forget once it is old and every record of the time it was
   /// young came, and asks the backend to tell when that is (5.8).
   fn await_delivery(&mut self, key: NodeKey, modified: i64) {

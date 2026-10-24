@@ -17,7 +17,6 @@ use crate::{
   tree::{Depth, Kind, Mark, Node, Tree, Watch},
 };
 
-/// Watch, commit, then scan: every ask queues a scan for after the next commit.
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Asks the backend for the directory when the node wants more than was asked, or `force`
   /// says the watch may be gone.
@@ -223,10 +222,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       self.gave_back = true;
     }
   }
-}
 
-/// Where no OS watch tells: the poll, a directory that may have moved, a dead backend.
-impl<B: Backend, F: Fs> Engine<B, F> {
   /// The work of one poll: everything that no OS watch tells about.
   pub(super) fn mark_polled(&mut self) {
     self.tree.tidy_polled();
