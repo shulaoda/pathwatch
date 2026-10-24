@@ -446,8 +446,8 @@ enum Op {
   /// `after`: not now, but in the middle of an engine call, before the disk or backend call
   /// that comes `after` such calls from now. Only an error that says nothing comes that way. A
   /// drive that is unplugged between the `watch` and the `commit` of a stream takes no stream
-  /// with it, so nothing tells when it is back: that is the known hole of the prefix backend
-  /// once more (a directory above a stream that is away and back before the next poll).
+  /// with it, and nothing here tells when it is back: the simulated disk sends no notice when a
+  /// volume appears, as the kernel queue of macOS does (`references/architecture.md`, 4.2).
   Offline {
     gone: bool,
     after: Option<u8>,
@@ -824,9 +824,9 @@ struct Run<B: Deliver> {
   /// The paths that `Deny` took the permission from.
   denied: Vec<String>,
   offline: bool,
-  /// The prefix backend was not told about a move. A poll has to see it before the disk
-  /// changes again: `references/design.md` lists "away and back before the next poll" as a
-  /// known hole.
+  /// The prefix backend was not told about a move behind a link. A poll has to see it before
+  /// the disk changes again: `references/architecture.md`, section 5, lists a link that is
+  /// changed and changed back before the next poll as a known hole.
   poll_first: bool,
 }
 

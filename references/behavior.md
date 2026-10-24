@@ -297,7 +297,9 @@ watcher gets in the way of other programs. None of them is fixed.
   `Update` when it becomes 2 s old, even when nothing changed, and even when it was written just
   before `watch`.
 - **The target of a watched symbolic link changes** (the link now points elsewhere): this is
-  detected by a poll within one second, or within the poll interval when polling is on.
+  detected by a poll within one second, or within the poll interval when polling is on. A link
+  that points elsewhere and back within that time is not detected, and nothing is reported of what
+  happened at the other target in between.
 - **A watched path that is a symbolic link to a file**: a write to the file behind it is detected
   by the same poll, within one second, with every backend. A rewrite of the same size that restores
   the old modification time is not reported for such a path, on Linux either.

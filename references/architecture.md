@@ -1541,7 +1541,8 @@ Known holes of the engine:
   `Update` when it is 2 s old, even when nothing changed, including a file written just before
   `watch` (2.8).
 - A change of a symbolic link on the way to a watched path, or of a watched path that is a
-  symbolic link, is found only by the poll (2.14).
+  symbolic link, is found only by the poll (2.14). A link that is changed and changed back before
+  that poll is found as it was, and what the path led to in between is never reported.
 - Equal fingerprints (2.8) where no `Written` hint arrives (FSEvents, polling): a rewrite of the
   same size that restores the old modification time; a file that is removed and, within the
   delete delay, replaced by another of the same size and time on a file system that reuses inode
