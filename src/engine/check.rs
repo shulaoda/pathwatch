@@ -1,5 +1,3 @@
-//! One entry: `check` reads what is at a path and brings the node in line with it.
-
 use std::{
   cmp::Reverse,
   ffi::OsString,
@@ -23,14 +21,10 @@ use crate::{
   },
 };
 
-/// A file is young this long: two writes inside it can leave one modification time.
-const YOUNG: Duration = Duration::from_millis(20);
-/// The same on a file system that counts in whole seconds (FAT: two), and under the poll.
-const YOUNG_COARSE: Duration = Duration::from_secs(2);
-/// A bigger file is not hashed.
 const HASH_LIMIT: u64 = 16 * 1024 * 1024;
+const YOUNG: Duration = Duration::from_millis(20);
+const YOUNG_COARSE: Duration = Duration::from_secs(2);
 
-/// What is at a path, after the rules of what counts.
 pub(super) enum Found {
   Missing,
   /// The disk has the entry under another spelling: it is gone under this name, at once.
@@ -541,8 +535,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       // Found old, a `Pending` file stays so until a look reports it, or until every record of
       // the time it was young came (`forget_delivered`): the hint of a write while it was young
       // can still be on its way, or the loss report that took it, behind the hints of this look.
-      let pending = matches!(kept, Some(Content::Pending)) && !changed;
-      (young || pending).then_some(Content::Pending)
+      (young || (matches!(kept, Some(Content::Pending)) && !changed)).then_some(Content::Pending)
     } else {
       young.then(|| hash.map_or(Content::Unknown, Content::Hash))
     };
@@ -619,14 +612,18 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// How long the file is young for (5.8): the short time with a fine time stamp under an OS
   /// watch, the long one with a whole second, or where only the poll looks at it.
   fn youth(&self, key: NodeKey, modified: i64) -> Duration {
-    let whole_seconds = modified >= 0 && modified % nanos_of(Duration::from_secs(1)) == 0;
-    if whole_seconds || self.only_polled(key) { YOUNG_COARSE } else { YOUNG }
+    if (modified >= 0 && modified % nanos_of(Duration::from_secs(1)) == 0) || self.only_polled(key)
+    {
+      YOUNG_COARSE
+    } else {
+      YOUNG
+    }
   }
 
   /// Whether only the poll looks at the entry: its directory is polled, or it is a link.
   fn only_polled(&self, key: NodeKey) -> bool {
-    let heard = self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().is_heard());
-    !heard || self.tree.link(key).is_some()
+    !self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().is_heard())
+      || self.tree.link(key).is_some()
   }
 }
 
