@@ -1,5 +1,3 @@
-//! Windows. What the calls of std do not tell, and what they cost too much for.
-
 use std::{
   borrow::Cow,
   error::Error,
@@ -38,22 +36,15 @@ use windows_sys::Win32::{
 
 use super::{DirId, Entry, FileType, Meta, meta};
 
-/// Other programs may still write, delete and rename what is looked at. Not rename another
-/// file over it, nor a directory above it: Windows refuses that while any handle is open,
-/// whatever the handle shares.
 pub const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-/// From 1601 to 1970, in the steps of 100 ns that Windows counts time in.
 const TO_1970: u64 = 116_444_736_000_000_000;
-/// The bit of a reparse tag that makes the entry a link for std, and so here.
 const NAME_SURROGATE: u32 = 0x2000_0000;
 
-/// A time before 1970 is no time a watcher has to tell from another one.
 fn time(since_1601: u64) -> SystemTime {
   let steps = since_1601.saturating_sub(TO_1970);
   SystemTime::UNIX_EPOCH + Duration::from_nanos(steps.saturating_mul(100))
 }
 
-/// The kind of an entry with these attributes. `tag` is the one of its reparse point.
 fn kind(attributes: u32, tag: u32) -> FileType {
   if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && tag & NAME_SURROGATE != 0 {
     FileType::Symlink
@@ -69,10 +60,6 @@ fn meta_of(kind: FileType, written: u64, size: u64, dir_id: DirId) -> Meta {
   Meta { kind, modified, size, file_id: dir_id.inode, dir_id }
 }
 
-/// "Access denied" is also what Windows says for an entry that is being deleted and for a
-/// directory opened as a file; only the status of the kernel tells these from an entry that
-/// may not be read. Call it right after the failed call, on the same thread. A server that
-/// cannot be reached says nothing about the path, though std calls that "not found".
 pub fn classify(error: io::Error) -> io::Error {
   #[link(name = "ntdll")]
   unsafe extern "system" {
@@ -81,8 +68,6 @@ pub fn classify(error: io::Error) -> io::Error {
 
   match error.raw_os_error().map(i32::cast_unsigned) {
     Some(ERROR_BAD_NETPATH) => return io::Error::new(io::ErrorKind::HostUnreachable, error),
-    // Another program holds the entry with no sharing, for a moment as a rule: no answer, and
-    // nothing is wrong with the disk.
     Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION) => {
       return io::Error::new(io::ErrorKind::ResourceBusy, error);
     }
@@ -91,7 +76,6 @@ pub fn classify(error: io::Error) -> io::Error {
   }
   match RtlGetLastNtStatus() {
     STATUS_DELETE_PENDING => io::Error::new(io::ErrorKind::NotFound, DeletePending),
-    // The last two come from the listing that std asks for an entry it cannot open.
     STATUS_FILE_IS_A_DIRECTORY
     | STATUS_NO_SUCH_FILE
     | STATUS_OBJECT_NAME_NOT_FOUND
@@ -100,8 +84,6 @@ pub fn classify(error: io::Error) -> io::Error {
   }
 }
 
-/// The entry is being deleted: its name goes when the last handle on it is closed, unless the
-/// holder takes the deletion back. Not found for a look, with this mark on the error.
 #[derive(Debug)]
 struct DeletePending;
 
@@ -113,17 +95,12 @@ impl fmt::Display for DeletePending {
 
 impl Error for DeletePending {}
 
-/// Whether the error says that the entry is being deleted.
 pub fn is_delete_pending(error: &io::Error) -> bool {
   error.get_ref().is_some_and(<dyn Error + Send + Sync>::is::<DeletePending>)
 }
 
-/// `lstat`, or `stat` with `follow`. std gives no file index and no volume, and only the
-/// file index tells a file that was removed and written again from the old one. By name
-/// where Windows has the call (3.5 us, measured), else through a handle (10 us).
 pub fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
   match by_name(path) {
-    // What is behind a link is only found through a handle.
     Some(Ok(found)) if follow && found.kind == FileType::Symlink => {}
     Some(result) => return result,
     None => {}
@@ -131,7 +108,6 @@ pub fn stat(path: &Path, follow: bool) -> io::Result<Meta> {
   by_handle(path, follow)
 }
 
-/// `FILE_STAT_BASIC_INFORMATION`, the answer of `GetFileInformationByName`.
 #[repr(C)]
 #[derive(Default)]
 struct StatBasic {
@@ -152,20 +128,15 @@ struct StatBasic {
   file_id_128: [u8; 16],
 }
 
-/// `GetFileInformationByName(name, class, answer, size)`.
 type ByName = unsafe extern "system" fn(*const u16, i32, *mut c_void, u32) -> i32;
-/// `FileStatBasicByNameInfo`.
 const STAT_BASIC: i32 = 3;
 
-/// A function of `kernel32.dll` that not every Windows has: an import of it would keep the
-/// program from starting there.
 pub fn kernel32(name: &CStr) -> FARPROC {
   // SAFETY: both names end with a NUL. `kernel32.dll` is loaded in every process and is
   // never unloaded, so the address stays good.
   unsafe { GetProcAddress(GetModuleHandleW(windows_sys::w!("kernel32.dll")), name.as_ptr().cast()) }
 }
 
-/// The call, where this Windows has it (Windows 11 24H2 and later).
 fn by_name_call() -> Option<ByName> {
   static CALL: OnceLock<Option<ByName>> = OnceLock::new();
   *CALL.get_or_init(|| {
@@ -174,12 +145,8 @@ fn by_name_call() -> Option<ByName> {
   })
 }
 
-/// `lstat` in one call that opens nothing. `None`: the handle is asked, as for every error
-/// but "nothing is there".
 fn by_name(path: &Path) -> Option<io::Result<Meta>> {
   let call = by_name_call()?;
-  // The call takes the path as it is. A longer one needs the `\\?\` form that std makes, and
-  // so does one with a name that Windows would read as another.
   if is_odd(path) {
     return None;
   }
@@ -197,7 +164,6 @@ fn by_name(path: &Path) -> Option<io::Result<Meta>> {
     let error = classify(io::Error::last_os_error());
     return (error.kind() == io::ErrorKind::NotFound).then_some(Err(error));
   }
-  // The low half is the number that a handle gives: both ways must name a volume alike.
   let volume = info.volume_serial_number & u64::from(u32::MAX);
   let dir_id = DirId { volume, inode: info.file_id, birth: info.creation_time };
   let kind = kind(info.file_attributes, info.reparse_tag);
@@ -215,7 +181,6 @@ fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
   let file = match opened.map_err(classify) {
     Ok(file) => file,
     Err(error) => {
-      // A system file in use cannot be opened. Its listing still tells of it, without an index.
       let code = error.raw_os_error().map(i32::cast_unsigned);
       let in_use = error.kind() == io::ErrorKind::ResourceBusy;
       if !in_use && !matches!(code, Some(ERROR_ACCESS_DENIED)) {
@@ -236,7 +201,6 @@ fn by_handle(path: &Path, follow: bool) -> io::Result<Meta> {
   let index = u64_of(info.nFileIndexHigh, info.nFileIndexLow);
   let birth = u64_of(info.ftCreationTime.dwHighDateTime, info.ftCreationTime.dwLowDateTime);
   let dir_id = DirId { volume: u64::from(info.dwVolumeSerialNumber), inode: index, birth };
-  // Only a reparse point has a tag, and this answer does not hold it.
   let mut tag = FILE_ATTRIBUTE_TAG_INFO { FileAttributes: 0, ReparseTag: 0 };
   if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
     let size = u32::try_from(size_of::<FILE_ATTRIBUTE_TAG_INFO>()).unwrap_or(0);
@@ -258,28 +222,19 @@ fn u64_of(high: u32, low: u32) -> u64 {
   (u64::from(high) << 32) | u64::from(low)
 }
 
-/// The room for one answer of the system. The records in it start at multiples of eight.
 #[repr(C, align(8))]
 struct Aligned([u8; 16 * 1024]);
 
-// A record is read from its bytes at these offsets, each checked against the answer.
 const NEXT: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, NextEntryOffset);
 const CREATED: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, CreationTime);
 const WRITTEN: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, LastWriteTime);
 const SIZE: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, EndOfFile);
 const ATTRIBUTES: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileAttributes);
 const NAME_BYTES: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength);
-/// For a reparse point this field holds its tag.
 const TAG: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, EaSize);
 const INDEX: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileId);
 const NAME: usize = mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
 
-/// Lists `dir` with what `lstat` tells of each regular file, 0.35 us for an entry (measured).
-/// `Ok(false)`: std lists it instead. The disk is not NTFS, the only one where this was measured
-/// to match `lstat`, or the first answer fails (the disk does not know the class, or `dir` is a
-/// file).
-/// The listing is behind for a file that a writer has open (`Fs::listing_lags`) and for a
-/// hard link written through another name.
 pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<bool> {
   let dir = OpenOptions::new()
     .access_mode(FILE_LIST_DIRECTORY)
@@ -303,9 +258,6 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
 
   let mut records = Aligned([0; _]);
   let size = u32::try_from(records.0.len()).unwrap_or(u32::MAX);
-  // The text of a name, kept for the next entry: a listing asks for no memory for each entry
-  // (a directory of 50,000 files: 615 ns an entry with a name made for each, 571 ns now,
-  // measured).
   let mut text = String::new();
   let mut class = FileIdBothDirectoryRestartInfo;
   loop {
@@ -316,11 +268,7 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
       let error = io::Error::last_os_error();
       return match error.raw_os_error().map(i32::cast_unsigned) {
         Some(ERROR_NO_MORE_FILES) => Ok(true),
-        // The first answer for a directory with no entry at all: the root of an empty disk,
-        // which has no `.` and no `..`.
         Some(ERROR_FILE_NOT_FOUND) if class == FileIdBothDirectoryRestartInfo => Ok(true),
-        // A disk that says "NTFS" and does not know the class (the drive of a Remote Desktop
-        // client), or a handle that is open on a file: std lists, and says what is no directory.
         _ if class == FileIdBothDirectoryRestartInfo => Ok(false),
         _ => Err(classify(error)),
       };
@@ -343,8 +291,6 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
   }
 }
 
-/// The record at the start of `bytes`: where the next one starts (zero: none) and what it
-/// tells, with the bytes of its name. `None`: it does not fit into the bytes.
 fn record(bytes: &[u8], volume: u64) -> Option<(usize, &[u8], Entry)> {
   let u32_at = |at: usize| Some(u32::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
   let u64_at = |at: usize| Some(u64::from_ne_bytes(*bytes.get(at..)?.first_chunk()?));
@@ -356,11 +302,9 @@ fn record(bytes: &[u8], volume: u64) -> Option<(usize, &[u8], Entry)> {
   let (attributes, index) = (u32_at(ATTRIBUTES)?, u64_at(INDEX)?);
   let plain = attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
   let told = match kind(attributes, u32_at(TAG)?) {
-    // A reparse point that is no link (a file in a cloud, a mounted disk) is left to `lstat`.
     FileType::File if plain => {
       Entry::File { modified: time(u64_at(WRITTEN)?), size: u64_at(SIZE)?, file_id: index }
     }
-    // The identity never changes, so the listing is never behind with it.
     FileType::Dir if plain => Entry::Dir {
       id: DirId { volume, inode: index, birth: u64_at(CREATED)? },
       modified: time(u64_at(WRITTEN)?),
@@ -370,10 +314,6 @@ fn record(bytes: &[u8], volume: u64) -> Option<(usize, &[u8], Entry)> {
   Some((next, name_bytes, told))
 }
 
-/// Whether Windows reads a name of `path` as another one, unless the path has the `\\?\` form:
-/// it takes a dot or a space off the end of a name, and reads the name of a device (`NUL`,
-/// `COM1`, on an older Windows also `aux.c`) as the device. No watched path has a name of the
-/// first kind (`path::normalize`), but a directory can list both.
 fn is_odd(path: &Path) -> bool {
   let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
   let mut names = path.as_os_str().as_encoded_bytes().split(is_separator);
@@ -383,8 +323,6 @@ fn is_odd(path: &Path) -> bool {
   })
 }
 
-/// Whether some Windows reads `name` as a device: what is before its first dot or colon,
-/// without the spaces at its end, is the name of one.
 fn is_device(name: &[u8]) -> bool {
   let end = name.iter().position(|byte| matches!(byte, b'.' | b':')).unwrap_or(name.len());
   let stem = name[..end].trim_ascii_end();
@@ -393,16 +331,12 @@ fn is_device(name: &[u8]) -> bool {
     |port: &[u8]| port.eq_ignore_ascii_case(b"COM") || port.eq_ignore_ascii_case(b"LPT");
   match stem {
     [_, _, _] => is(b"CON") || is(b"PRN") || is(b"AUX") || is(b"NUL"),
-    // `COM0` to `COM9` and `LPT0` to `LPT9`.
     [port @ .., digit] if port.len() == 3 && digit.is_ascii_digit() => is_port(port),
-    // The same with a digit that is written high: `¹`, `²`, `³`.
     [port @ .., 0xC2, 0xB2 | 0xB3 | 0xB9] if port.len() == 3 => is_port(port),
     _ => is(b"CONIN$") || is(b"CONOUT$"),
   }
 }
 
-/// `path` as Windows reads these very names: in the `\\?\` form when a name in it is odd
-/// (`is_odd`). Every call that takes a path of the engine gets it this way.
 pub(crate) fn literal(path: &Path) -> Cow<'_, Path> {
   if !is_odd(path) {
     return Cow::Borrowed(path);
@@ -410,8 +344,6 @@ pub(crate) fn literal(path: &Path) -> Cow<'_, Path> {
   Cow::Owned(PathBuf::from(OsString::from_wide(&verbatim(path, true))))
 }
 
-/// The units of `path`, in the `\\?\` form when it is long, as std does for its own calls, or
-/// when `always`.
 fn verbatim(path: &Path, always: bool) -> Vec<u16> {
   const SEPARATOR: u16 = b'\\' as u16;
   let units = path.as_os_str().encode_wide();
@@ -420,16 +352,12 @@ fn verbatim(path: &Path, always: bool) -> Vec<u16> {
   let is_verbatim = units.starts_with(&[SEPARATOR, SEPARATOR, u16::from(b'?'), SEPARATOR]);
   let (prefix, rest) = match units.as_slice() {
     units if is_verbatim || (!always && units.len() < MAX_PATH as usize - 12) => ("", units),
-    // `\\server\share` becomes `\\?\UNC\server\share`.
     [SEPARATOR, rest @ ..] if rest.first() == Some(&SEPARATOR) => (r"\\?\UNC", rest),
     units => (r"\\?\", units),
   };
   prefix.encode_utf16().chain(rest.iter().copied()).collect()
 }
 
-/// Opens the regular file at `path` for reading. A link or a junction (a reparse point that
-/// stands for another name) is not followed: `None`. Any other reparse point (a file of a cloud
-/// drive, a compressed file) is the file itself, and is read as such.
 pub fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
   let path = &*literal(path);
   let opened = OpenOptions::new()
@@ -450,14 +378,10 @@ pub fn open_regular(path: &Path) -> io::Result<Option<fs::File>> {
   Ok(file.metadata()?.is_file().then_some(file))
 }
 
-/// A name with a separator in it, which a disk that another system filled can hold: no path
-/// names such an entry, so it is left out of a listing. Both are one byte in the encoded form.
 pub(super) fn has_separator(name: &OsStr) -> bool {
   name.as_encoded_bytes().iter().any(|&byte| matches!(byte, b'\\' | b'/'))
 }
 
-/// A name that Windows gives as UTF-16 units, through `text`: a name is Unicode text unless it
-/// holds a lone surrogate, and only such a one asks for memory.
 pub(crate) fn wide_name(
   units: impl Iterator<Item = u16> + Clone,
   text: &mut String,
@@ -470,11 +394,7 @@ pub(crate) fn wide_name(
   }
 }
 
-/// A search for the one path gives the entry as the directory holds it. In a directory that
-/// may be passed but not listed the question has no answer, which says nothing against the
-/// name, as on Linux.
 pub fn name_on_disk(path: &Path) -> io::Result<OsString> {
-  // In the form that names this very entry.
   let mut wide = verbatim(path, is_odd(path));
   wide.push(0);
   // SAFETY: all zeros is a valid value of this plain struct of numbers.
@@ -488,7 +408,6 @@ pub fn name_on_disk(path: &Path) -> io::Result<OsString> {
   if search == INVALID_HANDLE_VALUE {
     let error = io::Error::last_os_error();
     return match error.raw_os_error().map(i32::cast_unsigned) {
-      // What NTFS answers for an entry that went while the directory was searched.
       Some(ERROR_NO_MORE_FILES) => Err(io::ErrorKind::NotFound.into()),
       Some(ERROR_ACCESS_DENIED) => match classify(error) {
         error if error.kind() == io::ErrorKind::NotFound => Err(error),
@@ -543,7 +462,6 @@ mod tests {
     fs::write(&file, "written").unwrap();
     fs::create_dir(&dir).unwrap();
     junction(&link, &dir);
-    // An older Windows has no call by name.
     if by_name(&file).is_none() {
       return;
     }
@@ -572,7 +490,6 @@ mod tests {
       seen.sort_by(|a, b| a.0.cmp(&b.0));
       listed.unwrap().then_some(seen)
     };
-    // Not NTFS: the listing of std is used there.
     let Some(seen) = list() else { return };
     let [
       (_, Entry::Dir { id, modified: dir_modified }),
@@ -589,7 +506,6 @@ mod tests {
     assert_eq!((id, dir_modified), (dir_meta.dir_id, dir_meta.modified));
     assert_eq!(id, by_handle(&dir, false).unwrap().dir_id);
 
-    // A handle on a file does not take the class: std lists then, and says what is no directory.
     assert!(!read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap());
     let error = StdFs.read_dir(&top.path().join("file"), &mut |_, _| {}).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::NotADirectory, "{error:?}");
@@ -605,7 +521,6 @@ mod tests {
     assert_eq!(size(), 16);
   }
 
-  /// Also at the end of a path of more than 260 units.
   #[test]
   fn the_name_on_disk() {
     let top = tempfile::tempdir().unwrap();
@@ -621,7 +536,6 @@ mod tests {
     }
   }
 
-  /// Takes the right to list a directory away from the user of the test, and gives it back.
   struct Unlisted(PathBuf);
 
   impl Unlisted {
@@ -641,8 +555,6 @@ mod tests {
     }
   }
 
-  /// The name of an entry in a directory that may be passed but not listed: the question has
-  /// no answer, and the name is taken as given.
   #[test]
   fn the_name_on_disk_in_a_directory_that_may_not_be_listed() {
     let top = tempfile::tempdir().unwrap();
@@ -653,13 +565,10 @@ mod tests {
     assert!(fs::read_dir(&dir).is_err(), "the directory can still be listed");
     assert_eq!(stat(&dir.join("readme.md"), false).unwrap().kind, FileType::File);
     assert_eq!(name_on_disk(&dir.join("readme.md")).unwrap(), "readme.md");
-    // The question cannot tell a name that is not there either; the look before it can.
     assert_eq!(name_on_disk(&dir.join("gone.md")).unwrap(), "gone.md");
     assert_eq!(stat(&dir.join("gone.md"), false).unwrap_err().kind(), io::ErrorKind::NotFound);
   }
 
-  /// `SetFileInformationByHandle(FileDispositionInfo)`: the deletion that waits for the last
-  /// handle to close, which `DeleteFile` no longer uses on NTFS.
   fn dispose(holder: &fs::File, delete: bool) {
     let info = FILE_DISPOSITION_INFO { DeleteFile: delete };
     let size = u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).unwrap();
@@ -671,8 +580,6 @@ mod tests {
     assert!(set != 0, "{}", io::Error::last_os_error());
   }
 
-  /// A server that cannot be reached is no answer, and an entry that is being deleted is
-  /// missing, with the mark that says so.
   #[test]
   fn what_the_errors_of_windows_mean() {
     let unreachable = classify(io::Error::from_raw_os_error(ERROR_BAD_NETPATH.cast_signed()));
@@ -682,8 +589,6 @@ mod tests {
     let busy = classify(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION.cast_signed()));
     assert_eq!(busy.kind(), io::ErrorKind::ResourceBusy, "{busy:?}");
 
-    // A directory that another program holds with no sharing: its listing is no answer, and
-    // the look at the directory itself still works.
     let top = tempfile::tempdir().unwrap();
     let held = top.path().join("held");
     fs::create_dir(&held).unwrap();
@@ -710,9 +615,7 @@ mod tests {
       assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error:?}");
       assert!(is_delete_pending(&error), "{error:?}");
     }
-    // The directory still lists the name.
     assert_eq!(name_on_disk(&file).unwrap(), "held.txt");
-    // Taken back: the file is there, as if nothing had happened.
     dispose(&holder, false);
     assert_eq!(stat(&file, false).unwrap().size, 1);
     dispose(&holder, true);
@@ -761,11 +664,9 @@ mod tests {
     assert_eq!(literal(Path::new(r"\\server\share\nul")), Path::new(r"\\?\UNC\server\share\nul"));
   }
 
-  /// Every call reads the entry with the odd name, not the one that Windows makes of it.
   #[test]
   fn an_odd_name_is_read_as_it_is() {
     let top = tempfile::tempdir().unwrap();
-    // Only a path in `\\?\` form lets std make such a name.
     let verbatim = fs::canonicalize(top.path()).unwrap();
     fs::write(top.path().join("foo"), "the other one").unwrap();
     for name in ["foo.", "foo ", "nul", "aux.c"] {
@@ -781,15 +682,12 @@ mod tests {
     let dir = top.path().join("dir.");
     assert_eq!(stat(&dir, false).unwrap().kind, FileType::Dir);
     let mut seen = Vec::new();
-    // Not NTFS: the listing of std is used there.
     if read_dir(&dir, &mut |name, _| seen.push(name.to_owned())).unwrap() {
       assert_eq!(seen, ["x.txt"]);
     }
     assert_eq!(stat(&dir.join("x.txt"), false).unwrap().size, 1);
   }
 
-  /// The clock of the time stamps is the clock of now, and a file that is removed and written
-  /// again has another identity, with the same content and inside the same step of the clock.
   #[test]
   fn the_time_is_of_now_and_a_file_made_again_is_another_file() {
     let top = tempfile::tempdir().unwrap();

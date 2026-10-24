@@ -1,7 +1,3 @@
-//! macOS: a listing with what `lstat` tells of each entry, in one call, the name of one entry
-//! as the disk spells it, and the kind of a disk. A file or a directory is taken from the
-//! listing on APFS only (`references/design.md` 5.4).
-
 use std::{
   ffi::{CString, OsStr, OsString, c_char},
   fs::OpenOptions,
@@ -22,19 +18,14 @@ use libc::{
 
 use super::{DirId, Entry, FileType, unsigned_nanos};
 
-/// What a look at a regular file or a directory reads, in the common attributes: the birth time
-/// is in the identity of a directory.
 const LOOK: u32 =
   ATTR_CMN_DEVID | ATTR_CMN_CRTIME | ATTR_CMN_MODTIME | ATTR_CMN_FLAGS | ATTR_CMN_FILEID;
-// Not in `libc`.
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
-/// The content of the file is in a cloud, not on this disk.
 const SF_DATALESS: u32 = 0x4000_0000;
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
 const VLNK: u32 = 5;
 
-/// The attributes to ask for, in the common group and the groups of a directory and a file.
 fn attr_list(common: u32, dir: u32, file: u32) -> libc::attrlist {
   libc::attrlist {
     bitmapcount: ATTR_BIT_MAP_COUNT,
@@ -56,7 +47,6 @@ fn stat_fs(dir: &Path) -> Option<libc::statfs> {
   (result == 0).then_some(answer)
 }
 
-/// The device number of the disk under `dir`, if it is an APFS disk.
 fn apfs_volume(dir: &Path) -> Option<i32> {
   let answer = stat_fs(dir)?;
   if !answer.f_fstypename.map(c_char::cast_unsigned).starts_with(b"apfs\0") {
@@ -67,7 +57,6 @@ fn apfs_volume(dir: &Path) -> Option<i32> {
   Some(device)
 }
 
-/// The name of the file system under `dir` (`nfs`, `smbfs`), if it is not on this machine.
 pub fn remote_disk(dir: &Path) -> Option<String> {
   let answer = stat_fs(dir).filter(|answer| answer.f_flags & MNT_LOCAL.cast_unsigned() == 0)?;
   let name = answer.f_fstypename.map(c_char::cast_unsigned);
@@ -75,16 +64,11 @@ pub fn remote_disk(dir: &Path) -> Option<String> {
   Some(String::from_utf8_lossy(name).into_owned())
 }
 
-/// Lists `dir` with what `lstat` tells of each entry. `Ok(false)`: std lists it instead, as the
-/// disk is not APFS. An entry on another device is given as a name only: the directory can be
-/// another one by now.
 pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<bool> {
   let Some(volume) = apfs_volume(dir) else { return Ok(false) };
-  // Not a pipe, which would wait for its writer.
   let dir = OpenOptions::new().read(true).custom_flags(O_DIRECTORY).open(dir)?;
   let common = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | LOOK;
   let wanted = attr_list(common, ATTR_DIR_MOUNTSTATUS, ATTR_FILE_DATALENGTH);
-  // An entry takes less than 1 KiB.
   let mut buffer = [0_u8; 16 * 1024];
   loop {
     // SAFETY: `dir` is open, `wanted` is a whole `attrlist` that the call only reads, and the
@@ -120,8 +104,6 @@ pub fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::Result<b
   }
 }
 
-/// One entry of the answer: its length, the attributes that follow as bits, and then these
-/// attributes in the order of their bits. `None`: it has no name.
 fn record(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   let mut fields = Fields { bytes: entry, at: size_of::<u32>() };
   let [common, _, dir, file, _] = [(); 5].map(|()| fields.u32());
@@ -146,8 +128,6 @@ fn record(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   }
   let (created, modified, flags, file_id) =
     (fields.time(), fields.time(), fields.u32()?, fields.u64()?);
-  // A time before 1970, and a file in a cloud, are left to `lstat`: not measured. So is a
-  // directory that a disk is mounted on, as the listing tells of the one below the disk.
   let told = match (kind, created, modified) {
     (FileType::Dir, Some(created), Some(modified)) if fields.u32()? == 0 => {
       let volume = i64::from(volume).cast_unsigned();
@@ -185,14 +165,12 @@ impl<'a> Fields<'a> {
     self.take().map(u64::from_ne_bytes)
   }
 
-  /// A `struct timespec`; `None` before 1970.
   fn time(&mut self) -> Option<SystemTime> {
     let [seconds, nanos] = [(); 2].map(|()| self.take().map(i64::from_ne_bytes));
     let since = u64::try_from(seconds?).ok().zip(u32::try_from(nanos?).ok());
     since.map(|(seconds, nanos)| SystemTime::UNIX_EPOCH + Duration::new(seconds, nanos))
   }
 
-  /// An `attrreference_t`: the bytes it points to, counted from where it starts, without the NUL.
   fn reference(&mut self) -> Option<&'a [u8]> {
     let (from, offset, len) = (self.at, self.i32()?, self.u32()?);
     let start = from.checked_add_signed(isize::try_from(offset).ok()?)?;
@@ -209,13 +187,9 @@ fn file_type(object_type: u32) -> FileType {
   }
 }
 
-/// The name that the directory holds for the entry at `path`, and the kind of the entry, in
-/// one `getattrlist` call. A link at the end is not followed.
 pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
   let c_path = CString::new(path.as_os_str().as_bytes())?;
   let wanted = attr_list(ATTR_CMN_NAME | ATTR_CMN_OBJTYPE, 0, 0);
-  // The length, the name as an `attrreference_t`, the object type, then the name: at most 255
-  // UTF-16 units of at most three bytes here, and a NUL.
   let mut answer = [0_u8; 4 * size_of::<u32>() + 255 * 3 + 1];
   // SAFETY: `c_path` ends with a NUL, `wanted` is a whole `attrlist` that the call only reads,
   // and the call writes at most `answer.len()` bytes into `answer`.
@@ -254,8 +228,6 @@ mod tests {
 
   use crate::fs::{Entry, FileType, Fs, StdFs};
 
-  /// On APFS the listing tells of a file and of a directory what `lstat` tells, also while the
-  /// file is open and written.
   #[test]
   fn the_listing_tells_what_lstat_tells() {
     let top = tempfile::tempdir().unwrap();
@@ -280,7 +252,6 @@ mod tests {
     let dir = StdFs.lstat(&top.path().join("dir")).unwrap();
     assert_eq!((id, dir_modified), (dir.dir_id, dir.modified));
 
-    // A pipe is no directory: the listing fails and does not wait for a writer.
     let pipe = top.path().join("pipe");
     assert!(Command::new("mkfifo").arg(&pipe).status().unwrap().success());
     let error = StdFs.read_dir(&pipe, &mut |_, _| {}).unwrap_err();
