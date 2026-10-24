@@ -1,0 +1,19 @@
+src/engine/watched_paths.rs
+  s_0070b6318eca36::t_1ac9b10c70a0d5 69-71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "37cee0dd05109fefc61304bd3d8b36128c51c875",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
