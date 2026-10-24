@@ -1,6 +1,3 @@
-//! The Windows backend: `ReadDirectoryChangesW` on at most 64 directory handles. See
-//! `references/design.md` 7.3.
-
 use std::{io, mem, path::Path, sync::Arc, time::SystemTime};
 
 #[cfg(feature = "test-hooks")]
@@ -23,20 +20,10 @@ pub struct WindowsBackend {
   covered: Vec<NodeKey>,
 }
 
-/// What the port sends: the bytes of one read on a handle, the keys that lost their handle,
-/// and the answer to `ask_delivered`.
 #[derive(Debug)]
 pub enum Raw {
-  /// What one read on the handle `watch`, which stands on `dir`, gave.
-  Read {
-    watch: WatchId,
-    dir: Arc<Path>,
-    extended: bool,
-    result: io::Result<Vec<u8>>,
-  },
+  Read { watch: WatchId, dir: Arc<Path>, extended: bool, result: io::Result<Vec<u8>> },
   Lost(Vec<NodeKey>),
-  /// Every record of a change before this time, by the clock of the system, came before: the
-  /// answer to `ask_delivered`.
   Delivered(SystemTime),
 }
 
@@ -51,8 +38,6 @@ impl WindowsBackend {
     self.handles.serves(key)
   }
 
-  /// Keeps what a call of the handles told, and waits for the handles that it closed: a
-  /// directory above one of them can be renamed when the call of the backend returns.
   fn finish_call(&mut self, told: Told) {
     self.covered.extend(told.covered);
     if !told.lost.is_empty() {
@@ -99,7 +84,6 @@ impl Backend for WindowsBackend {
   }
 }
 
-/// The hints of one message of the port.
 pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
   let lost = |key| Hint::Changed { dir: key, rel: Path::new("") };
   let (watch, dir, extended, result) = match raw {
@@ -119,7 +103,6 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
   handles.delivered(watch);
   let records = if extended { Records::extended(&bytes) } else { Records::new(&bytes) };
   let mut route = handles.route_below(&dir);
-  // A record with no name is a loss for every key below the handle: once a read is enough.
   let mut told_lost = false;
   for record in records {
     let Ok(record) = record else {
@@ -136,8 +119,6 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
     if written && record.is_dir == Some(true) || !route.take(record.name()) {
       continue;
     }
-    // Windows says "modified" for a directory when an entry in it changes, and that entry has
-    // a record of its own.
     if written && route.is_at_a_key() {
       continue;
     }
@@ -162,11 +143,6 @@ mod place {
     pub keys: Vec<NodeKey>,
   }
 
-  /// Where the handles go for these keys, at most `max` of them. `is_link`: whether the
-  /// directory is a junction or a directory link. A handle reports nothing behind a link below
-  /// it, so a directory with a link on the way down from a common directory is not joined
-  /// there: it keeps a handle of its own, and the others share without it. Such a handle can
-  /// stand below a shared one; a key goes to the deepest handle at or above its directory.
   pub fn place(
     wanted: &[(NodeKey, &Path, Want)],
     max: usize,
@@ -185,7 +161,6 @@ mod place {
     }
 
     let shared: Vec<usize> = tops.windows(2).map(|pair| common_parts(pair[0], pair[1])).collect();
-    // The tops that share a handle: each top names the first top of its group.
     let mut group: Vec<usize> = (0..tops.len()).collect();
     let mut count = tops.len();
     let mut depths = shared.clone();
@@ -206,9 +181,6 @@ mod place {
           && let common = first_parts(tops[at], depth)
           && may_watch_a_tree(&common)
         {
-          // A directory with a link between the common directory and itself cannot be served
-          // from there; the others join, also across it. The tops of a group have no link
-          // below their common directory, so a link above it holds back all of them.
           let mut first = None;
           for top in at..=end {
             if link_between(&common, tops[top], &mut *is_link) {
@@ -225,7 +197,6 @@ mod place {
       }
     }
 
-    // A group shares the common directory of its tops: of the first and the last of them.
     let mut last: Vec<usize> = (0..tops.len()).collect();
     for (top, &first) in group.iter().enumerate() {
       last[first] = top;
@@ -235,7 +206,6 @@ mod place {
       let dir = first_parts(top, common_parts(top, tops[last[first]]));
       places.push(Place { dir, keys: Vec::new() });
     }
-    // A place can lie below another one: the deepest at or above a directory serves it.
     places.sort_by(|a, b| a.dir.cmp(&b.dir));
     let (mut at, mut above) = (0, Vec::new());
     for &(key, dir, _) in &wanted {
@@ -266,7 +236,6 @@ mod place {
     path.components().take(count).collect()
   }
 
-  /// Whether a link lies on the way from `top` down to `dir`, `dir` itself included.
   pub(super) fn link_between(top: &Path, dir: &Path, is_link: impl FnMut(&Path) -> bool) -> bool {
     let names = dir.strip_prefix(top).map_or(0, |below| below.components().count());
     dir.ancestors().take(names).any(is_link)
@@ -289,15 +258,11 @@ mod handles {
     fs::wide_name,
   };
 
-  /// At most this many handles are open: more go up to a directory they have in common
-  /// (`place`).
   pub const MAX_HANDLES: usize = 64;
 
-  /// One open handle: new for each open, so a read of a handle that closed is told apart.
   #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
   pub struct WatchId(pub usize);
 
-  /// What the handles ask of the system: the port, or a fake one in the tests.
   pub trait System {
     fn open(&mut self, id: WatchId, dir: &Path) -> io::Result<()>;
 
@@ -306,15 +271,12 @@ mod handles {
     fn is_link(&mut self, path: &Path) -> bool;
   }
 
-  /// What a call tells besides its answer: the keys that lost their handle, and the keys that
-  /// waited and that a new handle covers.
   #[derive(Debug, Default, PartialEq, Eq)]
   pub struct Told {
     pub lost: Vec<NodeKey>,
     pub covered: Vec<NodeKey>,
   }
 
-  /// The handles, and the keys that each serves (`references/design.md` 7.3).
   #[derive(Debug, Default)]
   pub struct Handles {
     keys: FxHashMap<NodeKey, Served>,
@@ -324,8 +286,6 @@ mod handles {
     unsettled: bool,
     refused: FxHashSet<NodeKey>,
     waiting: FxHashMap<NodeKey, PathBuf>,
-    /// The keys whose last handle died before it delivered anything. Kept by key, not by the
-    /// directory of the handle: a shared handle stands on a directory of no key.
     dead: FxHashMap<NodeKey, Death>,
   }
 
@@ -333,7 +293,6 @@ mod handles {
   struct Handle {
     id: WatchId,
     dir: PathBuf,
-    /// It delivered records: its death is no death at once.
     delivered: bool,
   }
 
@@ -344,15 +303,12 @@ mod handles {
     handle: Option<WatchId>,
   }
 
-  /// What the last handle of a key died of, and whether it died before it delivered anything
-  /// while the death before it was still on record.
   #[derive(Debug)]
   struct Death {
     again: bool,
     error: io::Error,
   }
 
-  /// The calls of the backend, and what a read on a handle tells.
   impl Handles {
     pub fn watch(
       &mut self,
@@ -365,17 +321,12 @@ mod handles {
       let waited = self.waiting.remove(&key).is_some();
       let refused = self.refused.remove(&key);
 
-      // The deepest handle at or above the directory: one can stand below another, behind a
-      // link.
       let above = self.open.iter().enumerate().filter(|(_, handle)| dir.starts_with(&handle.dir));
       if let Some((at, _)) = above.max_by_key(|(_, handle)| handle.dir.as_os_str().len()) {
         if link_between(&self.open[at].dir, dir, |path| system.is_link(path)) {
           self.drop_key(key, system);
           return (Coverage::NotWatched, told);
         }
-        // A `watch` for the very directory of the handle puts a new handle there: the old one
-        // may be on a directory that was renamed away. A key that only waited, or got no handle
-        // at the last commit, takes the one that the commit just opened.
         if !(waited || refused)
           && self.open[at].dir == dir
           && let Err(error) = self.reopen(at, system)
@@ -392,8 +343,6 @@ mod handles {
         self.waiting.insert(key, dir.to_owned());
         return (Coverage::NotWatched, told);
       }
-      // The handles of this key die as soon as they are opened (a server that refuses the
-      // request): the engine polls it, and asks again at each poll.
       if self.dead.get(&key).is_some_and(|death| death.again)
         && let Some(death) = self.dead.remove(&key)
       {
@@ -409,8 +358,6 @@ mod handles {
       told.lost.retain(|&lost| lost != key);
       let coverage = match settled {
         Ok(()) if self.serves(key) => Coverage::WatchedTree,
-        // The handle that came to serve the key stands above a link: the key was forgotten,
-        // and not refused.
         Ok(()) if !self.refused.contains(&key) => Coverage::NotWatched,
         Ok(()) => Coverage::Failed(watch_limit("the limit of open directory handles is reached")),
         Err(error) => Coverage::Failed(error),
@@ -433,7 +380,6 @@ mod handles {
       told
     }
 
-    /// The handle died: the read on it failed. The keys it served, which are forgotten.
     pub fn closed(&mut self, id: WatchId, error: &io::Error) -> Vec<NodeKey> {
       let Some(at) = self.open.iter().position(|handle| handle.id == id) else { return Vec::new() };
       let handle = self.open.swap_remove(at);
@@ -451,8 +397,6 @@ mod handles {
       self.keys.get(&key).is_some_and(|served| served.handle.is_some())
     }
 
-    /// The handle delivered records: the deaths of its keys before it are forgotten, at its
-    /// first read.
     pub(super) fn delivered(&mut self, id: WatchId) {
       let Some(handle) = self.open.iter_mut().find(|handle| handle.id == id) else { return };
       if mem::replace(&mut handle.delivered, true) || self.dead.is_empty() {
@@ -464,12 +408,7 @@ mod handles {
     }
   }
 
-  /// Where the handles stand: worked out at a commit for every key together (`place`), and the
-  /// keys that each serves.
   impl Handles {
-    /// The key is forgotten. A handle that it alone used closes now (rule 6: the OS watch goes
-    /// with its last key); where the handles stand is worked out once, at the next commit, not
-    /// for each key that goes.
     fn drop_key(&mut self, key: NodeKey, system: &mut dyn System) {
       let Some(gone) = self.forget(key) else { return };
       if gone.want == Want::Contents {
@@ -499,10 +438,6 @@ mod handles {
     fn move_handles(&mut self, system: &mut dyn System, told: &mut Told) -> io::Result<()> {
       let wanted: Vec<(NodeKey, &Path, Want)> =
         self.keys.iter().map(|(&key, served)| (key, &*served.dir, served.want)).collect();
-      // The links are found where a key would come to lie behind one, and the placement is
-      // made again with them known, until no new one turns up: a directory behind a link then
-      // has a handle of its own. A key that still lies behind a link (below a directory that
-      // has a handle anyway) is not served.
       let mut looked: FxHashMap<PathBuf, bool> = FxHashMap::default();
       let (places, behind_a_link) = loop {
         let known = looked.values().filter(|&&is| is).count();
@@ -550,7 +485,6 @@ mod handles {
       self.open = kept;
       for handle in &new {
         let waiting = self.waiting.iter().filter(|(_, dir)| dir.starts_with(&handle.dir));
-        // A key behind a link below the new handle is not reported by it.
         let covered = waiting.filter(|(_, dir)| {
           !link_between(&handle.dir, dir, |path| is_link(&mut looked, system, path))
         });
@@ -576,7 +510,6 @@ mod handles {
       Ok(())
     }
 
-    /// The open handle on `dir`.
     fn handle_on(&self, dir: &Path) -> Option<WatchId> {
       self.open.iter().find(|handle| handle.dir == dir).map(|handle| handle.id)
     }
@@ -621,12 +554,10 @@ mod handles {
     }
   }
 
-  /// Whether `path` is a junction or a directory link: the system is asked once for each path.
   fn is_link(looked: &mut FxHashMap<PathBuf, bool>, system: &mut dyn System, path: &Path) -> bool {
     *looked.entry(path.to_owned()).or_insert_with(|| system.is_link(path))
   }
 
-  /// `path` with its names in lower case (`lower_name`). The drive or the share stays as it is.
   fn lowered(path: &Path) -> PathBuf {
     let (mut lower, mut text) = (PathBuf::new(), String::new());
     for part in path.components() {
@@ -638,9 +569,6 @@ mod handles {
     lower
   }
 
-  /// A name in lower case, through `text`: NTFS takes the two cases of a letter for one name,
-  /// and folds each character by itself (`ΟΔΟΣ` is `οδοσ`, not `οδος`). A name that is no
-  /// Unicode text gets its ASCII letters folded.
   fn lower_name<'a>(name: &'a OsStr, text: &'a mut String) -> Cow<'a, OsStr> {
     let Some(name) = name.to_str() else { return Cow::Owned(name.to_ascii_lowercase()) };
     text.clear();
@@ -648,9 +576,7 @@ mod handles {
     Cow::Borrowed(OsStr::new(text.as_str()))
   }
 
-  /// The way from the records of a read to the keys.
   impl Handles {
-    /// The way to the keys for the records of a read on the handle at `dir`.
     pub(super) fn route_below(&self, dir: &Path) -> Route<'_> {
       let is_separator = |byte: &u8| matches!(byte, b'\\' | b'/');
       let lower_dir = lowered(dir);
@@ -658,8 +584,6 @@ mod handles {
       let mut lower = lower_dir.as_os_str().as_encoded_bytes().to_vec();
       path.push(b'\\');
       lower.push(b'\\');
-      // The directories on the way up, each with its spelling in lower case. The names below
-      // one start after the separators that follow it in `path`.
       let above = dir.ancestors().zip(lower_dir.ancestors()).filter_map(|(up, lower_up)| {
         let keys = self.at.get(lower_up)?;
         let end = up.as_os_str().len();
@@ -681,38 +605,18 @@ mod handles {
     }
   }
 
-  /// The way of the records of one read to every key whose directory holds the path of the
-  /// record, the deepest first. What the records share is worked out once for the read: the
-  /// directory of the handle in lower case, and the keys at and above it. Each record then
-  /// costs a look for each of its own names, by its text: 0.53 µs a record in a flood of
-  /// 63,000, where a walk up the whole path of each in lower case took 2.1 µs (measured).
-  ///
-  /// A key above one that was told gets a hint it may not need; left out, it would miss the
-  /// path when the tree reaches it only from above: through another spelling of a name, or from
-  /// the other letter case of the drive, which is another top node.
   pub(super) struct Route<'a> {
     at: &'a FxHashMap<PathBuf, Vec<NodeKey>>,
-    /// The keys at and above the directory, the deepest first, each with where the names of a
-    /// record below their directory start in `path`.
     above: Vec<(&'a [NodeKey], usize)>,
-    /// The directory, a separator, and the names of the record with one separator between
-    /// them, as encoded text (`OsStr::as_encoded_bytes`); `lower` the same in lower case.
     path: Vec<u8>,
     lower: Vec<u8>,
-    /// How long the directory and its separator are in `path` and in `lower`.
     base: (usize, usize),
-    /// Where each name of the record ends in `path` and in `lower`.
     ends: Vec<(usize, usize)>,
-    /// Room for a name on the way, and for its lower case.
     text: String,
     name: String,
   }
 
   impl Route<'_> {
-    /// Takes the name of a record, from its UTF-16 units. `false`: it is no name of an entry
-    /// below the directory. NTFS gives names with separators between them and nothing else; a
-    /// disk that another system filled, or a server, could give a root, a drive, a `.` or a
-    /// `..`, a NUL, or a `:`, which starts a stream of a file.
     pub(super) fn take(&mut self, units: impl Iterator<Item = u16> + Clone) -> bool {
       let Self { path, lower, base, ends, text, name, .. } = self;
       let given = wide_name(units, text);
@@ -742,13 +646,10 @@ mod handles {
       !ends.is_empty()
     }
 
-    /// Whether a key stands at the path of the record.
     pub(super) fn is_at_a_key(&self) -> bool {
       self.at.contains_key(cut(&self.lower, 0, self.lower.len()))
     }
 
-    /// Calls `found` with every key whose directory holds the path of the record, the deepest
-    /// first, and the path below that directory.
     pub(super) fn keys(&self, found: &mut dyn FnMut(NodeKey, &Path)) {
       let len = self.path.len();
       for &(end, lower_end) in self.ends.iter().rev() {
@@ -767,9 +668,6 @@ mod handles {
     }
   }
 
-  /// The path in `text[start..end]`. `text` is encoded text with separators between its
-  /// pieces (`Route::path`), and each end of the range is an end of it or lies next to a
-  /// separator.
   fn cut(text: &[u8], start: usize, end: usize) -> &Path {
     let next_to_ascii =
       |at: usize| at == 0 || at == text.len() || text[at - 1].is_ascii() || text[at].is_ascii();
@@ -791,7 +689,6 @@ mod records {
 
   const NEXT_ENTRY_OFFSET: usize = offset_of!(Short, NextEntryOffset);
   const ACTION: usize = offset_of!(Short, Action);
-  // Both record layouts are read with these two offsets.
   const _: () = assert!(
     offset_of!(Extended, NextEntryOffset) == NEXT_ENTRY_OFFSET
       && offset_of!(Extended, Action) == ACTION
@@ -932,7 +829,6 @@ mod port {
     fs::{FileType, Fs, SHARE_ALL, StdFs, kernel32},
   };
 
-  // No creation time: a tool that only sets it would give a `Written` hint.
   const FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
     | FILE_NOTIFY_CHANGE_DIR_NAME
     | FILE_NOTIFY_CHANGE_SIZE
@@ -945,16 +841,7 @@ mod port {
 
   const STOP_WAIT_MS: u32 = 2000;
 
-  /// The kernel completes a read as soon as one record is in it. So after a read that came
-  /// back with less than this, the next read is queued `REARM_DELAY` later: while no read is
-  /// queued the kernel keeps the records in a buffer of its own, as big as ours, and the next
-  /// read takes them all. Without the rest a flood is one read, one packet and one wake-up of
-  /// two threads for each record (93,000 reads for the 63,000 records of 30,000 new files,
-  /// measured). A read that came back fuller is queued again at once: the flood is heavy.
   const BATCH_BYTES: usize = BUFFER_BYTES as usize / 2;
-  /// The rest before the next read. A flood of 20,000 records a second fills 2 KiB of the
-  /// kernel's 64 KiB in it. The first record of a quiet handle is not delayed: the read that
-  /// waits for it comes back at once, and the rest comes after it.
   const REARM_DELAY: Duration = Duration::from_millis(1);
 
   #[derive(Debug)]
@@ -962,7 +849,6 @@ mod port {
     iocp: Arc<Iocp>,
     commands: mpsc::Sender<Command>,
     worker: Option<thread::JoinHandle<()>>,
-    /// A close was queued since the last wait.
     closing: bool,
   }
 
@@ -985,14 +871,10 @@ mod port {
       self.iocp.wake()
     }
 
-    /// Asks the worker for `Raw::Delivered` at or after `after`. A later question takes the
-    /// place of an earlier one.
     pub(super) fn ask_delivered(&self, after: SystemTime) {
       let _ = self.send(Command::Deliver { after });
     }
 
-    /// Returns when every handle whose close was queued is closed: a directory above one of
-    /// them can be renamed then. A worker that stopped answers by dropping the reply.
     pub(super) fn wait_for_closes(&mut self) {
       if !mem::take(&mut self.closing) {
         return;
@@ -1035,35 +917,19 @@ mod port {
   }
 
   enum Command {
-    Open {
-      id: WatchId,
-      dir: Arc<Path>,
-      reply: mpsc::SyncSender<io::Result<()>>,
-    },
-    Close {
-      id: WatchId,
-    },
-    /// Answered when no handle is closing any more.
-    Closed {
-      reply: mpsc::SyncSender<()>,
-    },
-    Deliver {
-      after: SystemTime,
-    },
+    Open { id: WatchId, dir: Arc<Path>, reply: mpsc::SyncSender<io::Result<()>> },
+    Close { id: WatchId },
+    Closed { reply: mpsc::SyncSender<()> },
+    Deliver { after: SystemTime },
     Stop,
   }
 
-  /// The handles, each by its id, whose number is the key of its packets on the port:
-  /// every open gets a new id, and a read that failed at once sends no packet (`Watch::read`).
   struct Worker {
     iocp: Arc<Iocp>,
     commands: mpsc::Receiver<Command>,
     sink: Sink<Raw>,
     watches: FxHashMap<WatchId, Watch>,
-    /// The reply that waits for the closes.
     waiting: Option<mpsc::SyncSender<()>>,
-    /// The time the engine asked about (`Backend::ask_delivered`): then every handle is read
-    /// until nothing is left, and `Raw::Delivered` says so.
     deliver_after: Option<SystemTime>,
   }
 
@@ -1077,9 +943,6 @@ mod port {
           continue;
         }
         let packet = match self.next_rest() {
-          // The time of a question is waited for on the port, not by a sleep, which would leave
-          // the records of the time between alone. Its wait counts in ticks of the clock (15.6
-          // ms): a late answer only keeps the doubt of a young file a little longer.
           None => match self.deliver_after {
             None => self.iocp.wait(INFINITE),
             Some(after) => {
@@ -1093,9 +956,6 @@ mod port {
               self.rearm(Some(now));
               continue;
             }
-            // The timeout of the port counts in ticks of the clock (15.6 ms): the port is
-            // looked at, and the thread sleeps the rest of the rest, which a sleep keeps to
-            // half a millisecond.
             match self.iocp.wait(0) {
               Packet::Timeout => {
                 thread::sleep(at.saturating_duration_since(now));
@@ -1122,16 +982,10 @@ mod port {
       self.stop();
     }
 
-    /// The earliest time at which a resting handle takes its next read.
     fn next_rest(&self) -> Option<Instant> {
       self.watches.values().filter_map(|watch| watch.rest_until).min()
     }
 
-    /// Reads every handle until nothing is left, then sends the time the last look at the port
-    /// began: a queued read completes as soon as one record is in it, its packet is queued
-    /// before the call that made the change returns, and a resting handle keeps its records for
-    /// the next read, so every record of a change before that time is sent (design.md 7.3).
-    /// `false`: the worker stops.
     fn read_empty(&mut self) -> bool {
       self.rearm(None);
       loop {
@@ -1158,7 +1012,6 @@ mod port {
       }
     }
 
-    /// Queues the next read of every handle whose rest is over at `now`, or of every resting one.
     fn rearm(&mut self, now: Option<Instant>) {
       let over = |watch: &Watch| watch.rest_until.is_some_and(|at| now.is_none_or(|now| at <= now));
       let due: Vec<WatchId> =
@@ -1203,7 +1056,6 @@ mod port {
             self.watches.insert(id, watch);
             return Ok(());
           }
-          // The disk does not know the longer records: the plain read goes on a new handle.
           Err(error) if extended && not_supported(&error) => extended = false,
           Err(error) => return Err(error),
         }
@@ -1212,7 +1064,6 @@ mod port {
 
     fn close(&mut self, id: WatchId) {
       let Some(watch) = self.watches.get_mut(&id) else { return };
-      // A resting handle keeps its records in the kernel: the read after the close takes them.
       let resting = watch.rest_until.take().is_some();
       watch.closing =
         if resting && watch.read().is_ok() { Closing::LastRead } else { Closing::Asked };
@@ -1223,7 +1074,6 @@ mod port {
       }
     }
 
-    /// The reply that waits for the closes gets it once no handle is closing.
     fn answer_closed(&mut self) {
       if self.watches.values().any(|watch| watch.closing != Closing::No) {
         return;
@@ -1233,24 +1083,17 @@ mod port {
       }
     }
 
-    /// `draining`: the handles are read until nothing is left, so none rests.
     fn completed(&mut self, id: WatchId, result: io::Result<u32>, draining: bool) {
       let Some(watch) = self.watches.get_mut(&id) else { return };
       watch.pending = false;
       let result = match result {
         Ok(len) => Ok(watch.records(len)),
-        // The kernel had no room for the records: a loss, as a read with no bytes.
         Err(error) if error.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR.cast_signed()) => {
           Ok(Vec::new())
         }
         Err(error) => Err(error),
       };
       if watch.closing != Closing::No {
-        // The kernel keeps the records of a handle between two reads and drops them with the
-        // handle: a read queued before the close may have left some there. One read queued
-        // after it takes them, and the cancel ends it at once when nothing is left. What comes
-        // later, the handle that took over reports: it was opened before the close. Reading
-        // on until nothing is left would not end in a flood.
         if let Ok(records) = result {
           self.sink.raw(watch.raw(id, Ok(records)));
           let before = mem::replace(&mut watch.closing, Closing::LastRead);
@@ -1266,7 +1109,6 @@ mod port {
       let records = match result {
         Ok(records) => records,
         Err(error) => {
-          // The read is over: the handle can take the next one.
           if watch.extended && not_supported(&error) {
             watch.extended = false;
             if watch.read().is_ok() {
@@ -1284,7 +1126,6 @@ mod port {
         self.died(id, io::Error::other("every read of the handle comes back with no bytes"));
         return;
       }
-      // A read that came back nearly full, or with a loss (no bytes), is queued again at once.
       if len == 0 || len >= BATCH_BYTES || draining {
         if let Err(error) = watch.read() {
           self.died(id, error);
@@ -1326,18 +1167,13 @@ mod port {
     empty_reads: u8,
     extended: bool,
     closing: Closing,
-    /// No read is queued until then: the kernel gathers the records of a flood meanwhile.
     rest_until: Option<Instant>,
   }
 
-  /// Whether the handle is given up: then it is read once more, and closed.
   #[derive(Clone, Copy, PartialEq, Eq)]
   enum Closing {
     No,
-    /// The read that is queued, if any, was queued before the close.
     Asked,
-    /// The read after the close is queued: once it is over, nothing is left that only this
-    /// handle reports.
     LastRead,
   }
 
@@ -1356,8 +1192,6 @@ mod port {
       }
     }
 
-    /// Queues one read. When the call fails it started no request: no read is pending, no
-    /// packet comes, and the blocks are free.
     fn read(&mut self) -> io::Result<()> {
       *self.overlapped = OVERLAPPED::default();
       let (handle, buffer) = (self.dir.as_raw_handle(), self.buffer.as_mut_ptr().cast());
@@ -1388,15 +1222,12 @@ mod port {
       Raw::Read { watch: id, dir: Arc::clone(&self.path), extended: self.extended, result }
     }
 
-    /// The first `len` bytes of the buffer.
     fn records(&self, len: u32) -> Vec<u8> {
       let len = (len as usize).min(BUFFER_BYTES as usize);
       // SAFETY: the buffer is `BUFFER_BYTES` long, and the bytes of its words are plain bytes.
       unsafe { slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), len) }.to_vec()
     }
 
-    /// Cancels the pending read. It fails when the read is over already: then its packet is
-    /// on its way, and the handle stays until it is taken.
     fn cancel(&mut self) {
       if self.pending {
         // SAFETY: the handle is open, and `overlapped` is the block of its pending read.
@@ -1407,7 +1238,6 @@ mod port {
 
   impl Drop for Watch {
     fn drop(&mut self) {
-      // The kernel may still write into the blocks of a pending read: they are left to it.
       if self.pending {
         Box::leak(mem::take(&mut self.buffer));
         Box::leak(mem::take(&mut self.overlapped));
@@ -1470,11 +1300,7 @@ mod port {
 
   enum Packet {
     Wake,
-    Completed {
-      id: WatchId,
-      result: io::Result<u32>,
-    },
-    /// The time given to the wait is over.
+    Completed { id: WatchId, result: io::Result<u32> },
     Timeout,
     Nothing(io::Error),
   }

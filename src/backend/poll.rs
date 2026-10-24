@@ -1,10 +1,7 @@
-//! The backend that watches nothing: the engine polls every directory.
-
 use std::{convert::Infallible, path::Path};
 
 use crate::backend::{Backend, Coverage, Hint, NodeKey, Want};
 
-/// Watches nothing.
 #[derive(Debug)]
 pub struct PollBackend;
 

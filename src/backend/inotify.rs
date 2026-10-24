@@ -1,5 +1,3 @@
-//! The inotify backend: one kernel watch for each directory. See `references/design.md` 7.1.
-
 #[cfg(feature = "test-hooks")]
 use std::os::fd::{AsRawFd, RawFd};
 use std::{
@@ -34,7 +32,6 @@ const WATCH_ENDED: u32 = libc::IN_IGNORED | libc::IN_UNMOUNT | libc::IN_DELETE_S
 const NEW_CONTENT: u32 = libc::IN_MODIFY | libc::IN_CREATE | libc::IN_MOVED_TO;
 const READ_BUFFER_LEN: usize = 64 * 1024;
 const READ_INTERVAL: Duration = Duration::from_millis(1);
-/// The kernel tells of each mount and unmount of the namespace by a priority event on it.
 const MOUNTS: &str = "/proc/self/mountinfo";
 
 const ERROR_WATCH_LIMIT: &str =
@@ -50,15 +47,10 @@ pub struct InotifyBackend {
   wd_by_key: FxHashMap<NodeKey, i32>,
 }
 
-/// What the reader thread sends.
 #[derive(Debug)]
 pub enum Raw {
-  /// What one read of the queue gave.
   Events(Vec<u8>),
-  /// The mount points that came or went in one wake-up: inotify says nothing of them.
   Mounts(Vec<PathBuf>),
-  /// The queue was read empty: every event of a change before this time came before. The
-  /// answer to `ask_delivered`.
   Delivered(SystemTime),
 }
 
@@ -78,12 +70,8 @@ impl Keys {
 struct Fds {
   inotify: File,
   stop: File,
-  /// `MOUNTS`, where it can be opened.
   mounts: Option<File>,
-  /// Wakes the reader for a question of the engine.
   ask: File,
-  /// The time the engine asked about (`Backend::ask_delivered`), in nanoseconds since the epoch.
-  /// Zero: none.
   asked: AtomicU64,
 }
 
@@ -110,7 +98,6 @@ impl InotifyBackend {
     })
   }
 
-  /// The two tables are given back when most of their keys are gone.
   fn shrink(&mut self) {
     give_room_back(&mut self.wd_by_key);
     give_room_back(&mut self.keys_by_wd);
@@ -127,7 +114,6 @@ impl Backend for InotifyBackend {
     };
     match ffi::add_watch(&self.fds.inotify, dir, events | WATCH_FLAGS) {
       Ok(wd) if self.wd_by_key.get(&key) == Some(&wd) => Coverage::Watched,
-      // A kernel watch belongs to the inode: a second add for it gives the old `wd`.
       Ok(wd) => {
         self.unwatch(key);
         self.wd_by_key.insert(key, wd);
@@ -182,8 +168,6 @@ impl Backend for InotifyBackend {
       }
       let Some(keys) = self.keys_by_wd.get(&event.wd) else { continue };
       let is_dir = event.mask & libc::IN_ISDIR != 0;
-      // A directory that was touched (`ATTRIB`) or "modified" (`MODIFY`, which some tools get
-      // for a directory): its entries that came or went have records of their own.
       let is_touched_dir = is_dir && event.mask & (libc::IN_ATTRIB | libc::IN_MODIFY) != 0;
       if is_touched_dir {
         continue;
@@ -224,7 +208,6 @@ impl Drop for InotifyBackend {
   }
 }
 
-/// What the tests look at.
 #[cfg(feature = "test-hooks")]
 impl InotifyBackend {
   pub fn inotify_fd(&self) -> RawFd {
@@ -240,12 +223,10 @@ impl InotifyBackend {
   }
 }
 
-/// `known`: the mounts when the backend started.
 fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Raw>) {
   let mut buffer = vec![0; READ_BUFFER_LEN];
   let mut next_read = Instant::now();
   let error = loop {
-    // A question of the engine wakes the reader at its time.
     let asked = fds.asked.load(Ordering::Relaxed);
     let until = (asked != 0).then(|| asked.saturating_sub(unsigned_nanos(SystemTime::now())));
     let ready = ffi::wait_until_ready(fds, until);
@@ -260,10 +241,6 @@ fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Raw>) {
       Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
       Err(error) => break error,
     };
-    // inotify says nothing of a volume that is mounted over a watched directory or one above:
-    // the mount points that came or went are told by their paths. In every wake-up that says
-    // so, as the wait that sees a change of the mounts takes the word, which comes once; and
-    // before an answer below, which is about every change before its time.
     if mounted && let Some(mounts) = fds.mounts.as_ref().and_then(read_mounts) {
       let points = mount_points(&known, &mounts);
       known = mounts;
@@ -271,15 +248,8 @@ fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Raw>) {
         sink.raw(Raw::Mounts(points));
       }
     }
-    // Its time came: the queue is read empty, and `Raw::Delivered`, with the time the read that
-    // found it empty began, says so. The kernel queues an event before the call that made the
-    // change returns, the loss report too, so every event of a change before that time is sent
-    // (design.md 7.1). One read a turn: a flood can keep the queue from being empty for long,
-    // and the reader still sees a stop. A later question stays.
     let began = if asked == 0 { 0 } else { unsigned_nanos(SystemTime::now()) };
     let answers = asked != 0 && began >= asked;
-    // At most one read a millisecond, unless the last read filled over half of the buffer:
-    // a flood of small writes would wake the reader for each.
     if !answers {
       thread::sleep(next_read.saturating_duration_since(Instant::now()));
     }
@@ -304,10 +274,6 @@ fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Raw>) {
   sink.failed(error);
 }
 
-/// The mounts of the namespace, each by its id with its mount point. Mount ids and not only
-/// points: a volume mounted over another one at the same point is a change too.
-// The file stays open for the poll of the mounts, and is read again from its start: a read by
-// path (`fs::read`) could open another file under the name.
 #[expect(clippy::verbose_file_reads, reason = "the open file is read again, not a path")]
 fn read_mounts(mut file: &File) -> Option<BTreeSet<(u64, Vec<u8>)>> {
   let mut text = Vec::new();
@@ -324,7 +290,6 @@ fn read_mounts(mut file: &File) -> Option<BTreeSet<(u64, Vec<u8>)>> {
   Some(mounts)
 }
 
-/// A mount point with its space, tab, newline and backslash as the kernel writes them: `\040`.
 fn unescape(mut field: &[u8]) -> Vec<u8> {
   let mut text = Vec::with_capacity(field.len());
   loop {
@@ -340,8 +305,6 @@ fn unescape(mut field: &[u8]) -> Vec<u8> {
   }
 }
 
-/// Each mount point that came or went, once: a volume mounted over another one at the same
-/// point is one.
 fn mount_points(old: &BTreeSet<(u64, Vec<u8>)>, new: &BTreeSet<(u64, Vec<u8>)>) -> Vec<PathBuf> {
   let points: BTreeSet<&[u8]> =
     old.symmetric_difference(new).map(|(_, point)| point.as_slice()).collect();
@@ -396,19 +359,14 @@ mod ffi {
   }
 
   pub(super) fn remove_watch(inotify: &File, wd: i32) {
-    // The libc of Android takes the descriptor as u32.
     #[cfg(target_os = "android")]
     let wd = wd.cast_unsigned();
     // SAFETY: the call takes no memory of ours.
     unsafe { libc::inotify_rm_watch(inotify.as_raw_fd(), wd) };
   }
 
-  /// Whether `inotify` and `stop` are readable, whether the mounts changed, and whether `ask`
-  /// is readable. A file of the mounts always reads, and tells of a change by a priority event.
-  /// `nanos`: the longest wait (rounded up to a millisecond); `None` waits until one is ready.
   pub(super) fn wait_until_ready(fds: &super::Fds, nanos: Option<u64>) -> io::Result<[bool; 4]> {
     let wait = |fd: i32, events: i16| libc::pollfd { fd, events, revents: 0 };
-    // A negative descriptor is left out.
     let mounts = fds.mounts.as_ref().map_or(-1, AsRawFd::as_raw_fd);
     let mut polled = [
       wait(fds.inotify.as_raw_fd(), libc::POLLIN),
