@@ -56,7 +56,7 @@ Only files are reported, never a directory. A batch has at most one event for a 
 | OS | Watch API |
 |---|---|
 | Linux, Android | inotify |
-| macOS | FSEvents |
+| macOS | FSEvents, with kqueue for the directories on the way |
 | Windows | `ReadDirectoryChangesW` |
 | every other target | none: always polling |
 
