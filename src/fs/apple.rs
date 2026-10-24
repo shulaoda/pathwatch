@@ -16,7 +16,7 @@ use libc::{
   ATTR_FILE_DATALENGTH, FSOPT_NOFOLLOW, MNT_LOCAL, O_DIRECTORY,
 };
 
-use super::{DirId, Entry, FileType, unsigned_nanos};
+use super::{DirId, Entry, FileType, stat_fs, unsigned_nanos};
 
 const LOOK: u32 =
   ATTR_CMN_DEVID | ATTR_CMN_CRTIME | ATTR_CMN_MODTIME | ATTR_CMN_FLAGS | ATTR_CMN_FILEID;
@@ -36,15 +36,6 @@ fn attr_list(common: u32, dir: u32, file: u32) -> libc::attrlist {
     fileattr: file,
     forkattr: 0,
   }
-}
-
-fn stat_fs(dir: &Path) -> Option<libc::statfs> {
-  let c_path = CString::new(dir.as_os_str().as_bytes()).ok()?;
-  // SAFETY: all zeros is a valid value of this plain struct of numbers.
-  let mut answer: libc::statfs = unsafe { mem::zeroed() };
-  // SAFETY: `c_path` ends with a NUL, and the call writes one whole `struct statfs`.
-  let result = unsafe { libc::statfs(c_path.as_ptr(), &raw mut answer) };
-  (result == 0).then_some(answer)
 }
 
 struct Fields<'a> {

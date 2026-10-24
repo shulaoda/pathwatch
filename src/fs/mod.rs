@@ -56,7 +56,7 @@ pub trait Fs {
   }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Debug)]
 pub struct Meta {
   pub kind: FileType,
   pub modified: SystemTime,
@@ -73,7 +73,7 @@ pub enum Entry {
   Dir { id: DirId, modified: SystemTime },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FileType {
   File,
   Dir,
@@ -81,7 +81,7 @@ pub enum FileType {
   Other,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct DirId {
   pub volume: u64,
   pub inode: u64,
@@ -109,7 +109,7 @@ pub(crate) fn is_delete_pending(_error: &io::Error) -> bool {
   false
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug)]
 pub struct StdFs;
 
 impl Fs for StdFs {
@@ -284,8 +284,6 @@ fn name_on_disk(path: &Path) -> io::Result<OsString> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn remote_disk(dir: &Path) -> Option<String> {
-  use std::{ffi::CString, mem, os::unix::ffi::OsStrExt};
-
   const KINDS: [(i128, &str); 6] = [
     (0x6969, "nfs"),
     (0x517b, "smb"),
@@ -294,13 +292,18 @@ fn remote_disk(dir: &Path) -> Option<String> {
     (0x0102_1997, "9p"),
     (0x6573_5546, "fuse"),
   ];
-  let path = CString::new(dir.as_os_str().as_bytes()).ok()?;
+  let kind = i128::from(stat_fs(dir)?.f_type) & 0xffff_ffff;
+  KINDS.iter().find(|(magic, _)| *magic == kind).map(|(_, name)| (*name).to_owned())
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn stat_fs(dir: &Path) -> Option<libc::statfs> {
+  use std::{ffi::CString, mem, os::unix::ffi::OsStrExt};
+
+  let c_path = CString::new(dir.as_os_str().as_bytes()).ok()?;
   // SAFETY: all zeros is a valid value of this plain struct of numbers.
   let mut answer: libc::statfs = unsafe { mem::zeroed() };
-  // SAFETY: `path` ends with a NUL, and the call writes one whole `struct statfs`.
-  if unsafe { libc::statfs(path.as_ptr(), &raw mut answer) } != 0 {
-    return None;
-  }
-  let kind = i128::from(answer.f_type) & 0xffff_ffff;
-  KINDS.iter().find(|(magic, _)| *magic == kind).map(|(_, name)| (*name).to_owned())
+  // SAFETY: `c_path` ends with a NUL, and the call writes one whole `struct statfs`.
+  let result = unsafe { libc::statfs(c_path.as_ptr(), &raw mut answer) };
+  (result == 0).then_some(answer)
 }

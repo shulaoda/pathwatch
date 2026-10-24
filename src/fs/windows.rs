@@ -181,16 +181,12 @@ pub(crate) fn kernel32(name: &CStr) -> FARPROC {
   unsafe { GetProcAddress(GetModuleHandleW(windows_sys::w!("kernel32.dll")), name.as_ptr().cast()) }
 }
 
-fn by_name_call() -> Option<ByName> {
+fn by_name(path: &Path) -> Option<io::Result<Meta>> {
   static CALL: OnceLock<Option<ByName>> = OnceLock::new();
-  *CALL.get_or_init(|| {
+  let call = (*CALL.get_or_init(|| {
     // SAFETY: the function with this name has this signature.
     unsafe { mem::transmute::<FARPROC, Option<ByName>>(kernel32(c"GetFileInformationByName")) }
-  })
-}
-
-fn by_name(path: &Path) -> Option<io::Result<Meta>> {
-  let call = by_name_call()?;
+  }))?;
   if is_odd(path) {
     return None;
   }
