@@ -182,7 +182,7 @@ fn a_missing_chain_that_appears_at_once_is_reported_promptly() {
     }
     let took = start.elapsed();
     // The poll of the missing places runs once a second: the chains in turn would take ten. A
-    // watcher that only polls rests after a slow round (design.md 5.13): no bound for it.
+    // watcher that only polls rests after a slow round (design.md 4.11): no bound for it.
     let bounded = w.backend == "native";
     assert!(!bounded || took < Duration::from_secs(5), "{CHAINS} chains took {took:?}");
     w.expect(&each(Create, &files));

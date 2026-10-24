@@ -267,7 +267,7 @@ fn watch_does_not_reach_below_its_directory() {
 
 /// Asked about a time, the reader reads the queue empty then, and sends word of it after
 /// every event it read: the events of every change before that time are in front of the answer
-/// (design.md 7.1), also the ones still in the queue of the kernel when the question came. A
+/// (architecture.md 4.1), also the ones still in the queue of the kernel when the question came. A
 /// question about a time to come waits for it.
 #[test]
 fn a_delivery_comes_after_the_events_of_every_change_before_its_time() {

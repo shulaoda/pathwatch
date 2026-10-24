@@ -585,8 +585,8 @@ fn a_dropped_signal_wakes_the_thread() {
 
 /// A delivery that comes behind a dropped signal is no delivery of that signal: the overflow is
 /// taken where the drop was in the queue. Taken at the end of the turn, the delivery ended the
-/// doubt of a young file that was not read (design.md 5.8), and the scan after the overflow did
-/// not count it as written, though the dropped signal can have been its write.
+/// doubt of a young file that was not read (architecture.md 2.8), and the scan after the overflow
+/// did not count it as written, though the dropped signal can have been its write.
 #[test]
 fn a_delivery_behind_a_dropped_signal_does_not_end_the_doubt() {
   let dir = tempfile::tempdir().unwrap();

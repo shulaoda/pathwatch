@@ -61,8 +61,9 @@ Only files are reported, never a directory. A batch has at most one event for a 
 | every other target | none: always polling |
 
 The promises, the known holes and the timing are in
-[`references/behavior.md`](references/behavior.md); how it works is in
-[`references/design.md`](references/design.md).
+[`references/behavior.md`](references/behavior.md); the rules it follows are in
+[`references/design.md`](references/design.md), and how the code follows them is in
+[`references/architecture.md`](references/architecture.md).
 
 ## License
 

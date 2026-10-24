@@ -232,7 +232,7 @@ fn a_flood_of_records_comes_in_batches() {
 
 /// Asked about a time, the worker reads every handle until nothing is left, the resting ones
 /// too, and then says so: the records of every change before that time are in front of the
-/// answer (design.md 7.3), also the ones the kernel still keeps when the question comes. A
+/// answer (architecture.md 4.3), also the ones the kernel still keeps when the question comes. A
 /// question about a time to come waits for it.
 #[test]
 fn a_delivery_comes_after_the_records_of_every_change_before_its_time() {

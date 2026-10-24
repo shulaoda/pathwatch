@@ -2,7 +2,8 @@
 
 This document specifies the observable behavior of `pathwatch`: its API, the events it reports,
 its options, the guarantees it makes, the cases it handles wrongly, and how soon events arrive.
-The README gives a short overview, and `design.md` describes the implementation.
+The README gives a short overview, `design.md` states the rules behind this behavior, and
+`architecture.md` describes the implementation.
 
 ## Terms
 
@@ -25,13 +26,15 @@ The README gives a short overview, and `design.md` describes the implementation.
 
 | Call | Behavior |
 |---|---|
-| `Watcher::new(handler)` | Starts a watcher with the default `Config`. Nothing is watched yet. |
-| `Watcher::with_config(config, handler)` | Starts a watcher with the given `Config`. |
+| `Watcher::new(handler)` | Starts a watcher with the default `Config`. Nothing is watched yet. It fails only when the watcher thread, or the queue that feeds it, cannot be created. When the watch API of the OS cannot start, the handler receives one error (`WatchLimit` or `Io`) and the watcher polls everything. |
+| `Watcher::with_config(config, handler)` | Starts a watcher with the given `Config`, in the same way. |
 | `watch(paths)` | Watches the given paths as one operation. Each path can be a file, a directory together with everything below it, or a path that does not exist yet. Returns once every path is watched. Watching a path that is already watched has no effect. |
 | `unwatch(paths)` | Undoes an earlier `watch` of exactly these paths. Nothing is reported for them, with one exception: when such a path was followed through a symbolic link inside a watched directory, the link becomes an ordinary file of that directory again, and this change is reported (promise 12). |
-| `close()` | Stops the watcher and waits for its thread to exit. A disk check in progress stops at its next step. Dropping the `Watcher` has the same effect. |
+| `close()` | Stops the watcher and waits for its thread to exit. A disk check in progress stops at its next step, so the wait lasts at most one look at the disk. Afterwards the handler is not called again, and `watch` and `unwatch` return `Closed`. Dropping the `Watcher` has the same effect. |
 
-`watch`, `unwatch` and `close` can be called from any thread, including from inside the handler.
+The handler is an `FnMut(Result<Vec<Event>, Error>) + Send + 'static`, and `Watcher` is
+`Send + Sync`. `watch`, `unwatch` and `close` can be called from any thread, including from inside
+the handler.
 Called from another thread, they block until the handler has returned, including the handler call
 for the batch that the call itself produces. The handler must therefore never wait for such a
 caller (for a lock the caller holds, for room in a bounded channel the caller fills, or for a call
@@ -42,11 +45,12 @@ If the handler or the ignore filter panics, the watcher thread ends: nothing mor
 
 `watch` and `unwatch` return an error only for a path that cannot be used (`InvalidPath`) and when
 the watcher is closed (`Closed`). A path that the OS cannot watch or read is not an error of the
-call; the handler receives the error instead.
+call: it stays watched, the handler receives the error, and the path is polled.
 
 ## Events
 
-Only files are reported, never directories.
+Only files are reported, never directories. Each event is an `Event { path, kind }`, where `kind`
+is an `EventKind`:
 
 | Event | Meaning |
 |---|---|
@@ -59,12 +63,27 @@ thread, so it should do little more than pass the batch on.
 
 - A batch is never empty and contains at most one event per path. The order of the events within
   a batch is unspecified.
-- An event path is a watched path exactly as it was given, either alone or followed by the path of
-  a file below it.
+- An event path is a watched path in its clean form (promise 8), either alone or followed by the
+  path of a file below it: it starts with the watched path, byte for byte.
 - An error means that something could not be watched or read. The watcher keeps running.
-  `error.kind()` is one of `InvalidPath`, `WatchLimit`, `PermissionDenied`, `RemoteDisk`, `Io` and
-  `Closed`. The handler receives at most one error of each kind per batch, carrying one path that
-  shows the problem. `RemoteDisk` is reported once per disk.
+  `error.kind()` says what the caller can do about it, and is one of `InvalidPath`, `WatchLimit`,
+  `PermissionDenied`, `RemoteDisk`, `Io` and `Closed`. `error.path()` is one path that shows the
+  problem, and none when the problem is the watcher itself. `error.source()` is what the OS or the
+  backend reported. The handler receives at most one error of each kind per batch. `RemoteDisk` is
+  reported once per disk.
+
+The text of an error consists of its kind, what happened to the watcher when the error concerns
+it, its path, and its source, each stated once:
+
+```text
+permission denied: /p/secret: Permission denied (os error 13)
+the OS has no room for one more watch, polling instead: /p/src: inotify has no watch left for this user (raise fs.inotify.max_user_watches)
+input or output error: the OS watcher stopped, so every path is polled: Bad file descriptor (os error 9)
+```
+
+The source of a limit error names the exact limit that was hit and what to raise. An error without
+a path concerns the watcher: its backend did not start or has stopped; the text says which, and that
+every path is now polled.
 
 ## Options
 
@@ -152,9 +171,11 @@ The story with sockets (promise 1) runs on Unix only.
    inside a watched directory through which the path was followed becomes an ordinary file of that
    directory again, and this change is reported (promise 12).
 8. **Paths.** A relative path is resolved against the current directory at the time of the call.
-   `.`, `..` and repeated separators are removed textually; no symbolic link is resolved. A path
-   that cannot be used (empty, containing a NUL, or a file system root) is rejected with
-   `InvalidPath`; the other paths of the same `watch` call are still watched.
+   `.`, repeated separators and a trailing separator are removed, and `..` removes the component
+   before it, all textually; no symbolic link is resolved. This clean form is the watched path. A
+   path that cannot be used (empty, containing a NUL, going above the root, or a top directory:
+   `/`, `C:\`, `\\server\share`) is rejected: the call returns `InvalidPath` with the first such
+   path, and the other paths of the same call are still watched.
 
    On Windows the same applies to a name that Windows does not accept as written: one that ends
    with a dot or a space, or that contains `:` (which denotes a stream of a file), a control
@@ -284,7 +305,7 @@ watcher gets in the way of other programs. None of them is fixed.
   is created, recreated or removed, the events can arrive up to one second late. On macOS each of
   them is instead held open for kernel events, which arrive at once; only when the process has no
   file descriptors left for them (`ulimit -n`) are they polled, and the watcher reports this
-  (`design.md`, section 7.2).
+  (`architecture.md`, section 4.2).
 - **macOS: many watched paths and a busy disk.** Events arrive late when the watcher has many
   separate paths and other programs write a lot. Measured while 50,000 other files were written:
   0.1 s with 100 paths, 0.9 s with 500, 1.8 s with 1,000, 3.5 s with 2,000. Nothing is lost. Other
