@@ -1,0 +1,41 @@
+README.md
+  s_0070b6318eca36::t_ebf2f0c88b2888 3-4,9,13,16,22,32,36,41,46-52,56,58-61,63-65,67,69
+references/behavior.md
+  s_0070b6318eca36::t_1d6f0a130be780 1-313
+references/design.md
+  s_0070b6318eca36::t_ac9483251f35e1 598,792,862,1762,1861,1875-1941,1944-1947,1949-1976
+src/lib.rs
+  s_0070b6318eca36::t_dca20f4f598d67 31-32
+tests/sim/fuzz.rs
+  s_0070b6318eca36::t_4b1ebd42459626 4-5
+tests/stories/contract.rs
+  s_0070b6318eca36::t_2d93714d0233f8 26
+tests/stories/disk.rs
+  s_0070b6318eca36::t_35bf5fb18d29e2 339
+tests/stories/main.rs
+  s_0070b6318eca36::t_4abb7c69c91a3a 14
+tests/stories/operations.rs
+  s_0070b6318eca36::t_f0936fa1797b3e 173
+tests/stories/projects.rs
+  s_0070b6318eca36::t_86f675e83c09de 78,151,170
+tests/stories/promises.rs
+  s_0070b6318eca36::t_df20991963d7e9 1-2,783
+tests/windows/parts.rs
+  s_0070b6318eca36::t_88084998427d27 1575
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "898c0b25d7621f8297daca358abcb622ec79a87a",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
