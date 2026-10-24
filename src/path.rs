@@ -1,27 +1,21 @@
-//! Cleans a path given to `watch`, by text only: `.` is dropped, `..` takes the name before it
-//! away, and no link is resolved. The disk is never asked. Also the rules of text that the
-//! engine and the tree share: where the top directory ends, and how a name goes on a path.
-
 use std::{
   ffi::{OsStr, OsString},
   path::{MAIN_SEPARATOR_STR, Path, PathBuf, is_separator},
 };
 
-/// The longest name that can be watched, in bytes. No disk takes a name of more than 765 bytes
-/// (255 UTF-16 units of 3 bytes), and the tree keeps the length of a name in 16 bits: two names
-/// for a share.
+/// The longest name that can be watched, in bytes. No disk takes a name of more than 765 bytes,
+/// and the tree keeps the length of a name in 16 bits, where a share is two names.
 const MAX_NAME: usize = 10_000;
 
-/// The registered form of `path`: absolute, no `.` or `..`, no repeated or trailing separator.
+/// The registered form of `path`: absolute, with no `.`, `..`, repeated or trailing separator.
 ///
-/// `None` when the path is relative, has a NUL, names a top directory (`/`, `C:\`,
-/// `\\server\share\`), goes above it with `..`, or has a name longer than `MAX_NAME`; on
-/// Windows also when a name is one that Windows does not take as it is (`is_name`).
+/// `None` if the path is relative, has a NUL, is a top directory (`/`, `C:\`, `\\server\share\`)
+/// or goes above one, has a name longer than `MAX_NAME`, or on Windows a name that Windows does
+/// not take as it is.
 pub fn normalize(path: &Path) -> Option<PathBuf> {
-  // The rules read the bytes of the path, on Windows too: every character that they name is one
-  // ASCII byte there, and every byte of another character is above 0x7F.
+  // Every character that the rules look at is one ASCII byte, on Windows too.
   let text = path.as_os_str().as_encoded_bytes();
-  // Anywhere else a path must be UTF-8.
+  // Elsewhere a path must be UTF-8.
   #[cfg(not(any(unix, windows)))]
   path.to_str()?;
   #[cfg(windows)]
@@ -36,36 +30,22 @@ pub fn normalize(path: &Path) -> Option<PathBuf> {
 #[cfg(any(not(windows), test))]
 fn unix(text: &[u8]) -> Option<Vec<u8>> {
   let rest = text.strip_prefix(b"/")?;
-  // The clean form is never longer than the text: one allocation is enough.
+  // The clean form is never longer than the text.
   let mut clean = Vec::with_capacity(text.len());
   clean.push(b'/');
   push_names(&mut clean, rest, |byte| byte == b'/', b'/', |_| true)?;
   Some(clean)
 }
 
-/// The Windows rules. They are compiled for the tests of every system.
+/// The Windows rules, compiled for the tests on every system.
 #[cfg(any(windows, test))]
 mod windows_rules {
   use super::{MAX_NAME, push_names};
 
-  /// Whether Windows finds an entry under this very name. It takes a dot or a space off the end
-  /// of a name, reads `:` as the start of a stream of the file, and has no name with a control
-  /// character or one of `< > " | ? *`. A path with such a name would be watched and never get
-  /// an event: no record of the OS spells it so.
-  fn is_name(name: &[u8]) -> bool {
-    let is_kept = |byte: u8| byte >= 0x20 && !br#"<>:"|?*"#.contains(&byte);
-    !matches!(name.last(), Some(b'.' | b' ')) && name.iter().all(|&byte| is_kept(byte))
-  }
-
-  fn is_separator(byte: u8) -> bool {
-    matches!(byte, b'\\' | b'/')
-  }
-
   pub(super) fn windows(text: &[u8]) -> Option<Vec<u8>> {
     let mut clean = Vec::with_capacity(text.len());
     let rest = if let Some(verbatim) = strip(text, br"\\?\") {
-      // In a verbatim path only `\` separates, and `/` is a plain character that the normal form
-      // cannot hold. Such a path is refused, so the usual separators find the same names.
+      // In a verbatim path `/` is a plain character, which the plain form cannot hold.
       if verbatim.contains(&b'/') {
         return None;
       }
@@ -82,24 +62,19 @@ mod windows_rules {
     Some(clean)
   }
 
-  /// Appends `C:\` and returns what comes after it. `C:name` and `\name` are not absolute.
-  fn push_drive<'a>(clean: &mut Vec<u8>, text: &'a [u8]) -> Option<&'a [u8]> {
-    let [letter, b':', b'\\' | b'/', rest @ ..] = text else { return None };
-    if !letter.is_ascii_alphabetic() {
-      return None;
-    }
-    clean.extend([*letter, b':', b'\\']);
-    Some(rest)
+  /// `text` after `prefix`, in any case of its ASCII letters.
+  fn strip<'a>(text: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    let (head, rest) = text.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(rest)
   }
 
-  /// Appends `\\server\share\` and returns what comes after it. `text` starts at the server name.
+  /// Appends `\\server\share\` and returns the rest. `text` starts at the server.
   fn push_share<'a>(clean: &mut Vec<u8>, text: &'a [u8]) -> Option<&'a [u8]> {
     let mut rest = text;
     clean.extend_from_slice(br"\\");
     for is_server in [true, false] {
       let start = rest.iter().position(|&byte| !is_separator(byte))?;
-      // Windows refuses a third separator before the server, and takes one too many before
-      // the share.
+      // Windows refuses a separator too many before the server, and takes one before the share.
       if is_server && start != 0 {
         return None;
       }
@@ -117,15 +92,31 @@ mod windows_rules {
     Some(rest)
   }
 
-  /// What comes after `prefix` at the start of `text`, in any case of its ASCII letters.
-  fn strip<'a>(text: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
-    let (head, rest) = text.split_at_checked(prefix.len())?;
-    head.eq_ignore_ascii_case(prefix).then_some(rest)
+  /// Appends `C:\` and returns the rest. `C:name` and `\name` are not absolute.
+  fn push_drive<'a>(clean: &mut Vec<u8>, text: &'a [u8]) -> Option<&'a [u8]> {
+    let [letter, b':', b'\\' | b'/', rest @ ..] = text else { return None };
+    if !letter.is_ascii_alphabetic() {
+      return None;
+    }
+    clean.extend([*letter, b':', b'\\']);
+    Some(rest)
+  }
+
+  fn is_separator(byte: u8) -> bool {
+    matches!(byte, b'\\' | b'/')
+  }
+
+  /// Whether Windows finds an entry under this very name. It drops a dot or a space at the end,
+  /// reads `:` as a stream, and has no name with a control character or one of `< > " | ? *`:
+  /// such a path would never get an event.
+  fn is_name(name: &[u8]) -> bool {
+    let is_kept = |byte: u8| byte >= 0x20 && !br#"<>:"|?*"#.contains(&byte);
+    !matches!(name.last(), Some(b'.' | b' ')) && name.iter().all(|&byte| is_kept(byte))
   }
 }
 
 /// Appends the names of `text` to `clean`, which holds the top directory and ends with a
-/// separator. At least one name must be left, or the path is a top directory.
+/// separator. `None` if no name is left: the path is a top directory.
 fn push_names(
   clean: &mut Vec<u8>,
   text: &[u8],
@@ -136,9 +127,8 @@ fn push_names(
   let top = clean.len();
   for name in text.split(|&byte| separator(byte)) {
     match name {
-      // Nothing, or `.`: the clean form leaves it out.
       [] | [b'.'] => {}
-      // `..` takes the name before it away. Above the top directory there is nothing to take.
+      // `..` takes the name before it away. Above the top directory there is none.
       [b'.', b'.'] => {
         if clean.len() == top {
           return None;
@@ -146,8 +136,6 @@ fn push_names(
         let last = clean[top..].iter().rposition(|&byte| byte == join).unwrap_or(0);
         clean.truncate(top + last);
       }
-      // A name with a NUL, one that is too long, or one that the system does not take as it is:
-      // the path cannot be used.
       _ if name.contains(&0) || name.len() > MAX_NAME || !is_name(name) => return None,
       _ => {
         if clean.len() > top {
@@ -162,25 +150,21 @@ fn push_names(
 
 /// Splits a clean path at its top directory: `/a/b` gives `/` and `a/b`.
 pub(crate) fn split_top(path: &Path) -> Option<(&OsStr, &Path)> {
-  // On Unix the top directory is always `/`: it is cut off at the front.
   #[cfg(unix)]
   let top = Path::new("/");
-  // Anywhere else it can be `C:\` or `\\server\share\`. It is found from the end of the path.
+  // `C:\` or `\\server\share\`.
   #[cfg(not(unix))]
   let top = path.ancestors().last()?;
   let rest = path.strip_prefix(top).ok()?;
   Some((top.as_os_str(), rest))
 }
 
-/// Appends `name` to `path` as one more name, by its text: `PathBuf::push` would start the path
-/// anew for a name that reads as a drive or a root (`C:`, `\\a`), which a disk that another system
-/// filled can list on Windows. `pop` takes such a name off again; a name with a separator in it
-/// never reaches the tree (`fs::read_dir` leaves it out).
+/// Appends `name` to `path` by its text. `PathBuf::push` would start the path anew for a name
+/// that reads as a drive or a root (`C:`, `\\a`), which Windows can list on a disk that another
+/// system filled.
 pub(crate) fn push_name(path: &mut PathBuf, name: &OsStr) {
   let text = path.as_mut_os_string();
-  let last = text.as_encoded_bytes().last().copied();
-  if !text.is_empty() && !last.is_some_and(|byte| byte.is_ascii() && is_separator(char::from(byte)))
-  {
+  if text.as_encoded_bytes().last().is_some_and(|&byte| !is_separator(char::from(byte))) {
     text.push(MAIN_SEPARATOR_STR);
   }
   text.push(name);
