@@ -20,11 +20,11 @@ pub trait Backend: 'static {
 
   /// Asks for a watch on the directory `dir` under `key`. The watch is live after the next
   /// [`commit`](Backend::commit).
-  fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage;
+  fn watch(&mut self, key: NodeKey, dir: &Path, want: Want) -> Coverage;
 
   /// Takes the watch of `key` back. A watch that other keys share stays; where the watches
   /// stand is worked out again at the next [`commit`](Backend::commit).
-  fn unwatch(&mut self, key: DirKey);
+  fn unwatch(&mut self, key: NodeKey);
 
   /// Makes the watches asked for since the last commit live. Says which keys got no watch,
   /// and which keys that were answered `NotWatched` before an OS watch reports now.
@@ -48,15 +48,15 @@ pub trait Backend: 'static {
   }
 }
 
-/// The name of a directory between the engine and a backend: its slot in the tree, and a
-/// generation that tells it from an earlier node in the slot.
+/// The name of a node of the tree: its slot, and a generation that tells it from an earlier node
+/// in the slot. A backend gets the keys of directories.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct DirKey {
+pub struct NodeKey {
   index: u32,
   generation: u32,
 }
 
-impl DirKey {
+impl NodeKey {
   pub const fn new(index: u32, generation: u32) -> Self {
     Self { index, generation }
   }
@@ -74,10 +74,10 @@ impl DirKey {
 #[derive(Debug, Default)]
 pub struct Committed {
   /// The keys that were answered `NotWatched` before and that an OS watch reports now.
-  pub now_watched: Vec<DirKey>,
+  pub now_watched: Vec<NodeKey>,
   /// The keys whose watch could not be made live, each with the reason: the engine reports
   /// it, polls the directory, and asks again later.
-  pub failed: Vec<(DirKey, io::Error)>,
+  pub failed: Vec<(NodeKey, io::Error)>,
 }
 
 /// What a directory asks to hear about.
@@ -107,13 +107,13 @@ pub enum Coverage {
 pub enum Hint<'a> {
   /// Something at `rel` below the directory `dir` changed. An empty `rel`: the directory
   /// itself, or its watch, and the engine scans everything below it.
-  Changed { dir: DirKey, rel: &'a Path },
+  Changed { dir: NodeKey, rel: &'a Path },
   /// The file at `rel` below `dir` was written: an `Update`, also with an equal fingerprint,
   /// under every spelling of the name where every disk is loose. `new`: the OS says so for a
   /// file that was created or moved in too (inotify), which holds other content than the name
   /// had before; a twin of such a name is left to its look, as a rename that changes only the
   /// case is the same file.
-  Written { dir: DirKey, rel: &'a Path, new: bool },
+  Written { dir: NodeKey, rel: &'a Path, new: bool },
   /// Notifications were lost, and the backend cannot say where.
   Lost,
   /// A volume was mounted or unmounted at `path`, a real path: another directory may stand

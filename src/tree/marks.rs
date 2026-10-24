@@ -10,7 +10,7 @@ use super::{
   Content, Depth, Kind, NONE, Node, Tree, Watch, emptied, is_plain, name_of, room_to_keep,
 };
 use crate::{
-  backend::{DirKey, Hint},
+  backend::{Hint, NodeKey},
   path::split_top,
 };
 
@@ -24,7 +24,7 @@ enum Said {
 
 /// A marked node as a flush takes it (`Tree::take_marked`): its level, the order of its key
 /// from the newest, its directory, the node, and the time of its hint.
-pub type Marked = (usize, usize, DirKey, DirKey, Option<Instant>);
+pub type Marked = (usize, usize, NodeKey, NodeKey, Option<Instant>);
 
 /// "Check this name at the next flush."
 #[derive(Clone, Copy, Default, Debug)]
@@ -87,7 +87,7 @@ impl Tree {
   }
 
   /// Marks the place to check for a change at `rel` below `dir`.
-  fn mark_below(&mut self, dir: DirKey, rel: &Path, said: Said) -> bool {
+  fn mark_below(&mut self, dir: NodeKey, rel: &Path, said: Said) -> bool {
     let Some(node) = self.get(dir) else { return false };
     if !node.is_dir() {
       let mut child = dir;
@@ -181,14 +181,14 @@ impl Tree {
   }
 
   /// Adds a mark to a node.
-  pub fn mark(&mut self, key: DirKey, mark: Mark) {
+  pub fn mark(&mut self, key: NodeKey, mark: Mark) {
     if self[key].add_mark(mark) {
       self.marked.push((key, mark.since));
     }
   }
 
   /// Takes the mark off a node.
-  pub fn take_mark(&mut self, key: DirKey) -> Option<Mark> {
+  pub fn take_mark(&mut self, key: NodeKey) -> Option<Mark> {
     let node = self.get_mut(key)?;
     let mark = node.mark();
     node.set_mark(None);
@@ -196,7 +196,7 @@ impl Tree {
   }
 
   /// Queues a scan of the directory `key`: once, with the deepest depth asked for.
-  pub fn queue_scan(&mut self, key: DirKey, depth: Depth) {
+  pub fn queue_scan(&mut self, key: NodeKey, depth: Depth) {
     let Some(dir) = self[key].dir_mut() else { return };
     if let Some(old) = dir.scan {
       dir.scan = Some(old.max(depth));
@@ -207,7 +207,7 @@ impl Tree {
   }
 
   /// Takes the queue into `scans`: every queued node, with its depth and whether it was away.
-  pub fn take_scans(&mut self, scans: &mut Vec<(DirKey, Depth, bool)>) {
+  pub fn take_scans(&mut self, scans: &mut Vec<(NodeKey, Depth, bool)>) {
     scans.clear();
     let mut queue = mem::take(&mut self.to_scan);
     scans.extend(queue.drain(..).filter_map(|key| {
@@ -247,7 +247,7 @@ impl Tree {
   }
 
   /// Puts the directory on the list of the timer if it has to be polled now.
-  pub fn list_if_polled(&mut self, key: DirKey) {
+  pub fn list_if_polled(&mut self, key: NodeKey) {
     if matches!(self[key].kind, Kind::Dir(dir) if dir.is_polled()) {
       self.polled.push(key);
       if self.polled.len() > 2 * self.slots.len() + 16 {

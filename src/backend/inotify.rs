@@ -21,7 +21,7 @@ use std::{
 use rustc_hash::FxHashMap;
 
 use crate::{
-  backend::{Backend, Coverage, DirKey, Hint, Sink, Want, give_room_back, watch_limit},
+  backend::{Backend, Coverage, Hint, NodeKey, Sink, Want, give_room_back, watch_limit},
   fs::unsigned_nanos,
 };
 
@@ -47,7 +47,7 @@ pub struct InotifyBackend {
   fds: Arc<Fds>,
   reader: Option<JoinHandle<()>>,
   keys_by_wd: FxHashMap<i32, Keys>,
-  wd_by_key: FxHashMap<DirKey, i32>,
+  wd_by_key: FxHashMap<NodeKey, i32>,
 }
 
 /// What the reader thread sends.
@@ -64,12 +64,12 @@ pub enum Raw {
 
 #[derive(Debug)]
 struct Keys {
-  first: DirKey,
-  more: Vec<DirKey>,
+  first: NodeKey,
+  more: Vec<NodeKey>,
 }
 
 impl Keys {
-  fn iter(&self) -> impl Iterator<Item = DirKey> {
+  fn iter(&self) -> impl Iterator<Item = NodeKey> {
     iter::once(self.first).chain(self.more.iter().copied())
   }
 }
@@ -120,7 +120,7 @@ impl InotifyBackend {
 impl Backend for InotifyBackend {
   type Raw = Raw;
 
-  fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
+  fn watch(&mut self, key: NodeKey, dir: &Path, want: Want) -> Coverage {
     let events = match want {
       Want::Names => ENTRY_EVENTS | SELF_EVENTS,
       Want::Contents => ENTRY_EVENTS | SELF_EVENTS | CONTENT_EVENTS,
@@ -143,7 +143,7 @@ impl Backend for InotifyBackend {
     }
   }
 
-  fn unwatch(&mut self, key: DirKey) {
+  fn unwatch(&mut self, key: NodeKey) {
     let Some(wd) = self.wd_by_key.remove(&key) else { return };
     let Entry::Occupied(mut keys) = self.keys_by_wd.entry(wd) else { return };
     let Keys { first, more } = keys.get_mut();
@@ -191,7 +191,7 @@ impl Backend for InotifyBackend {
       let is_written = !is_dir && event.mask & NEW_CONTENT != 0;
       let new = event.mask & libc::IN_MODIFY == 0;
       let rel = Path::new(OsStr::from_bytes(event.name));
-      let tell = |dir: DirKey| {
+      let tell = |dir: NodeKey| {
         hint(if is_written { Hint::Written { dir, rel, new } } else { Hint::Changed { dir, rel } });
       };
       keys.iter().for_each(tell);
@@ -231,7 +231,7 @@ impl InotifyBackend {
     self.fds.inotify.as_raw_fd()
   }
 
-  pub fn wd(&self, key: DirKey) -> Option<i32> {
+  pub fn wd(&self, key: NodeKey) -> Option<i32> {
     self.wd_by_key.get(&key).copied()
   }
 

@@ -9,7 +9,7 @@ use std::{
 
 use super::Engine;
 use crate::{
-  backend::{Backend, DirKey, Want},
+  backend::{Backend, NodeKey, Want},
   config::EntryKind,
   fs::Fs,
   path::{push_name, split_top},
@@ -93,14 +93,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Whether what is in a directory that appears, or becomes complete, is the baseline.
   /// `relinked`: the node is a link that was none at the last check.
-  pub(super) fn is_baseline_dir(&self, key: DirKey, relinked: bool) -> bool {
+  pub(super) fn is_baseline_dir(&self, key: NodeKey, relinked: bool) -> bool {
     // A link that the running call follows for the first time: nobody read its target before.
     let new_link = relinked && self.tree[key].added() == Added::Registered;
     new_link || !self.watched_before(key)
   }
 
   /// Whether the node was watched before the running `watch`: what is at it had to be reported.
-  pub(super) fn watched_before(&self, key: DirKey) -> bool {
+  pub(super) fn watched_before(&self, key: NodeKey) -> bool {
     let node = &self.tree[key];
     if node.is_path() && node.added() == Added::No {
       return true;
@@ -123,14 +123,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 /// What a watched path covers: the rule for a complete node (design.md 5.1).
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Whether the directory above covers the node: it tracks every entry, and the node is one.
-  pub(super) fn covered_by_parent(&self, key: DirKey) -> bool {
+  pub(super) fn covered_by_parent(&self, key: NodeKey) -> bool {
     !self.tree[key].is_unlisted()
       && self.tree.parent(key).is_some_and(|parent| self.tracks_every_entry(parent))
   }
 
   /// The rule for a complete node: a watched path, or inside one and not ignored. The tree can be
   /// behind it until the next look (design.md 5.1).
-  pub(super) fn tracks_every_entry(&self, key: DirKey) -> bool {
+  pub(super) fn tracks_every_entry(&self, key: NodeKey) -> bool {
     match self.tree[key].kind {
       Kind::Dir(dir) => dir.complete || self.is_covered(key, false),
       Kind::File(_) | Kind::Missing => false,
@@ -141,7 +141,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// nearest that was one before the running `watch`): each node on the way up to it is an
   /// entry of the directory above. The filter ignores none of them as a directory: each has a
   /// directory, or lies on the way to a watched path (design.md 5.1).
-  fn is_covered(&self, key: DirKey, before_call: bool) -> bool {
+  fn is_covered(&self, key: NodeKey, before_call: bool) -> bool {
     let mut at = key;
     loop {
       let node = &self.tree[at];
@@ -204,7 +204,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Forgets what the tree has at the node and below it, down to each watched path, which stays.
-  pub(super) fn uncover(&mut self, key: DirKey, tell_delete: bool) {
+  pub(super) fn uncover(&mut self, key: NodeKey, tell_delete: bool) {
     // A list, not a recursion: a tree can be deeper than the stack takes. The directories that
     // go vanish afterwards, each after the ones below it.
     let mut gone = Vec::new();
@@ -241,7 +241,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// The node is not registered any more: an entry like the others inside a watched directory,
   /// and nothing anywhere else.
-  fn let_go(&mut self, key: DirKey) {
+  fn let_go(&mut self, key: NodeKey) {
     // Asked while the node still says that the directory above lists it under another name.
     let covered = self.covered_by_parent(key);
     self.tree[key].set_unlisted(false);
@@ -264,7 +264,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 /// keeps of the answer (design.md 5.11).
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Asks the filter about the node, and keeps the answer on it.
-  pub(super) fn ignores(&mut self, key: DirKey, path: &Path, kind: EntryKind) -> bool {
+  pub(super) fn ignores(&mut self, key: NodeKey, path: &Path, kind: EntryKind) -> bool {
     if let Some(answer) = self.tree[key].ignored(kind) {
       return answer;
     }

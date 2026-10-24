@@ -156,7 +156,7 @@ The words, each for one idea:
 | watched path | a path given to `watch` and not taken back by `unwatch` | `Node::is_path` |
 | registered name | a watched path, or a name on the way to one | `Node::is_registered` |
 | node | one name the tree knows; nothing, a file or a directory is there | `Node`, `Kind` |
-| key | the name of a node, also for the backend | `DirKey` |
+| key | the name of a node, also for the backend | `NodeKey` |
 | root | the one fixed node above the top directories (`/`, `C:\`) | `Tree::ROOT` |
 | complete / partial | a directory node tracks every entry / only its registered names | `Dir::complete` |
 | told | the handler believes that a file is at the path | `Node::told` |
@@ -1206,7 +1206,7 @@ sink.
 
 **The types.**
 
-- `DirKey` names one directory node of the engine. A backend stores it and puts it into every
+- `NodeKey` names one directory node of the engine. A backend stores it and puts it into every
   hint for that directory, so no path spelling has to match between the two sides.
 - `Want` is what the engine asks about a directory (5.10). `Names`: tell when a name in the
   directory comes, goes or is replaced. Enough for a directory that only leads to watched
@@ -1934,7 +1934,7 @@ the order in which a change meets them.
 - **Watched path.** A path given to `watch` and not taken back. Its node `is_path`.
 - **Registered.** A node that is a watched path or leads to one (`is_ancestor`). A registered
   node stays in the tree while nothing is at its path.
-- **Key.** A `DirKey`: the slot of a node in the arena and a generation. The backend knows a
+- **Key.** A `NodeKey`: the slot of a node in the arena and a generation. The backend knows a
   directory by its key and never by its path, so the two sides need not agree on a spelling.
 - **Complete, partial.** A directory node that tracks every entry of its directory, or only its
   registered children. A watched directory is complete; a directory on the way to a watched path

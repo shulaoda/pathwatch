@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use pathwatch::backend::DirKey;
+use pathwatch::backend::NodeKey;
 
 /// Where the name starts in a record: after three `u32` fields.
 const FILE_NAME: usize = 12;
@@ -54,8 +54,8 @@ fn encode_extended(records: &[(u32, &str, bool)]) -> Vec<u8> {
   bytes
 }
 
-fn key(index: u32) -> DirKey {
-  DirKey::new(index, 0)
+fn key(index: u32) -> NodeKey {
+  NodeKey::new(index, 0)
 }
 
 /// An absolute path, from text with `/`.
@@ -67,7 +67,7 @@ mod place {
   use std::path::PathBuf;
 
   use pathwatch::backend::{
-    DirKey,
+    NodeKey,
     Want::{self, Contents, Names},
     windows::{MAX_HANDLES, place},
   };
@@ -92,7 +92,7 @@ mod place {
     let places = place(&wanted, max, &mut |path| links.iter().any(|link| link == path));
     places
       .into_iter()
-      .map(|place| (place.dir, place.keys.into_iter().map(DirKey::index).collect()))
+      .map(|place| (place.dir, place.keys.into_iter().map(NodeKey::index).collect()))
       .collect()
   }
 
@@ -291,7 +291,7 @@ mod handles {
   };
 
   use pathwatch::backend::{
-    Coverage, DirKey, Want, is_watch_limit,
+    Coverage, NodeKey, Want, is_watch_limit,
     windows::{Handles, MAX_HANDLES, System, Told, WatchId, place},
   };
 
@@ -402,8 +402,8 @@ mod handles {
 
     /// Keeps what a call told, and checks what holds after it.
     fn told(&mut self, told: Told) {
-      self.lost.extend(told.lost.into_iter().map(DirKey::index));
-      self.covered.extend(told.covered.into_iter().map(DirKey::index));
+      self.lost.extend(told.lost.into_iter().map(NodeKey::index));
+      self.covered.extend(told.covered.into_iter().map(NodeKey::index));
       self.check();
     }
 
@@ -434,7 +434,7 @@ mod handles {
       self.disk.open.retain(|(open, _)| *open != id);
       let died = io::Error::other("the read failed");
       let mut keys: Vec<u32> =
-        self.handles.closed(id, &died).into_iter().map(DirKey::index).collect();
+        self.handles.closed(id, &died).into_iter().map(NodeKey::index).collect();
       keys.sort_unstable();
       keys
     }
@@ -1290,11 +1290,11 @@ mod translate {
   /// A read counts for its bytes in the queue of the watcher, and a loss for its keys.
   #[test]
   fn a_raw_notification_counts_its_bytes() {
-    use pathwatch::backend::{Backend, DirKey, windows::WindowsBackend};
+    use pathwatch::backend::{Backend, NodeKey, windows::WindowsBackend};
     let bytes = <WindowsBackend as Backend>::raw_bytes(&read(WatchId(0), "/p", Ok(vec![0; 1000])));
     assert!(bytes >= 1000, "{bytes}");
-    let lost = Raw::Lost(vec![DirKey::new(1, 0), DirKey::new(2, 0)]);
-    assert!(<WindowsBackend as Backend>::raw_bytes(&lost) >= 2 * size_of::<DirKey>());
+    let lost = Raw::Lost(vec![NodeKey::new(1, 0), NodeKey::new(2, 0)]);
+    assert!(<WindowsBackend as Backend>::raw_bytes(&lost) >= 2 * size_of::<NodeKey>());
   }
 
   #[test]

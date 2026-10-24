@@ -24,7 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use self::ffi::{Notices, Queue, Stream};
 use crate::{
   backend::{
-    Backend, Committed, Coverage, DirKey, Hint, Sink, Want, copy_error, give_room_back,
+    Backend, Committed, Coverage, Hint, NodeKey, Sink, Want, copy_error, give_room_back,
     may_watch_a_tree, watch_limit,
   },
   fs::{FileType, is_missing, name_and_kind},
@@ -79,7 +79,7 @@ pub struct FsEventsBackend {
   guard_is_stale: bool,
   /// The keys asked for names of a directory that no stream reports, at its real path: its
   /// guard tells about it.
-  named: FxHashMap<DirKey, PathBuf>,
+  named: FxHashMap<NodeKey, PathBuf>,
   /// The parent that `real_path` asked last, and its real path: kept until the commit.
   last_parent: Option<(PathBuf, PathBuf)>,
 }
@@ -91,7 +91,7 @@ pub struct Raw {
   paths: Vec<u8>,
   records: Vec<(usize, u32)>,
   /// The keys that the backend reports lost by itself, with no record.
-  pub lost: Vec<DirKey>,
+  pub lost: Vec<NodeKey>,
 }
 
 impl Raw {
@@ -134,7 +134,7 @@ impl FsEventsBackend {
 impl Backend for FsEventsBackend {
   type Raw = Raw;
 
-  fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
+  fn watch(&mut self, key: NodeKey, dir: &Path, want: Want) -> Coverage {
     let real = match self.real_path(dir) {
       Ok(real) => real,
       Err(error) => {
@@ -177,7 +177,7 @@ impl Backend for FsEventsBackend {
     Coverage::WatchedTree
   }
 
-  fn unwatch(&mut self, key: DirKey) {
+  fn unwatch(&mut self, key: NodeKey) {
     if self.named.remove(&key).is_some() {
       give_room_back(&mut self.named);
       self.guard_is_stale = true;
@@ -276,7 +276,7 @@ impl Backend for FsEventsBackend {
   fn raw_bytes(raw: &Self::Raw) -> usize {
     raw.paths.capacity()
       + raw.records.capacity() * size_of::<(usize, u32)>()
-      + raw.lost.capacity() * size_of::<DirKey>()
+      + raw.lost.capacity() * size_of::<NodeKey>()
   }
 }
 
@@ -301,7 +301,7 @@ impl FsEventsBackend {
     self.covers.by_dir.paths()
   }
 
-  pub fn cover_of_key(&self) -> &FxHashMap<DirKey, PathBuf> {
+  pub fn cover_of_key(&self) -> &FxHashMap<NodeKey, PathBuf> {
     &self.covers.dir_of
   }
 
@@ -454,7 +454,7 @@ impl FsEventsBackend {
 
   /// The check after the start (`references/design.md` 7.2): a stream path, or a name between it
   /// and a cover, can have changed between `watch` and the start of the stream.
-  fn moved_since_asked(&mut self, started: &[PathBuf]) -> Vec<DirKey> {
+  fn moved_since_asked(&mut self, started: &[PathBuf]) -> Vec<NodeKey> {
     let mut moved = Vec::new();
     for path in started {
       let is_there = fs::canonicalize(path).is_ok_and(|real| real == *path);
@@ -605,7 +605,7 @@ impl FsEventsBackend {
   /// its directory, and each cover is read again, as its stream heard nothing while its path
   /// was another one, also when the path is back by now. The stream paths at and below these
   /// directories are trusted no more (`references/design.md` 7.2).
-  fn moved_keys(&mut self) -> Vec<DirKey> {
+  fn moved_keys(&mut self) -> Vec<NodeKey> {
     let moved = self.guard.take();
     if moved.is_empty() {
       return Vec::new();
@@ -744,12 +744,12 @@ fn wanted<'a>(
 /// The covers: the keys by the real path of their directory, and the real path of each key.
 #[derive(Debug, Default)]
 struct Covers {
-  by_dir: Dirs<Vec<DirKey>>,
-  dir_of: FxHashMap<DirKey, PathBuf>,
+  by_dir: Dirs<Vec<NodeKey>>,
+  dir_of: FxHashMap<NodeKey, PathBuf>,
 }
 
 impl Covers {
-  fn insert(&mut self, key: DirKey, dir: PathBuf) {
+  fn insert(&mut self, key: NodeKey, dir: PathBuf) {
     if self.dir_of.get(&key) == Some(&dir) {
       return;
     }
@@ -761,7 +761,7 @@ impl Covers {
   }
 
   /// Forgets the cover of `key`. Gives its directory when no key is left at it.
-  fn remove(&mut self, key: DirKey) -> Option<PathBuf> {
+  fn remove(&mut self, key: NodeKey) -> Option<PathBuf> {
     let dir = self.dir_of.remove(&key)?;
     give_room_back(&mut self.dir_of);
     let keys = self.by_dir.get_mut(&dir)?;
@@ -777,7 +777,7 @@ impl Covers {
   fn keys_at_or_below<'a>(
     &'a self,
     dirs: &'a [impl AsRef<Path>],
-  ) -> impl Iterator<Item = DirKey> + 'a {
+  ) -> impl Iterator<Item = NodeKey> + 'a {
     let at = dirs.iter().filter_map(|dir| self.by_dir.get(dir.as_ref()));
     at.chain(self.by_dir.below(dirs).map(|(_, keys)| keys)).flatten().copied()
   }

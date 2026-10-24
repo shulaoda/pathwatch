@@ -8,7 +8,7 @@ use std::{
   time::SystemTime,
 };
 
-use pathwatch::backend::{Backend, Committed, Coverage, DirKey, Hint, Want, watch_limit};
+use pathwatch::backend::{Backend, Committed, Coverage, Hint, NodeKey, Want, watch_limit};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::fs::SimFs;
@@ -53,17 +53,17 @@ pub struct SimBackend {
   fs: SimFs,
   mode: Mode,
   /// The last want of each key: for one key it only goes up (rule 5 of the backends).
-  wants: FxHashMap<DirKey, Want>,
-  bound: FxHashMap<DirKey, u64>,
-  keys: FxHashMap<u64, Vec<DirKey>>,
+  wants: FxHashMap<NodeKey, Want>,
+  bound: FxHashMap<NodeKey, u64>,
+  keys: FxHashMap<u64, Vec<NodeKey>>,
   /// By prefix: the real path of each stream.
   prefixes: FxHashMap<u64, PathBuf>,
   /// By prefix: what `watch` asked for since the last `commit`.
-  pending: Vec<(DirKey, PathBuf)>,
+  pending: Vec<(NodeKey, PathBuf)>,
   /// By prefix: the real directory of each key that uses a stream above its directory.
-  below: FxHashMap<DirKey, PathBuf>,
+  below: FxHashMap<NodeKey, PathBuf>,
   /// By prefix: the real directory of each key that got `NotWatched`.
-  not_watched: FxHashMap<DirKey, PathBuf>,
+  not_watched: FxHashMap<NodeKey, PathBuf>,
 }
 
 impl SimBackend {
@@ -86,7 +86,7 @@ impl SimBackend {
 impl Backend for SimBackend {
   type Raw = SimRaw;
 
-  fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
+  fn watch(&mut self, key: NodeKey, dir: &Path, want: Want) -> Coverage {
     self.fs.enter(|calls| calls.watch += 1);
     self.fs.lock().watch_calls.push(WatchCall { key, dir: dir.to_path_buf(), want: Some(want) });
     if let Some(had) = self.wants.insert(key, want) {
@@ -127,7 +127,7 @@ impl Backend for SimBackend {
     if self.mode == Mode::Inode { Coverage::Watched } else { Coverage::WatchedTree }
   }
 
-  fn unwatch(&mut self, key: DirKey) {
+  fn unwatch(&mut self, key: NodeKey) {
     self.fs.lock().log_unwatch(key);
     self.wants.remove(&key);
     self.not_watched.remove(&key);
@@ -156,7 +156,7 @@ impl Backend for SimBackend {
       return Committed { now_watched: Vec::new(), failed };
     }
     let is_new = |dir: &Path| new.iter().any(|stream| dir.starts_with(stream));
-    let now_streamed: Vec<DirKey> =
+    let now_streamed: Vec<NodeKey> =
       self.not_watched.iter().filter(|(_, dir)| is_new(dir)).map(|(&key, _)| key).collect();
     let mut bound = Vec::new();
     let mut started = Vec::new();
@@ -255,7 +255,7 @@ impl Backend for SimBackend {
 /// A backend that is dropped gives every OS watch back (rule 12 of the backends).
 impl Drop for SimBackend {
   fn drop(&mut self) {
-    for key in self.bound.keys().copied().collect::<Vec<DirKey>>() {
+    for key in self.bound.keys().copied().collect::<Vec<NodeKey>>() {
       self.unbind(key);
     }
   }
@@ -265,7 +265,7 @@ impl SimBackend {
   /// By prefix: a live stream at or above the directory reports it too, so the key joins that
   /// stream. No stream is started for a directory that is asked for names only: it would
   /// report the whole tree below it. `false`: there is no such stream.
-  fn join_stream_above(&mut self, key: DirKey, dir: &Path, want: Want) -> bool {
+  fn join_stream_above(&mut self, key: NodeKey, dir: &Path, want: Want) -> bool {
     let state = self.fs.lock();
     let Ok(id) = state.watchable(dir) else { return false };
     let real = state.real_path(id);
@@ -283,7 +283,7 @@ impl SimBackend {
     true
   }
 
-  fn bind(&mut self, key: DirKey, watch: u64) {
+  fn bind(&mut self, key: NodeKey, watch: u64) {
     if self.bound.get(&key) == Some(&watch) {
       return;
     }
@@ -296,7 +296,7 @@ impl SimBackend {
   }
 
   /// Forgets `key`. The OS watch goes when no other key uses it.
-  fn unbind(&mut self, key: DirKey) {
+  fn unbind(&mut self, key: NodeKey) {
     self.below.remove(&key);
     if let Some(watch) = self.bound.remove(&key) {
       self.leave(key, watch);
@@ -306,7 +306,7 @@ impl SimBackend {
   /// `key` has another OS watch than `old` now. A stream that ended and has not said so yet
   /// keeps the key: its directory was at another path for a while, and the backend of
   /// FSEvents reports a key whose directory has another real path than before.
-  fn move_on(&mut self, key: DirKey, old: u64) {
+  fn move_on(&mut self, key: NodeKey, old: u64) {
     let ended =
       self.prefixes.contains_key(&old) && !self.fs.lock().kernel.guards.contains_key(&old);
     if !ended {
@@ -315,7 +315,7 @@ impl SimBackend {
   }
 
   /// Takes `key` off the OS watch `watch`. The OS watch goes when no other key uses it.
-  fn leave(&mut self, key: DirKey, watch: u64) {
+  fn leave(&mut self, key: NodeKey, watch: u64) {
     let Some(keys) = self.keys.get_mut(&watch) else { return };
     keys.retain(|&other| other != key);
     if keys.is_empty() {
@@ -339,7 +339,7 @@ impl SimBackend {
 /// has them all, in the order of the calls.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WatchCall {
-  pub key: DirKey,
+  pub key: NodeKey,
   /// The directory. For `unwatch`: the one that the last `watch` call for the key named.
   pub dir: PathBuf,
   /// What `watch` asked for. `None`: the call was `unwatch`.

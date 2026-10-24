@@ -8,7 +8,7 @@ use crate::fixtures::{
   settled, show,
 };
 use pathwatch::{
-  backend::{Backend, Coverage, DirKey, Hint, Want},
+  backend::{Backend, Coverage, Hint, NodeKey, Want},
   engine::Options,
   fs::Fs,
 };
@@ -114,7 +114,7 @@ fn a_stream_that_one_key_leaves_and_another_joins_in_one_commit() {
   let mut backend = SimBackend::attach(&fs, Mode::Prefix);
   fs.mkdir("/x").unwrap();
   fs.mkdir("/y").unwrap();
-  let (one, other) = (DirKey::new(1, 0), DirKey::new(2, 0));
+  let (one, other) = (NodeKey::new(1, 0), NodeKey::new(2, 0));
   assert!(matches!(backend.watch(one, Path::new("/x"), Want::Contents), Coverage::WatchedTree));
   backend.commit();
   assert_eq!(os_watches(&fs), [at("/x", Want::Contents)]);

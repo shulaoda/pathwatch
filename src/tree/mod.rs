@@ -24,7 +24,7 @@ use self::{
   spellings::child_hash,
 };
 use crate::{
-  backend::{DirKey, Want, give_room_back},
+  backend::{NodeKey, Want, give_room_back},
   fs::{DirId, Meta},
   path::push_name,
 };
@@ -244,24 +244,24 @@ pub struct Tree {
   /// Every node but the root, filed under its parent and its name.
   index: HashTable<u32>,
   /// The registered nodes that were links at their last check, with a hash of the real path.
-  links: FxHashMap<DirKey, u64>,
+  links: FxHashMap<NodeKey, u64>,
   /// The files whose fingerprint is not trusted at their next check.
-  contents: FxHashMap<DirKey, Content>,
+  contents: FxHashMap<NodeKey, Content>,
   /// The held nodes, each with the time of its second look.
-  holds: FxHashMap<DirKey, Instant>,
+  holds: FxHashMap<NodeKey, Instant>,
   /// The files whose time is far ahead of the clock, with the first look that found their
   /// fingerprint.
-  ahead: FxHashMap<DirKey, Instant>,
+  ahead: FxHashMap<NodeKey, Instant>,
   /// The registered nodes whose names are not plain, by the slot of their parent: the table does
   /// not find their other spellings ([`Tree::others_meant`]).
   not_plain: FxHashMap<u32, Vec<u32>>,
   /// The marked nodes, with the time of the hint that marked each. A key can be stale.
-  pub marked: Vec<(DirKey, Option<Instant>)>,
+  pub marked: Vec<(NodeKey, Option<Instant>)>,
   /// The nodes queued for a scan. A key can be stale or there twice.
-  pub to_scan: Vec<DirKey>,
+  pub to_scan: Vec<NodeKey>,
   /// The directories the timer looks at, the root always. A key can be stale or there twice
   /// until [`Tree::tidy_polled`].
-  pub polled: Vec<DirKey>,
+  pub polled: Vec<NodeKey>,
   /// Notifications were lost: everything is scanned, when the engine says.
   pub lost: bool,
   /// Every disk takes two spellings of a name for one (`Options::loose_spelling`).
@@ -269,7 +269,7 @@ pub struct Tree {
 }
 
 impl Tree {
-  pub const ROOT: DirKey = DirKey::new(0, 0);
+  pub const ROOT: NodeKey = NodeKey::new(0, 0);
 
   pub fn new() -> Self {
     let mut names = Names::default();
@@ -296,51 +296,51 @@ impl Tree {
     }
   }
 
-  pub fn get(&self, key: DirKey) -> Option<&Node> {
+  pub fn get(&self, key: NodeKey) -> Option<&Node> {
     let node = self.slots.get(key.index() as usize)?.node()?;
     (node.generation == key.generation()).then_some(node)
   }
 
-  pub fn get_mut(&mut self, key: DirKey) -> Option<&mut Node> {
+  pub fn get_mut(&mut self, key: NodeKey) -> Option<&mut Node> {
     let node = self.slots.get_mut(key.index() as usize)?.node_mut()?;
     (node.generation == key.generation()).then_some(node)
   }
 
   /// The key of the live node in the slot `index`.
-  fn key(&self, index: u32) -> DirKey {
-    DirKey::new(index, self.slots.linked(index).generation)
+  fn key(&self, index: u32) -> NodeKey {
+    NodeKey::new(index, self.slots.linked(index).generation)
   }
 
   /// Every node with its key, the root first.
-  pub fn nodes(&self) -> impl Iterator<Item = (DirKey, &Node)> + '_ {
+  pub fn nodes(&self) -> impl Iterator<Item = (NodeKey, &Node)> + '_ {
     (0..).zip(self.slots.iter()).filter_map(|(index, slot)| {
       let node = slot.node()?;
-      Some((DirKey::new(index, node.generation), node))
+      Some((NodeKey::new(index, node.generation), node))
     })
   }
 
   /// The name of a node. Empty for the root.
-  pub fn name(&self, key: DirKey) -> &OsStr {
+  pub fn name(&self, key: NodeKey) -> &OsStr {
     name_of(&self.names, &self[key])
   }
 
   /// The node above. `None` for the root.
-  pub fn parent(&self, key: DirKey) -> Option<DirKey> {
+  pub fn parent(&self, key: NodeKey) -> Option<NodeKey> {
     slot(self.get(key)?.parent).map(|parent| self.key(parent))
   }
 
   /// The directories above the node, from its parent up to the root.
-  pub fn ancestors(&self, key: DirKey) -> impl Iterator<Item = DirKey> {
+  pub fn ancestors(&self, key: NodeKey) -> impl Iterator<Item = NodeKey> {
     self.ancestor_slots(key).map(|at| self.key(at))
   }
 
   /// [`Tree::ancestors`], by slot.
-  fn ancestor_slots(&self, key: DirKey) -> impl Iterator<Item = u32> {
+  fn ancestor_slots(&self, key: NodeKey) -> impl Iterator<Item = u32> {
     let first = self.get(key).and_then(|node| slot(node.parent));
     iter::successors(first, move |&at| slot(self.slots.linked(at).parent))
   }
 
-  pub fn child(&self, parent: DirKey, name: &OsStr) -> Option<DirKey> {
+  pub fn child(&self, parent: NodeKey, name: &OsStr) -> Option<NodeKey> {
     self.get(parent)?;
     self.child_slot(parent.index(), name).map(|index| self.key(index))
   }
@@ -357,19 +357,19 @@ impl Tree {
   }
 
   /// The children of a node, the newest first.
-  pub fn children(&self, key: DirKey) -> impl Iterator<Item = DirKey> + '_ {
+  pub fn children(&self, key: NodeKey) -> impl Iterator<Item = NodeKey> + '_ {
     let first = self.get(key).and_then(|node| slot(node.first_child));
     iter::successors(first, move |&index| slot(self.slots.linked(index).next))
       .map(|index| self.key(index))
   }
 
   /// The next child of the parent. A loop may free the node it is at once it read the next.
-  pub fn next_sibling(&self, child: DirKey) -> Option<DirKey> {
+  pub fn next_sibling(&self, child: NodeKey) -> Option<NodeKey> {
     slot(self.get(child)?.next).map(|next| self.key(next))
   }
 
   /// Adds the child `name`, which `parent` must not have yet.
-  pub fn insert_child(&mut self, parent: DirKey, name: &OsStr) -> DirKey {
+  pub fn insert_child(&mut self, parent: NodeKey, name: &OsStr) -> NodeKey {
     let parent = parent.index();
     debug_assert!(self.child_slot(parent, name).is_none(), "the child is there already");
     let name_at = self.names.add(name);
@@ -398,7 +398,7 @@ impl Tree {
   }
 
   /// Frees the node if nothing needs it: nothing at its path, not registered, no mark, not told.
-  pub fn prune(&mut self, key: DirKey) {
+  pub fn prune(&mut self, key: NodeKey) {
     let Some(node) = self.get(key) else { return };
     let nothing = matches!(node.kind, Kind::Missing);
     let needed = !nothing || node.is_registered() || node.is_marked() || node.told();
@@ -409,7 +409,7 @@ impl Tree {
   }
 
   /// Takes a node without children out of the tree. Its key never names a node again.
-  fn remove(&mut self, key: DirKey) {
+  fn remove(&mut self, key: NodeKey) {
     let slot = &mut self.slots[key.index() as usize];
     let Some(generation) = slot.node().map(|node| node.generation.wrapping_add(1)) else { return };
     let Slot::Live(node) = mem::replace(slot, Slot::Free(generation)) else { return };
@@ -460,14 +460,14 @@ impl Tree {
     }
   }
 
-  pub fn path(&self, key: DirKey) -> PathBuf {
+  pub fn path(&self, key: NodeKey) -> PathBuf {
     let mut path = PathBuf::new();
     self.path_into(key, &mut path);
     path
   }
 
   /// Writes the path of the node into `path`: empty for the root.
-  pub fn path_into(&self, key: DirKey, path: &mut PathBuf) {
+  pub fn path_into(&self, key: NodeKey, path: &mut PathBuf) {
     path.clear();
     if self.get(key).is_some() {
       self.push_names(key.index(), path);
@@ -494,7 +494,7 @@ impl Tree {
   }
 
   /// Makes the node a watched path, or takes that back. `false`: it was so already.
-  pub fn set_path(&mut self, key: DirKey, is_path: bool) -> bool {
+  pub fn set_path(&mut self, key: NodeKey, is_path: bool) -> bool {
     let node = &mut self[key];
     if node.is_path() == is_path {
       return false;
@@ -546,7 +546,7 @@ impl Tree {
 
   /// What to ask of the backend for the directory: `Contents` when the node is complete or a
   /// registered child is a file, `Names` when each is a directory, `None` when one has nothing.
-  pub fn want(&self, key: DirKey) -> Option<Want> {
+  pub fn want(&self, key: NodeKey) -> Option<Want> {
     if self[key].is_complete() {
       return Some(Want::Contents);
     }
@@ -566,23 +566,23 @@ impl Tree {
   }
 
   /// A hash of the real path, if the node was a link at its last check.
-  pub fn link(&self, key: DirKey) -> Option<u64> {
+  pub fn link(&self, key: NodeKey) -> Option<u64> {
     self.links.get(&key).copied()
   }
 
-  pub fn set_link(&mut self, key: DirKey, link: Option<u64>) {
+  pub fn set_link(&mut self, key: NodeKey, link: Option<u64>) {
     match link {
       Some(real_place) => self.links.insert(key, real_place),
       None => self.links.remove(&key),
     };
   }
 
-  pub fn links(&self) -> impl Iterator<Item = DirKey> + '_ {
+  pub fn links(&self) -> impl Iterator<Item = NodeKey> + '_ {
     self.links.keys().copied()
   }
 
   /// What is kept to compare at the next check. `None`: an equal fingerprint means unchanged.
-  pub fn content(&self, key: DirKey) -> Option<Content> {
+  pub fn content(&self, key: NodeKey) -> Option<Content> {
     self.contents.get(&key).copied()
   }
 
@@ -590,7 +590,7 @@ impl Tree {
     self.contents.len()
   }
 
-  pub fn set_content(&mut self, key: DirKey, content: Option<Content>) {
+  pub fn set_content(&mut self, key: NodeKey, content: Option<Content>) {
     if let Some(content) = content {
       self.contents.insert(key, content);
     } else if !self.contents.is_empty() && self.contents.remove(&key).is_some() {
@@ -600,11 +600,11 @@ impl Tree {
   }
 
   /// For a file far ahead of the clock: when a look first found its fingerprint.
-  pub fn ahead_since(&self, key: DirKey) -> Option<Instant> {
+  pub fn ahead_since(&self, key: NodeKey) -> Option<Instant> {
     self.ahead.get(&key).copied()
   }
 
-  pub fn set_ahead_since(&mut self, key: DirKey, since: Option<Instant>) {
+  pub fn set_ahead_since(&mut self, key: NodeKey, since: Option<Instant>) {
     if let Some(since) = since {
       self.ahead.insert(key, since);
     } else if !self.ahead.is_empty() {
@@ -613,12 +613,12 @@ impl Tree {
   }
 
   /// A look found nothing at the node: it and everything below stay until the second look.
-  pub fn hold(&mut self, key: DirKey, until: Instant) {
+  pub fn hold(&mut self, key: NodeKey, until: Instant) {
     self[key].set_held(true);
     self.holds.insert(key, until);
   }
 
-  pub fn unhold(&mut self, key: DirKey) {
+  pub fn unhold(&mut self, key: NodeKey) {
     if let Some(node) = self.get_mut(key)
       && node.is_held()
     {
@@ -629,7 +629,7 @@ impl Tree {
     }
   }
 
-  pub fn held_until(&self, key: DirKey) -> Option<Instant> {
+  pub fn held_until(&self, key: NodeKey) -> Option<Instant> {
     self.holds.get(&key).copied()
   }
 
@@ -638,7 +638,7 @@ impl Tree {
   }
 
   /// Whether a node above is held: then nothing is done here before its second look.
-  pub fn frozen(&self, key: DirKey) -> bool {
+  pub fn frozen(&self, key: NodeKey) -> bool {
     !self.holds.is_empty() && self.ancestor_slots(key).any(|at| self.slots.linked(at).is_held())
   }
 
@@ -722,16 +722,16 @@ impl Default for Tree {
   }
 }
 
-impl Index<DirKey> for Tree {
+impl Index<NodeKey> for Tree {
   type Output = Node;
 
-  fn index(&self, key: DirKey) -> &Node {
+  fn index(&self, key: NodeKey) -> &Node {
     self.get(key).expect("the key names a live node")
   }
 }
 
-impl IndexMut<DirKey> for Tree {
-  fn index_mut(&mut self, key: DirKey) -> &mut Node {
+impl IndexMut<NodeKey> for Tree {
+  fn index_mut(&mut self, key: NodeKey) -> &mut Node {
     self.get_mut(key).expect("the key names a live node")
   }
 }
@@ -783,14 +783,14 @@ mod tests {
   };
 
   use super::{Tree, nanos};
-  use crate::backend::DirKey;
+  use crate::backend::NodeKey;
 
   #[test]
   fn the_names_are_packed_when_many_nodes_go() {
     let mut tree = Tree::new();
     let top = tree.insert_child(Tree::ROOT, OsStr::new("/"));
     let name = |i: usize| format!("module-{i:04}.js");
-    let keys: Vec<DirKey> =
+    let keys: Vec<NodeKey> =
       (0..1000).map(|i| tree.insert_child(top, OsStr::new(&name(i)))).collect();
     let full = tree.names.len();
     assert_eq!(full, 1 + 1000 * name(0).len());
@@ -826,7 +826,7 @@ mod tests {
   fn the_memory_is_given_back_when_the_nodes_go() {
     let mut tree = Tree::new();
     let top = tree.insert_child(Tree::ROOT, OsStr::new("/"));
-    let keys: Vec<DirKey> =
+    let keys: Vec<NodeKey> =
       (0..10_000).map(|i| tree.insert_child(top, OsStr::new(&i.to_string()))).collect();
     let (last, others) = keys.split_last().unwrap();
     let table = tree.index.capacity();

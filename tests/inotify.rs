@@ -25,7 +25,7 @@ use std::{
 
 use gate::Gate;
 use pathwatch::backend::{
-  Backend, Coverage, DirKey, Hint, Signal, Sink, Want,
+  Backend, Coverage, Hint, NodeKey, Signal, Sink, Want,
   inotify::{InotifyBackend, Raw},
   is_watch_limit,
 };
@@ -36,25 +36,25 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Seen {
-  Changed(DirKey, PathBuf),
-  Written(DirKey, PathBuf),
+  Changed(NodeKey, PathBuf),
+  Written(NodeKey, PathBuf),
   Lost,
   Mount(PathBuf),
   Delivered(SystemTime),
 }
 
 /// `""` is the directory of `dir` itself.
-fn changed(dir: DirKey, rel: &str) -> Seen {
+fn changed(dir: NodeKey, rel: &str) -> Seen {
   Seen::Changed(dir, PathBuf::from(rel))
 }
 
-fn written(dir: DirKey, rel: &str) -> Seen {
+fn written(dir: NodeKey, rel: &str) -> Seen {
   Seen::Written(dir, PathBuf::from(rel))
 }
 
 /// MODIFY or CREATE (`Written`) and then CLOSE_WRITE (`Changed`). How many of each is up to the
 /// kernel, so they are compared as a set.
-fn written_and_closed(dir: DirKey, rel: &str) -> HashSet<Seen> {
+fn written_and_closed(dir: NodeKey, rel: &str) -> HashSet<Seen> {
   HashSet::from([written(dir, rel), changed(dir, rel)])
 }
 
@@ -82,7 +82,7 @@ struct Harness {
   dir: TempDir,
   /// Watched by the harness itself, for `hints`.
   sentinel_dir: TempDir,
-  sentinel_key: DirKey,
+  sentinel_key: NodeKey,
   sentinels: u32,
 }
 
@@ -99,7 +99,7 @@ impl Harness {
     });
     let mut backend = InotifyBackend::new(sink).unwrap();
     let sentinel_dir = tempfile::tempdir().unwrap();
-    let sentinel_key = DirKey::new(u32::MAX, u32::MAX);
+    let sentinel_key = NodeKey::new(u32::MAX, u32::MAX);
     assert!(matches!(
       backend.watch(sentinel_key, sentinel_dir.path(), Want::Names),
       Coverage::Watched
@@ -113,8 +113,8 @@ impl Harness {
     self.dir.path().join(rel)
   }
 
-  fn watch(&mut self, index: u32, rel: &str, want: Want) -> DirKey {
-    let key = DirKey::new(index, 0);
+  fn watch(&mut self, index: u32, rel: &str, want: Want) -> NodeKey {
+    let key = NodeKey::new(index, 0);
     let coverage = self.backend.watch(key, &self.path(rel), want);
     assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
     self.backend.commit();
@@ -122,13 +122,13 @@ impl Harness {
   }
 
   fn watch_fails(&mut self, index: u32, path: &Path) -> io::Error {
-    match self.backend.watch(DirKey::new(index, 0), path, Want::Contents) {
+    match self.backend.watch(NodeKey::new(index, 0), path, Want::Contents) {
       Coverage::Failed(error) => error,
       coverage => panic!("{coverage:?} for {}", path.display()),
     }
   }
 
-  fn wd(&self, key: DirKey) -> Option<i32> {
+  fn wd(&self, key: NodeKey) -> Option<i32> {
     self.backend.wd(key)
   }
 
@@ -140,7 +140,7 @@ impl Harness {
   }
 
   /// The events that the kernel reports for the watch of `key`.
-  fn kernel_events(&self, key: DirKey) -> u32 {
+  fn kernel_events(&self, key: NodeKey) -> u32 {
     let watch = format!("inotify wd:{:x} ", self.wd(key).unwrap());
     let watches = self.kernel_watches();
     let line = watches.iter().find(|line| line.starts_with(&watch)).unwrap();
@@ -625,7 +625,7 @@ fn missing_path_and_file_fail() {
   let with_nul = Path::new(OsStr::from_bytes(b"/tmp/a\0b"));
   assert_eq!(h.watch_fails(1, with_nul).kind(), io::ErrorKind::InvalidInput);
 
-  assert_eq!(h.wd(DirKey::new(1, 0)), None);
+  assert_eq!(h.wd(NodeKey::new(1, 0)), None);
   assert_eq!(h.watches(), 0);
 }
 
@@ -691,7 +691,7 @@ fn watch_limit_is_reported() {
   for index in 1..=64 {
     let path = h.path(&index.to_string());
     fs::create_dir(&path).unwrap();
-    let key = DirKey::new(index, 0);
+    let key = NodeKey::new(index, 0);
     if let Coverage::Failed(error) = h.backend.watch(key, &path, Want::Contents) {
       assert!(is_watch_limit(&error));
       assert!(error.to_string().contains("fs.inotify.max_user_watches"), "{error}");

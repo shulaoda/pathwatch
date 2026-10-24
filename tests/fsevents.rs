@@ -24,7 +24,7 @@ use std::{
 
 use pathwatch::{
   backend::{
-    Backend, Coverage, DirKey, Hint, Signal, Sink, Want,
+    Backend, Coverage, Hint, NodeKey, Signal, Sink, Want,
     fsevents::{
       FsEventsBackend, MAX_NEW_STREAMS, MAX_PATHS_PER_STREAM, MAX_STREAM_PATHS, MAX_STREAMS, Raw,
       flag, is_too_high,
@@ -131,16 +131,16 @@ const NO_PATHS: [&Path; 0] = [];
 /// A hint, owned. The backend never sends `Hint::Written`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Seen {
-  Changed(DirKey, PathBuf),
+  Changed(NodeKey, PathBuf),
   Lost,
 }
 
-fn changed(dir: DirKey, rel: &str) -> Seen {
+fn changed(dir: NodeKey, rel: &str) -> Seen {
   Seen::Changed(dir, PathBuf::from(rel))
 }
 
 /// The paths below the directory of `key` that `hints` name.
-fn rels(hints: &[Seen], key: DirKey) -> HashSet<&str> {
+fn rels(hints: &[Seen], key: NodeKey) -> HashSet<&str> {
   let rels = hints.iter().filter_map(|hint| match hint {
     Seen::Changed(dir, rel) if *dir == key => rel.to_str(),
     _ => None,
@@ -169,12 +169,12 @@ struct Harness {
   /// the one of the records.
   dir: TempDir,
   /// The directory that each key was watched with.
-  watched: Vec<(DirKey, PathBuf)>,
+  watched: Vec<(NodeKey, PathBuf)>,
   sentinels: u32,
   /// Every record that came in.
   records: Vec<(PathBuf, u32)>,
   /// Every key that the backend reported lost by itself.
-  lost: Vec<DirKey>,
+  lost: Vec<NodeKey>,
   /// Given back last, when the streams are stopped and the playground is removed.
   _turn: Turn,
 }
@@ -219,8 +219,8 @@ impl Harness {
   }
 
   /// `watch` without `commit`.
-  fn watch(&mut self, index: u32, dir: &Path, want: Want) -> DirKey {
-    let key = DirKey::new(index, 0);
+  fn watch(&mut self, index: u32, dir: &Path, want: Want) -> NodeKey {
+    let key = NodeKey::new(index, 0);
     let coverage = self.backend.watch(key, dir, want);
     assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
     self.watched.retain(|(known, _)| *known != key);
@@ -229,7 +229,7 @@ impl Harness {
   }
 
   /// Says which keys that got `NotWatched` a stream reports now.
-  fn commit(&mut self) -> Vec<DirKey> {
+  fn commit(&mut self) -> Vec<NodeKey> {
     let committed = self.backend.commit();
     assert!(committed.failed.is_empty(), "{:?}", committed.failed);
     committed.now_watched
@@ -237,7 +237,7 @@ impl Harness {
 
   /// `watch`, `commit` and a sync: a new stream also delivers what happened shortly before
   /// its start.
-  fn cover(&mut self, index: u32, rel: &str) -> DirKey {
+  fn cover(&mut self, index: u32, rel: &str) -> NodeKey {
     let key = self.watch(index, &self.path(rel), Want::Contents);
     self.commit();
     self.sync(key);
@@ -308,7 +308,7 @@ impl Harness {
   /// Every hint for what the test did so far below the stream path of `key`: a stream delivers
   /// its records in order, so all of them come before the record of a new file in the
   /// directory. Two streams keep no order.
-  fn sync(&mut self, key: DirKey) -> Vec<Seen> {
+  fn sync(&mut self, key: NodeKey) -> Vec<Seen> {
     self.sentinels += 1;
     let name = format!(".sync-{}", self.sentinels);
     let (_, dir) = self.watched.iter().find(|(known, _)| *known == key).unwrap();
@@ -319,7 +319,7 @@ impl Harness {
   /// Receives until every file of `files` (path below `key`, time before its write) is reported.
   fn wait_for_files(
     &mut self,
-    key: DirKey,
+    key: NodeKey,
     reported: &mut Reported,
     mut files: Vec<(PathBuf, Instant)>,
   ) {
@@ -350,7 +350,7 @@ struct Reported {
 }
 
 impl Reported {
-  fn add(&mut self, key: DirKey, at: Instant, hints: Vec<Seen>) {
+  fn add(&mut self, key: NodeKey, at: Instant, hints: Vec<Seen>) {
     for hint in hints {
       match hint {
         Seen::Changed(dir, rel) if dir == key && is_loss(&rel) => self.last_lost = Some(at),
@@ -635,7 +635,7 @@ fn ancestor_is_guarded_unless_a_stream_reports_it() {
   fs::create_dir_all(h.path("cover/below")).unwrap();
   fs::create_dir(h.path("other")).unwrap();
 
-  let alone = DirKey::new(9, 0);
+  let alone = NodeKey::new(9, 0);
   let coverage = h.backend.watch(alone, &h.path("other"), Want::Names);
   assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
   h.commit();
@@ -884,7 +884,7 @@ fn the_short_path_out_of_the_data_volume() {
   h.hints_until(&[changed(key, "file")]);
 
   // No stream stands on `/Users`.
-  let users = DirKey::new(2, 0);
+  let users = NodeKey::new(2, 0);
   let coverage = h.backend.watch(users, &data.join("Users"), Want::Contents);
   assert!(matches!(coverage, Coverage::NotWatched), "{coverage:?}");
   h.backend.unwatch(users);
@@ -907,7 +907,7 @@ fn no_stream_stands_on_the_root_or_a_home() {
   let key = h.cover(1, "dir");
   let home = PathBuf::from(std::env::var_os("HOME").unwrap());
   for (index, dir) in [(2, Path::new("/")), (3, Path::new("/Users")), (4, home.as_path())] {
-    let key = DirKey::new(index, 0);
+    let key = NodeKey::new(index, 0);
     let coverage = h.backend.watch(key, dir, Want::Contents);
     assert!(matches!(coverage, Coverage::NotWatched), "{}: {coverage:?}", dir.display());
   }
@@ -1016,7 +1016,7 @@ fn a_directory_above_a_cover_is_replaced() {
 fn a_directory_away_when_its_guard_opens_is_checked_again() {
   let mut h = Harness::new();
   fs::create_dir(h.path("n")).unwrap();
-  let key = DirKey::new(1, 0);
+  let key = NodeKey::new(1, 0);
   let coverage = h.backend.watch(key, &h.path("n"), Want::Names);
   assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
   fs::rename(h.path("n"), h.path("away")).unwrap();
@@ -1128,7 +1128,7 @@ fn the_guard_stands_at_and_above_each_stream_path() {
   let playground = h.real("").ancestors().count();
   assert_eq!(h.backend.guarded().len(), playground + 3);
 
-  let b = DirKey::new(3, 0);
+  let b = NodeKey::new(3, 0);
   h.backend.watch(b, &h.path("b"), Want::Names);
   h.commit();
   assert_eq!(h.backend.guarded().len(), playground + 4);
@@ -1157,7 +1157,7 @@ fn a_directory_that_gets_no_guard_fails_its_keys_only() {
   }
   let committed = h.backend.commit();
   drop(hogs);
-  let failed: HashSet<DirKey> = committed.failed.iter().map(|(key, _)| *key).collect();
+  let failed: HashSet<NodeKey> = committed.failed.iter().map(|(key, _)| *key).collect();
   assert_eq!(failed, HashSet::from([z, y]), "{committed:?}");
   assert!(committed.failed.iter().all(|(_, error)| is_watch_limit(error)), "{committed:?}");
   assert_eq!(h.backend.streamed(), [h.real("a/x")]);
@@ -1195,7 +1195,7 @@ fn the_guards_that_fit_go_from_the_top_down() {
   hogs.truncate(hogs.len().saturating_sub(room));
   let committed = h.backend.commit();
   drop(hogs);
-  let failed: HashSet<DirKey> = committed.failed.iter().map(|(key, _)| *key).collect();
+  let failed: HashSet<NodeKey> = committed.failed.iter().map(|(key, _)| *key).collect();
   assert_eq!(failed, below_b, "{committed:?}");
   assert_eq!(h.backend.streamed(), [h.real("a/x")]);
   File::create(h.path("a/x/file")).unwrap();
@@ -1512,9 +1512,9 @@ fn more_covers_than_one_stream_can_hold() {
   assert_eq!(h.backend.streamed().len(), dirs.len());
 
   // A stream with this many paths drops records easily, and says so for each path.
-  let mut waiting: HashMap<DirKey, Instant> = HashMap::new();
+  let mut waiting: HashMap<NodeKey, Instant> = HashMap::new();
   for (index, dir) in (0..count).zip(&dirs) {
-    waiting.insert(DirKey::new(index, 0), Instant::now());
+    waiting.insert(NodeKey::new(index, 0), Instant::now());
     File::create(dir.path().join("file")).unwrap();
   }
   let deadline = Instant::now() + TIMEOUT;
@@ -1540,7 +1540,7 @@ fn more_covers_than_one_stream_can_hold() {
   let lost: Vec<(&Path, u32)> =
     dirs.iter().map(|dir| (dir.path(), flag::MUST_SCAN_SUB_DIRS | flag::USER_DROPPED)).collect();
   let hints = h.translate(raw(&lost));
-  let expected: Vec<Seen> = (0..count).map(|index| changed(DirKey::new(index, 0), "")).collect();
+  let expected: Vec<Seen> = (0..count).map(|index| changed(NodeKey::new(index, 0), "")).collect();
   assert_eq!(hints, expected);
 }
 
@@ -1560,7 +1560,7 @@ fn many_covers_share_stream_paths_on_common_directories() {
   fs::create_dir(h.path("g0/apart")).unwrap();
 
   // No stream reports a group directory yet: its guard does.
-  let group = DirKey::new(1000, 0);
+  let group = NodeKey::new(1000, 0);
   let coverage = h.backend.watch(group, &h.path("g0"), Want::Names);
   assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
   assert_eq!(h.commit(), []);
@@ -1576,7 +1576,7 @@ fn many_covers_share_stream_paths_on_common_directories() {
 
   // A stream reports the group directory now, and still none reports the playground.
   let group = h.watch(1000, &h.path("g0"), Want::Names);
-  let coverage = h.backend.watch(DirKey::new(1001, 0), &h.path(""), Want::Names);
+  let coverage = h.backend.watch(NodeKey::new(1001, 0), &h.path(""), Want::Names);
   assert!(matches!(coverage, Coverage::Watched), "{coverage:?}");
   assert_eq!(h.commit(), []);
   assert_eq!(h.backend.stream_count(), MAX_NEW_STREAMS);
@@ -1652,14 +1652,14 @@ fn drop_while_a_writer_is_active() {
     let rebuild = round % 2 == 1;
     for index in 0..if rebuild { covers } else { 1 } {
       let dir = dir.path().join(format!("dir-{index}"));
-      let coverage = backend.watch(DirKey::new(index, 0), &dir, Want::Contents);
+      let coverage = backend.watch(NodeKey::new(index, 0), &dir, Want::Contents);
       assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
     }
     assert!(backend.commit().failed.is_empty());
     // Every second round drops the backend right after a rebuild: the stops of the replaced
     // streams wait on the queue.
     if rebuild {
-      let coverage = backend.watch(DirKey::new(covers, 0), dir.path(), Want::Contents);
+      let coverage = backend.watch(NodeKey::new(covers, 0), dir.path(), Want::Contents);
       assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
       assert!(backend.commit().failed.is_empty());
     }
@@ -1724,7 +1724,7 @@ fn failed_start_is_reported_and_the_old_streams_stay() {
   for index in 0..=MAX_STREAMS {
     fs::create_dir(h.path(&format!("dir-{index}"))).unwrap();
   }
-  let keys: Vec<DirKey> = (0..MAX_STREAMS)
+  let keys: Vec<NodeKey> = (0..MAX_STREAMS)
     .map(|index| {
       let key =
         h.watch(u32::try_from(index).unwrap(), &h.path(&format!("dir-{index}")), Want::Contents);
@@ -1739,7 +1739,7 @@ fn failed_start_is_reported_and_the_old_streams_stay() {
   let mut hogs = Vec::new();
   loop {
     let mut hog = FsEventsBackend::new(Sink::new(|_signal| {})).unwrap();
-    let coverage = hog.watch(DirKey::new(0, 0), unwatched.path(), Want::Contents);
+    let coverage = hog.watch(NodeKey::new(0, 0), unwatched.path(), Want::Contents);
     assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
     if !hog.commit().failed.is_empty() {
       break;
@@ -1752,15 +1752,15 @@ fn failed_start_is_reported_and_the_old_streams_stay() {
   // The commit fails for the two keys it was for, and names them: the backend forgets them.
   let last = h.path(&format!("dir-{MAX_STREAMS}"));
   fs::create_dir(last.join("below")).unwrap();
-  let (new, below) = (DirKey::new(100, 0), DirKey::new(101, 0));
+  let (new, below) = (NodeKey::new(100, 0), NodeKey::new(101, 0));
   assert!(matches!(h.backend.watch(new, &last, Want::Contents), Coverage::WatchedTree));
   let coverage = h.backend.watch(below, &last.join("below"), Want::Names);
   assert!(matches!(coverage, Coverage::WatchedTree));
   let committed = h.backend.commit();
-  let failed: HashSet<DirKey> = committed.failed.iter().map(|(key, _)| *key).collect();
+  let failed: HashSet<NodeKey> = committed.failed.iter().map(|(key, _)| *key).collect();
   assert_eq!(failed, HashSet::from([new, below]));
   assert!(committed.failed.iter().all(|(_, error)| is_watch_limit(error)), "{committed:?}");
-  let known: HashSet<DirKey> = h.backend.cover_of_key().keys().copied().collect();
+  let known: HashSet<NodeKey> = h.backend.cover_of_key().keys().copied().collect();
   assert_eq!(known, keys.iter().copied().collect());
   assert_eq!(h.backend.stream_count(), MAX_STREAMS);
   assert_eq!(h.backend.covers().len(), MAX_STREAMS);
@@ -1983,7 +1983,7 @@ fn the_cost_of_single_files() {
   say(&format!("the real path of a directory from the OS: {each:.1?}"));
   let started = Instant::now();
   for (index, dir) in (0..).zip(&dirs) {
-    let coverage = h.backend.watch(DirKey::new(index, 0), dir, Want::Contents);
+    let coverage = h.backend.watch(NodeKey::new(index, 0), dir, Want::Contents);
     assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
   }
   let each = started.elapsed() / u32::try_from(dirs.len()).unwrap();

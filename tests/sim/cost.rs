@@ -18,7 +18,7 @@ use std::{
 use crate::fixtures::{Mode, SimBackend, SimFs};
 use pathwatch::{
   EventKind,
-  backend::{Backend, Committed, Coverage, DirKey, Hint, Signal, Want, poll::PollBackend},
+  backend::{Backend, Committed, Coverage, Hint, NodeKey, Signal, Want, poll::PollBackend},
   engine::{Engine, Ignored, Options, Output},
   fs::{Entry, Fs, Meta},
 };
@@ -121,8 +121,8 @@ impl Fs for Timed<SimFs> {
 
 /// A hint that owns its path.
 enum Kept {
-  Changed(DirKey, PathBuf),
-  Written(DirKey, PathBuf),
+  Changed(NodeKey, PathBuf),
+  Written(NodeKey, PathBuf),
   Lost,
   Mount(PathBuf),
   Delivered(SystemTime),
@@ -153,11 +153,11 @@ impl Kept {
 impl<B: Backend> Backend for Timed<B> {
   type Raw = B::Raw;
 
-  fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
+  fn watch(&mut self, key: NodeKey, dir: &Path, want: Want) -> Coverage {
     timed(&self.outside, || self.inner.watch(key, dir, want))
   }
 
-  fn unwatch(&mut self, key: DirKey) {
+  fn unwatch(&mut self, key: NodeKey) {
     timed(&self.outside, || self.inner.unwatch(key));
   }
 
@@ -183,13 +183,13 @@ struct ByHand {
   /// a watch of its own, as with inotify.
   trees: bool,
   /// The key of each directory that the engine asked a watch for.
-  keys: Arc<Mutex<HashMap<PathBuf, DirKey>>>,
+  keys: Arc<Mutex<HashMap<PathBuf, NodeKey>>>,
 }
 
 impl Backend for ByHand {
   type Raw = Arc<Vec<Kept>>;
 
-  fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
+  fn watch(&mut self, key: NodeKey, dir: &Path, want: Want) -> Coverage {
     if self.trees && want == Want::Names {
       return Coverage::NotWatched;
     }
@@ -197,7 +197,7 @@ impl Backend for ByHand {
     if self.trees { Coverage::WatchedTree } else { Coverage::Watched }
   }
 
-  fn unwatch(&mut self, _key: DirKey) {}
+  fn unwatch(&mut self, _key: NodeKey) {}
 
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     for kept in raw.iter() {

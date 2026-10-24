@@ -13,14 +13,14 @@ pub use self::{
   records::{Malformed, Record, Records},
 };
 use self::{port::Port, records::FILE_ACTION_MODIFIED};
-use crate::backend::{Backend, Committed, Coverage, DirKey, Hint, Sink, Want};
+use crate::backend::{Backend, Committed, Coverage, Hint, NodeKey, Sink, Want};
 
 #[derive(Debug)]
 pub struct WindowsBackend {
   handles: Handles,
   port: Port,
   sink: Sink<Raw>,
-  covered: Vec<DirKey>,
+  covered: Vec<NodeKey>,
 }
 
 /// What the port sends: the bytes of one read on a handle, the keys that lost their handle,
@@ -34,7 +34,7 @@ pub enum Raw {
     extended: bool,
     result: io::Result<Vec<u8>>,
   },
-  Lost(Vec<DirKey>),
+  Lost(Vec<NodeKey>),
   /// Every record of a change before this time, by the clock of the system, came before: the
   /// answer to `ask_delivered`.
   Delivered(SystemTime),
@@ -47,7 +47,7 @@ impl WindowsBackend {
   }
 
   #[cfg(feature = "test-hooks")]
-  pub fn serves(&self, key: DirKey) -> bool {
+  pub fn serves(&self, key: NodeKey) -> bool {
     self.handles.serves(key)
   }
 
@@ -65,13 +65,13 @@ impl WindowsBackend {
 impl Backend for WindowsBackend {
   type Raw = Raw;
 
-  fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
+  fn watch(&mut self, key: NodeKey, dir: &Path, want: Want) -> Coverage {
     let (coverage, told) = self.handles.watch(key, dir, want, &mut self.port);
     self.finish_call(told);
     coverage
   }
 
-  fn unwatch(&mut self, key: DirKey) {
+  fn unwatch(&mut self, key: NodeKey) {
     self.handles.unwatch(key, &mut self.port);
     self.port.wait_for_closes();
   }
@@ -154,12 +154,12 @@ pub fn translate(handles: &mut Handles, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)
 mod place {
   use std::path::{Path, PathBuf};
 
-  use crate::backend::{DirKey, Want, may_watch_a_tree};
+  use crate::backend::{NodeKey, Want, may_watch_a_tree};
 
   #[derive(Debug, PartialEq, Eq)]
   pub struct Place {
     pub dir: PathBuf,
-    pub keys: Vec<DirKey>,
+    pub keys: Vec<NodeKey>,
   }
 
   /// Where the handles go for these keys, at most `max` of them. `is_link`: whether the
@@ -168,7 +168,7 @@ mod place {
   /// there: it keeps a handle of its own, and the others share without it. Such a handle can
   /// stand below a shared one; a key goes to the deepest handle at or above its directory.
   pub fn place(
-    wanted: &[(DirKey, &Path, Want)],
+    wanted: &[(NodeKey, &Path, Want)],
     max: usize,
     is_link: &mut dyn FnMut(&Path) -> bool,
   ) -> Vec<Place> {
@@ -285,7 +285,7 @@ mod handles {
 
   use super::place::{link_between, place};
   use crate::{
-    backend::{Coverage, DirKey, Want, copy_error, give_room_back, may_watch_a_tree, watch_limit},
+    backend::{Coverage, NodeKey, Want, copy_error, give_room_back, may_watch_a_tree, watch_limit},
     fs::wide_name,
   };
 
@@ -310,23 +310,23 @@ mod handles {
   /// waited and that a new handle covers.
   #[derive(Debug, Default, PartialEq, Eq)]
   pub struct Told {
-    pub lost: Vec<DirKey>,
-    pub covered: Vec<DirKey>,
+    pub lost: Vec<NodeKey>,
+    pub covered: Vec<NodeKey>,
   }
 
   /// The handles, and the keys that each serves (`references/design.md` 7.3).
   #[derive(Debug, Default)]
   pub struct Handles {
-    keys: FxHashMap<DirKey, Served>,
-    at: FxHashMap<PathBuf, Vec<DirKey>>,
+    keys: FxHashMap<NodeKey, Served>,
+    at: FxHashMap<PathBuf, Vec<NodeKey>>,
     open: Vec<Handle>,
     next_id: usize,
     unsettled: bool,
-    refused: FxHashSet<DirKey>,
-    waiting: FxHashMap<DirKey, PathBuf>,
+    refused: FxHashSet<NodeKey>,
+    waiting: FxHashMap<NodeKey, PathBuf>,
     /// The keys whose last handle died before it delivered anything. Kept by key, not by the
     /// directory of the handle: a shared handle stands on a directory of no key.
-    dead: FxHashMap<DirKey, Death>,
+    dead: FxHashMap<NodeKey, Death>,
   }
 
   #[derive(Debug)]
@@ -356,7 +356,7 @@ mod handles {
   impl Handles {
     pub fn watch(
       &mut self,
-      key: DirKey,
+      key: NodeKey,
       dir: &Path,
       want: Want,
       system: &mut dyn System,
@@ -418,7 +418,7 @@ mod handles {
       (coverage, told)
     }
 
-    pub fn unwatch(&mut self, key: DirKey, system: &mut dyn System) {
+    pub fn unwatch(&mut self, key: NodeKey, system: &mut dyn System) {
       self.waiting.remove(&key);
       self.refused.remove(&key);
       self.dead.remove(&key);
@@ -434,11 +434,11 @@ mod handles {
     }
 
     /// The handle died: the read on it failed. The keys it served, which are forgotten.
-    pub fn closed(&mut self, id: WatchId, error: &io::Error) -> Vec<DirKey> {
+    pub fn closed(&mut self, id: WatchId, error: &io::Error) -> Vec<NodeKey> {
       let Some(at) = self.open.iter().position(|handle| handle.id == id) else { return Vec::new() };
       let handle = self.open.swap_remove(at);
       let served = self.keys.iter().filter(|(_, served)| served.handle == Some(id));
-      let keys: Vec<DirKey> = served.map(|(&key, _)| key).collect();
+      let keys: Vec<NodeKey> = served.map(|(&key, _)| key).collect();
       for &key in &keys {
         self.forget(key);
         let again = !handle.delivered && self.dead.contains_key(&key);
@@ -447,7 +447,7 @@ mod handles {
       keys
     }
 
-    pub fn serves(&self, key: DirKey) -> bool {
+    pub fn serves(&self, key: NodeKey) -> bool {
       self.keys.get(&key).is_some_and(|served| served.handle.is_some())
     }
 
@@ -470,7 +470,7 @@ mod handles {
     /// The key is forgotten. A handle that it alone used closes now (rule 6: the OS watch goes
     /// with its last key); where the handles stand is worked out once, at the next commit, not
     /// for each key that goes.
-    fn drop_key(&mut self, key: DirKey, system: &mut dyn System) {
+    fn drop_key(&mut self, key: NodeKey, system: &mut dyn System) {
       let Some(gone) = self.forget(key) else { return };
       if gone.want == Want::Contents {
         self.unsettled = true;
@@ -487,7 +487,7 @@ mod handles {
       self.unsettled = false;
       let moved = self.move_handles(system, told);
       let left = self.keys.iter().filter(|(_, served)| served.handle.is_none());
-      let left: Vec<DirKey> = left.map(|(&key, _)| key).collect();
+      let left: Vec<NodeKey> = left.map(|(&key, _)| key).collect();
       for key in left {
         self.forget(key);
         self.refused.insert(key);
@@ -497,7 +497,7 @@ mod handles {
     }
 
     fn move_handles(&mut self, system: &mut dyn System, told: &mut Told) -> io::Result<()> {
-      let wanted: Vec<(DirKey, &Path, Want)> =
+      let wanted: Vec<(NodeKey, &Path, Want)> =
         self.keys.iter().map(|(&key, served)| (key, &*served.dir, served.want)).collect();
       // The links are found where a key would come to lie behind one, and the placement is
       // made again with them known, until no new one turns up: a directory behind a link then
@@ -600,13 +600,13 @@ mod handles {
       WatchId(self.next_id - 1)
     }
 
-    fn remember(&mut self, key: DirKey, dir: &Path, want: Want, handle: Option<WatchId>) {
+    fn remember(&mut self, key: NodeKey, dir: &Path, want: Want, handle: Option<WatchId>) {
       self.forget(key);
       self.at.entry(lowered(dir)).or_default().push(key);
       self.keys.insert(key, Served { dir: dir.to_owned(), want, handle });
     }
 
-    fn forget(&mut self, key: DirKey) -> Option<Served> {
+    fn forget(&mut self, key: NodeKey) -> Option<Served> {
       let gone = self.keys.remove(&key)?;
       let lower = lowered(&gone.dir);
       if let Some(keys) = self.at.get_mut(&lower) {
@@ -674,7 +674,7 @@ mod handles {
       Route { at: &self.at, above, path, lower, base, ends, text, name }
     }
 
-    pub(super) fn below(&self, dir: &Path) -> Vec<DirKey> {
+    pub(super) fn below(&self, dir: &Path) -> Vec<NodeKey> {
       let dir = lowered(dir);
       let below = self.at.iter().filter(|(lower, _)| lower.starts_with(&dir));
       below.flat_map(|(_, keys)| keys).copied().collect()
@@ -691,10 +691,10 @@ mod handles {
   /// path when the tree reaches it only from above: through another spelling of a name, or from
   /// the other letter case of the drive, which is another top node.
   pub(super) struct Route<'a> {
-    at: &'a FxHashMap<PathBuf, Vec<DirKey>>,
+    at: &'a FxHashMap<PathBuf, Vec<NodeKey>>,
     /// The keys at and above the directory, the deepest first, each with where the names of a
     /// record below their directory start in `path`.
-    above: Vec<(&'a [DirKey], usize)>,
+    above: Vec<(&'a [NodeKey], usize)>,
     /// The directory, a separator, and the names of the record with one separator between
     /// them, as encoded text (`OsStr::as_encoded_bytes`); `lower` the same in lower case.
     path: Vec<u8>,
@@ -749,7 +749,7 @@ mod handles {
 
     /// Calls `found` with every key whose directory holds the path of the record, the deepest
     /// first, and the path below that directory.
-    pub(super) fn keys(&self, found: &mut dyn FnMut(DirKey, &Path)) {
+    pub(super) fn keys(&self, found: &mut dyn FnMut(NodeKey, &Path)) {
       let len = self.path.len();
       for &(end, lower_end) in self.ends.iter().rev() {
         let Some(keys) = self.at.get(cut(&self.lower, 0, lower_end)) else { continue };

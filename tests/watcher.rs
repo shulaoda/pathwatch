@@ -17,7 +17,7 @@ use std::{
 
 use pathwatch::{
   Config, Error, ErrorKind, Event, EventKind, Watcher,
-  backend::{Backend, Coverage, DirKey, Hint, Sink, Want, poll::PollBackend, watch_limit},
+  backend::{Backend, Coverage, Hint, NodeKey, Sink, Want, poll::PollBackend, watch_limit},
   engine::{Ignored, Options},
 };
 use tempfile::TempDir;
@@ -223,11 +223,11 @@ struct Silent {
 impl Backend for Silent {
   type Raw = Vec<u8>;
 
-  fn watch(&mut self, _key: DirKey, _dir: &Path, _want: Want) -> Coverage {
+  fn watch(&mut self, _key: NodeKey, _dir: &Path, _want: Want) -> Coverage {
     if self.polled { Coverage::NotWatched } else { Coverage::Watched }
   }
 
-  fn unwatch(&mut self, _key: DirKey) {}
+  fn unwatch(&mut self, _key: NodeKey) {}
 
   fn translate(&mut self, raw: Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     if raw == [1] {

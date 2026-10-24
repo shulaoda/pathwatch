@@ -9,18 +9,18 @@ use std::{
 };
 
 use pathwatch::{
-  backend::{DirKey, Hint, Want},
+  backend::{Hint, NodeKey, Want},
   fs::DirId,
   tree::{Content, Depth, Dir, Fingerprint, Kind, Mark, Tree, Watch},
 };
 
-fn child(tree: &mut Tree, parent: DirKey, name: &str) -> DirKey {
+fn child(tree: &mut Tree, parent: NodeKey, name: &str) -> NodeKey {
   assert_eq!(tree.child(parent, OsStr::new(name)), None);
   tree.insert_child(parent, OsStr::new(name))
 }
 
 /// Puts a directory at the node.
-fn on_disk(tree: &mut Tree, key: DirKey, complete: bool) {
+fn on_disk(tree: &mut Tree, key: NodeKey, complete: bool) {
   let id = DirId { volume: 1, inode: u64::from(key.index()), birth: 0 };
   tree[key].kind = Kind::Dir(Dir { watch: Watch::Watched, ..Dir::new(id, complete) });
 }
@@ -29,13 +29,13 @@ fn on_disk(tree: &mut Tree, key: DirKey, complete: bool) {
 /// `/p/gone/deep/x.js` a watched path below a chain that is not on disk.
 struct Fixture {
   tree: Tree,
-  top: DirKey,
-  p: DirKey,
-  r: DirKey,
-  sub: DirKey,
-  gone: DirKey,
-  deep: DirKey,
-  f: DirKey,
+  top: NodeKey,
+  p: NodeKey,
+  r: NodeKey,
+  sub: NodeKey,
+  gone: NodeKey,
+  deep: NodeKey,
+  f: NodeKey,
 }
 
 fn fixture() -> Fixture {
@@ -76,7 +76,7 @@ fn marks(tree: &Tree) -> Vec<String> {
 }
 
 /// The marks of a flush (`Tree::take_marked`): level, directory, node and time of each.
-fn taken(tree: &mut Tree) -> Vec<(usize, DirKey, DirKey, Option<Instant>)> {
+fn taken(tree: &mut Tree) -> Vec<(usize, NodeKey, NodeKey, Option<Instant>)> {
   let mut marks = Vec::new();
   tree.take_marked(&mut marks);
   marks.into_iter().map(|(level, _, parent, key, since)| (level, parent, key, since)).collect()
@@ -95,7 +95,7 @@ fn clear_marks(tree: &mut Tree) {
   }
 }
 
-fn changed(dir: DirKey, rel: &str, written: bool) -> Hint<'_> {
+fn changed(dir: NodeKey, rel: &str, written: bool) -> Hint<'_> {
   let rel = Path::new(rel);
   if written { Hint::Written { dir, rel, new: false } } else { Hint::Changed { dir, rel } }
 }
@@ -147,7 +147,7 @@ fn children_come_and_go() {
   let twin = child(&mut tree, other, "0-1");
   assert_eq!(tree.child(Tree::ROOT, OsStr::new("/")), Some(top));
   assert_eq!(tree.parent(Tree::ROOT), None);
-  let mut live: Vec<(String, DirKey)> = Vec::new();
+  let mut live: Vec<(String, NodeKey)> = Vec::new();
   let mut highest = top.index();
   for round in 0..4 {
     for number in 0..500 {
@@ -169,7 +169,7 @@ fn children_come_and_go() {
     live = kept;
     tree.check_links().unwrap();
     // The newest child comes first.
-    let newest_first: Vec<DirKey> = live.iter().rev().map(|(_, key)| *key).collect();
+    let newest_first: Vec<NodeKey> = live.iter().rev().map(|(_, key)| *key).collect();
     assert_eq!(tree.children(top).collect::<Vec<_>>(), newest_first);
     let walk = iter::successors(tree.children(top).next(), |&at| tree.next_sibling(at));
     assert!(walk.eq(tree.children(top)));
@@ -303,7 +303,7 @@ fn the_side_tables_of_a_node() {
   tree.set_link(f, Some(7));
   tree.set_link(r, Some(0));
   assert_eq!((tree.link(f), tree.link(r)), (Some(7), Some(0)));
-  let mut links: Vec<DirKey> = tree.links().collect();
+  let mut links: Vec<NodeKey> = tree.links().collect();
   links.sort_by_key(|key| key.index());
   assert_eq!(links, [r, f]);
   tree.set_link(f, None);
@@ -690,7 +690,7 @@ fn an_old_key_does_not_reach_the_node_that_reuses_its_slot() {
   on_disk(&mut f.tree, new, true);
   assert_eq!(new.index(), old.index());
   assert_ne!(new.generation(), old.generation());
-  let keys: Vec<DirKey> = f.tree.nodes().map(|(key, _)| key).collect();
+  let keys: Vec<NodeKey> = f.tree.nodes().map(|(key, _)| key).collect();
   assert!(keys.contains(&new) && !keys.contains(&old));
 
   assert!(f.tree.get(old).is_none() && f.tree.get_mut(old).is_none());
@@ -745,7 +745,7 @@ fn lost_notifications_scan_everything() {
 fn the_list_of_the_timer() {
   let mut f = fixture();
   assert_eq!(f.tree.polled, [Tree::ROOT]);
-  let set = |tree: &mut Tree, key: DirKey, watch: Watch, has_error: bool| {
+  let set = |tree: &mut Tree, key: NodeKey, watch: Watch, has_error: bool| {
     let dir = tree[key].dir_mut().unwrap();
     (dir.watch, dir.has_error) = (watch, has_error);
     tree.list_if_polled(key);

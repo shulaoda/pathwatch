@@ -5,7 +5,7 @@ use std::{cmp::Reverse, time::Instant};
 
 use super::{Engine, Output};
 use crate::{
-  backend::{Backend, DirKey},
+  backend::{Backend, NodeKey},
   event::{Event, EventKind},
   fs::Fs,
   tree::{Added, Dir, Kind, Mark, Node, Watch, emptied, room_to_keep},
@@ -39,7 +39,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// What the tree has at the node is gone for good.
-  pub(super) fn gone(&mut self, key: DirKey) {
+  pub(super) fn gone(&mut self, key: NodeKey) {
     match self.tree[key].kind {
       Kind::File(_) => self.forget_file(key),
       Kind::Dir(_) => self.vanish(key),
@@ -48,7 +48,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Forgets the file at the node; the end of the flush tells the handler.
-  pub(super) fn forget_file(&mut self, key: DirKey) {
+  pub(super) fn forget_file(&mut self, key: NodeKey) {
     self.tree[key].kind = Kind::Missing;
     self.tree.set_content(key, None);
     self.tree.set_ahead_since(key, None);
@@ -62,7 +62,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Nothing is at the node, and the tree has something: the first look holds it, the second look
   /// decides (design.md 5.9). The delay counts from the hint that asked for the look, `since`.
-  pub(super) fn missing(&mut self, key: DirKey, since: Option<Instant>) {
+  pub(super) fn missing(&mut self, key: NodeKey, since: Option<Instant>) {
     let now = self.now.expect("a check runs inside a flush");
     // The time of this look, not of the start of the flush: a flush can take long before it
     // reaches the node.
@@ -82,7 +82,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Holds the node until `until`. A directory gives its watch back meanwhile.
-  fn hold(&mut self, key: DirKey, until: Instant) {
+  fn hold(&mut self, key: NodeKey, until: Instant) {
     if let Kind::Dir(dir) = &mut self.tree[key].kind {
       let asked = dir.asked.is_some();
       // Polled from now on: a hold can end without a look when a node above is held too.

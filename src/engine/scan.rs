@@ -8,13 +8,13 @@ use super::{
   check::{Found, Listed},
 };
 use crate::{
-  backend::{Backend, DirKey},
+  backend::{Backend, NodeKey},
   fs::{DirId, Entry, FileType, Fs, is_missing},
   tree::{Depth, Dir, Kind, Mark, Node, Watch, is_plain},
 };
 
 /// One node to check in a scan, with what the listing said about it.
-pub(super) type ScanEntry = (DirKey, Listed);
+pub(super) type ScanEntry = (NodeKey, Listed);
 
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ScanEntry>() == 40);
@@ -37,7 +37,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// `path` and `entries` are buffers.
   pub(super) fn scan(
     &mut self,
-    key: DirKey,
+    key: NodeKey,
     depth: Depth,
     path: &mut PathBuf,
     entries: &mut Vec<ScanEntry>,
@@ -96,7 +96,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Lists the directory and adds a node for each entry the tree does not know. With loose
   /// spelling, `listed` gets what the listing said of the known nodes.
-  fn list_new(&mut self, key: DirKey, path: &mut PathBuf, entries: &mut Vec<ScanEntry>) -> Listing {
+  fn list_new(
+    &mut self,
+    key: NodeKey,
+    path: &mut PathBuf,
+    entries: &mut Vec<ScanEntry>,
+  ) -> Listing {
     let known = entries.len();
     // A listing that lags behind a write is trusted for a file only where an OS watch reports
     // the write.
@@ -178,7 +183,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// A directory is on disk where the tree had none. `relinked`: as for `is_baseline_dir`.
   pub(super) fn appear(
     &mut self,
-    key: DirKey,
+    key: NodeKey,
     path: &mut PathBuf,
     id: DirId,
     complete: bool,
@@ -195,7 +200,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// A directory is still on disk at the node. `away`: the writes in it can have gone unheard
   /// (`Dir::away`).
-  pub(super) fn still_there(&mut self, key: DirKey, path: &mut PathBuf, deep: bool, away: bool) {
+  pub(super) fn still_there(&mut self, key: NodeKey, path: &mut PathBuf, deep: bool, away: bool) {
     // Also when not deep: the node may want more, or the watch above may be gone.
     self.arm(key, path, deep);
     let Some(dir) = self.tree[key].dir_mut() else { return };
@@ -211,7 +216,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// The directory is gone for good, with everything below it: the end of the flush tells the
   /// handler.
-  pub(super) fn vanish(&mut self, key: DirKey) {
+  pub(super) fn vanish(&mut self, key: NodeKey) {
     // A list, not a recursion: a tree can be deeper than the stack takes. Nothing is asked for
     // when the node is no directory, or an empty one.
     let first = self.touched.len();

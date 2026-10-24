@@ -21,7 +21,7 @@ use std::{
 
 use gate::Gate;
 use pathwatch::backend::{
-  Backend, Coverage, DirKey, Hint, Signal, Sink, Want,
+  Backend, Coverage, Hint, NodeKey, Signal, Sink, Want,
   windows::{MAX_HANDLES, Raw, WindowsBackend},
 };
 use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
@@ -30,14 +30,14 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Seen {
-  Changed { key: DirKey, rel: PathBuf },
-  Written { key: DirKey, rel: PathBuf },
+  Changed { key: NodeKey, rel: PathBuf },
+  Written { key: NodeKey, rel: PathBuf },
   Lost,
   Delivered(SystemTime),
 }
 
 impl Seen {
-  fn key(&self) -> Option<DirKey> {
+  fn key(&self) -> Option<NodeKey> {
     match self {
       Self::Changed { key, .. } | Self::Written { key, .. } => Some(*key),
       Self::Lost | Self::Delivered(_) => None,
@@ -45,7 +45,7 @@ impl Seen {
   }
 
   /// A `Changed` or a `Written` for this path.
-  fn names(&self, of: DirKey, path: &str) -> bool {
+  fn names(&self, of: NodeKey, path: &str) -> bool {
     matches!(
       self,
       Self::Changed { key, rel } | Self::Written { key, rel }
@@ -54,7 +54,7 @@ impl Seen {
   }
 
   /// A loss report for the directory of the key itself.
-  fn names_the_directory(&self, of: DirKey) -> bool {
+  fn names_the_directory(&self, of: NodeKey) -> bool {
     *self == Self::Changed { key: of, rel: PathBuf::new() }
   }
 }
@@ -82,13 +82,13 @@ impl Harness {
     Self { backend: WindowsBackend::new(sink).unwrap(), signals, next_key: 0, reads: 0 }
   }
 
-  fn watch(&mut self, dir: &Path, want: Want) -> (DirKey, Coverage) {
-    let key = DirKey::new(self.next_key, 0);
+  fn watch(&mut self, dir: &Path, want: Want) -> (NodeKey, Coverage) {
+    let key = NodeKey::new(self.next_key, 0);
     self.next_key += 1;
     (key, self.watch_again(key, dir, want))
   }
 
-  fn watch_again(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
+  fn watch_again(&mut self, key: NodeKey, dir: &Path, want: Want) -> Coverage {
     let coverage = self.backend.watch(key, dir, want);
     self.backend.commit();
     // A key that got no handle at the commit is asked again, as the engine does: that answer
@@ -102,7 +102,7 @@ impl Harness {
   }
 
   /// Opens a handle on `dir`.
-  fn handle(&mut self, dir: &Path) -> DirKey {
+  fn handle(&mut self, dir: &Path) -> NodeKey {
     let (key, coverage) = self.watch(dir, Want::Contents);
     assert!(matches!(coverage, Coverage::WatchedTree), "{}: {coverage:?}", dir.display());
     key
@@ -429,7 +429,7 @@ fn watch_again_takes_the_directory_that_is_at_the_path_now() {
 fn more_directories_than_handles_share_a_handle() {
   let temp = scratch();
   let mut harness = Harness::new();
-  let keys: Vec<DirKey> =
+  let keys: Vec<NodeKey> =
     (0..MAX_HANDLES).map(|n| harness.handle(&make_dir(temp.path().join(n.to_string())))).collect();
   let one_more = make_dir(temp.path().join("one more"));
   let more_key = harness.handle(&one_more);
@@ -486,13 +486,13 @@ fn drop_ends_the_thread() {
   let mut backend = WindowsBackend::new(sink).unwrap();
   for n in 0..4 {
     let dir = make_dir(temp.path().join(n.to_string()));
-    let coverage = backend.watch(DirKey::new(n, 0), &dir, Want::Contents);
+    let coverage = backend.watch(NodeKey::new(n, 0), &dir, Want::Contents);
     assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
   }
   // The handles open at the commit.
   backend.commit();
   for n in 0..4 {
-    assert!(backend.serves(DirKey::new(n, 0)), "{n}");
+    assert!(backend.serves(NodeKey::new(n, 0)), "{n}");
   }
 
   drop(backend);
@@ -721,7 +721,7 @@ fn a_directory_behind_a_junction_below_a_handle_is_not_covered() {
   // by the commit, and only then is the junction below it known. The key behind it is told,
   // and the ask that follows says why.
   let mut harness = Harness::new();
-  let (top_key, key) = (DirKey::new(100, 0), DirKey::new(101, 0));
+  let (top_key, key) = (NodeKey::new(100, 0), NodeKey::new(101, 0));
   for (key, dir) in [(top_key, &top), (key, &behind)] {
     let coverage = harness.backend.watch(key, dir, Want::Contents);
     assert!(matches!(coverage, Coverage::WatchedTree), "{coverage:?}");
@@ -782,7 +782,7 @@ fn directories_above_the_limit_and_a_junction_come_to_rest() {
   let project = make_dir(temp.path().join("project"));
   let target = make_dir(temp.path().join("target"));
   let mut harness = Harness::new();
-  let keys: Vec<DirKey> =
+  let keys: Vec<NodeKey> =
     (0..MAX_HANDLES).map(|n| harness.handle(&make_dir(project.join(format!("d{n}"))))).collect();
   let link = project.join("link");
   junction(&link, &target);

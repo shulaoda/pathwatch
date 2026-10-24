@@ -13,7 +13,7 @@ use rustc_hash::FxHasher;
 
 use super::Engine;
 use crate::{
-  backend::{Backend, DirKey, Want},
+  backend::{Backend, NodeKey, Want},
   config::EntryKind,
   error::ErrorKind,
   fs::{DirId, Entry, FileType, Fs, is_delete_pending, is_link_loop, is_missing},
@@ -86,7 +86,7 @@ impl Listed {
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Brings the node in line with the disk. `path` holds the directory of the node and is left so;
   /// `listed` is what a listing of it said.
-  pub(super) fn check(&mut self, key: DirKey, path: &mut PathBuf, listed: Listed, why: Mark) {
+  pub(super) fn check(&mut self, key: NodeKey, path: &mut PathBuf, listed: Listed, why: Mark) {
     let mut twins = Vec::new();
     self.check_one(key, path, listed, why, &mut twins, false);
     // The twins of a node that goes are looked at now: their looks were unsure of the spelling
@@ -104,11 +104,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// taken into the check: the look is made now, and what the hint said of the node holds.
   fn check_one(
     &mut self,
-    key: DirKey,
+    key: NodeKey,
     path: &mut PathBuf,
     listed: Listed,
     why: Mark,
-    twins: &mut Vec<DirKey>,
+    twins: &mut Vec<NodeKey>,
     followed: bool,
   ) {
     let why = match self.tree.take_mark(key) {
@@ -175,7 +175,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// design.md 5.4.
   fn apply(
     &mut self,
-    key: DirKey,
+    key: NodeKey,
     path: &mut PathBuf,
     found: Found,
     was_unlisted: bool,
@@ -256,14 +256,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// directories of a baseline are not looked at again (one `lstat` for each of them at the
   /// first flush after `watch` before, 5,011 of them for 50,000 files in 5,000 directories,
   /// 47 ms, measured).
-  fn look_again_at_a_new_dir(&mut self, key: DirKey, young: bool) {
+  fn look_again_at_a_new_dir(&mut self, key: NodeKey, young: bool) {
     if self.options.two_step_links && young {
       self.tree.mark(key, Mark::default());
     }
   }
 
   /// The partial node tracks every entry of its directory from now on.
-  pub(super) fn make_complete(&mut self, key: DirKey, relinked: bool) {
+  pub(super) fn make_complete(&mut self, key: NodeKey, relinked: bool) {
     let baseline = self.is_baseline_dir(key, relinked);
     let node = &mut self.tree[key];
     node.set_baseline(baseline);
@@ -284,8 +284,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// a registered node from this look on, when it listed it under its own name before.
   fn read_entry(
     &mut self,
-    parent: DirKey,
-    key: DirKey,
+    parent: NodeKey,
+    key: NodeKey,
     path: &Path,
     listed: Listed,
     listed_as: &mut Option<OsString>,
@@ -396,8 +396,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// What an error of the `lstat` at the node means.
   fn look_error(
     &mut self,
-    parent: DirKey,
-    key: DirKey,
+    parent: NodeKey,
+    key: NodeKey,
     path: &Path,
     listed: Listed,
     error: io::Error,
@@ -419,14 +419,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// The name the disk has for the entry, when it is another one than the node has.
-  fn other_spelling(&self, key: DirKey, path: &Path) -> io::Result<Option<OsString>> {
+  fn other_spelling(&self, key: NodeKey, path: &Path) -> io::Result<Option<OsString>> {
     let name = self.fs.name_on_disk(path)?;
     Ok(Some(name).filter(|name| name != self.tree.name(key)))
   }
 
   /// Whether the disk has to say how it spells the name, in a complete directory that counts as
   /// loose (design.md 5.2).
-  fn spelling_is_unsure(&self, key: DirKey, listed: Listed) -> bool {
+  fn spelling_is_unsure(&self, key: NodeKey, listed: Listed) -> bool {
     if listed.is_named() {
       return false;
     }
@@ -439,7 +439,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// What an error of the disk means for the path. `owner` is polled until the error is gone.
-  pub(super) fn disk_error(&mut self, owner: DirKey, path: &Path, error: io::Error) -> Found {
+  pub(super) fn disk_error(&mut self, owner: NodeKey, path: &Path, error: io::Error) -> Found {
     if is_missing(&error) {
       return Found::Missing;
     }
@@ -475,7 +475,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// Stores the file that is at the node `key`, and notes what that means for the handler.
   fn store_file(
     &mut self,
-    key: DirKey,
+    key: NodeKey,
     path: &Path,
     kind: FileType,
     fingerprint: Fingerprint,
@@ -558,7 +558,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// that was away (`Dir::away`), or such a scan is queued above; or the file was held, and a
   /// held node keeps its file until this second look (it was away itself, or its hint went into
   /// the look that found it missing).
-  fn hint_may_be_lost(&self, key: DirKey, why: Mark) -> bool {
+  fn hint_may_be_lost(&self, key: NodeKey, why: Mark) -> bool {
     why.lost
       || self.tree[key].is_held()
       || self.away_scan
@@ -571,7 +571,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// compare.
   fn content_hash(
     &self,
-    key: DirKey,
+    key: NodeKey,
     path: &Path,
     kind: FileType,
     size: u64,
@@ -599,7 +599,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// gets old by the clock, and the file would be read at every look for ever. A write after
   /// the first look gives it another time, so it is young for the long time after the first
   /// look that found this fingerprint (`same`: the tree has it). Then it is old.
-  fn is_young(&mut self, key: DirKey, modified: i64, same: bool) -> bool {
+  fn is_young(&mut self, key: NodeKey, modified: i64, same: bool) -> bool {
     if self.is_ahead(modified) {
       let now = self.now.expect("a check runs inside a flush");
       let since = self.tree.ahead_since(key).filter(|_| same).unwrap_or(now);
@@ -618,13 +618,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// How long the file is young for (5.8): the short time with a fine time stamp under an OS
   /// watch, the long one with a whole second, or where only the poll looks at it.
-  fn youth(&self, key: DirKey, modified: i64) -> Duration {
+  fn youth(&self, key: NodeKey, modified: i64) -> Duration {
     let whole_seconds = modified >= 0 && modified % nanos_of(Duration::from_secs(1)) == 0;
     if whole_seconds || self.only_polled(key) { YOUNG_COARSE } else { YOUNG }
   }
 
   /// Whether only the poll looks at the entry: its directory is polled, or it is a link.
-  fn only_polled(&self, key: DirKey) -> bool {
+  fn only_polled(&self, key: NodeKey) -> bool {
     let heard = self.tree.parent(key).is_some_and(|parent| self.tree[parent].watch().is_heard());
     !heard || self.tree.link(key).is_some()
   }
@@ -635,7 +635,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Keeps the `Pending` file to forget once it is old and every record of the time it was
   /// young came, and asks the backend to tell when that is (5.8).
-  fn await_delivery(&mut self, key: DirKey, modified: i64) {
+  fn await_delivery(&mut self, key: NodeKey, modified: i64) {
     let old_at = self.old_at(key, modified);
     self.pending.push(Reverse((old_at, key)));
     // An entry stays until a delivery passes its time, also when the file was written again or
@@ -650,7 +650,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// When a file with this modification time gets old, in nanoseconds of the clock of the
   /// watcher. A time far ahead of the clock gets old by the clock of the engine (`is_young`):
   /// never by this one, and such a file keeps its `Pending` until a look reports it.
-  fn old_at(&self, key: DirKey, modified: i64) -> i64 {
+  fn old_at(&self, key: NodeKey, modified: i64) -> i64 {
     if self.is_ahead(modified) {
       i64::MAX
     } else {

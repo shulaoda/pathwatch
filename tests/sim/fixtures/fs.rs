@@ -12,7 +12,7 @@ use std::{
 };
 
 use pathwatch::{
-  backend::{DirKey, Want},
+  backend::{NodeKey, Want},
   fs::{DirId, Entry, FileType, Fs, Meta},
 };
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -826,7 +826,7 @@ impl State {
     is_dir
   }
 
-  pub(crate) fn log_unwatch(&mut self, key: DirKey) {
+  pub(crate) fn log_unwatch(&mut self, key: NodeKey) {
     self.calls.unwatch += 1;
     let asked = self.watch_calls.iter().rev().find(|call| call.key == key && call.want.is_some());
     let dir = asked.map(|call| call.dir.clone()).unwrap_or_default();

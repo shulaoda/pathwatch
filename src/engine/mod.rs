@@ -25,7 +25,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::{check::Listed, scan::ScanEntry};
 use crate::{
-  backend::{Backend, DirKey, Hint, Signal},
+  backend::{Backend, Hint, NodeKey, Signal},
   config::EntryKind,
   error::{Error, ErrorKind},
   event::Event,
@@ -132,14 +132,14 @@ pub struct Engine<B: Backend, F: Fs> {
   /// The next poll. `None` while a poll has nothing to look at (`has_poll_work`).
   poll_at: Option<Instant>,
   /// The held nodes by the time of their second look, the earliest on top. An entry can be stale.
-  hold_queue: BinaryHeap<Reverse<(Instant, DirKey)>>,
+  hold_queue: BinaryHeap<Reverse<(Instant, NodeKey)>>,
   /// The held nodes whose second look is due in the running tick.
-  due_holds: Vec<DirKey>,
+  due_holds: Vec<NodeKey>,
   /// The pacing of the scans that loss reports ask for.
   loss: Loss,
   /// The young files that were not read (`Content::Pending`), by the time they get old, the
   /// earliest on top. An entry can be stale.
-  pending: BinaryHeap<Reverse<(i64, DirKey)>>,
+  pending: BinaryHeap<Reverse<(i64, NodeKey)>>,
   /// Every record of a change before this time came (`Hint::Delivered`), in nanoseconds.
   delivered: i64,
   /// The time the backend was last asked about (`Backend::ask_delivered`).
@@ -159,14 +159,14 @@ pub struct Engine<B: Backend, F: Fs> {
   /// A watch was given back since the last commit: the backend may move its watches then.
   gave_back: bool,
   /// The nodes the flush changed: `finish` reads their events. A key can be stale.
-  touched: Vec<DirKey>,
+  touched: Vec<NodeKey>,
   /// The directories that may want less after an `unwatch` or a drop: asked once at the end of
   /// the call, not once for each path.
-  narrowing: Vec<DirKey>,
+  narrowing: Vec<NodeKey>,
   /// Set by the watcher when it closes: a flush ends at the next check, with the tree as it is.
   stop: Option<Arc<AtomicBool>>,
   /// With loose spelling: what the listing of the running scan said of the nodes it named.
-  listed: FxHashMap<DirKey, Listed>,
+  listed: FxHashMap<NodeKey, Listed>,
   /// A read of the disk failed during the running scan.
   scan_had_error: bool,
 
@@ -176,7 +176,7 @@ pub struct Engine<B: Backend, F: Fs> {
   /// The marks of a flush, in the order of their checks (`Tree::take_marked`).
   marks: Vec<Marked>,
   /// The scans of one round.
-  scans: Vec<(DirKey, Depth, bool)>,
+  scans: Vec<(NodeKey, Depth, bool)>,
   /// The nodes of the directory that is scanned.
   entries: Vec<ScanEntry>,
 

@@ -17,7 +17,7 @@ use std::{
 
 use pathwatch::{
   EventKind,
-  backend::{Backend, Coverage, DirKey, Hint, Signal, Want},
+  backend::{Backend, Coverage, Hint, NodeKey, Signal, Want},
   engine::{Engine, Options, Output},
   fs::{DirId, Entry, FileType, Fs, Meta},
 };
@@ -84,14 +84,14 @@ impl Fs for PlainDisk {
 /// file of a directory was written.
 struct Direct {
   /// The key of each directory that the engine asked a watch for.
-  keys: Arc<Mutex<Vec<(PathBuf, DirKey)>>>,
+  keys: Arc<Mutex<Vec<(PathBuf, NodeKey)>>>,
 }
 
 impl Backend for Direct {
-  type Raw = (DirKey, &'static str);
+  type Raw = (NodeKey, &'static str);
 
   /// As FSEvents and Windows: a directory asked for its names only is left to the poll.
-  fn watch(&mut self, key: DirKey, dir: &Path, want: Want) -> Coverage {
+  fn watch(&mut self, key: NodeKey, dir: &Path, want: Want) -> Coverage {
     if want == Want::Names {
       return Coverage::NotWatched;
     }
@@ -99,7 +99,7 @@ impl Backend for Direct {
     Coverage::Watched
   }
 
-  fn unwatch(&mut self, _: DirKey) {}
+  fn unwatch(&mut self, _: NodeKey) {}
 
   fn translate(&mut self, (dir, name): Self::Raw, hint: &mut dyn FnMut(Hint<'_>)) {
     hint(Hint::Written { dir, rel: Path::new(name), new: false });
@@ -111,7 +111,7 @@ struct Story {
   engine: Engine<Direct, PlainDisk>,
   disk: PlainDisk,
   /// The key of `/p/src`.
-  src: DirKey,
+  src: NodeKey,
   now: Instant,
 }
 

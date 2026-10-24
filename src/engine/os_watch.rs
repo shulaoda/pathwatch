@@ -9,7 +9,7 @@ use std::{
 
 use super::Engine;
 use crate::{
-  backend::{Backend, Committed, Coverage, DirKey, Want, is_watch_limit},
+  backend::{Backend, Committed, Coverage, NodeKey, Want, is_watch_limit},
   config::EntryKind,
   error::{Error, ErrorKind},
   fs::{FileType, Fs, is_missing},
@@ -21,7 +21,7 @@ use crate::{
 impl<B: Backend, F: Fs> Engine<B, F> {
   /// Asks the backend for the directory when the node wants more than was asked, or `force`
   /// says the watch may be gone.
-  pub(super) fn arm(&mut self, key: DirKey, path: &mut PathBuf, force: bool) {
+  pub(super) fn arm(&mut self, key: NodeKey, path: &mut PathBuf, force: bool) {
     let Some(asked) = self.tree[key].dir().map(|dir| dir.asked) else { return };
     if self.backend.is_none() {
       return self.set_watch(key, Watch::Polled);
@@ -42,7 +42,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Asks the backend to watch the directory with `want`, and queues the scan.
-  pub(super) fn ask(&mut self, key: DirKey, path: &Path, want: Want) {
+  pub(super) fn ask(&mut self, key: NodeKey, path: &Path, want: Want) {
     if let Some(dir) = self.tree[key].dir_mut() {
       dir.asked = Some(want);
     }
@@ -54,7 +54,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// After `unwatch` the directory may want names only: its watch for the contents is given back
   /// and asked again. `scan_comes`: a deep scan from above comes here anyway. Says whether a
   /// watch for a whole tree went.
-  pub(super) fn narrow(&mut self, key: DirKey, scan_comes: bool) -> bool {
+  pub(super) fn narrow(&mut self, key: NodeKey, scan_comes: bool) -> bool {
     let Some(dir) = self.tree.get(key).and_then(Node::dir) else { return false };
     let covers_a_tree = match (dir.watch, dir.asked) {
       (Watch::WatchedTree, Some(Want::Contents)) => true,
@@ -82,12 +82,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     covers_a_tree
   }
 
-  pub(super) fn tells_names_only(&self, key: DirKey) -> bool {
+  pub(super) fn tells_names_only(&self, key: NodeKey) -> bool {
     self.tree[key].dir().is_some_and(|dir| dir.asked == Some(Want::Names))
   }
 
   /// Whether a directory is at the watched path now. Only the kind is read, nothing is stored.
-  pub(super) fn is_dir_on_disk(&mut self, key: DirKey, path: &Path) -> bool {
+  pub(super) fn is_dir_on_disk(&mut self, key: NodeKey, path: &Path) -> bool {
     let kind = self.fs.lstat(path).map(|meta| meta.kind);
     let kind = if matches!(kind, Ok(FileType::Symlink)) {
       self.fs.stat(path).map(|meta| meta.kind)
@@ -101,7 +101,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Makes the watches asked for since the last commit live. Gives the directories that an OS
   /// watch reports now (see `ask_again`). A key that got no watch is polled and asked again.
-  pub(super) fn commit(&mut self) -> Vec<DirKey> {
+  pub(super) fn commit(&mut self) -> Vec<NodeKey> {
     let Some(backend) = &mut self.backend else { return Vec::new() };
     let Committed { now_watched, failed } = backend.commit();
     for (key, error) in failed {
@@ -115,7 +115,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Asks again for the directories that got `NotWatched` and that an OS watch reports now.
-  pub(super) fn ask_again(&mut self, keys: Vec<DirKey>) {
+  pub(super) fn ask_again(&mut self, keys: Vec<NodeKey>) {
     for key in keys {
       let Some(dir) = self.tree.get(key).and_then(Node::dir) else { continue };
       let (Watch::Polled, Some(want)) = (dir.watch, dir.asked) else { continue };
@@ -132,7 +132,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   /// What the directory asks from the backend (design.md 5.10). Where the tree has nothing at a
   /// watched path in it, the disk says: the contents when no directory is there. A name on the
   /// way is not asked: a directory is expected there.
-  fn want(&mut self, key: DirKey, path: &mut PathBuf) -> Want {
+  fn want(&mut self, key: NodeKey, path: &mut PathBuf) -> Want {
     if let Some(want) = self.tree.want(key) {
       return want;
     }
@@ -154,7 +154,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Notes how changes in the directory are heard when the backend was not asked.
-  fn set_watch(&mut self, key: DirKey, watch: Watch) {
+  fn set_watch(&mut self, key: NodeKey, watch: Watch) {
     if let Some(dir) = self.tree[key].dir_mut() {
       dir.watch = watch;
     }
@@ -162,7 +162,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Stores what the backend answered for the directory.
-  fn store_answer(&mut self, key: DirKey, answer: Coverage, path: &Path) {
+  fn store_answer(&mut self, key: NodeKey, answer: Coverage, path: &Path) {
     let Some(dir) = self.tree[key].dir_mut() else { return };
     let (old, volume) = (dir.watch, dir.id.volume);
     let mut to_report = None;
@@ -212,12 +212,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// What the backend answers for the directory. A backend that is gone watches nothing.
-  fn watch_dir(&mut self, key: DirKey, path: &Path, want: Want) -> Coverage {
+  fn watch_dir(&mut self, key: NodeKey, path: &Path, want: Want) -> Coverage {
     let backend = self.backend.as_mut();
     backend.map_or(Coverage::NotWatched, |backend| backend.watch(key, path, want))
   }
 
-  pub(super) fn unwatch_dir(&mut self, key: DirKey) {
+  pub(super) fn unwatch_dir(&mut self, key: NodeKey) {
     if let Some(backend) = &mut self.backend {
       backend.unwatch(key);
       self.gave_back = true;
@@ -232,11 +232,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.tidy_polled();
     // Nothing tells when a link leads somewhere else: each poll checks the registered links whose
     // directory is not polled anyway.
-    let has_to_be_marked = |&key: &DirKey| {
+    let has_to_be_marked = |&key: &NodeKey| {
       let parent = self.tree.parent(key).and_then(|parent| self.tree[parent].dir());
       parent.is_some_and(|parent| !parent.is_polled())
     };
-    let links: Vec<DirKey> = self.tree.links().filter(has_to_be_marked).collect();
+    let links: Vec<NodeKey> = self.tree.links().filter(has_to_be_marked).collect();
 
     // Only the directories that are on the list now: `arm` can put one on it.
     for index in 0..self.tree.polled.len() {
@@ -296,7 +296,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// The directory at or above the node that only a poll of its parent checks.
-  fn below_polled_parent(&self, mut key: DirKey) -> Option<DirKey> {
+  fn below_polled_parent(&self, mut key: NodeKey) -> Option<NodeKey> {
     loop {
       let parent = self.tree.parent(key).filter(|&parent| parent != Tree::ROOT)?;
       let linked = self.tree.link(key).is_some();

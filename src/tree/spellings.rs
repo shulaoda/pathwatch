@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 
 use super::{Tree, name_of};
-use crate::backend::DirKey;
+use crate::backend::NodeKey;
 
 #[expect(clippy::cast_possible_truncation, reason = "the two halves of a product are taken")]
 pub(super) fn child_hash(parent: u32, name: &OsStr) -> u64 {
@@ -84,21 +84,21 @@ impl Tree {
     alike.filter(|&child| any_child || self.slots.linked(child).is_registered()).collect()
   }
 
-  pub fn has_spellings(&self, key: DirKey) -> bool {
+  pub fn has_spellings(&self, key: NodeKey) -> bool {
     let name = self.name(key);
     !is_plain(name) || name.as_encoded_bytes().iter().any(u8::is_ascii_alphabetic)
   }
 
-  pub fn has_other_spelling(&self, key: DirKey) -> bool {
+  pub fn has_other_spelling(&self, key: NodeKey) -> bool {
     !is_plain(self.name(key)) || self.twins(key).next().is_some()
   }
 
-  pub fn marked_twins(&self, key: DirKey) -> Vec<DirKey> {
+  pub fn marked_twins(&self, key: NodeKey) -> Vec<NodeKey> {
     let marked = self.twins(key).filter(|&twin| self.slots.linked(twin).is_marked());
     marked.map(|twin| self.key(twin)).collect()
   }
 
-  fn twins(&self, key: DirKey) -> impl Iterator<Item = u32> + '_ {
+  fn twins(&self, key: NodeKey) -> impl Iterator<Item = u32> + '_ {
     let node = &self[key];
     self.alike(node.parent, name_of(&self.names, node), Some(key.index()))
   }

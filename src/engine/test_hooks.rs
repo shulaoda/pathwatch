@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, iter, path::PathBuf, time::Instant};
 
 use super::Engine;
 use crate::{
-  backend::{Backend, DirKey},
+  backend::{Backend, NodeKey},
   config::EntryKind,
   fs::Fs,
   tree::{Added, Fingerprint, Kind, Node, Tree, Watch},
@@ -30,7 +30,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// Every file the tree holds, with its stored fingerprint, for a test to compare with the disk.
   pub fn fingerprints(&self) -> Vec<(PathBuf, Fingerprint)> {
-    let stored = |(key, node): (DirKey, &Node)| match node.kind {
+    let stored = |(key, node): (NodeKey, &Node)| match node.kind {
       Kind::File(fingerprint) => Some((self.tree.path(key), fingerprint)),
       _ => None,
     };
@@ -39,7 +39,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   /// The files whose `Delete` waits for a second look.
   pub fn pending_deletes(&self) -> BTreeSet<PathBuf> {
-    let waits = |key: DirKey, node: &Node| node.told() && (node.is_held() || self.tree.frozen(key));
+    let waits =
+      |key: NodeKey, node: &Node| node.told() && (node.is_held() || self.tree.frozen(key));
     let pending = self.tree.nodes().filter(|(key, node)| waits(*key, node));
     pending.map(|(key, _)| self.tree.path(key)).collect()
   }
@@ -92,12 +93,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   /// Whether a directory is to be complete, and the look that makes it so is still to come.
-  fn is_behind(&self, key: DirKey) -> bool {
+  fn is_behind(&self, key: NodeKey) -> bool {
     matches!(self.tree[key].kind, Kind::Dir(dir) if !dir.complete) && self.tracks_every_entry(key)
   }
 
   /// Whether a mark waits on the node `key` or on a node above it.
-  fn mark_waits_above(&self, key: DirKey) -> bool {
+  fn mark_waits_above(&self, key: NodeKey) -> bool {
     iter::successors(Some(key), |&at| self.tree.parent(at)).any(|at| self.tree[at].is_marked())
   }
 
