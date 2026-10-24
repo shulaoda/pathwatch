@@ -826,7 +826,7 @@ struct Run<B: Deliver> {
   offline: bool,
   /// The prefix backend was not told about a move behind a link. A poll has to see it before
   /// the disk changes again: `references/architecture.md`, section 5, lists a link that is
-  /// changed and changed back before the next poll as a known hole.
+  /// changed and changed back before the next poll as a known limitation.
   poll_first: bool,
 }
 

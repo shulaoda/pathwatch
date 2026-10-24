@@ -1572,7 +1572,8 @@ mod translate {
   }
 
   /// A short (8.3) name in a record is a name like any other: the engine asks the disk how it
-  /// spells a name it does not know. One that matches no key is dropped (behavior.md, "Holes").
+  /// spells a name it does not know. One that matches no key is dropped (behavior.md, "Known
+  /// limitations").
   #[test]
   fn a_short_name_is_a_name_like_any_other() {
     let mut handles = Handles::default();

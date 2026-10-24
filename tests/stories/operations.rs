@@ -170,7 +170,7 @@ fn two_watchers_in_one_process_both_see_a_change() {
 
 /// A watched file written through another hard link of it is an `Update`: the file is the
 /// same, whatever name the writer used. Not with inotify and ReadDirectoryChangesW, which
-/// report a write under the name the writer used (a hole in behavior.md).
+/// report a write under the name the writer used (a known limitation in behavior.md).
 #[test]
 fn a_write_through_another_hard_link_is_an_update() {
   on_disk(|w| {

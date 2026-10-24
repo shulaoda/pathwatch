@@ -336,7 +336,8 @@ impl World for Disk {
   }
 
   /// Windows refuses to rename a directory while a listing of the watcher holds one below it
-  /// open, for a moment (behavior.md, "Holes"): the rename is tried again, for a second at most.
+  /// open, for a moment (behavior.md, "Known limitations"): the rename is tried again, for a
+  /// second at most.
   fn rename(&mut self, from: &str, to: &str) {
     let (from, to) = (self.path(from), self.path(to));
     let end = Instant::now() + Duration::from_secs(1);

@@ -780,7 +780,8 @@ fn a_name_that_windows_reads_as_another_is_reported() {
 /// second, and reports the link: a file inside a watched directory, and what is behind it at a
 /// watched path. Between the steps the story only waits, longer than the quiet time, so that
 /// the first look falls between them, and not long, so that no poll does: a flush between the
-/// steps would be the one more look, and would see the directory (behavior.md, "Holes").
+/// steps would be the one more look, and would see the directory (behavior.md, "Known
+/// limitations").
 #[cfg(windows)]
 #[test]
 fn a_junction_made_in_two_steps() {

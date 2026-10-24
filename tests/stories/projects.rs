@@ -148,7 +148,7 @@ fn a_directory_is_moved_away_changed_and_moved_back() {
     w.mkdir("outside");
     w.watch(&["r"]);
     // The files are old by then: a young one in a directory that was away is reported as
-    // written (behavior.md, "Holes").
+    // written (behavior.md, "Known limitations").
     w.expect(&[]);
 
     w.rename("r/sub", "outside/sub");
@@ -167,7 +167,7 @@ fn a_directory_is_moved_away_changed_and_moved_back() {
 /// A watch of macOS stands below the renamed directory and hears nothing about the renames:
 /// the poll of the directories above finds the directory gone within a second, and the
 /// delete delay holds it until it is back. Moved back before that second, the changes would
-/// not be noticed (behavior.md, "Holes").
+/// not be noticed (behavior.md, "Known limitations").
 #[test]
 fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
   on_disk_with(&slow_delete(), |w| {
