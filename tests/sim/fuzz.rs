@@ -1,7 +1,8 @@
 //! The fuzzer: random changes of the disk mixed with deliveries, clock steps, `watch` and
 //! `unwatch` calls and failures. A run is a list of [`Op`]s made from a seed alone, so it can be
 //! replayed and cut down. It plays the handler by rules that are written down here a second
-//! time, not by the engine's. `README.md` has the commands for the big runs and for one seed.
+//! time, not by the engine's. `references/design.md` (section 8) has the commands for the big
+//! runs and for one seed.
 
 use std::{
   collections::{BTreeMap, BTreeSet},

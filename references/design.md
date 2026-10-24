@@ -595,7 +595,7 @@ changed, its watch lost records (a `lost` mark), the watch of the tree it had wa
 its time, not a `watch` call) while only a watch above covers it (its name changed: the records
 of its files came under the other name; a watch of its own follows the directory, as inotify
 does). A young file that was not read (`Content::Pending`, 5.8) counts as written in such a
-scan, also when nothing was written to it (README, "Holes"). Not one whose doubt ended: once
+scan, also when nothing was written to it (behavior.md, "Holes"). Not one whose doubt ended: once
 every record of the time it was young came (`Hint::Delivered`, 5.8), no write can hide behind
 its fingerprint. (A rule forgot the doubt of a file that was old when the record named the
 directory came, `forget_pending_old_at`. It took the time a record came for the time of its
@@ -789,7 +789,7 @@ Two guards:
 
 The clock is the clock of the watcher (`Fs::now`), not of the disk: a disk whose clock is
 behind it (a network disk) has no young files, and a second write of the same size inside one
-step of its time stamps is found only where the OS reports writes (README, "Holes"). A disk
+step of its time stamps is found only where the OS reports writes (behavior.md, "Holes"). A disk
 whose clock is ahead is the next case.
 
 **A time far ahead of the clock** (more than 2 s: the clock of another machine, a time that a
@@ -859,7 +859,7 @@ is not told at once.
   a busy machine for more than 10 ms in 31% of the saves, 20 ms in 18%, 50 ms in 6%. Such a save
   is a `Delete` and a `Create` when the path stays missing longer than both the delete delay and
   the quiet time: with 10 ms, 1 of 60 saves idle and 7 to 23 of 60 busy; with 50 ms and a quiet
-  time of 20 ms, none idle and 0 to 7 busy (README, "Holes"). On macOS FSEvents tells about
+  time of 20 ms, none idle and 0 to 7 busy (behavior.md, "Holes"). On macOS FSEvents tells about
   10 ms after the change, when a save is done (5.13): the delay is 10 ms there, a guard that costs
   little, and the only wait, as there is no quiet time (with a quiet time of 10 ms or 20 ms and
   no delay, none of VS Code, vim, `sed -i`, `git checkout` and a JetBrains-like save was wrong,
@@ -1759,7 +1759,7 @@ make no Windows call: `place`, `Handles`, `Records`, `translate`) pass on Window
   that cannot be read → `Lost`. A read that fails → the handle is closed, `Changed` with an
   empty `rel` for each of its keys. A short (8.3) name in a record is a name like any other:
   below a watched directory the engine asks the disk how it spells a name it does not know,
-  and finds the entry under its long name; one that no key holds is dropped (README, "Holes").
+  and finds the entry under its long name; one that no key holds is dropped (behavior.md, "Holes").
 - The kernel completes a read as soon as one record is in it. After a read that came back
   with less than half the buffer, the next read is queued a millisecond later: while no read
   is queued the kernel keeps the records in a buffer of its own, as big as ours, and the next
@@ -1858,7 +1858,7 @@ The test files of the simulator:
 - The watcher thread (`tests/watcher.rs`): `watch`, `unwatch`, `close` and `drop` from every
   side, relative paths, a bad path, the queue bound, a backend that cannot start.
 - The stories (`tests/stories`): `contract` (the rows of section 3), `projects` (what editors
-  and big projects do), `promises` (the promises of the README; its first lines say which test
+  and big projects do), `promises` (the promises of `behavior.md`; its first lines say which test
   proves which), `engine` (what the engine has to get right below the promises: a batch of
   paths, a directory that becomes a watched path above others, files and links on the way,
   directories that are renamed or replaced), `operations` (every way a user writes, renames
@@ -1872,15 +1872,108 @@ The test files of the simulator:
   (the debounce, the delete delay, the poll of a link once a second, and about 10 ms of the
   OS), 4 s the changes that the tests make, and 0.2 s the `watch` calls.
 
-How to run them (the README has the commands for the other platforms and the lints):
+**The repository.**
+
+```
+src/
+  lib.rs                 the crate docs; re-exports the API
+  config.rs  error.rs  event.rs
+  watcher.rs             the thread and the queue; picks the backend
+  backend/               mod.rs: the `Backend` trait, what the engine asks of an OS watch API;
+                         inotify.rs  fsevents.rs  windows.rs  poll.rs: one backend each
+  engine/                the engine: watched_paths, check, scan, os_watch, events,
+                         and test_hooks, what the tests see of it
+  tree/  fs/  path.rs
+tests/
+  stories/               the promises of `behavior.md`: each story on the real disk, and on the
+                         simulated disk of `sim/` where its words allow
+  sim/                   the engine on a disk in memory (Unix hosts): what the real disk
+                         cannot play on demand, with a fuzzer and a cost program; the
+                         disk and the backends are in `fixtures/`
+  watcher.rs             the thread
+  tree.rs                the tree of the engine, alone
+  poll.rs                the poll backend on a real directory, with a clock the test moves,
+                         and the hash of a file
+  inotify.rs  fsevents.rs  windows/     each backend alone, on its OS; `windows/parts.rs`
+                         holds the parts of that backend that call no Windows
+  common/                gate.rs: the gate in the sink that inotify.rs and windows/os.rs share
+examples/                watch.rs, dev_server.rs
+references/
+  design.md                  how it works
+bench/                       the comparison with other watchers: a workspace of its own,
+                             with the tables of the last full runs in BENCHMARK.md
+```
+
+`pathwatch` shows seven names: `Watcher`, `Config`, `Event`, `EventKind`, `EntryKind`, `Error`,
+`ErrorKind`. Its other public modules are hidden from the docs. They are there for the tests and
+can change in any release. What only the tests call is built with the feature `test-hooks`,
+which the tests turn on themselves.
+
+**How to run them.** The Rust toolchain is the one in `rust-toolchain.toml`.
 
 ```sh
-cargo test --workspace                # everything for this OS; 250 fuzz seeds for each backend
+cargo test --workspace
+```
+
+This runs, on the machine it is called on:
+
+- the engine on a simulated disk, with a fuzzer (`tests/sim`, on Unix hosts),
+- the backend of this OS against the real watch API (`tests/inotify.rs`,
+  `fsevents.rs` or `windows/os.rs`),
+- the watcher thread (`tests/watcher.rs`),
+- the tree alone (`tests/tree.rs`), and on a real directory the poll backend with a clock that
+  the test moves and the hash of a file (`tests/poll.rs`),
+- on Windows, also the parts of its backend that call no Windows (`tests/windows/parts.rs`):
+  the backend is compiled there only,
+- the stories (`tests/stories`): each once with the backend of this OS and once with polling
+  on the real disk, and a story that needs no more than files, directories, links and renames
+  also on each simulated backend of `tests/sim` (the note above the promises in
+  `behavior.md` says which of them run where). A story about the delete delay skips polling,
+  which has none.
+
+| Platform | How |
+|---|---|
+| macOS | `cargo test --workspace` |
+| Linux | `cargo test --workspace`. From macOS with OrbStack: `orb bash -c 'source $HOME/.cargo/env; cd <this directory> && CARGO_TARGET_DIR=$HOME/pathwatch-target-inotify cargo test --workspace'`. The tests use the temporary directory of the VM, because inotify does not see changes that macOS makes on the shared folder. |
+| Windows | `cargo test --workspace` on a Windows machine. Done on Windows 11 with NTFS. From another OS only a type check is possible: `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` |
+| Android, WASI, FreeBSD, musl, 32-bit Linux | Only a lint of the crate and its tests, as on CI: `cargo clippy -p pathwatch --all-targets --target aarch64-linux-android`, and the same with `wasm32-wasip1-threads`, `x86_64-unknown-freebsd`, `x86_64-unknown-linux-musl` or `i686-unknown-linux-gnu`. The engine with the poll backend was run once under wasmtime on a preopened directory (a probe, not a test). |
+
+The fuzzer (`tests/sim/fuzz.rs`):
+
+```sh
+# The quick run: 250 seeds for each backend. It is a part of `cargo test --workspace`.
+cargo test -p pathwatch --test sim fuzz::
+
+# The long run, with a range of seeds of your choice. CI runs it on the seeds of the day.
 PATHWATCH_FUZZ_FIRST=100000 PATHWATCH_FUZZ_SEEDS=20000 \
-  cargo test --release -p pathwatch --test sim fuzz::big -- --ignored         # the long fuzz
-PATHWATCH_FUZZ_SEED=1234 \
-  cargo test -p pathwatch --test sim fuzz::replay -- --ignored --nocapture    # one seed again
-cargo test --release -p pathwatch --test sim cost:: -- --ignored --nocapture  # the cost program
+  cargo test --release -p pathwatch --test sim fuzz::big -- --ignored
+
+# One seed again, on every backend, with the short story of each failure. A failure of the
+# `long` run needs `PATHWATCH_FUZZ_STEPS=5000` too.
+PATHWATCH_FUZZ_SEED=1234 cargo test -p pathwatch --test sim fuzz::replay -- --ignored --nocapture
+```
+
+More:
+
+```sh
+# What the engine costs for big cases. Run it before and after a change and compare.
+cargo test --release -p pathwatch --test sim cost:: -- --ignored --nocapture
+
+# macOS: what 20,000 files watched one by one cost the FSEvents backend. It runs alone.
+cargo test --release -p pathwatch --test fsevents the_cost_of_single_files -- --ignored --nocapture
+
+# The FSEvents test that fills the stream limit of the process. It runs alone.
+cargo test -p pathwatch --test fsevents -- --ignored failed_start
+
+# The inotify tests of the watch limit and of a mount. They need a lowered limit and mounts of
+# their own, and run one after the other: they share the limit and see each other's mounts.
+unshare -Urm sh -c 'echo 8 > /proc/sys/user/max_inotify_watches &&
+  cargo test -p pathwatch --test inotify -- --ignored --test-threads=1'
+
+# Lints and the docs.
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p pathwatch --no-deps
 ```
 
 ## 9. Not in version 1

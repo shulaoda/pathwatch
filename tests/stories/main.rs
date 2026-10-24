@@ -11,7 +11,7 @@
 //! [`on_disk`], and gets the [`Disk`] with everything it has.
 //!
 //! - `contract`: the rows S1 to S14 of `references/design.md`.
-//! - `promises`: the promises of the README.
+//! - `promises`: the promises of `references/behavior.md`.
 //! - `projects`: what editors, package managers and big projects do.
 //! - `engine`: what the engine has to get right below the promises.
 //! - `operations`: every way a user writes, renames and links a file.

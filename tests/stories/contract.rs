@@ -23,7 +23,7 @@ fn s1_a_write_in_place() {
 
 /// A write that keeps the time stamp and the size, as inside one step of a coarse clock: a
 /// young file is read, so every backend finds it. An old one is found where the OS reports the
-/// write itself (not FSEvents, not the poll: README, "Holes").
+/// write itself (not FSEvents, not the poll: behavior.md, "Holes").
 #[test]
 fn s1_a_write_in_place_that_keeps_the_time_and_the_size() {
   on_disk(|w| {

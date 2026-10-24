@@ -28,7 +28,8 @@
 //! # }
 //! ```
 //!
-//! The README of the repository has every promise, and what is reported late or not at all.
+//! `references/behavior.md` in the repository has every promise, and what is reported late or
+//! not at all.
 
 mod config;
 mod error;
