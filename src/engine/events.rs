@@ -52,15 +52,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let node = &self.tree[key];
     let unknown_file = matches!(node.kind, Kind::File(_)) && !node.told();
     match self.tree.held_until(key) {
-      Some(until) if until > looked => {}
-      None if !delay.is_zero() && !unknown_file => {
-        self.hold(key, (since.unwrap_or(looked) + delay).max(looked));
-      }
-      _ => self.gone(key),
+      Some(until) if until > looked => return,
+      None if !delay.is_zero() && !unknown_file => {}
+      _ => return self.gone(key),
     }
-  }
-
-  fn hold(&mut self, key: NodeKey, until: Instant) {
+    let until = (since.unwrap_or(looked) + delay).max(looked);
     if let Kind::Dir(dir) = &mut self.tree[key].kind {
       let asked = dir.asked.is_some();
       *dir = Dir { watch: Watch::Polled, ..Dir::new(dir.id, dir.complete) };
@@ -114,12 +110,10 @@ mod tests {
     tree::{Dir, Fingerprint, Kind, Tree},
   };
 
-  /// What the changes of one path inside one flush come to.
   #[test]
   fn the_event_of_a_node() {
     let file = Kind::File(Fingerprint { modified: 0, size: 1, id: 1 });
     let dir = Kind::Dir(Dir::new(DirId::default(), true));
-    // What the handler believed, what is there now, `changed`, `baseline`.
     let table = [
       (false, file, false, false, Some(Create), "a file came"),
       (false, file, true, false, Some(Create), "it came and was written: it is still new"),

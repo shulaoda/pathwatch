@@ -1,5 +1,3 @@
-//! Hooks for tests: the handler's view, the stored fingerprints and the invariants of the tree.
-
 use std::{collections::BTreeSet, iter, path::PathBuf, time::Instant};
 
 use super::Engine;
@@ -11,24 +9,19 @@ use crate::{
 };
 
 impl<B: Backend, F: Fs> Engine<B, F> {
-  /// How long the list of the directories that the timer looks at is, stale keys included.
   pub fn polled_len(&self) -> usize {
     self.tree.polled.len()
   }
 
-  /// The room that the young files take: the table of what is kept to compare, and the queue of
-  /// the files that wait for a delivery.
   pub fn young_room(&self) -> usize {
     self.tree.content_room() + self.pending.capacity()
   }
 
-  /// Every file the handler believes to exist, a file whose `Delete` waits too.
   pub fn view(&self) -> BTreeSet<PathBuf> {
     let told = self.tree.nodes().filter(|(_, node)| node.told());
     told.map(|(key, _)| self.tree.path(key)).collect()
   }
 
-  /// Every file the tree holds, with its stored fingerprint, for a test to compare with the disk.
   pub fn fingerprints(&self) -> Vec<(PathBuf, Fingerprint)> {
     let stored = |(key, node): (NodeKey, &Node)| match node.kind {
       Kind::File(fingerprint) => Some((self.tree.path(key), fingerprint)),
@@ -37,7 +30,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.nodes().filter_map(stored).collect()
   }
 
-  /// The files whose `Delete` waits for a second look.
   pub fn pending_deletes(&self) -> BTreeSet<PathBuf> {
     let waits =
       |key: NodeKey, node: &Node| node.told() && (node.is_held() || self.tree.frozen(key));
@@ -45,12 +37,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     pending.map(|(key, _)| self.tree.path(key)).collect()
   }
 
-  /// Whether a `tick` at `now` runs a poll.
   pub fn poll_due(&self, now: Instant) -> bool {
     self.poll_at.is_some_and(|at| at <= now)
   }
 
-  /// Checks that nothing is left to do but the next poll. The error names what is left.
   pub fn check_idle(&self) -> Result<(), String> {
     let left = [
       (self.flush_at.is_some(), "a flush is due"),
@@ -67,8 +57,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
   }
 
-  /// Checks the kept answer of the disk, `Node::is_unlisted`, against the disk once the tree has
-  /// caught up.
   pub fn check_spellings(&self) -> Result<(), String> {
     if !self.tree.loose_spelling {
       return Ok(());
@@ -81,7 +69,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let path = self.tree.path(key);
       let Ok(name) = self.fs.name_on_disk(&path) else { continue };
       let is_other = name != self.tree.name(key);
-      // A node with nothing in the tree is no entry of the directory, whatever its flag says.
       let counts_as_entry = !node.is_unlisted() && !matches!(node.kind, Kind::Missing);
       if (node.is_unlisted() && !is_other) || (counts_as_entry && !node.is_held() && is_other) {
         let flag = if node.is_unlisted() { "another name" } else { "this name" };
@@ -92,20 +79,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     Ok(())
   }
 
-  /// Whether a directory is to be complete, and the look that makes it so is still to come.
-  fn is_behind(&self, key: NodeKey) -> bool {
-    matches!(self.tree[key].kind, Kind::Dir(dir) if !dir.complete) && self.tracks_every_entry(key)
-  }
-
-  /// Whether a mark waits on the node `key` or on a node above it.
-  fn mark_waits_above(&self, key: NodeKey) -> bool {
-    iter::successors(Some(key), |&at| self.tree.parent(at)).any(|at| self.tree[at].is_marked())
-  }
-
-  /// Checks the invariants of design.md 5.1 between two calls of the engine. The error names the
-  /// first one that does not hold.
   pub fn check_invariants(&self) -> Result<(), String> {
-    // 1. Every node but the root has a parent that knows it.
     self.tree.check_links()?;
     for (key, node) in self.tree.nodes() {
       let fail = |what: &str| Err(format!("{}: {what}", self.tree.path(key).display()));
@@ -120,18 +94,15 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         continue;
       };
       let parent_is_dir = matches!(self.tree[parent].kind, Kind::Dir(_));
-      // 2. The tree has nothing below a node that is no directory.
       if !matches!(node.kind, Kind::Missing) && !parent_is_dir {
         return fail("the tree has it below a node that is no directory");
       }
-      // 3. The handler knows exactly the files the tree has, and the bits of one call are cleared.
       if node.told() != matches!(node.kind, Kind::File(_)) {
         return fail("the handler and the tree do not agree about a file here");
       }
       if node.changed() || node.baseline() || node.added() != Added::No {
         return fail("an event, or the baseline, is left over from a call");
       }
-      // 4. A held node has something, and its second look comes: by the queue, or by a mark.
       if node.is_held() {
         if matches!(node.kind, Kind::Missing) {
           return fail("is held, and the tree has nothing there");
@@ -147,20 +118,17 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let frozen = self.tree.frozen(key);
       let waits = self.mark_waits_above(key);
       match &node.kind {
-        // 5. A node with nothing at its path is kept only for a watched path or a mark.
         Kind::Missing => {
           if !node.is_registered() && !node.is_marked() {
             return fail("nothing is at the path, and nothing needs the node");
           }
         }
         Kind::File(_) => {
-          // 5. A partial node knows a file only if the rule makes it complete.
           if !node.is_path() && !self.covered_by_parent(key) {
             return fail("a partial node knows a file that is no watched path");
           }
         }
         Kind::Dir(dir) => {
-          // `hold` takes the watch away; the backend is asked again when the directory is back.
           if node.is_held() && (dir.asked.is_some() || dir.watch != Watch::Polled) {
             return fail("is held, and the backend still has its watch");
           }
@@ -170,15 +138,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           if parent == Tree::ROOT && dir.complete {
             return fail("a top directory is complete");
           }
-          // 5. A partial node with no registered name is a directory that is to be complete.
           if !dir.complete && !node.is_ancestor() && !self.is_behind(key) {
             return fail("is partial and has no registered name");
           }
           if dir.scan.is_some() && !self.tree.to_scan.contains(&key) {
             return fail("waits for a scan but is not on the list");
           }
-          // A scan that is not deep sets `away` below it only while a lost mark waits above: the
-          // deep scan of that mark takes it.
           if dir.away && dir.scan.is_none() && !frozen && !waits {
             return fail("was away, and no scan comes that knows it");
           }
@@ -187,20 +152,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           }
         }
       }
-      // 6. A directory asked for names only holds no registered name without a directory, unless
-      // it is frozen or a mark waits above it.
       let names_only = self.tells_names_only(parent);
       if names_only && node.is_registered() && !node.is_dir() && !frozen && !waits {
         return fail("is a registered name with no directory at it, and its directory tells names");
       }
-      // 7. A directory that relies on a watch above has one, unless it is frozen or a mark waits
-      // above it.
       let covered = self.tree[parent].watch().covers_below();
       if node.watch() == Watch::FromAbove && !covered && !frozen && !waits {
         return fail("relies on a watch above, and there is none");
       }
-      // 8. Every node but the root that has a file or a directory keeps the answer "not
-      // ignored" for that kind.
       if !keeps_not_ignored(node) {
         return fail("has what the filter ignores, or what it was never asked about");
       }
@@ -216,7 +175,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if !self.touched.is_empty() {
       return Err("touched nodes are left over from a flush".to_owned());
     }
-    // A key whose node has no mark keeps the timer of the poll for nothing (`has_poll_work`).
     if let Some(&(key, _)) =
       self.tree.marked.iter().find(|&&(key, _)| !self.tree.get(key).is_some_and(Node::is_marked))
     {
@@ -224,10 +182,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     }
     Ok(())
   }
+
+  fn is_behind(&self, key: NodeKey) -> bool {
+    matches!(self.tree[key].kind, Kind::Dir(dir) if !dir.complete) && self.tracks_every_entry(key)
+  }
+
+  fn mark_waits_above(&self, key: NodeKey) -> bool {
+    iter::successors(Some(key), |&at| self.tree.parent(at)).any(|at| self.tree[at].is_marked())
+  }
 }
 
-/// Whether the node keeps the answer "not ignored" of the filter for the file or the directory
-/// at it. A node with nothing at it can keep any answer.
 fn keeps_not_ignored(node: &Node) -> bool {
   match node.kind {
     Kind::File(_) => node.ignored(EntryKind::File) == Some(false),
