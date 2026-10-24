@@ -527,7 +527,6 @@ mod windows {
 
     use super::Inbox;
 
-    /// The wait ends with the deadline, not with the next tick of the clock (15.6 ms).
     #[test]
     fn a_wait_ends_at_its_deadline() {
       let (_post, inbox) = Inbox::<()>::new().unwrap();

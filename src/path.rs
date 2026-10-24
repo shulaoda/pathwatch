@@ -165,20 +165,16 @@ mod tests {
       ("/./a/./b/.", Some("/a/b")),
       ("/a/.hidden/..b/c..", Some("/a/.hidden/..b/c..")),
       ("/a b/c\u{e9}", Some("/a b/c\u{e9}")),
-      // Not absolute.
       ("", None),
       ("a/b", None),
       ("./a", None),
-      // `..` takes the name before it away, by text. Above the root there is nothing.
       ("/a/../b", Some("/b")),
       ("/a/b/../../c/d/..", Some("/c")),
       ("/a/b/..", Some("/a")),
       ("/a/..", None),
       ("/..", None),
       ("/a/../..", None),
-      // NUL.
       ("/a\0b", None),
-      // A top directory has no parent to watch it from.
       ("/", None),
       ("//", None),
       ("/.", None),
@@ -198,50 +194,40 @@ mod tests {
       (r"C:\a\\b\.\c", Some(r"C:\a\b\c")),
       (r"c:\a", Some(r"c:\a")),
       (r"C:\a b\..c", Some(r"C:\a b\..c")),
-      // A share.
       (r"\\server\share\a\b", Some(r"\\server\share\a\b")),
       ("//server/share/a", Some(r"\\server\share\a")),
       (r"\\server\share\\a\.\b\", Some(r"\\server\share\a\b")),
-      // A verbatim path becomes the plain form.
       (r"\\?\C:\a\b", Some(r"C:\a\b")),
       (r"\\?\C:\a\\b\", Some(r"C:\a\b")),
       (r"\\?\UNC\server\share\a", Some(r"\\server\share\a")),
       (r"\\?\unc\server\share\a", Some(r"\\server\share\a")),
-      // Names outside ASCII are bytes like the others.
       ("C:\\\u{e9}\\\u{4e2d}", Some("C:\\\u{e9}\\\u{4e2d}")),
-      // Not absolute.
       ("", None),
       (r"a\b", None),
       (r"\a\b", None),
       (r"C:a\b", None),
       ("C:", None),
       ("/a/b", None),
-      // `..`, NUL.
       (r"C:\a\..\b", Some(r"C:\b")),
       (r"C:\a\..", None),
       (r"\\server\share\a\..\b", Some(r"\\server\share\b")),
       (r"\\server\share\..", None),
       ("C:\\a\0b", None),
-      // A top directory.
       (r"C:\", None),
       (r"C:\.", None),
       (r"\\server\share", None),
       (r"\\server\share\", None),
       (r"\\?\C:\", None),
       (r"\\?\UNC\server\share\", None),
-      // A separator too many before the share, not before the server.
       (r"\\server\\share\f", Some(r"\\server\share\f")),
       ("//server//share/f", Some(r"\\server\share\f")),
       (r"\\\server\share\f", None),
       ("///server/share/f", None),
-      // No share, a device, a volume name, a `/` that a verbatim path would keep as a character.
       (r"\\server", None),
       (r"\\.\pipe\x", None),
       ("//?/C:/a", None),
       (r"\\?\Volume{1b3b1146-4076-11e1-84aa-806e6f6e6963}\a", None),
       (r"\\?\C:\a/b", None),
-      // A name that Windows does not take as it is: a dot or a space at its end, a stream, a
-      // wildcard, a control character. Also in the verbatim form, which is not kept.
       (r"C:\a\b.", None),
       (r"C:\a\b ", None),
       (r"C:\a.\b", None),
@@ -275,7 +261,6 @@ mod tests {
     assert!(clean_windows(&format!(r"\\{longest}\{longest}\a")).is_some());
     assert_eq!(clean_windows(&format!(r"\\{too_long}\share\a")), None);
     assert_eq!(clean_windows(&format!(r"\\server\{too_long}\a")), None);
-    // The length is in bytes on Windows too: `é` is two.
     let (longest, too_long) = ("\u{e9}".repeat(MAX_NAME / 2), "\u{e9}".repeat(MAX_NAME / 2 + 1));
     assert!(clean_windows(&format!(r"C:\a\{longest}")).is_some());
     assert_eq!(clean_windows(&format!(r"C:\a\{too_long}")), None);
@@ -303,8 +288,6 @@ mod tests {
     assert_eq!(normalize(Path::new(r"\\?\C:\a\.\b\")).as_deref(), Some(Path::new(r"C:\a\b")));
     assert_eq!(normalize(Path::new(r"C:\")), None);
 
-    // A name that is no UTF-16 is kept as it is, and the two halves of a character in two names
-    // stay apart.
     let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
     let given = [wide(r"C:\a\"), vec![0xD83D], wide(r"\x\..\"), vec![0xDE00], wide(r"\.\")];
     let expected = [wide(r"C:\a\"), vec![0xD83D], wide(r"\"), vec![0xDE00]];

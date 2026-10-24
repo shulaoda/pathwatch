@@ -89,11 +89,8 @@ impl Config {
       debounce: self.debounce,
       delete_delay: if polling { Duration::ZERO } else { self.delete_delay },
       poll_interval: if polling { self.poll_interval } else { FALLBACK_POLL_INTERVAL },
-      // macOS and Windows: a disk takes two spellings of a name for one.
       loose_spelling: cfg!(any(target_vendor = "apple", windows)),
-      // The poll lists a directory again by itself.
       two_step_links: cfg!(windows) && !polling,
-      // inotify and ReadDirectoryChangesW report every write; FSEvents and the poll do not.
       written_hints: cfg!(any(target_os = "linux", target_os = "android", windows)) && !polling,
     }
   }
