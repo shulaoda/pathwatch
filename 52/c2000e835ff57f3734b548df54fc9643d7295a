@@ -1,0 +1,21 @@
+src/engine/test_hooks.rs
+  s_0070b6318eca36::t_c217b5ca58bd06 157
+src/engine/watched_paths.rs
+  s_0070b6318eca36::t_b18cec828724f4 19-20,30-31,99,102-103,126,163-164,167,169-170,178,194-205,246,252,256,271,291,301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "52c2000e835ff57f3734b548df54fc9643d7295a",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
