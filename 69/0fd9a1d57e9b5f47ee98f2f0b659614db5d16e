@@ -1,0 +1,21 @@
+src/engine/check.rs
+  s_0070b6318eca36::t_33998d7eda25cb 495-497,505,507,509,526-529,543
+src/engine/os_watch.rs
+  s_0070b6318eca36::t_c8fed5be5777d3 100
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "690fd9a1d57e9b5f47ee98f2f0b659614db5d16e",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
