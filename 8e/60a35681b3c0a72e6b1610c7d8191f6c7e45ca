@@ -1,0 +1,23 @@
+src/fs/apple.rs
+  s_0070b6318eca36::t_3e42448cf8a1c6 50-83,87-93,96,136-145,213-219
+src/fs/mod.rs
+  s_0070b6318eca36::t_a5ee6e2e639815 91-111,234-247
+src/fs/windows.rs
+  s_0070b6318eca36::t_e8d7751e63599c 39,63,98,102-146,178,282,361-369,373-374,377,397,571-599,617-707
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8e60a35681b3c0a72e6b1610c7d8191f6c7e45ca",
+  "prompts": {},
+  "sessions": {
+    "s_0070b6318eca36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8400c26d-6bdc-4f98-9972-270548411b3a",
+        "model": "unknown"
+      },
+      "human_author": "shulaoda <165626830+shulaoda@users.noreply.github.com>"
+    }
+  }
+}
