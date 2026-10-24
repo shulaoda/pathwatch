@@ -68,7 +68,7 @@ impl<'a> Fields<'a> {
     since.map(|(seconds, nanos)| SystemTime::UNIX_EPOCH + Duration::new(seconds, nanos))
   }
 
-  fn reference(&mut self) -> Option<&'a [u8]> {
+  fn name(&mut self) -> Option<&'a [u8]> {
     let (from, offset, len) = (self.at, self.i32()?, self.u32()?);
     let start = from.checked_add_signed(isize::try_from(offset).ok()?)?;
     self.bytes.get(start..start.checked_add((len as usize).checked_sub(1)?)?)
@@ -117,8 +117,8 @@ pub(super) fn read_dir(dir: &Path, each: &mut dyn FnMut(&OsStr, Entry)) -> io::R
       let entry = Fields { bytes: rest, at: 0 }.u32().and_then(|len| rest.get(..len as usize));
       let entry = entry.ok_or_else(|| io::Error::other("getattrlistbulk gave no entry"))?;
       rest = &rest[entry.len()..];
-      if let Some((name, told)) = record(entry, volume) {
-        each(name, told);
+      if let Some((name, listed)) = record(entry, volume) {
+        each(name, listed);
       }
     }
   }
@@ -143,7 +143,7 @@ fn record(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   if !has(ATTR_CMN_NAME) {
     return None;
   }
-  let name = OsStr::from_bytes(fields.reference()?);
+  let name = OsStr::from_bytes(fields.name()?);
   let device = if has(ATTR_CMN_DEVID) { Some(fields.i32()?) } else { None };
   let kind = if has(ATTR_CMN_OBJTYPE) { Some(fields.u32()?) } else { None };
   let Some(kind) = kind.map(file_type) else { return Some((name, Entry::Name)) };
@@ -158,8 +158,9 @@ fn record(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
   }
   let (created, modified, flags, file_id) =
     (fields.time(), fields.time(), fields.u32()?, fields.u64()?);
-  let told = match (kind, created, modified) {
-    (FileType::Dir, Some(created), Some(modified)) if fields.u32()? == 0 => {
+  let is_mount_point = |fields: &mut Fields<'_>| fields.u32().map(|status| status != 0);
+  let listed = match (kind, created, modified) {
+    (FileType::Dir, Some(created), Some(modified)) if !is_mount_point(&mut fields)? => {
       let volume = i64::from(volume).cast_unsigned();
       Entry::Dir { id: DirId { volume, inode: file_id, birth: unsigned_nanos(created) }, modified }
     }
@@ -168,7 +169,7 @@ fn record(entry: &[u8], volume: i32) -> Option<(&OsStr, Entry)> {
     }
     _ => Entry::Kind(kind),
   };
-  Some((name, told))
+  Some((name, listed))
 }
 
 pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
@@ -190,10 +191,8 @@ pub(crate) fn name_and_kind(path: &Path) -> io::Result<(OsString, FileType)> {
     return Err(io::Error::last_os_error());
   }
   let mut fields = Fields { bytes: &answer, at: size_of::<u32>() };
-  let (name, kind) = fields
-    .reference()
-    .zip(fields.u32())
-    .ok_or_else(|| io::Error::other("getattrlist gave no name"))?;
+  let (name, kind) =
+    fields.name().zip(fields.u32()).ok_or_else(|| io::Error::other("getattrlist gave no name"))?;
   Ok((OsStr::from_bytes(name).to_owned(), file_type(kind)))
 }
 

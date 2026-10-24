@@ -117,8 +117,8 @@ impl Backend for InotifyBackend {
       Ok(wd) => {
         self.unwatch(key);
         self.wd_by_key.insert(key, wd);
-        let first = Keys { first: key, more: Vec::new() };
-        self.keys_by_wd.entry(wd).and_modify(|keys| keys.more.push(key)).or_insert(first);
+        let alone = Keys { first: key, more: Vec::new() };
+        self.keys_by_wd.entry(wd).and_modify(|keys| keys.more.push(key)).or_insert(alone);
         Coverage::Watched
       }
       Err(error) => {
@@ -222,25 +222,24 @@ impl InotifyBackend {
   }
 }
 
-fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Raw>) {
+fn forward(fds: &Fds, mut known: BTreeSet<Mount>, sink: &Sink<Raw>) {
   let mut buffer = vec![0; READ_BUFFER_LEN];
   let mut next_read = Instant::now();
   let error = loop {
     let asked = fds.asked.load(Ordering::Relaxed);
     let until = (asked != 0).then(|| asked.saturating_sub(unsigned_nanos(SystemTime::now())));
-    let ready = ffi::wait_until_ready(fds, until);
-    let mounted = match ready {
-      Ok([_, true, _, _]) => return,
-      Ok([_, _, mounted, asks]) => {
-        if asks {
-          let _ = (&fds.ask).read(&mut [0; 8]);
-        }
-        mounted
-      }
+    let ready = match ffi::wait_until_ready(fds, until) {
+      Ok(ready) if ready.stop => return,
+      Ok(ready) => ready,
       Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
       Err(error) => break error,
     };
-    if mounted && let Some(mounts) = fds.mounts.as_ref().and_then(read_mounts) {
+    if ready.ask {
+      let _ = (&fds.ask).read(&mut [0; 8]);
+    }
+    if ready.mounts
+      && let Some(mounts) = fds.mounts.as_ref().and_then(read_mounts)
+    {
       let points = mount_points(&known, &mounts);
       known = mounts;
       if !points.is_empty() {
@@ -274,7 +273,7 @@ fn forward(fds: &Fds, mut known: BTreeSet<(u64, Vec<u8>)>, sink: &Sink<Raw>) {
 }
 
 #[expect(clippy::verbose_file_reads, reason = "the open file is read again, not a path")]
-fn read_mounts(mut file: &File) -> Option<BTreeSet<(u64, Vec<u8>)>> {
+fn read_mounts(mut file: &File) -> Option<BTreeSet<Mount>> {
   let mut text = Vec::new();
   file.seek(SeekFrom::Start(0)).ok()?;
   file.read_to_end(&mut text).ok()?;
@@ -283,7 +282,8 @@ fn read_mounts(mut file: &File) -> Option<BTreeSet<(u64, Vec<u8>)>> {
     .filter_map(|line| {
       let mut fields = line.split(|&byte| byte == b' ');
       let id = str::from_utf8(fields.next()?).ok()?.parse().ok()?;
-      Some((id, unescape(fields.nth(3)?)))
+      let (_parent, _device, _root) = (fields.next()?, fields.next()?, fields.next()?);
+      Some(Mount { id, point: unescape(fields.next()?) })
     })
     .collect();
   Some(mounts)
@@ -304,10 +304,16 @@ fn unescape(mut field: &[u8]) -> Vec<u8> {
   }
 }
 
-fn mount_points(old: &BTreeSet<(u64, Vec<u8>)>, new: &BTreeSet<(u64, Vec<u8>)>) -> Vec<PathBuf> {
+fn mount_points(old: &BTreeSet<Mount>, new: &BTreeSet<Mount>) -> Vec<PathBuf> {
   let points: BTreeSet<&[u8]> =
-    old.symmetric_difference(new).map(|(_, point)| point.as_slice()).collect();
+    old.symmetric_difference(new).map(|mount| mount.point.as_slice()).collect();
   points.into_iter().map(|point| PathBuf::from(OsStr::from_bytes(point))).collect()
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Mount {
+  id: u64,
+  point: Vec<u8>,
 }
 
 struct Event<'a> {
@@ -364,7 +370,13 @@ mod ffi {
     unsafe { libc::inotify_rm_watch(inotify.as_raw_fd(), wd) };
   }
 
-  pub(super) fn wait_until_ready(fds: &super::Fds, nanos: Option<u64>) -> io::Result<[bool; 4]> {
+  pub(super) struct Ready {
+    pub stop: bool,
+    pub mounts: bool,
+    pub ask: bool,
+  }
+
+  pub(super) fn wait_until_ready(fds: &super::Fds, nanos: Option<u64>) -> io::Result<Ready> {
     let wait = |fd: i32, events: i16| libc::pollfd { fd, events, revents: 0 };
     let mounts = fds.mounts.as_ref().map_or(-1, AsRawFd::as_raw_fd);
     let mut polled = [
@@ -379,7 +391,8 @@ mod ffi {
     if unsafe { libc::poll(polled.as_mut_ptr(), 4, timeout) } < 0 {
       return Err(io::Error::last_os_error());
     }
-    Ok(polled.map(|file| file.revents != 0))
+    let [_, stop, mounts, ask] = polled.map(|file| file.revents != 0);
+    Ok(Ready { stop, mounts, ask })
   }
 
   fn owned(fd: libc::c_int) -> io::Result<File> {

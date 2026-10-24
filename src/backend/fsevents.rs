@@ -178,7 +178,7 @@ impl Backend for FsEventsBackend {
   }
 
   fn commit(&mut self) -> Committed {
-    let mut lost = self.moved_keys();
+    let mut lost = self.take_moved();
     self.stop_idle();
     self.last_parent = None;
     let mut committed = Committed::default();
@@ -187,17 +187,18 @@ impl Backend for FsEventsBackend {
     }
     let Started { fresh, unguarded, failed } = self.start_pending();
     if !unguarded.is_empty() || failed.is_some() {
-      let why = |dir: &Path| unguarded.holders(dir).next().map(|(why, _)| why.as_ref());
+      let why = |dir: &Path| unguarded.holders(dir).next().map(|(error, _)| error);
       let named = self.named.iter().map(|(&key, dir)| (key, why(dir)));
       let covered = self.covers.dir_of.iter().filter(|(_, dir)| !self.paths.holds(dir));
-      let covered = covered.map(|(&key, dir)| (key, why(dir).or(failed.as_ref().map(Some))));
+      let covered = covered.map(|(&key, dir)| (key, why(dir).or(failed.as_ref())));
       let taken: Vec<_> = named.chain(covered).filter_map(|(key, why)| Some((key, why?))).collect();
-      for (key, why) in taken {
+      for (key, error) in taken {
         self.named.remove(&key);
         self.covers.remove(key);
-        match why {
-          Some(error) => committed.failed.push((key, copy_error(error))),
-          None => lost.push(key),
+        if is_missing(error) {
+          lost.push(key);
+        } else {
+          committed.failed.push((key, copy_error(error)));
         }
       }
     }
@@ -210,12 +211,12 @@ impl Backend for FsEventsBackend {
   }
 
   fn translate(&mut self, raw: Raw, hint: &mut dyn FnMut(Hint<'_>)) {
-    for key in raw.lost.iter().copied().chain(self.moved_keys()) {
+    for key in raw.lost.iter().copied().chain(self.take_moved()) {
       hint(Hint::Changed { dir: key, rel: Path::new("") });
     }
     let covers = &self.covers.by_dir;
     let mut lost_places = Vec::new();
-    let mut moved_dirs = Vec::new();
+    let mut replaced_dirs = Vec::new();
     for (path, flags) in raw.records() {
       if flags & flag::RECORDS_LOST != 0 {
         let names_a_place = flags & flag::MUST_SCAN_SUB_DIRS != 0 && path != Path::new("/");
@@ -231,7 +232,7 @@ impl Backend for FsEventsBackend {
         continue;
       }
       if is_dir && flags & flag::DIR_REPLACED != 0 {
-        moved_dirs.push(path);
+        replaced_dirs.push(path);
       }
       for (keys, rel) in covers.holders(path) {
         for &key in keys {
@@ -240,7 +241,8 @@ impl Backend for FsEventsBackend {
       }
     }
     let holding = lost_places.iter().flat_map(|place| covers.holders(place)).map(|(keys, _)| keys);
-    let below = covers.below(&lost_places).chain(covers.below(&moved_dirs)).map(|(_, keys)| keys);
+    let below =
+      covers.below(&lost_places).chain(covers.below(&replaced_dirs)).map(|(_, keys)| keys);
     for &key in holding.chain(below).flatten() {
       hint(Hint::Changed { dir: key, rel: Path::new("") });
     }
@@ -293,10 +295,10 @@ impl FsEventsBackend {
     let real = match (dir.parent(), dir.file_name()) {
       (Some(parent), Some(name)) => {
         let last = match self.last_parent.take() {
-          Some(last) if last.0 == parent => last,
+          Some((last, real)) if last == parent => (last, real),
           _ => (parent.to_owned(), short_path(fs::canonicalize(parent)?)),
         };
-        let real_parent = &self.last_parent.insert(last).1;
+        let (_, real_parent) = self.last_parent.insert(last);
         match name_and_kind(dir)? {
           (on_disk, kind) if kind != FileType::Symlink && on_disk.eq_ignore_ascii_case(name) => {
             real_parent.join(on_disk)
@@ -333,16 +335,16 @@ impl FsEventsBackend {
     let (mut paths, keep) = if replace {
       let covered = self.covers.by_dir.keys().map(Path::to_owned).collect();
       let placed = place(covered, MAX_STREAM_PATHS - MAX_NEW_STREAMS);
-      let keep = self.keep(&placed);
+      let keep = self.streams_to_keep(&placed);
       (placed, keep)
     } else {
       (new, Vec::new())
     };
-    let placed = paths.len();
-    let kept = self.running.iter().zip(&keep).filter(|(_, keep)| **keep);
-    let kept: FxHashSet<&Path> =
-      kept.flat_map(|(running, _)| &running.paths).map(PathBuf::as_path).collect();
-    paths.retain(|path| !kept.contains(path.as_path()));
+    let needed = paths.len();
+    let kept_streams = self.running.iter().zip(&keep).filter(|(_, keep)| **keep);
+    let already_streamed: FxHashSet<&Path> =
+      kept_streams.flat_map(|(running, _)| &running.paths).map(PathBuf::as_path).collect();
+    paths.retain(|path| !already_streamed.contains(path.as_path()));
     let unguarded = self
       .guard
       .open(paths.iter().map(PathBuf::as_path), self.named.values().map(PathBuf::as_path));
@@ -350,30 +352,14 @@ impl FsEventsBackend {
     if paths.is_empty() {
       return Started { fresh: Vec::new(), unguarded, failed: None };
     }
-    let stream_count =
-      MAX_NEW_STREAMS.min(paths.len()).max(paths.len().div_ceil(MAX_PATHS_PER_STREAM));
-    let start = |first: usize| -> io::Result<Running> {
-      let every_nth = || paths.iter().skip(first).step_by(stream_count);
-      let stream = Stream::start(&self.queue, &self.sink, every_nth())?;
-      Ok(Running { _stream: stream, paths: every_nth().cloned().collect() })
-    };
-    let streams = match (0..stream_count).map(start).collect::<io::Result<Vec<Running>>>() {
+    let streams = match self.start_streams(&paths) {
       Ok(streams) => streams,
       Err(error) => return Started { fresh: Vec::new(), unguarded, failed: Some(error) },
     };
     let fresh = paths.iter().filter(|path| !self.paths.contains(path)).cloned().collect();
     if replace {
-      let mut keep = keep.into_iter();
-      let replaced: Vec<Running> =
-        self.running.extract_if(.., |_| keep.next() == Some(false)).collect();
-      if !replaced.is_empty() {
-        self.stop(replaced);
-      }
-      self.paths = Dirs::default();
-      for path in self.running.iter().flat_map(|running| &running.paths) {
-        self.paths.insert(path.clone(), ());
-      }
-      self.path_limit = if placed > MAX_STREAM_PATHS { 2 * placed } else { MAX_STREAM_PATHS };
+      self.stop_replaced(keep);
+      self.path_limit = if needed > MAX_STREAM_PATHS { 2 * needed } else { MAX_STREAM_PATHS };
     }
     self.running.extend(streams);
     for path in paths {
@@ -382,9 +368,32 @@ impl FsEventsBackend {
     Started { fresh, unguarded, failed: None }
   }
 
-  fn keep(&self, placed: &[PathBuf]) -> Vec<bool> {
+  fn start_streams(&self, paths: &[PathBuf]) -> io::Result<Vec<Running>> {
+    let count = MAX_NEW_STREAMS.min(paths.len()).max(paths.len().div_ceil(MAX_PATHS_PER_STREAM));
+    let start = |first: usize| -> io::Result<Running> {
+      let every_nth = || paths.iter().skip(first).step_by(count);
+      let stream = Stream::start(&self.queue, &self.sink, every_nth())?;
+      Ok(Running { _stream: stream, paths: every_nth().cloned().collect() })
+    };
+    (0..count).map(start).collect()
+  }
+
+  fn stop_replaced(&mut self, keep: Vec<bool>) {
+    let mut keep = keep.into_iter();
+    let replaced: Vec<Running> =
+      self.running.extract_if(.., |_| keep.next() == Some(false)).collect();
+    if !replaced.is_empty() {
+      self.stop(replaced);
+    }
+    self.paths = Dirs::default();
+    for path in self.running.iter().flat_map(|running| &running.paths) {
+      self.paths.insert(path.clone(), ());
+    }
+  }
+
+  fn streams_to_keep(&self, placed: &[PathBuf]) -> Vec<bool> {
     let mut placed: FxHashSet<&Path> = placed.iter().map(PathBuf::as_path).collect();
-    let mut kept = Vec::new();
+    let mut by_covers = Vec::new();
     for (index, running) in self.running.iter().enumerate().rev() {
       let stays = |path: &PathBuf| placed.contains(path.as_path()) && self.paths.contains(path);
       if running.paths.iter().all(stays) {
@@ -393,14 +402,14 @@ impl FsEventsBackend {
         }
         let covers_at =
           |path: &PathBuf| self.covers.by_dir.below(slice::from_ref(path)).count() + 1;
-        kept.push((running.paths.iter().map(covers_at).sum::<usize>(), index));
+        by_covers.push((running.paths.iter().map(covers_at).sum::<usize>(), index));
       }
     }
     let room = if self.running.len() >= MAX_STREAMS { MAX_STREAMS / 2 } else { MAX_STREAMS };
-    kept.sort_unstable_by(|a, b| b.cmp(a));
-    kept.truncate(room - MAX_NEW_STREAMS);
+    by_covers.sort_unstable_by(|a, b| b.cmp(a));
+    by_covers.truncate(room - MAX_NEW_STREAMS);
     let mut keep = vec![false; self.running.len()];
-    for (_, index) in kept {
+    for (_, index) in by_covers {
       keep[index] = true;
     }
     keep
@@ -409,21 +418,21 @@ impl FsEventsBackend {
   fn moved_since_asked(&mut self, started: &[PathBuf]) -> Vec<NodeKey> {
     let mut moved = Vec::new();
     for path in started {
-      let is_there = fs::canonicalize(path).is_ok_and(|real| real == *path);
-      if !is_there {
+      let is_still_real = fs::canonicalize(path).is_ok_and(|real| real == *path);
+      if !is_still_real {
         self.distrust(slice::from_ref(path));
         moved.extend(self.covers.keys_at_or_below(slice::from_ref(path)));
         continue;
       }
-      let mut spelled = path.as_path();
+      let mut checked = path.as_path();
       for (cover, keys) in self.covers.by_dir.below(slice::from_ref(path)) {
         let is_spelled = |dir: &Path| {
           name_and_kind(dir).is_ok_and(|(name, kind)| {
             kind != FileType::Symlink && Some(name.as_os_str()) == dir.file_name()
           })
         };
-        if cover.ancestors().take_while(|dir| !spelled.starts_with(dir)).all(is_spelled) {
-          spelled = cover;
+        if cover.ancestors().take_while(|dir| !checked.starts_with(dir)).all(is_spelled) {
+          checked = cover;
         } else {
           moved.extend(keys);
         }
@@ -469,7 +478,7 @@ impl FsEventsBackend {
 
 struct Started {
   fresh: Vec<PathBuf>,
-  unguarded: Dirs<Option<io::Error>>,
+  unguarded: Dirs<io::Error>,
   failed: Option<io::Error>,
 }
 
@@ -507,20 +516,21 @@ fn place(covers: Vec<PathBuf>, max: usize) -> Vec<PathBuf> {
   let mut deepest_first: Vec<usize> = joins.iter().copied().filter(|&depth| depth > 0).collect();
   deepest_first.sort_unstable_by(|a, b| b.cmp(a));
   let level = deepest_first.get(too_many - 1).copied().unwrap_or(1);
-  let mut left = paths.len() - deepest_first.iter().take_while(|&&depth| depth > level).count();
+  let mut remaining =
+    paths.len() - deepest_first.iter().take_while(|&&depth| depth > level).count();
   let mut placed = Vec::new();
-  let mut kept = usize::MAX;
-  let mut takes_level = None;
+  let mut common_depth = usize::MAX;
+  let mut merges_at_level = None;
   for (path, join) in paths.into_iter().zip(joins.into_iter().chain([0])) {
     if join < level {
-      takes_level = None;
+      merges_at_level = None;
     }
-    if join > level || join == level && *takes_level.get_or_insert(left > max) {
-      left -= usize::from(join == level);
-      kept = kept.min(join);
+    if join > level || join == level && *merges_at_level.get_or_insert(remaining > max) {
+      remaining -= usize::from(join == level);
+      common_depth = common_depth.min(join);
     } else {
-      placed.push(path.components().take(kept).collect());
-      kept = usize::MAX;
+      placed.push(path.components().take(common_depth).collect());
+      common_depth = usize::MAX;
     }
   }
   placed
@@ -533,8 +543,8 @@ fn top_most(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 impl FsEventsBackend {
-  fn moved_keys(&mut self) -> Vec<NodeKey> {
-    let moved = self.guard.take();
+  fn take_moved(&mut self) -> Vec<NodeKey> {
+    let moved = self.guard.take_fired();
     if moved.is_empty() {
       return Vec::new();
     }
@@ -567,7 +577,7 @@ impl Guard {
     &mut self,
     paths: impl Iterator<Item = &'a Path>,
     named: impl Iterator<Item = &'a Path>,
-  ) -> Dirs<Option<io::Error>> {
+  ) -> Dirs<io::Error> {
     let mut unguarded = Dirs::default();
     for dir in wanted(paths, named) {
       if self.dirs.contains_key(dir) || unguarded.holds(dir) {
@@ -577,7 +587,7 @@ impl Guard {
         Ok(guarded) => {
           self.dirs.insert(dir.to_owned(), guarded);
         }
-        Err(error) => unguarded.insert(dir.to_owned(), (!is_missing(&error)).then_some(error)),
+        Err(error) => unguarded.insert(dir.to_owned(), error),
       }
     }
     unguarded
@@ -596,15 +606,15 @@ impl Guard {
     Ok(Guarded { file, _ticket: ticket, id: self.last_id })
   }
 
-  fn take(&mut self) -> Vec<PathBuf> {
-    let told = self.notices.take();
-    if told.is_empty() {
+  fn take_fired(&mut self) -> Vec<PathBuf> {
+    let fired = self.notices.take();
+    if fired.is_empty() {
       return Vec::new();
     }
-    let volumes = told.contains(&ffi::VOLUMES);
+    let volumes = fired.contains(&ffi::VOLUMES);
     let id = |found: fs::Metadata| (found.dev(), found.ino());
     let has_moved = |(dir, guarded): &(&PathBuf, &Guarded)| {
-      told.contains(&guarded.id)
+      fired.contains(&guarded.id)
         || (volumes && guarded.file.metadata().ok().map(id) != fs::metadata(dir).ok().map(id))
     };
     let moved = top_most(self.dirs.iter().filter(has_moved).map(|(dir, _)| dir.clone()).collect());
@@ -816,15 +826,15 @@ mod ffi {
 
   #[derive(Debug)]
   pub(super) struct Notices {
-    queue: i32,
+    kqueue: i32,
     source: NonNull<c_void>,
-    told: Arc<Mutex<Vec<usize>>>,
+    fired: Arc<Mutex<Vec<usize>>>,
   }
 
   struct Reader {
-    queue: OwnedFd,
+    kqueue: OwnedFd,
     sink: Arc<Sink<Raw>>,
-    told: Arc<Mutex<Vec<usize>>>,
+    fired: Arc<Mutex<Vec<usize>>>,
   }
 
   impl Notices {
@@ -834,9 +844,9 @@ mod ffi {
       let ident = usize::try_from(fd).map_err(|_| io::Error::last_os_error())?;
       // SAFETY: `fd` was just opened, and nothing else owns it.
       let queue_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-      let told = Arc::default();
+      let fired = Arc::default();
       let reader =
-        Box::new(Reader { queue: queue_fd, sink: Arc::clone(sink), told: Arc::clone(&told) });
+        Box::new(Reader { kqueue: queue_fd, sink: Arc::clone(sink), fired: Arc::clone(&fired) });
       // SAFETY: the type is the one of libdispatch, and the descriptor and the queue are open.
       let source =
         unsafe { dispatch_source_create(&raw const SOURCE_TYPE_READ, ident, 0, queue.0.as_ptr()) };
@@ -849,13 +859,13 @@ mod ffi {
         dispatch_source_set_cancel_handler_f(source.as_ptr(), free);
         dispatch_resume(source.as_ptr());
       }
-      let notices = Self { queue: fd, source, told };
+      let notices = Self { kqueue: fd, source, fired };
       notices.add(0, EVFILT_FS, VQ_MOUNT | VQ_UNMOUNT, VOLUMES)?;
       Ok(notices)
     }
 
     pub(super) fn take(&self) -> Vec<usize> {
-      mem::take(&mut self.told.lock().unwrap_or_else(PoisonError::into_inner))
+      mem::take(&mut self.fired.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     pub(super) fn cancel(&self) {
@@ -873,7 +883,7 @@ mod ffi {
       let change = libc::kevent { ident, filter, flags: EV_ADD | EV_CLEAR, fflags, data: 0, udata };
       // SAFETY: `change` is one whole `kevent`; the call reads it, writes none, and does not wait.
       let done =
-        unsafe { libc::kevent(self.queue, &raw const change, 1, ptr::null_mut(), 0, ptr::null()) };
+        unsafe { libc::kevent(self.kqueue, &raw const change, 1, ptr::null_mut(), 0, ptr::null()) };
       if done < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
     }
   }
@@ -896,19 +906,19 @@ mod ffi {
     let mut events = [NO_EVENT; 64];
     let room = i32::try_from(events.len()).unwrap_or(0);
     let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    let queue = reader.queue.as_raw_fd();
+    let kqueue = reader.kqueue.as_raw_fd();
     // SAFETY: `events` holds `room` `kevent`, which the call may write; it does not wait.
     let count =
-      unsafe { libc::kevent(queue, ptr::null(), 0, events.as_mut_ptr(), room, &raw const now) };
+      unsafe { libc::kevent(kqueue, ptr::null(), 0, events.as_mut_ptr(), room, &raw const now) };
     let Ok(count) = usize::try_from(count) else { return };
     if count > 0 {
-      let mut told = reader.told.lock().unwrap_or_else(PoisonError::into_inner);
+      let mut fired = reader.fired.lock().unwrap_or_else(PoisonError::into_inner);
       for id in events[..count].iter().map(|event| event.udata.addr()) {
-        if !told.contains(&id) {
-          told.push(id);
+        if !fired.contains(&id) {
+          fired.push(id);
         }
       }
-      drop(told);
+      drop(fired);
       reader.sink.raw(Raw::default());
     }
   }
