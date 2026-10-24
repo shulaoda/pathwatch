@@ -508,15 +508,16 @@ pub fn name_on_disk(path: &Path) -> io::Result<OsString> {
 #[cfg(test)]
 mod tests {
   use std::{
-    fs,
+    env, fs,
     io::{self, Write},
     os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
+    time::{Duration, SystemTime},
   };
 
   use windows_sys::Win32::{
-    Foundation::{ERROR_BAD_NETPATH, ERROR_SHARING_VIOLATION, GENERIC_READ},
+    Foundation::{ERROR_BAD_NETPATH, ERROR_FILE_NOT_FOUND, ERROR_SHARING_VIOLATION, GENERIC_READ},
     Storage::FileSystem::{
       DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FileDispositionInfo,
       SetFileInformationByHandle,
@@ -621,11 +622,11 @@ mod tests {
   }
 
   /// Takes the right to list a directory away from the user of the test, and gives it back.
-  struct Unlisted(std::path::PathBuf);
+  struct Unlisted(PathBuf);
 
   impl Unlisted {
     fn new(dir: &Path) -> Self {
-      let user = std::env::var("USERNAME").unwrap();
+      let user = env::var("USERNAME").unwrap();
       let denied =
         Command::new("icacls").arg(dir).args(["/deny", &format!("{user}:(RD)")]).output();
       assert!(denied.is_ok_and(|output| output.status.success()), "icacls /deny failed");
@@ -635,7 +636,7 @@ mod tests {
 
   impl Drop for Unlisted {
     fn drop(&mut self) {
-      let user = std::env::var("USERNAME").unwrap();
+      let user = env::var("USERNAME").unwrap();
       let _ = Command::new("icacls").arg(&self.0).args(["/remove:d", &user]).output();
     }
   }
@@ -676,7 +677,8 @@ mod tests {
   fn what_the_errors_of_windows_mean() {
     let unreachable = told(io::Error::from_raw_os_error(ERROR_BAD_NETPATH.cast_signed()));
     assert_eq!(unreachable.kind(), io::ErrorKind::HostUnreachable, "{unreachable:?}");
-    assert_eq!(told(io::Error::from_raw_os_error(2)).kind(), io::ErrorKind::NotFound);
+    let missing = told(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND.cast_signed()));
+    assert_eq!(missing.kind(), io::ErrorKind::NotFound);
     let busy = told(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION.cast_signed()));
     assert_eq!(busy.kind(), io::ErrorKind::ResourceBusy, "{busy:?}");
 
@@ -794,10 +796,10 @@ mod tests {
     let file = top.path().join("file");
     fs::write(&file, "one").unwrap();
     let first = stat(&file, false).unwrap();
-    let now = std::time::SystemTime::now();
+    let now = SystemTime::now();
     let age = now.duration_since(first.modified).unwrap_or_default();
-    assert!(age < std::time::Duration::from_secs(5), "{age:?}");
-    assert!(first.modified <= now + std::time::Duration::from_secs(5));
+    assert!(age < Duration::from_secs(5), "{age:?}");
+    assert!(first.modified <= now + Duration::from_secs(5));
 
     fs::remove_file(&file).unwrap();
     fs::write(&file, "one").unwrap();

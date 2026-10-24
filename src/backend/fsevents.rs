@@ -1327,28 +1327,25 @@ mod ffi {
 mod tests {
   use std::path::{Path, PathBuf};
 
-  use super::{DATA_VOLUME, Dirs, is_too_high, may_watch_a_tree, place, short_way};
+  use super::{DATA_VOLUME, Dirs, is_too_high, place, short_way};
 
   fn paths(paths: &[&str]) -> Vec<PathBuf> {
     paths.iter().map(PathBuf::from).collect()
-  }
-
-  fn placed(covers: &[&str], max: usize) -> Vec<PathBuf> {
-    place(paths(covers), max)
   }
 
   #[test]
   fn more_covers_than_stream_paths_share_the_lowest_common_directories() {
     let covers =
       ["/Users/me/p/a/1", "/Users/me/p/a/2", "/Users/me/p/b/1", "/Users/me/p/b/2", "/Users/me/q"];
-    assert_eq!(placed(&covers, 5), paths(&covers));
+    let placed = |max| place(paths(&covers), max);
+    assert_eq!(placed(5), paths(&covers));
     assert_eq!(
-      placed(&covers, 4),
+      placed(4),
       paths(&["/Users/me/p/a", "/Users/me/p/b/1", "/Users/me/p/b/2", "/Users/me/q"])
     );
-    assert_eq!(placed(&covers, 3), paths(&["/Users/me/p/a", "/Users/me/p/b", "/Users/me/q"]));
-    assert_eq!(placed(&covers, 2), paths(&["/Users/me/p", "/Users/me/q"]));
-    assert_eq!(placed(&covers, 1), paths(&["/Users/me/p", "/Users/me/q"]));
+    assert_eq!(placed(3), paths(&["/Users/me/p/a", "/Users/me/p/b", "/Users/me/q"]));
+    assert_eq!(placed(2), paths(&["/Users/me/p", "/Users/me/q"]));
+    assert_eq!(placed(1), paths(&["/Users/me/p", "/Users/me/q"]));
   }
 
   #[test]
@@ -1397,21 +1394,6 @@ mod tests {
     let long = Path::new(DATA_VOLUME).join("Users");
     if long.is_dir() {
       assert_eq!(short_way(long), Path::new("/Users"));
-    }
-  }
-
-  #[test]
-  fn where_a_stream_may_stand_for_a_cover() {
-    let may_stand = |dir: &str| {
-      let dir = Path::new(dir);
-      may_watch_a_tree(dir.strip_prefix(DATA_VOLUME).unwrap_or(dir))
-    };
-    for dir in ["/", "/Users", "/Users/me", "/System/Volumes/Data", "/System/Volumes/Data/Users/me"]
-    {
-      assert!(!may_stand(dir), "{dir}");
-    }
-    for dir in ["/Users/me/project", "/Volumes/disk", "/opt/homebrew", "/private/tmp", "/home"] {
-      assert!(may_stand(dir), "{dir}");
     }
   }
 

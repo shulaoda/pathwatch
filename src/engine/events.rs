@@ -168,9 +168,9 @@ mod tests {
       (true, file, true, true, Some(Update), "the baseline hides no change of a known file"),
       (true, Kind::Missing, false, true, Some(Delete), "and no `Delete` of one"),
     ];
+    let mut tree = Tree::new();
+    let key = tree.insert_child(Tree::ROOT, OsStr::new("/"));
     for (told, kind, changed, baseline, expected, what) in table {
-      let mut tree = Tree::new();
-      let key = tree.insert_child(Tree::ROOT, OsStr::new("/"));
       let node = &mut tree[key];
       node.kind = kind;
       node.set_told(told);

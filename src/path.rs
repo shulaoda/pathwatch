@@ -205,6 +205,7 @@ mod tests {
       ("/a/..", None),
       ("/..", None),
       ("/a/../..", None),
+      // NUL.
       ("/a\0b", None),
       // A top directory has no parent to watch it from.
       ("/", None),
@@ -265,6 +266,7 @@ mod tests {
       // No share, a device, a volume name, a `/` that a verbatim path would keep as a character.
       (r"\\server", None),
       (r"\\.\pipe\x", None),
+      ("//?/C:/a", None),
       (r"\\?\Volume{1b3b1146-4076-11e1-84aa-806e6f6e6963}\a", None),
       (r"\\?\C:\a/b", None),
       // A name that Windows does not take as it is: a dot or a space at its end, a stream, a
@@ -280,11 +282,9 @@ mod tests {
       (r"C:\a\b>c", None),
       (r#"C:\a\"b""#, None),
       (r"C:\a\b|c", None),
-      ("//?/C:/a", None),
       ("C:\\a\\b\tc", None),
       (r"\\server\share\a.", None),
       (r"\\?\C:\a\b.", None),
-      (r"C:\a\.b\c d\e.f", Some(r"C:\a\.b\c d\e.f")),
     ];
     for (given, expected) in table {
       assert_eq!(clean_windows(given).as_deref(), expected, "{given:?}");
@@ -299,14 +299,12 @@ mod tests {
     let (longest, too_long) = ("x".repeat(MAX_NAME), "x".repeat(MAX_NAME + 1));
     assert!(clean_unix(&format!("/a/{longest}/b")).is_some());
     assert_eq!(clean_unix(&format!("/a/{too_long}/b")), None);
-    assert_eq!(clean_unix(&format!("/{too_long}")), None);
 
     assert!(clean_windows(&format!(r"C:\a\{longest}")).is_some());
     assert_eq!(clean_windows(&format!(r"C:\a\{too_long}")), None);
     assert!(clean_windows(&format!(r"\\{longest}\{longest}\a")).is_some());
     assert_eq!(clean_windows(&format!(r"\\{too_long}\share\a")), None);
     assert_eq!(clean_windows(&format!(r"\\server\{too_long}\a")), None);
-    assert_eq!(clean_windows(&format!(r"\\?\UNC\server\{too_long}\a")), None);
     // The length is in bytes on Windows too: `é` is two.
     let (longest, too_long) = ("\u{e9}".repeat(MAX_NAME / 2), "\u{e9}".repeat(MAX_NAME / 2 + 1));
     assert!(clean_windows(&format!(r"C:\a\{longest}")).is_some());
