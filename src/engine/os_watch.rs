@@ -210,6 +210,19 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       }
     }
   }
+
+  /// What the backend answers for the directory. A backend that is gone watches nothing.
+  fn watch_dir(&mut self, key: DirKey, path: &Path, want: Want) -> Coverage {
+    let backend = self.backend.as_mut();
+    backend.map_or(Coverage::NotWatched, |backend| backend.watch(key, path, want))
+  }
+
+  pub(super) fn unwatch_dir(&mut self, key: DirKey) {
+    if let Some(backend) = &mut self.backend {
+      backend.unwatch(key);
+      self.gave_back = true;
+    }
+  }
 }
 
 /// Where no OS watch tells: the poll, a directory that may have moved, a dead backend.
@@ -259,19 +272,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       {
         self.tree.mark(moved, Mark::default());
       }
-    }
-  }
-
-  /// What the backend answers for the directory. A backend that is gone watches nothing.
-  fn watch_dir(&mut self, key: DirKey, path: &Path, want: Want) -> Coverage {
-    let backend = self.backend.as_mut();
-    backend.map_or(Coverage::NotWatched, |backend| backend.watch(key, path, want))
-  }
-
-  pub(super) fn unwatch_dir(&mut self, key: DirKey) {
-    if let Some(backend) = &mut self.backend {
-      backend.unwatch(key);
-      self.gave_back = true;
     }
   }
 
