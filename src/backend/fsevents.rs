@@ -82,6 +82,10 @@ pub struct Raw {
 }
 
 impl Raw {
+  fn lost(keys: Vec<NodeKey>) -> Self {
+    Self { lost: keys, ..Self::default() }
+  }
+
   pub fn push(&mut self, path: &[u8], flags: u32) {
     self.paths.extend_from_slice(path);
     self.records.push((self.paths.len(), flags));
@@ -133,7 +137,7 @@ impl Backend for FsEventsBackend {
       && *old != real
     {
       if self.paths.holds(old) {
-        self.sink.raw(Raw { lost: vec![key], ..Raw::default() });
+        self.sink.raw(Raw::lost(vec![key]));
       }
       self.unwatch(key);
     }
@@ -169,7 +173,7 @@ impl Backend for FsEventsBackend {
       && self.pending.contains(&dir)
     {
       self.pending.remove(&dir);
-      for (below, _) in self.covers.by_dir.below(&[&dir]) {
+      for (below, _) in self.covers.by_dir.below_one(&dir) {
         if !self.paths.holds(below) {
           self.pending.insert(below.to_owned(), ());
         }
@@ -186,25 +190,18 @@ impl Backend for FsEventsBackend {
       return committed;
     }
     let Started { fresh, unguarded, failed } = self.start_pending();
-    if !unguarded.is_empty() || failed.is_some() {
-      let why = |dir: &Path| unguarded.holders(dir).next().map(|(error, _)| error);
-      let named = self.named.iter().map(|(&key, dir)| (key, why(dir)));
-      let covered = self.covers.dir_of.iter().filter(|(_, dir)| !self.paths.holds(dir));
-      let covered = covered.map(|(&key, dir)| (key, why(dir).or(failed.as_ref())));
-      let taken: Vec<_> = named.chain(covered).filter_map(|(key, why)| Some((key, why?))).collect();
-      for (key, error) in taken {
-        self.named.remove(&key);
-        self.covers.remove(key);
-        if is_missing(error) {
-          lost.push(key);
-        } else {
-          committed.failed.push((key, copy_error(error)));
-        }
+    for (key, error) in self.keys_not_live(&unguarded, failed.as_ref()) {
+      self.named.remove(&key);
+      self.covers.remove(key);
+      if is_missing(error) {
+        lost.push(key);
+      } else {
+        committed.failed.push((key, copy_error(error)));
       }
     }
     lost.extend(self.moved_since_asked(&fresh));
     if !lost.is_empty() {
-      self.sink.raw(Raw { lost, ..Raw::default() });
+      self.sink.raw(Raw::lost(lost));
     }
     self.fit_guard();
     committed
@@ -263,33 +260,6 @@ impl Drop for FsEventsBackend {
   }
 }
 
-#[cfg(feature = "test-hooks")]
-impl FsEventsBackend {
-  pub fn stream_count(&self) -> usize {
-    self.running.len()
-  }
-
-  pub fn covers(&self) -> Vec<&Path> {
-    self.covers.by_dir.paths()
-  }
-
-  pub fn cover_of_key(&self) -> &FxHashMap<NodeKey, PathBuf> {
-    &self.covers.dir_of
-  }
-
-  pub fn guarded(&self) -> Vec<&Path> {
-    self.guard.dirs.keys().map(PathBuf::as_path).collect()
-  }
-
-  pub fn streamed(&self) -> Vec<&Path> {
-    self.paths.paths()
-  }
-
-  pub fn pending(&self) -> Vec<&Path> {
-    self.pending.paths()
-  }
-}
-
 impl FsEventsBackend {
   fn real_path(&mut self, dir: &Path) -> io::Result<PathBuf> {
     let real = match (dir.parent(), dir.file_name()) {
@@ -314,18 +284,34 @@ impl FsEventsBackend {
     }
     Ok(real)
   }
-}
 
-fn short_path(real: PathBuf) -> PathBuf {
-  let Ok(below) = real.strip_prefix(DATA_VOLUME) else { return real };
-  let short = Path::new("/").join(below);
-  let id = |path: &Path| fs::metadata(path).map(|found| (found.dev(), found.ino())).ok();
-  let is_same = fs::canonicalize(&short).is_ok_and(|own| own == short)
-    && id(&short).is_some_and(|short| Some(short) == id(&real));
-  if is_same { short } else { real }
-}
+  fn take_moved(&mut self) -> Vec<NodeKey> {
+    let moved = self.guard.take_fired();
+    if moved.is_empty() {
+      return Vec::new();
+    }
+    self.guard_is_stale = true;
+    self.distrust(&moved);
+    let is_below = |dir: &Path| moved.iter().any(|moved| dir.starts_with(moved));
+    let named = self.named.iter().filter(|(_, dir)| is_below(dir)).map(|(&key, _)| key);
+    named.chain(self.covers.keys_at_or_below(&moved)).collect()
+  }
 
-impl FsEventsBackend {
+  fn stop_idle(&mut self) {
+    let needed =
+      |path: &PathBuf| self.paths.contains(path) && self.covers.keys_under(path).next().is_some();
+    let idle: Vec<Running> =
+      self.running.extract_if(.., |running| !running.paths.iter().any(needed)).collect();
+    if idle.is_empty() {
+      return;
+    }
+    for path in idle.iter().flat_map(|running| &running.paths) {
+      self.paths.remove(path);
+    }
+    self.guard_is_stale = true;
+    self.queue.run(move || drop(idle));
+  }
+
   fn start_pending(&mut self) -> Started {
     let new = top_most(self.pending.drain().collect());
     let replace = !new.is_empty()
@@ -400,8 +386,7 @@ impl FsEventsBackend {
         for path in &running.paths {
           placed.remove(path.as_path());
         }
-        let covers_at =
-          |path: &PathBuf| self.covers.by_dir.below(slice::from_ref(path)).count() + 1;
+        let covers_at = |path: &PathBuf| self.covers.by_dir.below_one(path).count() + 1;
         by_covers.push((running.paths.iter().map(covers_at).sum::<usize>(), index));
       }
     }
@@ -415,22 +400,32 @@ impl FsEventsBackend {
     keep
   }
 
+  fn keys_not_live<'e>(
+    &self,
+    unguarded: &'e Dirs<io::Error>,
+    failed: Option<&'e io::Error>,
+  ) -> Vec<(NodeKey, &'e io::Error)> {
+    if unguarded.is_empty() && failed.is_none() {
+      return Vec::new();
+    }
+    let why = |dir: &Path| unguarded.holders(dir).next().map(|(error, _)| error);
+    let named = self.named.iter().map(|(&key, dir)| (key, why(dir)));
+    let covered = self.covers.dir_of.iter().filter(|(_, dir)| !self.paths.holds(dir));
+    let covered = covered.map(|(&key, dir)| (key, why(dir).or(failed)));
+    named.chain(covered).filter_map(|(key, why)| Some((key, why?))).collect()
+  }
+
   fn moved_since_asked(&mut self, started: &[PathBuf]) -> Vec<NodeKey> {
     let mut moved = Vec::new();
     for path in started {
       let is_still_real = fs::canonicalize(path).is_ok_and(|real| real == *path);
       if !is_still_real {
         self.distrust(slice::from_ref(path));
-        moved.extend(self.covers.keys_at_or_below(slice::from_ref(path)));
+        moved.extend(self.covers.keys_under(path));
         continue;
       }
       let mut checked = path.as_path();
-      for (cover, keys) in self.covers.by_dir.below(slice::from_ref(path)) {
-        let is_spelled = |dir: &Path| {
-          name_and_kind(dir).is_ok_and(|(name, kind)| {
-            kind != FileType::Symlink && Some(name.as_os_str()) == dir.file_name()
-          })
-        };
+      for (cover, keys) in self.covers.by_dir.below_one(path) {
         if cover.ancestors().take_while(|dir| !checked.starts_with(dir)).all(is_spelled) {
           checked = cover;
         } else {
@@ -441,28 +436,18 @@ impl FsEventsBackend {
     moved
   }
 
+  fn fit_guard(&mut self) {
+    let wanted = wanted(self.paths.keys(), self.named.values().map(PathBuf::as_path));
+    self.guard.dirs.retain(|dir, _| wanted.binary_search(&dir.as_path()).is_ok());
+    give_room_back(&mut self.guard.dirs);
+    self.guard_is_stale = false;
+  }
+
   fn distrust(&mut self, dirs: &[PathBuf]) {
     let below: Vec<PathBuf> = self.paths.below(dirs).map(|(path, ())| path.to_owned()).collect();
     for path in dirs.iter().chain(&below) {
       self.paths.remove(path);
     }
-  }
-
-  fn stop_idle(&mut self) {
-    let needed = |path: &PathBuf| {
-      self.paths.contains(path)
-        && self.covers.keys_at_or_below(slice::from_ref(path)).next().is_some()
-    };
-    let idle: Vec<Running> =
-      self.running.extract_if(.., |running| !running.paths.iter().any(needed)).collect();
-    if idle.is_empty() {
-      return;
-    }
-    for path in idle.iter().flat_map(|running| &running.paths) {
-      self.paths.remove(path);
-    }
-    self.guard_is_stale = true;
-    self.queue.run(move || drop(idle));
   }
 
   fn stop(&self, stopped: Vec<Running>) {
@@ -471,9 +456,24 @@ impl FsEventsBackend {
     let sink = Arc::clone(&self.sink);
     self.queue.run(move || {
       drop(stopped);
-      sink.raw(Raw { lost, ..Raw::default() });
+      sink.raw(Raw::lost(lost));
     });
   }
+}
+
+fn short_path(real: PathBuf) -> PathBuf {
+  let Ok(below) = real.strip_prefix(DATA_VOLUME) else { return real };
+  let short = Path::new("/").join(below);
+  let id = |path: &Path| fs::metadata(path).map(|found| (found.dev(), found.ino())).ok();
+  let is_same = fs::canonicalize(&short).is_ok_and(|own| own == short)
+    && id(&short).is_some_and(|short| Some(short) == id(&real));
+  if is_same { short } else { real }
+}
+
+fn is_spelled(dir: &Path) -> bool {
+  name_and_kind(dir).is_ok_and(|(name, kind)| {
+    kind != FileType::Symlink && Some(name.as_os_str()) == dir.file_name()
+  })
 }
 
 struct Started {
@@ -542,29 +542,6 @@ fn top_most(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
   paths
 }
 
-impl FsEventsBackend {
-  fn take_moved(&mut self) -> Vec<NodeKey> {
-    let moved = self.guard.take_fired();
-    if moved.is_empty() {
-      return Vec::new();
-    }
-    self.guard_is_stale = true;
-    self.distrust(&moved);
-    let is_below = |dir: &Path| moved.iter().any(|moved| dir.starts_with(moved));
-    let named = self.named.iter().filter(|(_, dir)| is_below(dir)).map(|(&key, _)| key);
-    named.chain(self.covers.keys_at_or_below(&moved)).collect()
-  }
-
-  fn fit_guard(&mut self) {
-    let wanted = wanted(self.paths.keys(), self.named.values().map(PathBuf::as_path));
-    self.guard.dirs.retain(|dir, _| wanted.binary_search(&dir.as_path()).is_ok());
-    give_room_back(&mut self.guard.dirs);
-    self.guard_is_stale = false;
-  }
-}
-
-static GUARD_FILES: AtomicUsize = AtomicUsize::new(0);
-
 #[derive(Debug)]
 struct Guard {
   notices: Notices,
@@ -630,6 +607,18 @@ struct Guarded {
   id: usize,
 }
 
+fn wanted<'a>(
+  paths: impl Iterator<Item = &'a Path>,
+  named: impl Iterator<Item = &'a Path>,
+) -> Vec<&'a Path> {
+  let mut wanted: Vec<&Path> = paths.flat_map(Path::ancestors).chain(named).collect();
+  wanted.sort_unstable();
+  wanted.dedup();
+  wanted
+}
+
+static GUARD_FILES: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Debug)]
 struct Ticket;
 
@@ -647,16 +636,6 @@ impl Drop for Ticket {
   fn drop(&mut self) {
     GUARD_FILES.fetch_sub(1, Ordering::Relaxed);
   }
-}
-
-fn wanted<'a>(
-  paths: impl Iterator<Item = &'a Path>,
-  named: impl Iterator<Item = &'a Path>,
-) -> Vec<&'a Path> {
-  let mut wanted: Vec<&Path> = paths.flat_map(Path::ancestors).chain(named).collect();
-  wanted.sort_unstable();
-  wanted.dedup();
-  wanted
 }
 
 #[derive(Debug, Default)]
@@ -689,12 +668,13 @@ impl Covers {
     Some(dir)
   }
 
-  fn keys_at_or_below<'a>(
-    &'a self,
-    dirs: &'a [impl AsRef<Path>],
-  ) -> impl Iterator<Item = NodeKey> + 'a {
-    let at = dirs.iter().filter_map(|dir| self.by_dir.get(dir.as_ref()));
-    at.chain(self.by_dir.below(dirs).map(|(_, keys)| keys)).flatten().copied()
+  fn keys_under<'a>(&'a self, dir: &'a Path) -> impl Iterator<Item = NodeKey> + 'a {
+    let at = self.by_dir.get(dir).into_iter();
+    at.chain(self.by_dir.below_one(dir).map(|(_, keys)| keys)).flatten().copied()
+  }
+
+  fn keys_at_or_below<'a>(&'a self, dirs: &'a [PathBuf]) -> impl Iterator<Item = NodeKey> + 'a {
+    dirs.iter().flat_map(move |dir| self.keys_under(dir))
   }
 }
 
@@ -778,20 +758,49 @@ impl<T> Dirs<T> {
       })
   }
 
+  fn below_one<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = (&'a Path, &'a T)> + 'a {
+    let mut prefix = path.components().as_path().as_os_str().to_owned();
+    if !prefix.as_bytes().ends_with(b"/") {
+      prefix.push("/");
+    }
+    let after = (Bound::Excluded(prefix.as_os_str()), Bound::Unbounded);
+    let dirs = self.by_path.range::<OsStr, _>(after);
+    let dirs = dirs.take_while(move |(dir, _)| dir.as_bytes().starts_with(prefix.as_bytes()));
+    dirs.map(|(dir, value)| (Path::new(dir), value))
+  }
+
   fn below<'a>(
     &'a self,
     paths: &'a [impl AsRef<Path>],
   ) -> impl Iterator<Item = (&'a Path, &'a T)> + 'a {
-    paths.iter().flat_map(move |path| {
-      let mut prefix = path.as_ref().components().as_path().as_os_str().to_owned();
-      if !prefix.as_bytes().ends_with(b"/") {
-        prefix.push("/");
-      }
-      let after = (Bound::Excluded(prefix.as_os_str()), Bound::Unbounded);
-      let dirs = self.by_path.range::<OsStr, _>(after);
-      let dirs = dirs.take_while(move |(dir, _)| dir.as_bytes().starts_with(prefix.as_bytes()));
-      dirs.map(|(dir, value)| (Path::new(dir), value))
-    })
+    paths.iter().flat_map(move |path| self.below_one(path.as_ref()))
+  }
+}
+
+#[cfg(feature = "test-hooks")]
+impl FsEventsBackend {
+  pub fn stream_count(&self) -> usize {
+    self.running.len()
+  }
+
+  pub fn covers(&self) -> Vec<&Path> {
+    self.covers.by_dir.paths()
+  }
+
+  pub fn cover_of_key(&self) -> &FxHashMap<NodeKey, PathBuf> {
+    &self.covers.dir_of
+  }
+
+  pub fn guarded(&self) -> Vec<&Path> {
+    self.guard.dirs.keys().map(PathBuf::as_path).collect()
+  }
+
+  pub fn streamed(&self) -> Vec<&Path> {
+    self.paths.paths()
+  }
+
+  pub fn pending(&self) -> Vec<&Path> {
+    self.pending.paths()
   }
 }
 
@@ -818,6 +827,37 @@ mod ffi {
   use crate::backend::{Sink, watch_limit};
 
   pub(super) const VOLUMES: usize = 0;
+
+  const CREATE_NO_DEFER: u32 = 0x2;
+  const CREATE_FILE_EVENTS: u32 = 0x10;
+  const SINCE_NOW: u64 = u64::MAX;
+  const ENCODING_UTF8: u32 = 0x0800_0100;
+  const VQ_MOUNT: u32 = 0x8;
+  const VQ_UNMOUNT: u32 = 0x10;
+  const NO_EVENT: libc::kevent =
+    libc::kevent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: ptr::null_mut() };
+
+  type CFTypeRef = *const c_void;
+  type FSEventStreamRef = *mut c_void;
+  type DispatchQueue = *mut c_void;
+
+  type FSEventStreamCallback = extern "C" fn(
+    stream: FSEventStreamRef,
+    info: *mut c_void,
+    count: usize,
+    paths: *mut c_void,
+    flags: *const u32,
+    ids: *const u64,
+  );
+
+  #[repr(C)]
+  struct FSEventStreamContext {
+    version: isize,
+    info: *mut c_void,
+    retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    release: Option<extern "C" fn(*const c_void)>,
+    copy_description: Option<extern "C" fn(*const c_void) -> CFTypeRef>,
+  }
 
   pub(super) fn open_file_limit() -> usize {
     // SAFETY: the call takes no memory of ours.
@@ -1101,37 +1141,6 @@ mod ffi {
       )
     };
     NonNull::new(array.cast_mut()).map(Cf)
-  }
-
-  const CREATE_NO_DEFER: u32 = 0x2;
-  const CREATE_FILE_EVENTS: u32 = 0x10;
-  const SINCE_NOW: u64 = u64::MAX;
-  const ENCODING_UTF8: u32 = 0x0800_0100;
-  const VQ_MOUNT: u32 = 0x8;
-  const VQ_UNMOUNT: u32 = 0x10;
-  const NO_EVENT: libc::kevent =
-    libc::kevent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: ptr::null_mut() };
-
-  type CFTypeRef = *const c_void;
-  type FSEventStreamRef = *mut c_void;
-  type DispatchQueue = *mut c_void;
-
-  type FSEventStreamCallback = extern "C" fn(
-    stream: FSEventStreamRef,
-    info: *mut c_void,
-    count: usize,
-    paths: *mut c_void,
-    flags: *const u32,
-    ids: *const u64,
-  );
-
-  #[repr(C)]
-  struct FSEventStreamContext {
-    version: isize,
-    info: *mut c_void,
-    retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
-    release: Option<extern "C" fn(*const c_void)>,
-    copy_description: Option<extern "C" fn(*const c_void) -> CFTypeRef>,
   }
 
   #[link(name = "CoreServices", kind = "framework")]
