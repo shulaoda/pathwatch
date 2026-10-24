@@ -1096,7 +1096,7 @@ a tick of the clock, which comes every 15.6 ms unless a program asked for more (
 31 ms, and one of 1 ms 15.6 ms, measured), and that was the whole of the 11 ms between the quiet
 time and the reported edit. The thread waits on an event that every sender sets after its message
 and on a waitable timer of high resolution, which comes within half a millisecond
-(`watcher::inbox`); on the other systems the wait of the channel keeps the time.
+(`watcher::windows`); on the other systems the wait of the channel keeps the time.
 
 **The debounce.** The disk is checked when no hint came for the quiet time: every hint that
 leaves work moves the flush to one quiet time after it. So a save in several steps is one

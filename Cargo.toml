@@ -62,9 +62,10 @@ all = { level = "deny", priority = -1 }
 # Same guidelines as rolldown: the pedantic group is on, restriction rules are opt-in, and a
 # rule is only turned off when it is a false positive or pure noise.
 pedantic = { level = "deny", priority = -1 }
-# `#[must_use]` everywhere is noise, a test helper needs no `# Panics` section, and the docs
-# name FSEvents and ReadDirectoryChangesW without backticks.
+# `#[must_use]` and an `# Errors` section everywhere are noise, a test helper needs no `# Panics`
+# section, and the docs name FSEvents and ReadDirectoryChangesW without backticks.
 must_use_candidate = "allow"
+missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 doc_markdown = "allow"
 

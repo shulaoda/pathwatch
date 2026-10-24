@@ -63,10 +63,6 @@ pub struct Watcher {
 
 impl Watcher {
   /// Starts a watcher with the default [`Config`].
-  ///
-  /// # Errors
-  ///
-  /// As for [`with_config`](Self::with_config).
   pub fn new<H>(handler: H) -> Result<Self, Error>
   where
     H: FnMut(Result<Vec<Event>, Error>) + Send + 'static,
@@ -150,7 +146,7 @@ impl Watcher {
     // While the process exits, Windows has already ended the other threads: sending could block
     // on a lock they held, and `join` would panic.
     #[cfg(windows)]
-    if process_is_exiting() {
+    if windows::process_is_exiting() {
       return;
     }
     // Wakes the thread up.
@@ -167,10 +163,6 @@ impl Watcher {
   }
 
   /// [`with_config`](Self::with_config) with a given backend, for the tests.
-  ///
-  /// # Errors
-  ///
-  /// The watcher thread, or the queue into it, could not be made.
   #[doc(hidden)]
   #[cfg(feature = "test-hooks")]
   pub fn with_backend<B, H>(
@@ -291,17 +283,6 @@ impl fmt::Debug for Watcher {
   }
 }
 
-/// Whether the process is exiting.
-#[cfg(windows)]
-fn process_is_exiting() -> bool {
-  #[link(name = "ntdll")]
-  unsafe extern "system" {
-    safe fn RtlDllShutdownInProgress() -> u8;
-  }
-
-  RtlDllShutdownInProgress() != 0
-}
-
 enum Message<R> {
   /// A signal of the backend, and its size in the queue.
   Signal(Signal<R>, usize),
@@ -324,7 +305,7 @@ type Done = Option<SyncSender<()>>;
 struct Post<R> {
   sender: Sender<Message<R>>,
   #[cfg(windows)]
-  wake: Arc<inbox::Wake>,
+  wake: Arc<windows::Wake>,
 }
 
 impl<R> Post<R> {
@@ -351,45 +332,20 @@ impl<R> Clone for Post<R> {
 struct Inbox<R> {
   receiver: Receiver<Message<R>>,
   #[cfg(windows)]
-  wake: Arc<inbox::Wake>,
+  wake: Arc<windows::Wake>,
   #[cfg(windows)]
-  timer: inbox::Timer,
+  timer: windows::Timer,
 }
 
+#[cfg(not(windows))]
 impl<R> Inbox<R> {
-  #[cfg_attr(
-    not(windows),
-    expect(clippy::unnecessary_wraps, reason = "the event and the timer of Windows can fail")
-  )]
+  #[expect(clippy::unnecessary_wraps, reason = "the event and the timer of Windows can fail")]
   fn new() -> io::Result<(Post<R>, Self)> {
     let (sender, receiver) = mpsc::channel();
-    #[cfg(windows)]
-    {
-      let wake = Arc::new(inbox::Wake::new()?);
-      let post = Post { sender, wake: Arc::clone(&wake) };
-      Ok((post, Self { receiver, wake, timer: inbox::Timer::new()? }))
-    }
-    #[cfg(not(windows))]
     Ok((Post { sender }, Self { receiver }))
   }
 
   /// The next message, or `None` at `deadline`. `Stop` once the watcher is dropped.
-  #[cfg(windows)]
-  fn take(&self, deadline: Option<Instant>) -> Option<Message<R>> {
-    loop {
-      match self.receiver.try_recv() {
-        Ok(message) => return Some(message),
-        Err(mpsc::TryRecvError::Disconnected) => return Some(Message::Command(Command::Stop)),
-        Err(mpsc::TryRecvError::Empty) => {}
-      }
-      if !self.timer.wait(&self.wake, deadline) {
-        return None;
-      }
-    }
-  }
-
-  /// The next message, or `None` at `deadline`. `Stop` once the watcher is dropped.
-  #[cfg(not(windows))]
   fn take(&self, deadline: Option<Instant>) -> Option<Message<R>> {
     let Some(deadline) = deadline else {
       return Some(self.receiver.recv().unwrap_or(Message::Command(Command::Stop)));
@@ -398,99 +354,6 @@ impl<R> Inbox<R> {
       Ok(message) => Some(message),
       Err(mpsc::RecvTimeoutError::Timeout) => None,
       Err(mpsc::RecvTimeoutError::Disconnected) => Some(Message::Command(Command::Stop)),
-    }
-  }
-}
-
-/// The wait of the watcher thread on Windows. A timed wait on a channel ends only at a clock
-/// tick (15.6 ms by default), so the thread waits on an event and a high-resolution timer.
-#[cfg(windows)]
-mod inbox {
-  use std::{
-    io,
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
-    ptr, thread,
-    time::{Duration, Instant},
-  };
-
-  use windows_sys::Win32::{
-    Foundation::{HANDLE, WAIT_OBJECT_0},
-    System::Threading::{
-      CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, INFINITE,
-      SetEvent, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
-    },
-  };
-
-  /// An event that every send sets. It stays set until a wait takes it, so no message is missed.
-  pub struct Wake(OwnedHandle);
-
-  impl Wake {
-    pub fn new() -> io::Result<Self> {
-      // SAFETY: the call reads no memory of ours. With these arguments it makes an event that
-      // resets itself and is not set.
-      let event = unsafe { CreateEventW(ptr::null(), 0, 0, ptr::null()) };
-      if event.is_null() {
-        return Err(io::Error::last_os_error());
-      }
-      // SAFETY: the event is a new open handle that nothing else owns.
-      Ok(Self(unsafe { OwnedHandle::from_raw_handle(event) }))
-    }
-
-    pub fn set(&self) {
-      // SAFETY: the handle is open.
-      unsafe { SetEvent(self.0.as_raw_handle()) };
-    }
-  }
-
-  /// A high-resolution timer where Windows has one (10, 1803 and later), else a plain one.
-  pub struct Timer(OwnedHandle);
-
-  impl Timer {
-    pub fn new() -> io::Result<Self> {
-      // SAFETY: the call reads no memory of ours. With these arguments it makes a new timer.
-      let make = |flags| unsafe {
-        CreateWaitableTimerExW(ptr::null(), ptr::null(), flags, TIMER_ALL_ACCESS)
-      };
-      let mut timer = make(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION);
-      if timer.is_null() {
-        timer = make(0);
-      }
-      if timer.is_null() {
-        return Err(io::Error::last_os_error());
-      }
-      // SAFETY: the timer is a new open handle that nothing else owns.
-      Ok(Self(unsafe { OwnedHandle::from_raw_handle(timer) }))
-    }
-
-    /// Waits until `wake` is set or `until` comes. `false` if the time came.
-    pub fn wait(&self, wake: &Wake, until: Option<Instant>) -> bool {
-      let Some(until) = until else {
-        // SAFETY: the handle is open.
-        unsafe { WaitForSingleObject(wake.0.as_raw_handle(), INFINITE) };
-        return true;
-      };
-      let left = until.saturating_duration_since(Instant::now());
-      // Negative: relative, in units of 100 ns.
-      let due = -i64::try_from(left.as_nanos() / 100).unwrap_or(i64::MAX);
-      let timer = self.0.as_raw_handle();
-      // SAFETY: the handle is open, `due` lives through the call, and no routine is given.
-      let set = unsafe { SetWaitableTimer(timer, &raw const due, 0, None, ptr::null(), 0) };
-      if set == 0 {
-        // Not with an open handle. Sleep a little, and the caller looks again.
-        thread::sleep(left.min(Duration::from_millis(1)));
-        return true;
-      }
-      let handles: [HANDLE; 2] = [wake.0.as_raw_handle(), timer];
-      // SAFETY: both handles are open, and the array lives through the call.
-      let which = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
-      if which == WAIT_OBJECT_0 + 1 {
-        return false;
-      }
-      if which != WAIT_OBJECT_0 {
-        // Not with open handles. Sleep a little, so as not to spin.
-        thread::sleep(left.min(Duration::from_millis(1)));
-      }
-      true
     }
   }
 }
@@ -624,45 +487,175 @@ fn clean(path: &Path) -> Result<PathBuf, Option<io::Error>> {
   }
   let current = env::current_dir().map_err(Some)?;
   #[cfg(windows)]
-  let path = rest_of_the_drive(path, &current).ok_or(None)?;
+  let path = windows::rest_of_the_drive(path, &current).ok_or(None)?;
   normalize(&current.join(path)).ok_or(None)
 }
 
-/// Windows: the rest of a `C:name` path when the current directory is on that drive, `None` for
-/// another drive, or the path as it is.
+/// What only Windows needs: the end of the process, the wait of the watcher thread, and a path
+/// with a drive and no root.
 #[cfg(windows)]
-fn rest_of_the_drive<'a>(path: &'a Path, current: &Path) -> Option<&'a Path> {
-  use std::path::{Component, Prefix};
-
-  let drive = |part: Option<Component<'_>>| match part {
-    Some(Component::Prefix(prefix)) => match prefix.kind() {
-      Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => Some(letter),
-      _ => None,
-    },
-    _ => None,
+mod windows {
+  use std::{
+    io,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    path::{Component, Path, Prefix},
+    ptr,
+    sync::{Arc, mpsc},
+    thread,
+    time::{Duration, Instant},
   };
-  let mut parts = path.components();
-  let Some(letter) = drive(parts.next()) else { return Some(path) };
-  (drive(current.components().next()) == Some(letter)).then_some(parts.as_path())
-}
 
-#[cfg(all(test, windows))]
-mod tests {
-  use std::time::{Duration, Instant};
+  use windows_sys::Win32::{
+    Foundation::{HANDLE, WAIT_OBJECT_0},
+    System::Threading::{
+      CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, INFINITE,
+      SetEvent, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
+    },
+  };
 
-  use super::Inbox;
+  use super::{Command, Inbox, Message, Post};
 
-  /// The wait ends with the deadline, not with the next tick of the clock (15.6 ms).
-  #[test]
-  fn a_wait_ends_at_its_deadline() {
-    let (_post, inbox) = Inbox::<()>::new().unwrap();
-    for (deadline, at_most) in [(2, 10), (20, 28)] {
-      let start = Instant::now();
-      let taken = inbox.take(Some(start + Duration::from_millis(deadline)));
-      let waited = start.elapsed();
-      assert!(taken.is_none());
-      assert!(waited >= Duration::from_millis(deadline), "{waited:?} for {deadline} ms");
-      assert!(waited < Duration::from_millis(at_most), "{waited:?} for {deadline} ms");
+  /// Whether the process is exiting.
+  pub fn process_is_exiting() -> bool {
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+      safe fn RtlDllShutdownInProgress() -> u8;
+    }
+
+    RtlDllShutdownInProgress() != 0
+  }
+
+  /// A timed wait on a channel ends only at a clock tick (15.6 ms by default), so the thread
+  /// waits on an event and a high-resolution timer.
+  impl<R> Inbox<R> {
+    pub fn new() -> io::Result<(Post<R>, Self)> {
+      let (sender, receiver) = mpsc::channel();
+      let wake = Arc::new(Wake::new()?);
+      let post = Post { sender, wake: Arc::clone(&wake) };
+      Ok((post, Self { receiver, wake, timer: Timer::new()? }))
+    }
+
+    /// The next message, or `None` at `deadline`. `Stop` once the watcher is dropped.
+    pub fn take(&self, deadline: Option<Instant>) -> Option<Message<R>> {
+      loop {
+        match self.receiver.try_recv() {
+          Ok(message) => return Some(message),
+          Err(mpsc::TryRecvError::Disconnected) => return Some(Message::Command(Command::Stop)),
+          Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if !self.timer.wait(&self.wake, deadline) {
+          return None;
+        }
+      }
+    }
+  }
+
+  /// An event that every send sets. It stays set until a wait takes it, so no message is missed.
+  pub struct Wake(OwnedHandle);
+
+  impl Wake {
+    pub fn new() -> io::Result<Self> {
+      // SAFETY: the call reads no memory of ours. With these arguments it makes an event that
+      // resets itself and is not set.
+      let event = unsafe { CreateEventW(ptr::null(), 0, 0, ptr::null()) };
+      if event.is_null() {
+        return Err(io::Error::last_os_error());
+      }
+      // SAFETY: the event is a new open handle that nothing else owns.
+      Ok(Self(unsafe { OwnedHandle::from_raw_handle(event) }))
+    }
+
+    pub fn set(&self) {
+      // SAFETY: the handle is open.
+      unsafe { SetEvent(self.0.as_raw_handle()) };
+    }
+  }
+
+  /// A high-resolution timer where Windows has one (10, 1803 and later), else a plain one.
+  pub struct Timer(OwnedHandle);
+
+  impl Timer {
+    pub fn new() -> io::Result<Self> {
+      // SAFETY: the call reads no memory of ours. With these arguments it makes a new timer.
+      let make = |flags| unsafe {
+        CreateWaitableTimerExW(ptr::null(), ptr::null(), flags, TIMER_ALL_ACCESS)
+      };
+      let mut timer = make(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION);
+      if timer.is_null() {
+        timer = make(0);
+      }
+      if timer.is_null() {
+        return Err(io::Error::last_os_error());
+      }
+      // SAFETY: the timer is a new open handle that nothing else owns.
+      Ok(Self(unsafe { OwnedHandle::from_raw_handle(timer) }))
+    }
+
+    /// Waits until `wake` is set or `until` comes. `false` if the time came.
+    pub fn wait(&self, wake: &Wake, until: Option<Instant>) -> bool {
+      let Some(until) = until else {
+        // SAFETY: the handle is open.
+        unsafe { WaitForSingleObject(wake.0.as_raw_handle(), INFINITE) };
+        return true;
+      };
+      let left = until.saturating_duration_since(Instant::now());
+      // Negative: relative, in units of 100 ns.
+      let due = -i64::try_from(left.as_nanos() / 100).unwrap_or(i64::MAX);
+      let timer = self.0.as_raw_handle();
+      // SAFETY: the handle is open, `due` lives through the call, and no routine is given.
+      let set = unsafe { SetWaitableTimer(timer, &raw const due, 0, None, ptr::null(), 0) };
+      if set == 0 {
+        // Not with an open handle. Sleep a little, and the caller looks again.
+        thread::sleep(left.min(Duration::from_millis(1)));
+        return true;
+      }
+      let handles: [HANDLE; 2] = [wake.0.as_raw_handle(), timer];
+      // SAFETY: both handles are open, and the array lives through the call.
+      let which = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+      if which == WAIT_OBJECT_0 + 1 {
+        return false;
+      }
+      if which != WAIT_OBJECT_0 {
+        // Not with open handles. Sleep a little, so as not to spin.
+        thread::sleep(left.min(Duration::from_millis(1)));
+      }
+      true
+    }
+  }
+
+  /// The rest of a `C:name` path when the current directory is on that drive, `None` for another
+  /// drive, or the path as it is.
+  pub fn rest_of_the_drive<'a>(path: &'a Path, current: &Path) -> Option<&'a Path> {
+    let drive = |part: Option<Component<'_>>| match part {
+      Some(Component::Prefix(prefix)) => match prefix.kind() {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => Some(letter),
+        _ => None,
+      },
+      _ => None,
+    };
+    let mut parts = path.components();
+    let Some(letter) = drive(parts.next()) else { return Some(path) };
+    (drive(current.components().next()) == Some(letter)).then_some(parts.as_path())
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::Inbox;
+
+    /// The wait ends with the deadline, not with the next tick of the clock (15.6 ms).
+    #[test]
+    fn a_wait_ends_at_its_deadline() {
+      let (_post, inbox) = Inbox::<()>::new().unwrap();
+      for (deadline, at_most) in [(2, 10), (20, 28)] {
+        let start = Instant::now();
+        let taken = inbox.take(Some(start + Duration::from_millis(deadline)));
+        let waited = start.elapsed();
+        assert!(taken.is_none());
+        assert!(waited >= Duration::from_millis(deadline), "{waited:?} for {deadline} ms");
+        assert!(waited < Duration::from_millis(at_most), "{waited:?} for {deadline} ms");
+      }
     }
   }
 }
