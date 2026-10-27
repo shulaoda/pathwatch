@@ -23,7 +23,7 @@ what happened, and asks the disk.
 | Module (`src/`) | Contents |
 |---|---|
 | `config`, `error`, `event`, `watcher` | The API. `watcher.rs` contains the single thread and its queue, and selects the backend. |
-| `engine/`, `tree`, `fs`, `path` | The engine, the tree, the disk as the engine sees it (`Fs`), and path cleaning. No thread, no clock, no OS watch API. |
+| `engine/`, `tree`, `fs`, `path` | The engine, the tree, the disk as the engine sees it (`Fs`), and path cleaning. No thread and no OS watch API. The engine and the tree read no clock themselves: the caller passes the time of each entry point, and the wall time and the flush timing come through `Fs` (`Fs::now`, `Fs::ticks`), which `StdFs` reads from the system clocks. |
 | `backend/` | The `Backend` trait and its types (`mod.rs`), and one backend per file below it: `inotify`, `fsevents`, `windows`, `poll`. Of the rest of the crate, the backends use only `backend` and the system calls in `fs` that the engine also makes. |
 
 The modules other than the API are `pub` but hidden from the documentation, because the tests need
@@ -37,12 +37,19 @@ and their fixtures, are in `tests/sim` (§6).
 - A **backend** sets up OS watches when the engine requests them, and its thread copies raw OS
   notifications into the queue. On the watcher thread, the backend turns each raw notification
   into **hints**.
-- A hint never says what happened. It says where to check: `Changed { dir, rel }`,
-  `Written { dir, rel }` or `Lost`. `dir` is the key that the engine gave when it requested the
-  watch, so the two sides never need to agree on how a path is spelled.
-- The engine collects hints as **marks** until no hint has arrived for the quiet time. Then it
-  **flushes**. It reads the disk at the marked places, compares the result with the tree, and
-  delivers the events. A hint that arrives twice, or late, costs one `lstat` and changes nothing.
+- Apart from `Written`, which reports a write (§2.8), a hint never says what happened. It says
+  where to check: `Changed { dir, rel }`, `Written { dir, rel }`, `Mount { path }` (inotify, by
+  real path) or `Lost`. `Delivered { before }` names no place. It answers a delivery request
+  (§3). `dir` is the key that the engine gave when it requested the watch, so the two sides never
+  need to agree on how a path is spelled.
+- The engine collects hints as **marks** until no hint has arrived for the quiet time, or until
+  the bound on the wait has passed: four quiet times after the first hint since the previous flush,
+  at most 500 ms unless the quiet time is longer (§2.13). Then it **flushes**. It reads the disk at
+  the marked places, compares the result with the tree, and delivers the events. A hint never
+  makes a wrong event. Copies that arrive before one flush merge into one mark. A late `Changed`
+  costs one more look and finds the tree unchanged (for a directory, the look is a deep scan below
+  it). A late `Written`, or a late `Changed` for a young file that was not read, costs one extra
+  `Update` (§2.2, §2.8).
 - **Watch, commit, scan.** The engine asks the backend to watch a directory, calls `commit`, and
   only then reads the directory. A change before the watch is found by the scan, and a change after
   the watch produces a hint. No change can fall between the two (`design.md`, principle 2).
@@ -55,8 +62,10 @@ into the options of the engine:
 
 - `loose_spelling` is on for macOS and Windows (`design.md` §4.7).
 - There is no delete delay when the watcher polls everything (§2.9).
-- Every duration setting is capped at one year, because `Duration::MAX` means "never" and cannot
-  be added to a clock reading.
+
+`with_debounce`, `with_delete_delay` and `with_poll_interval` cap their duration at one year,
+because `Duration::MAX` means "never" and cannot be added to a clock reading. The poll interval is
+also at least 1 ms.
 
 With a native backend, the poll of what the OS does not watch runs once per second. This is not
 configurable.
@@ -67,7 +76,7 @@ Each term denotes exactly one concept (`design.md` §6). The table names the cod
 
 | Term | Meaning | In code |
 |---|---|---|
-| watched path | a path passed to `watch` and not undone by `unwatch` | `Node::is_path` |
+| watched path | a path passed to `watch` that the filter does not skip, and not undone by `unwatch` | `Node::is_path` |
 | registered name | a watched path, or a name on the way to one | `Node::is_registered` |
 | node | one name known to the tree; nothing, a file or a directory is at it | `Node`, `Kind` |
 | key | the identifier of a node, also used by the backend | `NodeKey` |
@@ -75,25 +84,28 @@ Each term denotes exactly one concept (`design.md` §6). The table names the cod
 | complete, partial | a directory node that tracks every entry, or only its registered names | `Dir::complete` |
 | told | the handler believes that a file is at the path | `Node::told` |
 | baseline | what a `watch` call found; it becomes told without an event | `Node::baseline` |
-| hint | a place where a backend says to check | `Hint::{Changed, Written, Lost}` |
+| hint | what a backend derives from a raw notification: where to check (by key, or by real path for `Mount`), or that notifications were lost; `Delivered` instead answers a delivery request and leaves no mark | `Hint::{Changed, Written, Lost, Mount, Delivered}` |
 | loss report | a hint stating that notifications were lost, either everywhere (`Lost`) or at and below one directory (`Changed` with an empty `rel`) | `Mark::lost`, `Tree::lost` |
 | mark | a request to check the node in the next flush | `Mark { deep, written, lost }` |
 | check | the comparison of one node with the disk | `Engine::check`, `apply` |
-| scan | a check of every node of one directory; a deep scan also checks everything below, and a names scan checks only the nodes whose names are not both in the tree and in a listing | `Engine::scan`, `Depth` |
+| scan | a check of every node of one directory; a deep scan also checks everything below, and a names scan (loose disks only) skips the nodes that the listing names, that the tree has as entries and whose names are plain, and checks every other node | `Engine::scan`, `Depth` |
 | flush | checking the marks, then rounds of commit and scan, then delivering the events | `Engine::flush`, `check_marks`, `round`, `finish` |
 | touched | a node changed by a flush; its event is read at the end of the flush | `Engine::touched` |
 | want | what the engine asks a backend to report about a directory | `Want::{Names, Contents}` |
 | coverage | the backend's answer | `Coverage::{Watched, WatchedTree, NotWatched, Failed}` |
-| polled | no OS watch covers the directory, so the timer scans it | `Watch::Polled` |
+| polled | no OS watch covers the directory, so the timer scans it | `Watch::Polled`, `Watch::Failed`; the timer's list is `Tree::polled`, kept by `Dir::is_polled`, which also holds a directory where a read failed (`has_error`) until a scan of it succeeds (§2.10, §2.12) |
 | held | a look found nothing at the node; what the tree has there, and below, is kept until the second look | `Node::is_held`, `Tree::hold` |
 | delete delay | the time from the hint to the second look; 10 ms, and none under polling | `Options::delete_delay` |
 | young | a file whose modification time is too close to the check to be trusted | `Content` |
 | quiet time | the debounce, that is, how long no hint may arrive before the disk is checked | `Options::debounce` |
-| rest | the pause after work that no hint requested by name, such as a poll or the scans after loss reports | `REST`, `rest_until` |
+| rest | the pause after work that no hint requested by name, such as a poll or the scans after loss reports | `REST`, `LONGEST_LOSS_REST`, `Loss::rest_until` (after loss scans); `Engine::poll_at`, set in `tick` to `took + poll_interval.max(took)` (after a poll) |
 | cover | FSEvents only: a directory that the engine watches and that a stream reports | `Covers` in `backend/fsevents.rs` |
 | stream path | FSEvents only: a directory for which a stream was started; the stream reports the whole tree below it | `FsEventsBackend::paths` in `backend/fsevents.rs` |
 
-`tree/` holds the data and `engine/` the logic. Each is split into one file per responsibility.
+`tree/` holds the data and the steps that need only the data: the way from a hint to a mark
+(`tree/marks.rs`, §2.2) with the spellings a name can have (`tree/spellings.rs`), and what the tree
+alone can answer (`Tree::want`, `Tree::prune`). `engine/` holds the logic that reads the disk,
+talks to the backend and makes the events. Each is split into one file per responsibility.
 
 ### 2.1 The tree
 
@@ -114,11 +126,12 @@ A node that is none of these is freed (`Tree::prune`).
 
 **Storage.** Only `tree/` knows how nodes are stored. All nodes live in one arena. A key consists of
 an index and a generation, so an old key never names a new node. The arena and the names are
-stored in blocks of 64 KiB, and a full block never moves, so they grow without copying what is
-already there. When they grew as single blocks, they were briefly held twice at each growth, and
-macOS keeps the freed pages. The heap of a watcher of 50,000 files then grew to 8.0 MiB for 4.3 MiB
-in use, and its footprint grew with it. With blocks, the heap is 4.8 MiB, and 14 MiB is allocated
-in total instead of 39 MiB. Each node has the list of its children, and one table for the whole
+stored in blocks of 64 KiB, and a full block never moves, so growth copies at most the last block,
+the one still filling (under 64 KiB), and never what the full blocks hold. When they grew as single
+blocks, they were briefly held twice at each growth, and macOS keeps the freed pages. The heap of a
+watcher of 50,000 files then grew to 8 to 11 MiB, about half of it unused, and its footprint grew
+with it. With blocks, the heap is about 6.3 MiB, 30% of it unused, and 15 MiB is allocated in total
+instead of 40 MiB. Each node has the list of its children, and one table for the whole
 tree finds a child by its parent and name. Small side tables next to the arena hold what only a few
 nodes have: the link of a registered name (§2.14), the content hash of a young file (§2.8), the
 time of a hold (§2.9), the first look at a file whose time is ahead of the clock (§2.8), and the
@@ -127,18 +140,21 @@ registered names that are not plain, grouped by directory (§2.2).
 A tree that shrinks returns its memory (`Tree::give_back`). A node never moves, because its key is
 its position. Only the end of the arena can therefore be released, and only as far as no node
 lives there. One node created late keeps the arena at its length, and then only the names and the
-table shrink. In a measurement with one million nodes (94 bytes each, 91 MiB in total), nothing
-remains when all of them go, and 71 MiB remain when the last node created remains. A tree that
-disappears and comes back pays for its memory again, as it did the first time: 54 ns per node
-instead of 12 ns.
+table shrink. In a measurement with one million nodes (about 90 bytes each with names of 15 bytes,
+85 MiB in total), almost nothing remains when all of them go, and 66 MiB remain when the last node
+created remains: the arena blocks up to that node (61 MiB) and the list of free slots (4 MiB). A
+tree that disappears and comes back pays for its memory again, as it did the first time: about
+70 ns per node, where a tree that kept its memory would take about 16 ns (measured 2026-10-27 on
+macOS).
 
-Memory held by a watcher, measured on macOS as the heap of the process (`vmmap`):
+Memory in use by a watcher, measured on macOS as the bytes allocated on the heap of the process
+(`vmmap`, BYTES ALLOCATED):
 
-| What is watched | Heap | Per file |
+| What is watched | Heap in use | Per file |
 |---|---|---|
 | nothing | 0.1 MiB | |
-| one directory with 50,000 files in 5,000 directories | 4.3 MiB | 86 bytes |
-| 20,000 files in 2,000 directories, each watched by its own path | 3.0 MiB | 150 bytes, because the backend keeps the real path of each directory twice |
+| one directory with 50,000 files in 5,000 directories | 4.1 MiB | 86 bytes |
+| 20,000 files in 2,000 directories, each watched by its own path | 3.0 MiB | 157 bytes, because the backend keeps the real path of each directory twice; it grows with the length of the paths |
 
 While a `watch` call runs, the heap holds its paths a second time, for the watcher thread. The
 lists of a flush keep their memory for the next flush only up to 16 KiB each (`emptied`). A longer
@@ -147,9 +163,12 @@ time, the young files and the holds, release their room when most of it is free
 (`give_room_back`, `room_to_keep`). Previously, those of the young files did not. A burst of 10,000
 new files kept room for 14,000 entries in their table and 16,000 in their queue for the lifetime of
 the watcher, about 0.7 MB (`a_burst_of_young_files_gives_its_room_back`). The ordinary work of a
-watcher that runs for days allocates no memory. A `watch` of paths that are already watched (in
-their clean form), an `unwatch` of a path, and a poll allocate nothing, and a flush allocates only
-for the paths of its events. `tests/sim/allocations.rs` enforces these budgets.
+watcher that runs for days allocates no memory. In the engine, a `watch` of paths that are
+already watched (in their clean form) allocates nothing when no ignore filter is set. With one, the
+look at the directories above each path takes one path buffer. An `unwatch` of a path and a poll
+allocate nothing, and a flush allocates only for the paths of its events. The `Watcher` call itself
+copies and cleans its paths for the watcher thread. `tests/sim/allocations.rs` enforces these
+budgets.
 
 **`complete` is a rule** (`design.md` §4.1). Every check that finds the directory on disk evaluates
 the rule. The tree may lag behind the rule for a while. A directory that becomes a watched path is
@@ -159,8 +178,9 @@ partial directory. The evaluation walks up only to the watched path and asks the
 Every node with a file or a directory keeps the answer "not ignored" for that kind (invariant 8),
 and so does every name on the way to a watched path (`design.md` §4.8).
 
-**Invariants.** `Engine::check_invariants` and `Tree::check_links` verify them, and the simulator
-runs these checks after every engine call.
+**Invariants.** `Engine::check_invariants` and `Tree::check_links` verify them. The stories of the
+simulator run these checks after every `watch`, `unwatch` and `tick`, and the fuzz runs them after
+every operation and at every settle.
 
 1. Every node except the root has a parent that lists it, and the table finds it.
 2. Only a node of kind "directory" has a file or a directory below it.
@@ -171,8 +191,8 @@ runs these checks after every engine call.
    its entry in the queue, or a mark that waits for the disk to answer.
 5. A node with nothing at its path is kept only while it is registered or has a mark. In a partial
    node, a file is known only if it is a watched path, and a directory only if a watched path lies
-   below it. The single exception is a partial node that the rule makes complete and whose look is
-   still pending.
+   at or below it (it is registered). The single exception is a partial node that the rule makes
+   complete and whose look is still pending.
 6. A directory that was asked for names only holds no registered name with a file or nothing at it
    (§2.10), because no watch would report when something appears there. The exception is a name
    whose first check waits for the disk to answer. A mark then waits on the node or above it.
@@ -212,7 +232,10 @@ Invariants 6 and 7 say nothing about what lies below a held node, because nothin
      §2.8) is also treated as `written`. Every write produces a `Written`, so such a record is a
      rename or a removal, and the content may have changed under the other name. An example is a
      watched file that is renamed away, written, and renamed back under a Windows handle. Under
-     inotify this also applies to a `chmod` of such a file, which costs one `Update`.
+     inotify, `ATTRIB` (a `chmod`) and `CLOSE_WRITE` of such a file are `Changed` too, and this
+     rule applies to them. Each costs one `Update` when it comes in a later flush than the last
+     write: a `chmod`, a close with no write, or a close more than the quiet time after the write
+     (for example after an `fsync`).
    - At each `X`, the other children that `c` can denote (below) are marked too, or descended into
      when `c` is not the last component. When every disk is loose (`Options::loose_spelling`), a
      child that differs from `c` only in the case of ASCII letters is the entry that was written.
@@ -258,7 +281,8 @@ Linux machine can have a loose disk alongside its own, such as a FAT or SMB disk
 the casefold attribute, and it shows no sign of it. On a folder of a Mac, measured with OrbStack,
 `lstat` finds `APP.JS` for `app.js`, and no flag indicates this. §5 lists the wrong events that this
 gives below a watched directory. A watched path in another case of its ASCII letters still receives
-its events, because a hint for one name marks the other (below). A rule that determined the kind of
+its events, because a hint for one name marks the other (below), except a write that leaves the
+fingerprint unchanged, since that mark is deep, not written (§5). A rule that determined the kind of
 each directory from its looks was built and removed again. It tried an entry in the other case of
 its letters, made a third look to guard against a change in between, and withdrew its proof when a
 listing contradicted it. It took 250 lines for that one case and had gaps of its own: a disk that
@@ -286,34 +310,49 @@ of step 4 follows the child with the exact name in the hint, and also these chil
   directory an entry has one spelling, and the OS may name it in another one when it is gone. In a
   strict directory this costs one look at a file that did not change.
 
-The walk continues below each of them when the hint has more components, and the marks at the end
-are deep. If no child can be the name, the hint costs no look at the disk.
+When the hint has more components, the walk continues below each of them that is a directory. The
+marks at the end are deep, except for the cases of step 4. With `Options::loose_spelling`, a
+`Written` hint that is not `new` marks the twin that differs only in the case of ASCII letters
+`written`, and also the name at the end of a walk below such a twin. A `Changed` hint that ends at a
+young file that was not read (`Content::Pending`) is `written` there too. If no child can be the
+name, the hint costs no look at the disk.
 
 Two names can be the same name when they are equal ignoring the case of ASCII letters, or when
-neither of them is plain. A **plain** name (`is_plain`) consists only of ASCII characters and Han
-ideographs. An ideograph has no case and no second form, so a plain name has other spellings only
-in its ASCII letters. How a disk folds any other letter (an accented letter, Greek, kana, Hangul)
-is unknown here, so two names that are not plain can always be the same name.
+neither of them is plain. A **plain** name (`is_plain`) consists only of ASCII characters and the
+ideographs of the CJK Unified Ideographs blocks (U+3400 to U+4DBF, U+4E00 to U+9FFF, U+20000 to
+U+2F7FF, U+30000 to U+3FFFF). Such an ideograph has no case, so the engine takes a plain name to
+have other spellings only in its ASCII letters. A CJK compatibility ideograph is not plain, because
+it is a second form of a unified ideograph. APFS breaks the rule for a few other characters, and a
+hint does not join such spellings (§5). How a disk folds any other letter (an accented letter,
+Greek, kana, Hangul) is unknown here, so two names that are not plain can always be the same name.
 
-A plain name is found through the table. Its hash ignores the case of ASCII letters
-(`child_hash`), so the children that differ only in that respect share one hash. The same holds
-for any name where every directory distinguishes two spellings, since only the case of ASCII
-letters is followed there. Previously, a name that was not plain found nothing there. On a loose
-disk shared into Linux, a watched `Café.js` missed the writes to `café.js`. Such a hint costs one
-extra lookup, however many children the directory has: 18 ns among 20,000 registered children,
-where comparing with each child took 53 µs. Only letters are folded. A name that differs in the
-same bit of another byte (`@` and `` ` ``, or a byte of UTF-8) has a different hash, because names
-that share a hash cost the square of their number to list. Inserting 65,536 such names took 270 ms,
-against 4 ms for names with different hashes. The case variants of one name share a hash on
-purpose, since only a disk that distinguishes them can hold many.
+A plain name is found through the table. Its hash ignores the case of ASCII letters (`child_hash`),
+so the children that differ only in that respect share one hash. The same holds for any name where
+every directory distinguishes two spellings, since only the case of ASCII letters is followed there.
+A hint therefore never compares its name with each child, however many children the directory has.
+One pass over the names that share its hash finds the name and also tells whether a twin is
+registered (`Tree::spellings`). Only then is the table asked once more, for the twins (`twins_of`).
+When the table replaced the comparison with each child (measured on 2026-10-08, with loose
+spelling), a hint for a name that nobody watches cost one more lookup, 18 ns among 20,000 registered
+children, where the comparison took 53 µs. Since then the two lookups are one pass. Previously, a
+name that was not plain found nothing in the table. On a loose disk shared into Linux, a watched
+`Café.js` missed the writes to `café.js`. Only letters are folded. A name that differs in the same
+bit of another byte (`@` and `` ` ``, or a byte of UTF-8) has a different hash, because names that
+share a hash cost the square of their number to list. Inserting 65,536 such names took 270 ms,
+against 4 ms for names with different hashes. The case variants of one name share a hash on purpose,
+since only a disk that distinguishes them can hold many.
 
-In a loose directory two more rules apply. The registered names that are not plain are kept on a
-list per directory (`Tree::not_plain`), and a hint with such a name marks all of them, at one look
-each. The other children of a complete directory are on no list, and there can be many. So when a
-hint carries a name that is not plain and the tree does not have it as an entry (`Node::is_entry`),
-the flush compares the names of the directory with one listing (`Depth::Names`). A node that the
-listing names is not looked at, and a node that it does not name is. An edit of a file that the
-tree knows costs no listing.
+In a loose directory a hint whose name is not plain uses two other rules in place of the two
+above. It marks every registered name of the directory that is not plain, at one look each. These
+names are kept on a list per directory (`Tree::not_plain`). Its unregistered case twins are not
+marked, because in a loose directory none of them is an entry. The other children of a complete
+directory are on no list, and there can be many. So when a hint carries a name that is not plain
+and the tree does not have it as an entry (`Node::is_entry`), the flush compares the names of the
+directory with one listing (`Depth::Names`). A node is not looked at when the listing names it, the
+tree has it as an entry, and its name is plain, since a plain name cannot be another spelling of
+the hinted one. Every other node is looked at: a new name from the listing, a node that is not an
+entry, a node that the listing does not name, and every name that is not plain. Without a whole
+listing, every node is looked at. An edit of a file that the tree knows costs no listing.
 
 **A look asks for the spelling when it is unsure** (`Engine::spelling_is_unsure`). In a partial
 directory a look asks nothing, because a registered name is whatever `lstat` finds. A name with
@@ -327,15 +366,16 @@ name of that entry in these cases:
   applies to a name that the running `watch` registered (`Added::Registered`), even when the tree
   knew an entry at it, because the caller spelled it and the entry may have another spelling by
   now.
-- Another node of the directory can be the same name (`Tree::has_other_spelling`), and the disk
-  has only one of the two. A name that is not plain counts as such a name at every look.
+- Another node of the directory can be the same name (`Tree::has_other_spelling`), so the disk
+  may have only one of the two. The question is asked whether or not the disk has both. A name that
+  is not plain counts as such a name at every look.
 - The look is part of a scan that listed the whole directory, and the listing did not name it.
 
 A look is sure, and asks nothing, for a name that the listing of the running scan produced, and for
 an entry that the tree knows and that has no other spelling in the tree. An edit of a known file
-therefore costs what it costs on any disk. A symbolic link is never asked about, because the disk
-cannot report how it spells a link: the real path of a link is the path of its target. The listing
-is trusted for it.
+therefore costs what it costs on any disk. A symbolic link is asked about like any other entry.
+`Fs::name_on_disk` does not follow a link at the end of the path (on macOS, `getattrlist` with
+`FSOPT_NOFOLLOW`), so the disk reports how it spells the link, not its target.
 
 When the disk spells the name differently, the directory has no entry of this name (`design.md`
 §4.7). A name that is not registered is gone (`Found::OtherSpelling`). A registered name is
@@ -374,8 +414,9 @@ mark_moved                                           # §2.10
 for each marked node, from the top down:
     if a node above it is held: drop the mark
     if only a loss report requested the mark and the pacing does not allow it: keep the mark
+    if a hint left the mark, its quiet time is not over, and no hold below it is due: keep the mark
     else: check(node, mark)
-while a scan is queued:                              # one round
+while a scan is queued, or a watch was released since the last commit:   # one round
     backend.commit()                                 # on an error: §2.10
     for each node queued when the round started, if its directory is on disk:
         if a scan of this round queued it again: leave it for the next round
@@ -386,7 +427,16 @@ finish: read the event of each touched node (§2.9), deliver the batch
 `check` and `scan` never descend into a directory. They ask the backend for its watch and queue a
 scan (§2.5), which runs in the next round, after the commit. The engine therefore never reads a
 directory before the watch on it is live, and every backend goes through the same code path. When
-the disk gives no answer for a node, its mark is kept for the next flush.
+the disk gives no answer for a node, the node is marked again for the next flush, deep, because the
+tree below may have fallen behind in the meantime, and the mark keeps what the look knew about lost
+hints (`Engine::retry`).
+
+The marks of hints wait for the quiet time (`design.md` §4.11; `Marked::since`, `hints_due`). A poll
+or a second look that runs this flush before then keeps them, and so does `mark_moved`. A directory
+above a hold that is due is the exception, because it is checked with that second look. A `watch`
+or `unwatch` call ends the quiet time (`flush_now`). A flush that released a watch commits even
+when it queued no scan, so the backend can stop the streams or close the handles that no key uses
+(§4.2, §4.3).
 
 ### 2.4 `check(node, mark)`
 
@@ -394,7 +444,9 @@ The parent of `node` is a directory on disk, and `path` is the path of `node`.
 
 **Reading the disk** (`read_entry`):
 
-- An unregistered name in a partial directory is missing, without a call to the disk.
+- An unregistered name in a partial directory is missing, without a call to the disk. When the
+  rule makes that directory complete and the tree lags behind (§2.1), there is no answer instead,
+  and the mark waits for the look that makes the directory complete.
 - If a listing provided the type of the entry and the name is not registered, the filter is asked
   first. An ignored entry is missing and costs no `lstat`.
 - `lstat(path)` is called, unless the listing of the running scan provided everything (see
@@ -402,15 +454,18 @@ The parent of `node` is a directory on disk, and `path` is the path of `node`.
   the link (§2.14). An unregistered symbolic link is a file. Errors are handled as described in
   §2.12.
 
-**A complete listing** (`fs::Entry::File`). On APFS one call (`getattrlistbulk`) returns the
-entries of a directory together with what `lstat` would report for each. A scan takes every regular
-file from it, so there is no `lstat` per file, neither at the first scan nor at later ones such as a
-deep scan after a loss or a poll. Only what a look at a file reads is taken: its modification time,
-its size and its inode, which form its fingerprint (§2.8). A scan therefore holds 40 bytes per entry
-of the directory being scanned, rather than the 80 bytes of everything that `lstat` reports. A
-registered name, and a name whose spelling is uncertain, are still looked at with `lstat`. Measured
-on a tree of 5,000 directories with 50,000 files and one directory watched, the watcher is ready in
-122 ms, and in 153 ms with an `lstat` per file. What remains is one `open` per directory (8 µs here,
+**A complete listing** (`fs::Entry::File`, `fs::Entry::Dir`). On APFS one call
+(`getattrlistbulk`) returns the entries of a directory together with what `lstat` would report for
+each. A scan takes every regular file, and every directory that is not a mount point, from it, so
+there is no `lstat` per entry, neither at the first scan nor at later ones such as a deep scan after
+a loss or a poll. Only what a look reads is taken: for a file its modification time, its size and
+its inode, which form its fingerprint (§2.8), and for a directory its identity (device, file ID,
+creation time) and its modification time. A scan therefore holds 40 bytes per entry of the
+directory being scanned, rather than the 72 bytes of a key with everything that `lstat` reports
+(`fs::Meta`, 64 bytes). A registered name, and a name whose spelling is uncertain, are still looked
+at with `lstat`. Measured on 2026-10-10, before directories were taken from the listing, on a tree
+of 5,000 directories with 50,000 files and one directory watched, the watcher was ready in 122 ms,
+and in 153 ms with an `lstat` per file. What remains is one `open` per directory (8 µs here,
 a third of the time), the listing itself, and one `lstat` per directory.
 
 What the listing reports is as old as the listing, and the look at a file can come later. A write
@@ -425,10 +480,11 @@ Only what was measured to equal `lstat` is taken:
   Other disks are listed as before. On HFS+ the listing keeps the old times of a file written
   through another hard link, on exFAT an empty file gets another inode number at each call, and
   FAT32 provides no change time.
-- Regular files only. For a directory on which a disk is mounted, the listing reports what is under
-  the mount, and the engine follows a symbolic link itself. A file whose content is only in the
-  cloud (the `dataless` flag) is also left to `lstat`, because none with a size was available to
-  measure.
+- Regular files, and directories that are not mount points. For a directory on which a disk is
+  mounted, the listing reports the directory under the mount, not the root of the mounted disk, so
+  such a directory is left to `lstat`. A symbolic link and any other kind are left to `lstat` too,
+  and the engine follows a link itself. A file whose content is only in the cloud (the `dataless`
+  flag) is also left to `lstat`, because none with a size was available to measure.
 - The disk is first asked by path (`statfs`), and an entry counts only if it is on that exact
   device, because the directory may be a different one by the time it is opened.
 
@@ -446,7 +502,7 @@ the flush reads (§2.9). "Tell" in the table means exactly this.
 
 | Disk | Tree has | Action |
 |---|---|---|
-| no answer | anything | Keep the mark for the next flush. |
+| no answer | anything | Mark the node again for the next flush, deep, and keep what the look knew about lost hints (`Engine::retry`, §2.8). |
 | missing | file, directory | `missing(node)` holds the node. If its second look also finds nothing, it is gone (§2.9). |
 | missing | nothing | Nothing. |
 | file | nothing | Store it, and tell `Create`, or nothing if it is part of the baseline (§2.7). |
@@ -499,6 +555,9 @@ these cases:
 - A record named it (a hint with its time, not a `watch` call) while only a watch above covers it.
   Its name changed, so the records of its files arrived under the other name. A directory with a
   watch of its own does not need this, because that watch follows the directory, as inotify does.
+- The scan of a directory that was away found it again (`Engine::away_scan`). `take_scans` clears
+  the flag of each directory that it scans, so this step carries the doubt down: every directory of
+  a deep scan of an away directory is away in its own scan.
 
 A young file that was not read (`Content::Pending`, §2.8) counts as written in such a scan, even
 when nothing was written to it (`behavior.md`, "Known limitations"). This does not apply to a file
@@ -548,29 +607,36 @@ path, the engine walks down from the root, creates the missing nodes, and makes 
 watched path, which makes every node above it registered. It puts a deep mark on the deepest node on
 the way that has only directories on disk above it, each listed by the directory above it. It does
 not do so when a scan that checks every name of that node's directory is already queued, since a
-scan of names alone skips what the listing names. The walk ends at a name that the disk spelled
-differently at its last look. The tree can lag behind the disk when `watch` is called, with a
-notification still on its way, and that answer decides the baseline of what lies below. The engine
+scan of names alone skips what the listing names. The deep mark goes no deeper than a name that
+the disk spelled differently at its last look (`Node::is_unlisted`). That name itself can get the
+mark, so it is looked at again, but no node below it gets one. The walk itself still goes to the
+end of the path. The tree can lag behind the disk when `watch` is called, with a notification still
+on its way, and the answer of that new look decides the baseline of what lies below. The engine
 then runs one flush at once, without the quiet time, and returns when it is done. A `Written` hint
 that was on its way reports an `Update` for a file that the baseline has just seen (§2.8, guard 1).
 NTFS produces such a record for the content of a new file, so a file written under a handle a
 moment before `watch` can be reported twice, as `Create` and `Update` (the test
 `a_scan_that_waited_runs_inside_a_watch_of_a_file_below`, Handle).
 
-The whole batch is registered before the flush, and each node is checked once per flush. A batch
-therefore costs one `watch` call per directory and one `lstat` per name (the test
-`the_cost_of_a_batch`), plus one look for the kind of a watched path in each directory that holds
-watched paths (§2.10).
+The whole batch is registered before the flush, so a node that several paths of the batch share is
+checked once, not once per path. A batch therefore costs one `watch` call per directory and one
+`lstat` per name (the test `the_cost_of_a_batch`), plus one look for the kind of a watched path in
+each directory that holds watched paths (§2.10).
 
-**Baseline.** While a `watch` runs, each node records what the call made of it (`Node::added`), and
-a directory records that it became complete in this call (`Node::baseline`). At the moment of the
-look, `check` asks whether the node should have been reported before the call (`watched_before`).
-That is the case if it was a watched path before, or if the directory above was complete before.
-Where the directory above is still partial in the tree, the rule of §2.1 is evaluated for the
-watched paths that existed before the call, since the look of an older `watch` can still be waiting
-for the disk to answer. If neither holds, what the look finds is the baseline, and a file becomes
-`told` without an event. The end of the call clears both fields, so a look that has to be retried
-after the call reports what it finds.
+**Baseline.** While a `watch` runs, each node records what the call made of it (`Node::added`). A
+directory that becomes complete in this call records whether its entries are the baseline
+(`Node::baseline`). They are when the directory itself was not watched before the call
+(`watched_before`, below), or when a new link leads to it (§2.14). The second case also applies to a
+registered directory that was already complete. A new file records the same bit for itself. At the
+moment of the look, `check` asks whether the node should have been reported before the call
+(`watched_before`). That is the case if it was a watched path before, or if the directory above is
+complete and not baseline, because it was complete before or was itself covered before (for example
+a watched path whose look waited for the disk). An unlisted name (§2.2) is never covered by the
+directory above. Where the directory above is still partial in the tree, the rule of §2.1 is
+evaluated for the watched paths that existed before the call, since the look of an older `watch` can
+still be waiting for the disk to answer. If neither holds, what the look finds is the baseline, and
+a file becomes `told` without an event. The end of the call clears both fields, so a look that has
+to be retried after the call reports what it finds.
 
 **`unwatch`** (in the same file) is the inverse of registration:
 
@@ -599,14 +665,22 @@ equal fingerprints. The file ID of a fingerprint is the inode on Unix and the fi
 Windows. The identity of a directory is its device, inode and birth time on Unix (a birth time of
 zero where there is none), and its volume serial number, file index and creation time on Windows.
 The creation time alone is no identity there, because a new entry inherits the creation time of the
-entry that was removed under its name a moment earlier. A directory that was moved away and back
-keeps its inode, so the identity never lets a check be skipped.
+entry that was removed under its name a moment earlier. On WASI, where the standard library of
+Rust gives no inode on stable, the file ID is the time that `Metadata::created()` returns (the
+`ctim` of WASI, which wasmtime fills with the birth time), and every directory has the same
+identity, all zeros, so the identity never tells a replaced directory from the old one. A directory
+that was moved away and back keeps its inode, so the identity never lets a check be skipped.
 
 The guards are implemented as follows:
 
 1. A backend that knows of a write sends `Written`, and the engine reports `Update` without
-   consulting the fingerprint. Only a backend whose notifications correspond one to one to events
-   does this (inotify, Windows). FSEvents never sends `Written`.
+   consulting the fingerprint. Only a backend whose OS meets two conditions does this. First, a
+   write record always means that a write happened since the previous record. It never repeats a
+   flag of an earlier change. Second, a record follows every write, at the latest when the writer
+   closes the file. These are inotify (a `MODIFY` for each write, merged only with an identical
+   event that still waits in the queue, §4.1) and Windows (a record at the truncating open and one
+   at the close, none for the writes in between, §2.13). FSEvents never sends `Written`, because
+   its flags are merged and stay set.
 2. **Young files.** A file is young when its modification time is close to the time of the flush,
    or in the future. When a young regular file is stored, the engine also stores a hash of its
    content. At the next check with an equal fingerprint, the hash decides. When the file is no
@@ -625,7 +699,7 @@ The guards are implemented as follows:
      certain to come there, and a write that leaves the timestamp unchanged can only happen while
      the file is young.
 
-   **Where every write produces a hint** (`Options::written_hints`), a young file is not read at
+   **Where a hint follows every write** (`Options::written_hints`), a young file is not read at
    all. This applies to inotify and Windows, except for a file that only the poll looks at. Guard 1
    reports a write that leaves the fingerprint unchanged, so the hash would only repeat the hint.
    The node keeps `Content::Pending` while the file is young. A look counts a `Pending` file as
@@ -640,7 +714,8 @@ The guards are implemented as follows:
 
    A look that gets no answer (`Found::NoAnswer`), and a listing that cannot be finished, pass what
    they knew about lost hints to the retried look (`Engine::retry`). Previously, a listing left a
-   plain deep mark, and its scan took a rewritten file for untouched (Inode seed 103232).
+   deep mark without the lost flag (`Mark::DEEP`), and its scan took a rewritten file for untouched
+   (Inode seed 103232).
 
    **When the doubt ends.** A look that finds the file old and reports it ends the doubt, because
    the handler reads the file after the event and no later write can keep the fingerprint. A look
@@ -688,17 +763,19 @@ such as a network disk, has no young files. A second write of the same size with
 timestamps is then found only where the OS reports writes (`behavior.md`, "Known limitations"). A
 disk whose clock is ahead is the next case.
 
-**A time far ahead of the clock.** A file whose time is more than 2 s ahead of the clock never
-becomes old by the clock. Such a time comes from the clock of another machine, or from a tool that
-set it. Such a file used to be young forever. With polling, each round read every such file again
-(measured: 5 files of 4 MiB, 420 MiB read in 20 rounds). A write after a look gives the file
-another time, whatever the clock of its disk says. So the file is young for 2 s by the engine's
-clock after the first look that found its current fingerprint (`Tree::ahead_since`), and old after
-that.
+**A time far ahead of the clock.** A file whose time is 2 s or more ahead of the clock does not
+become old by the clock while it stays so far ahead. Such a time comes from the clock of another
+machine, or from a tool that set it. Such a file used to be young forever. With polling, each round
+read every such file again (measured: 5 files of 4 MiB, 420 MiB read in 20 rounds). A write after a
+look gives the file another time, whatever the clock of its disk says. So, while its time stays 2 s
+or more ahead of the clock, the file is young for 2 s by the engine's clock after the first look
+that found its current fingerprint (`Tree::ahead_since`), and old after that. When the clock comes
+within 2 s of that time, the table applies again, and the file is young until its youth after that
+time has passed.
 
 "Only the poll looks at it" means that the directory of the file is polled, or that the node is a
-symbolic link (§2.14). With polling, a young file larger than 16 MiB therefore gets one `Update`
-when it is 2 s old, even when nothing changed (§5).
+symbolic link (§2.14). Such a young file larger than 16 MiB, or one that cannot be read, therefore
+gets one `Update` when it is 2 s old, even when nothing changed (§5).
 
 When the file disappears between the `lstat` and the read for the hash, the check reports nothing,
 and the node is checked again in the next flush.
@@ -709,7 +786,8 @@ and the node is checked again in the next flush.
 means that the file differs from the one the handler was told about. A check only changes the node
 and adds it to the list `touched`. At the end of the flush, `finish` reads each touched node once
 (`engine/events.rs`) and decides its event by the table of `design.md` §4.3, where "it changed" is
-`changed`. Then `told` reflects what is there, and `changed` is cleared.
+`changed` and "part of the baseline" is the file's `Node::baseline` (§2.7). Then `told` reflects
+what is there, and `changed`, `baseline` and `added` are cleared.
 
 **The delete delay** (`design.md` §4.5). A held node keeps the time of its second look in a queue.
 When no hint requested the first look, the delay counts from the time of the look, not from the
@@ -744,35 +822,48 @@ a quiet time of 10 ms or 20 ms and no delay, none of the saves of VS Code, vim, 
 `git checkout` and a JetBrains-like save was wrong, idle or busy.
 
 When the watcher polls everything, there is no delay, since there is no quiet time
-(`Config::into_options`). The same holds in chokidar (`atomic` is off under `usePolling`), notify's
-`PollWatcher`, watchdog's `PollingObserver` and watchpack. A round that falls inside a save that
-leaves the path empty reports a `Delete`, and the next round a `Create`. With vim on Linux, polled
-every 100 ms, this happened in 4 of 100 saves, and in none with a delay of 10 ms or more. The engine
-still supports the second look under polling (`Options::delete_delay`), in case users ask for it.
+(`Config::into_options`). The same holds in notify's `PollWatcher`, watchdog's `PollingObserver`,
+watchpack and chokidar 3 (`atomic` is off under `usePolling`). chokidar 4 and 5 keep `atomic` on
+under polling, against their README. An `unlink` waits 100 ms for an `add`, which joins a save when
+the interval is shorter than that, but seldom at the default 100 ms, where the `add` comes one round
+after the `unlink`. A round that falls inside a save that leaves the path empty reports a `Delete`,
+and the next round a `Create`. With vim on Linux, polled every 100 ms, this happened in about 4 of
+100 saves when idle and in up to 13 when the path stayed missing longer on a busy machine, since a
+round falls inside a save about as often as the path is missing for that share of the interval. With
+a delay of 10 ms or more it happened in none, measured when idle on 2026-10-15. The engine still
+supports the second look under polling (`Options::delete_delay`), in case users ask for it.
 
 ### 2.10 Want, watch, poll
 
 **The want rule** is that of `design.md` §4.12. On FSEvents, `watch("/home/me/project")` therefore
 puts a stream on the project, not on the home directory. When directories above a watched path are
 missing, the watch of the lowest existing directory reports the whole tree below it on FSEvents and
-Windows, and the watch stays there afterwards.
+Windows, and the watch stays there afterwards. The exception is a directory too high for a watch of
+a tree (`may_watch_a_tree`: `/`, `/Users` or a home directory on macOS, and the like on Windows,
+§4.2, §4.3). It is answered `NotWatched` and polled, so a `mkdir -p` below it is found by the poll.
 
-The implementation (`Tree::want`, `Engine::want`, the end of `check`) is arranged so that no file is
-looked at before its watch is live:
+The implementation (`Tree::want`, `Engine::want`, `register`, the end of `check`) is arranged so
+that no file is looked at before its watch is live:
 
 - The tree answers when it knows. A complete directory, or a directory with a registered name that
   has a file or a held node, wants `Contents`. A directory whose registered names are all
   directories wants `Names`.
 - Where the tree has nothing at a **watched path**, the disk is asked before the backend, and
   **only for the kind** of what is there. Nothing is stored. In a batch of watched files this costs
-  one extra `lstat` per directory that holds some of them.
+  one extra `lstat` per directory that holds some of them. `Engine::want` does this when it arms
+  the directory, and `register` does it when a watched path is added to a directory that was
+  already asked for `Names`.
 - Where the tree has nothing at a **name on the way**, the disk is not asked, because a directory
   is expected there.
 - When a check finds no directory at a registered name whose directory was asked for names only,
   that directory is asked for `Contents`. This queues a scan of it, so the name is looked at once
   more when the wider watch is live.
-- For one key the want only increases. It decreases in one case only, through `unwatch` (`narrow`,
-  §2.7).
+- For one key the want only increases while its directory is on disk. It decreases in two cases,
+  both through `narrow`, which releases the watch (`backend.unwatch`) and arms the node again: an
+  `unwatch` that leaves a directory whose registered names are all directories (§2.7), and a check
+  that finds a registered directory under another spelling, which makes it partial (`uncover`,
+  §2.2). A directory that goes or is held asks for nothing, and its want is computed again when it
+  is back.
 
 `arm(node)` asks the backend for a watch when a directory appears, when a check finds it still
 there, and when the node wants more. It calls `backend.watch` when the node wants more than was
@@ -790,8 +881,9 @@ for after the next commit. The watch state of a node is one of these:
 
 - A node that loses `WatchedTree` gets a deep scan, which requests the watch of every node below
   it.
-- A node whose key `commit` reports as failed becomes `Failed`, with the reason that the backend
-  gave. No other node does.
+- A node becomes `Failed` when `watch` answers `Failed` for its key, or when `commit` reports its
+  key as failed. Either way the node keeps the reason that the backend gave. A commit makes no other
+  node `Failed`.
 - If the backend reports that it cannot continue, the error is reported once, every node becomes
   `Polled`, and everything is scanned. From then on the settings are those of a watcher that polls
   everything (`Engine::fall_back_to`): the configured poll interval and no delete delay. The same
@@ -799,26 +891,36 @@ for after the next commit. The watch state of a node is one of these:
   (`Engine::without_backend`).
 
 **The poll.** The tree keeps a list of the directories that the timer inspects (`Tree::polled`), so
-a poll does not walk every node. A directory is added to the list when its watch state is set (the
-backend's answer, or polled when there is no backend to ask), when a look in it fails, and when it
-is held. A stale key stays until the list is tidied. Each poll tidies it, and so do an insertion
-that finds the list longer than twice the arena, and the end of a poll when nothing is watched any
-more. A sequence of `watch` and `unwatch` calls on ever new paths, each shorter than the poll
+a poll does not walk every node. A directory is added to the list when its watch state is set to a
+polled one (`Polled` or `Failed`, from the backend's answer or because there is no backend to ask),
+when a look in it fails, and when it is held. A stale key stays until the list is tidied. Each poll
+tidies it, and so do an insertion that finds the list longer than twice the arena, and the end of
+every `watch` call, `unwatch` call or tick, or a backend failure, that leaves nothing watched
+(`Engine::set_poll`). While another path stays watched, the rule of twice the arena alone bounds
+the list. A sequence of `watch` and `unwatch` calls on ever new paths, each shorter than the poll
 interval, therefore cannot grow the list without bound. On each tick of the poll timer, each node
 on the list whose directory is on disk is handled by its state:
 
 - `Failed`: the backend is asked again, because it may have room now.
-- `Polled`, or a scan of it failed: a shallow scan is queued.
-- Any other state: a plain mark is put on each registered child that is a symbolic link (§2.14).
+- Otherwise (`Polled`, or a scan of it failed): a shallow scan is queued.
+
+The tidy at the start of each poll leaves no other state on the list. Apart from the list, each
+registered symbolic link whose parent directory is on disk and not polled gets a mark with no flags
+(`Mark::default()`, §2.14). A link in a polled directory is checked by the shallow scan of that
+directory.
 
 The marks and scans go through the normal flush, and the next poll is paced (§2.13). With a native
 backend the timer fires once per second, and the polled nodes are few: the root, the directories
 for which the backend answered `NotWatched`, and what failed. The timer runs only while the list
 holds more than the root, while a child of the root is not on disk (a drive that is not present
-yet), while a registered name is a symbolic link (§2.14), or while a flush has left work behind
-because the disk stopped answering. The next poll resumes that work. With inotify, which also
-watches the directories above, and with FSEvents, whose guard does so (§4.2), the thread sleeps
-until a notification arrives. With the poll backend every answer is `NotWatched`, so every node is
+yet), while a registered name is a symbolic link (§2.14), or while a flush has left marks or scans
+behind (`Tree::has_work`). That is a look that the disk gave no answer to, a directory that changed
+while it was listed, a file that went away while its hash was read, the one more look at a young
+directory with `two_step_links` (§2.5), or a mark that waits for its quiet time. The next poll
+resumes that work. With inotify, which also watches the directories above, and with FSEvents, whose
+guard does so (§4.2), the thread sleeps until a notification arrives. On FSEvents a directory on
+which no stream is placed (`/`, `/Users`, the home directory) is polled when it wants `Contents`,
+and keeps the timer running. With the poll backend every answer is `NotWatched`, so every node is
 polled, and the timer runs at the poll interval. Polling is this timer with the poll backend.
 
 **Asked again.** `NotWatched` is not permanent. A commit can place an OS watch over a polled
@@ -830,12 +932,14 @@ that is now reported gets a shallow scan after the next commit (watch, commit, t
 poll inspects it any more.
 
 **A watch below a watch.** A directory can have a watch of its own and also lie below a tree watch,
-when its path was watched first and a path above it later. It keeps its own watch until the
-directory disappears or the tree above it is unwatched. A record below it then produces one hint for
-each of the two keys, and the tree merges them into one mark. Until 2026-10-19 the lower watch was
-released after a deep scan, so that the OS watches did not depend on which path was watched first.
-That took 40 lines and two rules of its own, to save one cover and one duplicate hint per directory
-on FSEvents and Windows.
+when its path was watched first and a path above it later. It keeps its own watch: nothing gives it
+back in favor of the watch above. The two overlap until the directory disappears (when it comes
+back, the watch above covers it) or one of the two paths is unwatched. When the tree above is
+unwatched, the directory keeps its own watch alone. While they overlap, a record below it produces
+one hint for each of the two keys, and the tree merges them into one mark. Until 2026-10-19 the
+lower watch was released after a deep scan, so that the OS watches did not depend on which path was
+watched first. That took 40 lines and two rules of its own, to save one cover and one duplicate hint
+per directory on FSEvents and Windows.
 
 **A directory above a watch by path.** A watch by path (FSEvents) is bound to the text of a path.
 When a directory above it is renamed, even only to another spelling of its name, the watch reports
@@ -845,7 +949,8 @@ path. The engine does not try to detect such a rename. The kernel informs the ba
 reports each of its watches below that directory as lost (§4.2), and the engine watches the
 directory again and scans it deep, as after every loss report.
 
-Timestamps do not reveal such a rename, and the engine keeps none for directories. Measurements
+Timestamps do not reveal such a rename. The engine keeps no change or modification time for a
+directory, and the birth time in its identity (§2.8) stays the same through a rename. Measurements
 show that a rename changes the change time of the directory on APFS only (not on HFS+, exFAT or
 FAT32), and the modification time of the directory above. A file or a directory moved from the
 directory above into the renamed one, with one `rename` call, changes the same two timestamps. A
@@ -855,16 +960,20 @@ was moved into it from beside it, at a cost of 250 ms of CPU time.
 **`mark_moved`.** A mark can arrive through a watch that moved away with its directory. If the
 parent of that directory is only polled, nothing reports this in time, and the marks would be
 checked against the wrong directory. So at the start of a flush, for each marked node, the nearest
-directory at or above it whose parent is only polled, or that is reached through a symbolic link,
-gets a plain mark, unless it already has one. Marks are checked from the top down, so the parent
-checks it first.
+directory at or above its parent (the directory the mark is checked against) whose parent is only
+polled, or that is reached through a symbolic link, gets a mark with no flags, unless it already
+has one. A child of the root is never marked this way. Marks are checked from the top down, so the
+parent checks it first.
 
 ### 2.11 The ignore filter
 
-The rules are those of `design.md` §4.8. The engine asks the filter in three places. `read_entry`
-(`engine/check.rs`) asks about an entry inside a watched directory. `is_ignored_above` and
-`register` (`engine/watched_paths.rs`) ask about the directories above a path given to `watch` and
-about the path itself. The answers are stored with the node, one per kind (`Engine::ignores`). A
+The rules are those of `design.md` §4.8. The engine asks the filter in four places. `read_entry`
+(`engine/check.rs`) asks about an entry inside a watched directory, and about a watched path with
+the kind it has on disk. `is_ignored_above` and `register` (`engine/watched_paths.rs`) ask about the
+directories above a path given to `watch`, and about the path itself as a file, and also as a
+directory when it is ignored as a file. `counts_as_dir` (`engine/os_watch.rs`) asks about a watched
+path that is a directory on disk, when `register` or `want` decides whether its parent asks for
+`Names`. The answers are stored with the node, one per kind (`Engine::ignores`). A
 node on the way to a watched path keeps the answer for the directories above, so `read_entry` does
 not ask about it, and an ignored path gets no node. Hints from inside an ignored directory end at
 its parent and cost one `lstat` per flush. The stories in `tests/sim/filter.rs` fix this behavior,
@@ -879,17 +988,19 @@ replaces it.
 
 ### 2.12 Errors from the disk
 
-The two classes of `design.md` §4.10 are handled as follows:
+The two classes of `design.md` §4.10 are handled as follows. Every reported or unanswered error
+puts the directory in which the look failed (the directory itself when its listing failed) on the
+poll list (`Dir::has_error`, §2.10) until a scan of it has no error.
 
 | Error | Treatment |
 |---|---|
 | not found, not a directory | Missing. |
-| an invalid name, such as a path longer than the OS allows | Missing. Reported once as `Io`. The node is polled, since nothing can ever be at the path. |
+| an invalid name, such as a path longer than the OS allows | Missing, since nothing can ever be at the path. Reported once as `Io`. The directory in which the look failed is polled until a scan of it has no error, which for a path that stays invalid lasts as long as the entry is in the tree. |
 | an entry that is being deleted (on Windows the name disappears when the last handle on it is closed) | Missing. The node is looked at again in each flush until the name is gone or the file is there, because the holder can cancel the deletion and the OS then reports nothing. |
-| permission denied, symbolic link loop | Missing for events. Reported once. The node is polled until a scan of it succeeds. |
+| permission denied, symbolic link loop | Missing for events. Reported once. The directory in which the look failed is polled until a scan of it has no error. |
 | an unreachable server (`ERROR_BAD_NETPATH` on Windows, which std maps to "not found") | No answer. |
-| another program holds the entry without sharing (on Windows a sharing or lock violation, `ResourceBusy`) | No answer. The mark stays for the next flush, and the node is polled until a scan of it succeeds. Not reported, because nothing is wrong with the disk and the holder usually releases the entry in a moment. |
-| anything else | No answer. The tree stays as it is, no `Delete` is delivered, and the mark stays for the next flush. Reported once. The node is polled. |
+| another program holds the entry without sharing (on Windows a sharing or lock violation, `ResourceBusy`) | No answer. The node is marked deep for the next flush, and the directory in which the look failed is polled until a scan of it has no error. Not reported, because nothing is wrong with the disk and the holder usually releases the entry in a moment. |
+| anything else | No answer. The tree stays as it is, no `Delete` is delivered, and the node is marked deep for the next flush. Reported once. The directory in which the look failed is polled until a scan of it has no error. |
 
 A failed `watch` is reported as `WatchLimit`, `PermissionDenied` or `Io`. `WatchLimit` is reported
 once for the lifetime of the engine. A tree beyond the limit finds no room for one new directory
@@ -911,8 +1022,8 @@ reports the changes of other machines to the handle.
 
 ### 2.13 Time and the queue
 
-The engine has no thread and reads no clock. Its entry points receive the time from the caller
-(`engine/mod.rs`):
+The engine has no thread and calls no clock itself. Its entry points receive the time from the
+caller (`engine/mod.rs`):
 
 - `watch` and `unwatch`.
 - `signal`: one signal of the backend.
@@ -921,8 +1032,11 @@ The engine has no thread and reads no clock. Its entry points receive the time f
   node, a poll, or a loss report waiting for the end of a rest.
 - `tick`: perform what is due.
 
-It reads the disk through the `Fs` trait. `StdFs` is the real disk, and `SimFs` is the disk of the
-tests.
+It reads the disk through the `Fs` trait, and two clocks through it too: `Fs::now`, the wall clock
+against which a modification time is young (§2.8), and `Fs::ticks`, a monotonic clock that times
+each flush (the rest and the poll pacing below) and the moment of a look in `missing` (§2.9).
+`StdFs` is the real disk and the system clocks, and `SimFs` is the disk of the tests, with a clock
+that the test advances.
 
 **The watcher thread** (`watcher.rs`) is one loop around a queue. A backend thread never blocks. At
 most 16 MiB of signals wait (`Backend::raw_bytes` reports the size of a raw notification). A signal
@@ -949,27 +1063,32 @@ a clock tick, which occurs every 15.6 ms unless a program requested a finer reso
 20 ms took 31 ms, and one of 1 ms took 15.6 ms (measured), which accounted for all of the 11 ms
 between the quiet time and the reported edit. The thread instead waits on an event that every
 sender sets after its message, and on a high-resolution waitable timer, which fires within half a
-millisecond (`watcher::windows`). On the other systems the timed wait of the channel is accurate.
+millisecond (`watcher::windows`). On the other systems the timed wait of the channel is not rounded
+to a tick. On macOS it still ends late, by the timer leeway of the system, which grows with the
+wait. On battery a wait of 10 ms took 12.5 to 15 ms, and one of 100 ms took 105 ms (measured on
+2026-10-27).
 
-**The debounce** (`design.md` §4.11) is computed by `Engine::schedule`. The bound on the wait is four
-quiet times, and at most 500 ms unless the quiet time is longer. It is counted from the first hint
-after the previous flush, just as lodash's `maxWait` counts from the first call. Measured on Linux
-with a file in the watched tree written every 5 ms, an edit next to it waited 364 ms (p50) when the
-longest wait was 500 ms, and 25 to 28 ms with four quiet times. On macOS FSEvents leaves gaps of
-about 10 ms, and the edit waited 22 ms either way. A burst of 2,000 edits was delivered in 3 batches
-on macOS instead of 1, all equally soon (2026-10-15). @parcel/watcher counts its 500 ms from the
-previous batch instead. The first change after half a second of quiet is then delivered at once,
+**The debounce** (`design.md` §4.11) is computed by `Engine::schedule`. The bound on the wait is
+four quiet times, and at most 500 ms unless the quiet time is longer. It is counted from the first
+hint after the previous flush, just as lodash's `maxWait` counts from the first call. Measured on
+Linux with a quiet time of 20 ms (the default then) and a file in the watched tree written every
+5 ms, an edit next to it waited 364 ms (p50) when the longest wait was 500 ms, and 25 to 28 ms with
+four quiet times (80 ms). On macOS, with a quiet time of 10 ms (the default then), FSEvents leaves
+gaps of about 10 ms, and the edit waited 22 ms either way. A burst of 2,000 edits was delivered in 3
+batches on macOS instead of 1, all equally soon (2026-10-15). @parcel/watcher counts its 500 ms from
+the previous batch instead. The first change after half a second of quiet is then delivered at once,
 alone, and a disk check at that moment can catch a save that is half done (§2.9).
 
 The default quiet time on Linux is 10 ms. It is long enough for the steps of one save (a temporary
 file, a rename) to form one batch, even on a busy machine, and short enough not to be noticeable.
-This was measured on Linux with the saves of §2.9 on a busy machine. With 5 ms, 4 of 60 saves and 2
-of 1,000 files written by `git checkout` were reported twice, the first time half written. With
-10 ms none were (2026-10-15), and again none in the runs of 2026-10-22, idle and busy, where an
-edit was reported after 11 ms instead of 21 ms with 20 ms. vim and Neovim sync the new file before
-closing it. A sync longer than the quiet time, which is common on a busy machine, makes such a save
-reported twice, the second time after the close. With 10 ms this happened in 4 of 60 saves when
-idle and in 10 to 14 of 60 when busy. With 20 ms it happened in none of 300.
+This was measured on Linux with the saves of §2.9 on a busy machine. With 5 ms, 4 of 100 saves (2 of
+20 saves of 1 MB written in place and 2 of 20 vim saves) and 2 of 1,000 files written by `git
+checkout` were reported twice, the first time half written. With 10 ms none were (2026-10-15), and
+again none in the runs of 2026-10-22, idle and busy, where an edit was reported after 11 ms instead
+of 21 ms with 20 ms. vim and Neovim sync the new file before closing it. A sync longer than the
+quiet time, which is common on a busy machine, makes such a save reported twice, the second time
+after the close. With 10 ms this happened in 4 of 60 saves when idle and in 10 to 14 of 60 when
+busy. With 20 ms it happened in none of 300.
 
 On Windows a save produces two records, one when the open truncates the file and one at the close,
 and nothing for the writes in between (measured). The quiet time can only join those two, and a
@@ -997,27 +1116,35 @@ A check made by a scan takes the mark waiting on its node with it, `written` inc
   they took some time, the next ones wait nine times as long (`REST`), and at most half a second
   (`LONGEST_LOSS_REST`). The rest guards against a storm of loss reports, and the bound keeps one
   long scan from postponing the next loss report by seconds. A directory of 20,000 entries takes
-  about 200 ms to scan. Every mark that a hint requested is checked as usual.
-- The poll. The pause between two rounds is the only control of polling, as in notify and
-  watchdog. A round looks at every watched file once. For 20,000 files in 2,000 directories that is
-  22,000 `lstat` calls and 50 ms on APFS (measured), and a user with many files raises the
-  interval. For a while the rule was a rest of nine times the looks, at most a tenth of a core. It
-  made the interval a floor that the user could not see, and 20,000 files were polled every half
-  second.
+  about 20 to 45 ms to scan with a warm cache (measured on 2026-10-27, 19 to 42 ms on APFS with one
+  listing, 10 to 44 ms in the Linux VM with one `lstat` per entry), so the rest after it stays under
+  the bound. The bound acts only after a scan of more than about 55 ms, such as one of a much
+  bigger tree or a slow disk. Every mark that a hint requested is checked as usual.
+- The poll. The next round starts one poll interval after the end of a round, and never sooner than
+  the duration of that round after its end (`poll_interval.max(took)` in `Engine::tick`), so polling
+  uses at most half a core. Apart from this floor, the interval is the only control of polling, as
+  in notify and watchdog. A round looks at every watched file once. For 20,000 files in 2,000
+  directories that is 22,000 `lstat` calls and 50 ms on APFS (measured), and a user with many files
+  raises the interval. For a while the rule was a rest of nine times the looks, at most a tenth of a
+  core. It made the real pause up to ten times the round, which the user could not see, and 20,000
+  files were polled every half second.
 
 The time counted is the time of the whole flush in which the poll or the scans ran. The checks
 requested by hints in the same flush count toward it, as do the reads of young files and the time
 that the backend takes to make watches live. A flush counts for at most one minute
-(`LONGEST_FLUSH`). The clock keeps running while the machine sleeps, and a flush interrupted by
-sleep would otherwise pause the work for hours.
+(`LONGEST_FLUSH`). The flush is timed with `Instant`. On Windows this clock
+(QueryPerformanceCounter) keeps running while the machine sleeps. On macOS and Linux it stops.
+Without this bound, a flush interrupted by sleep on Windows, a process stopped for a long time
+(SIGSTOP, a debugger), or a disk call that hangs would pause the work for hours.
 
 ### 2.14 Symbolic links
 
 The rules are those of `design.md` §4.9. For a registered name that is a symbolic link, the engine
 stores a hash of the real path behind it and compares it at each look. If the look behind the link
 gets no answer, the stored hash stays as it was. A node reached through a link never becomes
-`FromAbove`, so the backend is asked about it. Every poll puts a plain mark on each registered child
-that is a link (§2.10), and `mark_moved` treats a node behind a link like a node with a polled
+`FromAbove`, so the backend is asked about it. Every poll puts a mark with no flags on each
+registered link whose parent is not polled, and the shallow scan of a polled parent checks the
+others (§2.10), and `mark_moved` treats a node behind a link like a node with a polled
 parent. An unregistered link is never opened (§2.8).
 
 ## 3. Backend interface
@@ -1033,7 +1160,7 @@ has its own `new(sink: Sink<Self::Raw>)`. `PollBackend` is a unit struct and nee
 | `Raw` | A raw OS notification. It is cheap to create, because the backend thread only copies it into the sink. |
 | `watch(key, dir, want)` | Report changes in `dir` as hints that carry `key`. The answer is a `Coverage`. |
 | `unwatch(key)` | Forget `key`. No hint should carry it afterwards, and a late one costs the engine one check. |
-| `commit()` | Make every watch requested since the previous call live. It returns two lists of keys (`Committed`). The first holds the keys whose watch could not be made live, each with the reason. The engine reports the reason, polls the directory, and asks again later. A key that is not listed is live. The second list holds the keys that received `NotWatched` and whose directories an OS watch now reports. The engine calls `watch` again for each of them, with the previous `Want`, and does not poll a directory that is reported (§2.10, "Asked again"). Only a backend that places one OS watch over many directories has work to do here, because its answer for one directory depends on the OS watches of other directories. FSEvents lists the keys that received no stream or no guard, and the Windows backend lists the keys that a handle now reports. Every other backend omits the method, which then does nothing and returns no key. |
+| `commit()` | Make every watch requested since the previous call live. It returns two lists of keys (`Committed`). `failed` holds the keys whose watch could not be made live, each with the reason. The engine reports the reason, polls the directory, and asks again later. A key that is not listed is live, unless the same call reported it lost (`Changed` with an empty `rel`, rule 10). The engine then checks it and calls `watch` again. `now_watched` holds the keys that received `NotWatched` and whose directories an OS watch now reports. The engine calls `watch` again for each of them, with the previous `Want`, and does not poll a directory that is reported (§2.10, "Asked again"). Only a backend that places one OS watch over many directories has work to do here, because its answer for one directory depends on the OS watches of other directories. FSEvents lists the keys that received no stream, or no guard for a reason other than a missing directory. A key whose directory is missing, or whose stream path or name changed since `watch`, it reports lost instead (§4.2). The Windows backend lists the keys that a handle now reports. Every other backend omits the method, which then does nothing and returns no key. |
 | `translate(raw, hint)` | Turn one raw notification into hints. |
 | `ask_delivered(after)` | Answer with `Hint::Delivered` once every notification of a change made before some time at or after `after` has arrived (rule 13). A backend that omits it never answers. |
 | `raw_bytes(raw)` | The number of bytes that `raw` keeps on the heap (§2.13). A backend that omits it reports 0. |
@@ -1063,7 +1190,9 @@ has its own `new(sink: Sink<Self::Raw>)`. `PollBackend` is a unit struct and nee
 - `watch_limit(message)` creates the error for "the OS has no room for one more watch". It is an
   `io::Error` that carries a marker of its own, so that no error of the OS is mistaken for one.
   Previously, the marker was the kind `StorageFull`, which the OS also returns. The message names
-  the limit and what to raise, so the text of the error names the exact limit that was hit.
+  the limit that was hit and, where the user can raise it, what to raise (the inotify watches and
+  instances, and the open files of the FSEvents guard). A stream that FSEvents did not start is put
+  down to its 512 streams per process or to FSEvents not being available.
   Previously, the kind named one limit per OS, even when another limit was hit. `is_watch_limit`
   tells whether an error is one, and the engine reports such an error as `ErrorKind::WatchLimit`.
 
@@ -1086,10 +1215,14 @@ the call that made the change returns.
   spelling, or a renamed directory) returns the old `wd`. The new key is added to it, and every key
   of a watch receives every hint. The kernel watch is removed with its last key. A watch almost
   always has one key, so the first key is stored in the table itself, and only a second one
-  requires memory. This costs 71 bytes of heap per watched directory and no lasting allocation,
-  where it was 92 bytes and one allocation before. The kernel keeps about 1 KB per watch. The two
-  tables shrink when most of their keys are gone. After 100,000 directories were unwatched, 67 KB
-  remain instead of 6.1 MB.
+  requires memory. With 100,000 watched directories, this costs 71 bytes of heap per directory and
+  no lasting allocation, where it was 92 bytes and one allocation before. The cost per directory
+  depends on how full the two hash tables are (89 bytes at 20,000 directories, and between about 62
+  and 124 bytes overall). The kernel keeps about 1 KB per watch. The two tables give their room back
+  once three quarters of it is free, and keep twice what is left (`give_room_back`, as the tree
+  does). After 100,000 directories were unwatched, the two tables keep 3.5 KB instead of 7.1 MB, and
+  the whole backend keeps about 73 KB, most of it the 64 KiB read buffer of the reader thread
+  (measured on arm64 Linux at f31cd1d).
 
 Each event becomes a hint as follows:
 
@@ -1110,22 +1243,26 @@ directory, and the old entry is removed with it.
   (`READ_INTERVAL`), and again at once after a read that filled more than half of its buffer. A
   first change is read when it arrives, and what follows within the millisecond comes with the next
   read. While events wait in the queue, the kernel merges an event that repeats the previous one,
-  and the two threads wake up at most a thousand times per second (see the measurements below). The
+  so the reader reads, and hands a batch to the watcher thread, at most about a thousand times per
+  second (see the measurements below). Two cases go past this. A flood that fills more than half of
+  the buffer in a millisecond is read back to back, and a delivery (below) reads until the queue is
+  empty (one writer at full speed on tmpfs caused 19,000 reads per second during deliveries). The
   watcher thread adds and removes the kernel watches itself, so nothing needs a lock.
 - **A volume mounted or unmounted** over a watched directory, or over a directory above one,
   produces no inotify event. This was measured with tmpfs over a watched directory, its parent and
   its grandparent, and the watches stay on the directories that the volume hides. The reader thread
-  therefore also waits on `/proc/self/mountinfo`, where the kernel signals each mount and unmount
-  in the namespace with a priority event (`POLLPRI`). In measurements the event came 19 to 27 ms
-  after `mount`, with no event when idle and none for a mount in another namespace. The reader then
-  reads the table again and compares it with the previous one by mount ID, since a volume mounted
-  over another at the same point is also a change. It sends the mount points that appeared or
-  disappeared together (`Raw::Mounts`), and each of them becomes a `Hint::Mount` with its path. The
-  engine checks the node at that path, if it has one, and recognizes the different directory there
-  by its identity (`a_mount_over_a_watched_directory_is_told`,
-  `a_volume_mounted_over_a_watched_directory`). The path is a real path, so a mount that a watched
-  path reaches through a symbolic link is not found this way. macOS reports mounts differently
-  (§4.2).
+  therefore also waits on `/proc/self/mountinfo`, where the kernel signals each mount and unmount in
+  the namespace with a priority event (`POLLPRI`). The kernel signals within the `mount` call
+  itself. In measurements the event came under 0.4 ms after mount(2) began, and the reader sent
+  `Raw::Mounts` under 0.5 ms after it began, with no event when idle and none for a mount in another
+  namespace (Linux 7.2, 2026-10-27). The reader then reads the table again and compares it with the
+  previous one by mount ID, since a volume mounted over another at the same point is also a change.
+  It sends the mount points that appeared or disappeared together (`Raw::Mounts`), and each of them
+  becomes a `Hint::Mount` with its path. The engine checks the node at that path, if it has one, and
+  recognizes the different directory there by its identity
+  (`a_mount_over_a_watched_directory_is_told`, `a_volume_mounted_over_a_watched_directory`). The
+  path is a real path, so a mount that a watched path reaches through a symbolic link is not found
+  this way. macOS reports mounts differently (§4.2).
 - **A delivery** (rule 13, `forward`). The reader also waits on an eventfd for a request from the
   engine, and for the time that the request names. It then drains the queue and sends
   `Raw::Delivered` behind what it read, with the time at which the last read began. This becomes
@@ -1144,10 +1281,11 @@ directory, and the old entry is removed with it.
   error. `EMFILE` and `ENFILE` when the backend starts indicate the limit of inotify instances
   (`fs.inotify.max_user_instances`) or of open files, and also produce the watch limit error.
 
-**Limits.** `MOVE_SELF` arrives only when the watched directory itself is renamed. A move of a
-directory above it is reported by the watches on the way. One behavior is expected but not tested:
-a removed directory that a process holds open sends `DELETE_SELF` only when that process releases
-it.
+**Limits.** A write through `mmap` produces no event of its own. The change is found at
+`CLOSE_WRITE`, when the writer releases the file. `MOVE_SELF` arrives only when the watched
+directory itself is renamed. A move of a directory above it is reported by the watches on the way.
+One behavior is expected but not tested: a removed directory that a process holds open sends
+`DELETE_SELF` only when that process releases it.
 
 **Measurements** on Linux, with 13 CPUs, the default queue limit of 16,384 events, and two events
 per new file:
@@ -1156,19 +1294,22 @@ per new file:
   already has a watch), `unwatch` 0.6 to 0.7 µs, and `translate` 7 ns per event.
 - New files on a disk (btrfs), 200,000 per second from 4 or from 8 threads. There is no overflow,
   and every event arrives.
-- New files on tmpfs. At 800,000 per second from 4 threads there is no overflow. At 900,000 per
-  second from 8 threads there are 15 to 20 overflows per run, and 36% to 47% of the events arrive. A
-  reader that uses the bare API and only counts gets the same result, so the reader thread of the
-  backend is not the cause. The writers hold the lock of the queue.
+- New files on tmpfs. With a read on every wake-up, at 800,000 per second from 4 threads there is no
+  overflow. At 900,000 per second from 8 threads there are 15 to 20 overflows per run, and 36% to
+  47% of the events arrive. A reader that uses the bare API and only counts gets the same result, so
+  the reader thread of the backend is not the cause. The writers hold the lock of the queue.
 - Small writes into files of one watched directory, on a disk. Every `write` call is an event.
   With a read on every wake-up, one writer (a million writes per second for half a second) cost the
   reader thread 220 ms of CPU time and the thread that receives its reads 130 ms, for 85,000 events
   in 75,000 reads. With one read per millisecond, it cost 2 ms and 3 ms, for 190 events in 135
   reads. Eight writers for five seconds cost 3 s and 1 s before, and 0.6 s and 0.05 s now, for the
   same four million events. There was no overflow in either case. One new file is read 60 µs after
-  the call, as before. The floods above overflow as often as before, and the writers of the flood
-  on tmpfs are faster (1.3 million files per second, up from 0.8 million), because the reader takes
-  the lock of the queue less often.
+  the call, as before. The floods on the disk and from 8 threads on tmpfs overflow as often as
+  before. The flood from 4 threads on tmpfs does not. Its writers are faster (about 1.0 million
+  files per second, up from 0.8 million), because the reader takes the lock of the queue less
+  often, and the queue now overflows in most runs (1 or 2 overflow events in 8 of 10 runs of
+  200,000 files, and 98% to 100% of the events arrive). A read on every wake-up overflowed in 1 of
+  13 runs (Linux 7.2.12, 2026-10-27).
 - A directory shared with another machine, seen from a virtual machine, with the file system
   `fuseblk`. `inotify_add_watch` works, changes made inside the machine arrive, and changes made by
   the other machine do not arrive at all. Nothing informs the backend of this, so the engine asks
@@ -1200,8 +1341,10 @@ per new file:
   - It looks at the path about 100 µs after the rename and sends the record only if the path is
     still different. "Rename away, create a file below, rename back" with no pause produced no
     record at all in 3 of 230 runs, and the file was not reported.
-  - It opens one file for each name of each stream path, and paths do not share them. 64 paths of
-    9 names are 769 open files.
+  - It opens one directory for each name of each stream path, and paths do not share them. A path
+    on the data volume (under `/Users` or `/private`) also opens `/System`, `/System/Volumes` and
+    `/System/Volumes/Data`, so a path of 9 names costs 12. With the one kqueue of the stream, 64
+    such paths are 769 open files (64 times 12, plus 1).
   - A stream with it takes 0.09 to 0.16 ms per path to create (paths of 9 and of 11 names),
     compared with 0.002 ms without it.
 
@@ -1216,7 +1359,9 @@ per new file:
   - Two renames with no pause produce one event.
   - No event was missed in 4,000 runs each of "rename away, create a file below, rename back", of a
     rename that only changes the case, of a swap of two directories in one call, and of a directory
-    that is replaced. The same holds on APFS, HFS+, exFAT and FAT32.
+    that is replaced. The same holds on APFS, HFS+, exFAT and FAT32, except the swap, which only
+    APFS can do. On HFS+ and exFAT, `renamex_np` with `RENAME_SWAP` fails with `ENOTSUP`, and on
+    FAT32 it does a plain rename instead (or fails with `ENOTEMPTY` when the target is not empty).
   - Nothing arrives on a descriptor of a directory below the renamed one, so each directory on the
     way needs its own descriptor.
   - Opening and registering a descriptor takes 10 µs, and the kernel keeps 248 bytes for it: a
@@ -1226,8 +1371,10 @@ per new file:
   - A dispatch source of type `READ` on the descriptor of the queue calls its handler 0.6 ms after
     a rename, and again while events wait. 200 events that waited at once arrived in 4 calls of at
     most 64.
-  - `fcntl(F_GETPATH)` on such a descriptor returns the current path of the directory in 0.3 µs, in
-    the short spelling of a path on the data volume (`/Users/...`).
+- `fcntl(F_GETPATH)` on such a descriptor returns the current path of the directory in 0.3 µs, in
+  the short spelling of a path on the data volume (`/Users/...`), where `realpath` keeps
+  `/System/Volumes/Data/...`. It is not used. The check after the start asks `realpath` again, as
+  `watch` did, so that a path spelled another way, with no rename, is not taken for a moved one.
 - A volume mounted on a directory, such as a disk image. The descriptors of that directory and of
   one below it receive no event, and the descriptor of its parent receives only `NOTE_WRITE`. A
   stream below the mount point receives no record, and continues by the text of its path, into the
@@ -1246,8 +1393,10 @@ per new file:
   - With 500 ms of overlap, nothing was missed in 40 runs.
   - With a loss report at the stop, nothing was missed in 40 runs, also with no overlap.
 - Records are lost with notice when files arrive at one stream faster than it delivers them. One
-  callback call of a stream carries at most 32 records. The flood of the probe was 20,000 new files
-  from 4 threads, about 50,000 per second, distributed in turn over 8 or more directories:
+  callback call of a stream carries at most 32 records of changes. A loss report comes in a call of
+  its own, with one record for each path of the stream (64 records with 64 paths, 200 with 200). The
+  flood of the probe was 20,000 new files from 4 threads, about 50,000 per second, distributed in
+  turn over 8 or more directories:
   - A stream for the directory above them, or one stream with these directories as its paths,
     reports `UserDropped` and `MustScanSubDirs` for each of its paths in 4 of 14 floods, and names
     87% to 99% of the files. With 64 paths it does so in 12 of 12 floods, 1 to 15 times per flood.
@@ -1268,7 +1417,11 @@ per new file:
   busy, a start took 16 to 430 ms, and 20,000 `watch` calls of one file each took 13.8 s instead of
   0.47 s.
 - The limits are 512 started streams per process and 4,096 paths per stream.
-- A write to a file that stays open, and a write through `mmap`, is not reported before the close.
+- On macOS 26 a new socket or FIFO produces no record (macOS 27 gives one). Its removal is reported
+  on both.
+- A write to a file that stays open is not reported before the close. A write through a writable
+  mapping is reported when the mapping is removed (`ubc_unmap`), not at the close. Without `msync`,
+  APFS keeps the old modification time, so the record finds an equal fingerprint.
 - Many stream paths lose nothing, but they are slow while other programs write a lot. With 50,000
   other files written, the time from the last write until all records had arrived was 0.1 s with 1
   or 100 paths, 0.9 s with 500, 1.8 s with 1,000, 3.5 s with 2,000, and 6.9 s with 4,000. A stream
@@ -1285,38 +1438,46 @@ under its real path with every key, in a table by path (`Dirs`). For `watch(key,
 no stream reports the real path of `dir` yet, the path goes into the stream of the next `commit`,
 and the answer is `WatchedTree`. For `watch(key, dir, Names)`, the answer is `WatchedTree` if a
 stream reports the directory, and `Watched` otherwise. In a directory on the way, names appear and
-disappear only when one of them is renamed or removed, and the guard of that name reports it
-(below), as the directory's own guard does for the directory. A stream is never placed on `/`,
-`/Users` or a home directory, where every program of the user writes. A cover there is answered
-`NotWatched` and polled. The rule (`may_watch_a_tree`) is the one that places no Windows handle on
-`C:\`, `C:\Users` or `C:\Users\<name>` (§4.3). Previously, a watched path whose lowest existing
-directory was the home directory placed a stream on the home directory. 2,000 files written
-elsewhere in it then produced 3,680 records, each dropped after one lookup.
+disappear only when one of them is renamed or removed. What watches that name reports it: its guard
+(below), as the directory's own guard does for the directory, or, for a name inside a stream, the
+record of its rename. A name with neither, a home directory answered `NotWatched` (below) or a
+symbolic link (§2.14), is found by its poll. A stream is never placed on `/`, `/Users` or a home
+directory, where every program of the user writes. A directory there is answered `NotWatched` and
+polled. The rule (`may_watch_a_tree`) is the one that places no Windows handle on `C:\`, `C:\Users`
+or `C:\Users\<name>` (§4.3). Previously, a watched path whose lowest existing directory was the home
+directory placed a stream on the home directory. 2,000 files written elsewhere in it then produced
+3,680 records, each dropped after one lookup.
 
 **Stream paths.** A stream path is a directory for which a stream was started. Usually it is a cover
-with no cover above it. With more than 64 stream paths (`MAX_STREAM_PATHS`), a commit places all
-covers again by the rule of `place`, the same rule as for the Windows handles. The measurements
-above showed that up to 100 paths cost nothing. Paths move up to directories that covers have in
-common, the deepest first, until 64 remain. A path never moves up to a directory that is too high
-(`is_too_high`). Such a directory is `/`, a directory in `/`, a directory one level further down (a
-home directory, the top of a volume, `/private/tmp`), or the temporary directory of a user together
-with the directories above it. Where only such a directory would serve, the paths stay separate. A
-cover below a running stream path needs no new stream. `place` sorts the covers and walks them once.
-It finds the depth of the last directory that has to be taken, takes every common directory below
-that depth, and at that depth takes one directory after another while too many paths remain. For
-20,000 covers in a deep tree this takes 13 ms, and for 100,000 it takes 69 ms. With a pass over all
-paths for every directory taken, it took 38 ms and 724 ms.
+with no cover above it. With more stream paths than the limit (`path_limit`, at first 64,
+`MAX_STREAM_PATHS`), a commit places all covers again by the rule of `place`, the same rule as for
+the Windows handles. The measurements above showed that up to 100 paths cost nothing. Paths move up
+to directories that covers have in common, the deepest first, until at most 56 remain
+(`MAX_STREAM_PATHS - MAX_NEW_STREAMS`, see **Streams are only added**). A path never moves up to a
+directory that is too high (`is_too_high`). Such a directory is `/`, a directory in `/`, a directory
+one level further down (a home directory, the top of a volume, `/private/tmp`), or a directory at
+most three levels below `/private/var/folders` (the directories of each user there, among them the
+temporary directory `T` and the cache directory `C`). Where only such a directory would serve, the
+paths stay separate. When a placement leaves more than 64 paths in this way, the limit becomes twice
+the number of placed paths, so that the next commits start streams for their own paths and do not
+place all covers again each time. A cover below a running stream path needs no new stream. `place`
+sorts the covers and walks them once. It finds the depth of the last directory that has to be taken,
+takes every common directory below that depth, and at that depth takes one directory after another
+while too many paths remain. For 20,000 covers in a deep tree this takes 13 ms, and for 100,000 it
+takes 69 ms. With a pass over all paths for every directory taken, it took 38 ms and 724 ms.
 
-**The real path** of a directory is composed of the real path of its parent, which is kept until the
-next commit, and of its own name as the disk spells it (one `getattrlist` call). A symbolic link,
-and a name that differs by more than the case of ASCII letters, are left to the OS (`realpath`).
+**The real path** of a directory is composed of the real path of its parent (`realpath`) and of its
+own name as the disk spells it (one `getattrlist` call). The real path of the last parent is kept
+until the next commit, or until a `watch` under another parent, so the watches of the children of
+one directory ask `realpath` once. A symbolic link, and a name that differs by more than the case of
+ASCII letters, are left to the OS (`realpath`).
 
 **Streams are only added.** `commit` starts streams for the new paths. Old streams keep running, so
 nothing ever falls into a gap. `commit` places all covers again when 64 streams are running
-(`MAX_STREAMS`), when there are too many stream paths, or when a new path lies above a running one,
-so that no stream path lies below another and no record arrives twice for long. The covers are then
-placed on 56 paths, not 64. This leaves room for the paths of the next few commits, so that a few
-new directories do not replace every stream again. A running stream whose paths are all placed
+(`MAX_STREAMS`), when the stream paths would pass the limit, or when a new path lies above a running
+one, so that no stream path lies below another and no record arrives twice for long. The covers are
+then placed on 56 paths, not 64. This leaves room for the paths of the next few commits, so that a
+few new directories do not replace every stream again. A running stream whose paths are all placed
 again, and are still trusted, continues; of two streams on one path, the newer one continues. New
 streams start only for the other paths, and only the streams that do not fit are replaced. With 64
 streams running, only the 24 with the most covers at and below their paths continue, so that the
@@ -1360,28 +1521,30 @@ backend waits on the queue after these stops, so no report arrives after it.
 **Hints.** A record becomes one `Changed` for each key of each cover that contains its path, and the
 remainder of the path is `rel`. The covers are found with one table lookup for each directory above
 the path that can be a cover. A record under no cover is dropped, because a stream path on a common
-directory also reports what lies next to the covers. A directory record without `Created`, `Removed`
-or `Renamed` is dropped. A record with `Mount` or `Unmount` is for a directory, although it does not
-say so.
+directory also reports what lies next to the covers. A directory record without `Created`,
+`Removed`, `Renamed`, `Mount` or `Unmount` is dropped. A record with `Mount` or `Unmount` is for a
+directory, although it does not say so.
 
-**Lost records.** A record with `MustScanSubDirs` for a path other than `/` becomes `Changed` with an
-empty `rel` for each key of every cover that contains the path, and of every cover below the path.
-If there is no such cover, there is no hint, because no key can see that place. A record for `/`,
-and a record with only `UserDropped` or `KernelDropped`, becomes `Lost`. These hints come after the
-other hints of the callback call. The covers are kept in the order of their paths (`Dirs`, an
-ordered map), so the covers below a path are one search away. The search takes 0.2 to 0.3 µs for a
-path with 50 to 100 covers below it, among 2,000 covers or 20,000. A flood of renamed directories
-costs one search per record. A record finds the covers that contain it in the same map, in 75 ns
-with 2,000 covers and 90 ns with 20,000, where a hash map took 65 to 75 ns. No second list of the
-paths is kept. A look at every cover for every record took 5 to 10 s for 4,100 records and 4,100
-covers in one call. A sorted copy of all cover paths, rebuilt after each change of the covers and
-kept, was as fast as the map, and held every path a second time.
+**Lost records.** A record with `MustScanSubDirs` for a path other than `/` becomes `Changed` with
+an empty `rel` for each key of every cover that contains the path, and of every cover below the
+path. If there is no such cover, there is no hint, because no key can see that place. A record for
+`/`, and a record with only `UserDropped` or `KernelDropped`, becomes `Lost`. The `Changed` hints of
+these places, and of the covers below a renamed directory (below), come after the other hints of the
+callback call. A `Lost` hint is sent where its record stands. The covers are kept in the order of
+their paths (`Dirs`, an ordered map), so the covers below a path are one search away. The search
+takes 0.2 to 0.3 µs for a path with 50 to 100 covers below it, among 2,000 covers or 20,000. A flood
+of renamed directories costs one search per record. A record finds the covers that contain it in the
+same map, in 75 ns with 2,000 covers and 90 ns with 20,000, where a hash map took 65 to 75 ns. No
+sorted list of the paths is kept beside the map. A look at every cover for every record took 5 to 10
+s for 4,100 records and 4,100 covers in one call. A sorted copy of all cover paths, rebuilt after
+each change of the covers and kept, was as fast as the map, and held every path once more, a third
+time beside the keys of `by_dir` and the values of `dir_of`.
 
 **`unwatch(key)`** forgets the key. The path stays in its stream until the streams are replaced, or
 until no path of that stream has a cover at or below it any more. The stream is then stopped at the
 next commit, with no loss report, since none of its records would reach a key. When no key is left
-at all, the streams that a replacement left running are also stopped at the next commit, before
-their time, so that nothing stays open.
+at all, no stream has a cover at or below its paths, so the next commit stops every stream and
+nothing stays open.
 
 **A cover is a text.** A stream is bound to the text of its path, and a record finds its cover by
 the text of the cover. Both hold only while every name in them is the name that the disk has. Each
@@ -1413,18 +1576,20 @@ everything for a dropped signal. Previously, the guards stayed on the old direct
   stream received nothing while its path was different.
 
 The engine watches each cover again, which resolves its real path anew and starts a stream there,
-and scans it deep. The stream that stood there is then idle, and the next commit stops it. The guard
-that fired is closed, since another directory may now stand at its path. So is each guard below it,
-because its directory left together with the one that fired, and no notice arrives on it. The next
-commit opens a guard where one is still needed. When the guards below were kept open, they held the
-old directories, and a rename of a new directory at their paths went unnoticed
-(`a_directory_above_a_cover_is_replaced`).
+and scans it deep. If the stream that stood there held no other path that is still trusted, it is
+then idle, and the next commit stops it. A stream that holds other paths keeps running until the
+streams are replaced (see Open issues). The guard that fired is closed, since another directory may
+now stand at its path. So is each guard below it, because its directory left together with the one
+that fired, and no notice arrives on it. The next commit opens a guard where one is still needed.
+When the guards below were kept open, they held the old directories, and a rename of a new directory
+at their paths went unnoticed (`a_directory_above_a_cover_is_replaced`).
 
 - A volume mounted on a guarded directory, or above one, fires no guard, and no stream below it
   reports it. The kernel queue therefore also reports each volume that appears or disappears. Each
   guard whose open directory is then not the one at its path counts as fired
-  (`a_volume_mounted_above_a_cover`). This is decided by device and inode, with one `stat` per
-  guard. A volume inside a stream is reported by its record (below).
+  (`a_volume_mounted_above_a_cover`). This is decided by device and inode, with an `fstat` of the
+  open guard and a `stat` of its path, for each guard. A volume inside a stream is reported by its
+  record (below).
 - At a commit in which the stream paths or the directories asked for names changed, the guards that
   the new streams need are opened before the streams start. A rename between the guard and the
   start is reported, and a rename before the guard is found by the check after the start. The
@@ -1433,8 +1598,10 @@ old directories, and a rename of a new directory at their paths went unnoticed
 - The guards of all watchers of the process use at most half of the open files that the process may
   have (`getdtablesize`). That is 128 for a program started from a shell, which gets 256. Node
   requests far more when it starts. A directory that gets no guard, for this or another reason,
-  gets no stream below it. The keys of the directories at and below it are listed as failed (the
-  watch limit error, `ulimit -n`), and they are polled and asked again. The guards are opened from
+  gets no stream below it. The keys of the directories at and below it are listed as failed with the
+  error of its guard: the watch limit error (`ulimit -n`) when the room is used up or the process
+  has no open file left (`EMFILE`, `ENFILE`), otherwise the error of `open`, such as a directory
+  without search permission. They are polled and asked again. The guards are opened from
   the top down, and none is opened below a directory that got none. The remaining room goes to
   complete paths downward, so the last guards to fit fail the fewest keys
   (`the_guards_that_fit_go_from_the_top_down`). A directory that is not present is not an error,
@@ -1442,12 +1609,18 @@ old directories, and a rename of a new directory at their paths went unnoticed
   back by then, with no guard to report its next rename. The engine checks them and watches them
   again, and the next commit opens the guard
   (`a_directory_away_when_its_guard_opens_is_checked_again`).
-- As a result, nothing is polled on the way to a watched path, and an idle watcher has no timer
-  (§2.10). The bench project with 20,000 watched files has 40 stream paths and about 50 guards.
-- Before 2026-10-15 the real path of each stream path was requested at each commit (`realpath`). A
-  poll of the directories above the covers triggered this once per second. It cost 1.6 ms per
-  second for 40 stream paths, and 23 to 28 s for 20,000 `watch` calls of one file each
-  (0.44 s now, measured side by side). A rename reverted within the second, with changes below in
+- As a result, no directory on the way to a watched path is polled, and an idle watcher has no timer
+  (§2.10), with two exceptions. A registered name that is a symbolic link is looked at by the poll
+  each second (§2.14), which is common on macOS, where `/tmp` and `/var`, and so the temporary
+  directories under `/var/folders`, are links to `/private`. A directory whose watch failed because
+  it was already gone is tried again only by the poll (§5). The bench project with 20,000 watched
+  files has 40 stream paths and about 50 guards.
+- Before 2026-10-19 the real path of each stream path was requested at each commit (`realpath`). A
+  poll of the directories above the covers triggered this once per second. It cost 1.6 ms per second
+  for 40 stream paths, and about 0.4 s for 20,000 `watch` calls of one file each (about 2,000
+  commits). Measured side by side with fseventsd idle, those calls took 0.7 to 0.9 s then and 0.5 to
+  0.7 s now. The 23 to 28 s measured at the time came from a busy fseventsd, which slows the starts
+  of the streams (see the measurements). A rename reverted within the second, with changes below in
   the meantime, went unnoticed. Before 2026-10-13 a guard ran alongside that poll, with a thread of
   its own, for the second it saved. It was removed.
 
@@ -1499,8 +1672,10 @@ cover from elsewhere.
 - A stream path that is no longer trusted keeps its stream until the streams are replaced, unless
   no path of that stream is trusted any more. In that case the stream is stopped at the next
   commit. While it keeps running and its directory is back, both that stream and the new one
-  report the directory. A record then arrives twice, which costs one more table lookup and nothing
-  else.
+  report the directory. A record then arrives twice. The second copy walks the covers and marks the
+  entry again. When the first copy has already been checked, the entry is checked again: an
+  `lstat`, a hash read for a young file, and a deep scan for a directory record. A young file larger
+  than 16 MiB, or one that cannot be read, then receives a second `Update` (§2.8, guard 2).
 - When a directory inside a stream gets another spelling of its name, each cover below it is
   scanned deep twice: once for the record of the rename, and once because its real path has
   changed. The scans are paced, and only what differs is reported. The second loss report cannot be
@@ -1657,36 +1832,63 @@ The known limitations of the engine:
 - Linux: every disk is assumed to distinguish two spellings of a name. On a disk that does not,
   such as a folder of a Mac or of Windows shared into the machine, a FAT or SMB disk, or a directory
   with the casefold flag, a watched path that differs from the disk only in the case of its ASCII
-  letters still receives its events, because a hint for one name marks the other (§2.2). Below a
-  watched directory the events can be wrong. A change made through another spelling of a name is
+  letters still receives its events, because a hint for one name marks the other (§2.2). The
+  exception is a write that leaves the fingerprint as it was (a rewrite of the same size that
+  restores the modification time, or a second write of the same size within one step of the
+  timestamps of that disk). The engine is strict there, so the other name gets only a deep mark,
+  not a written one, and its look trusts the equal fingerprint (§2.8). Below a watched directory
+  the events can be wrong. A change made through another spelling of a name is
   reported under a name that the disk does not have, or not at all, and a rename that changes only
   the case leaves the old name known. This was measured with the Linux build on a folder shared
   from macOS, also with polling.
 - A hint with a plain name never finds a registered name that is not plain, and vice versa (§2.2).
-  APFS treats a few characters as equal to plain ones (measured): `ß` as `ss`, the long s as `s`,
-  the Kelvin sign as `k`, a ligature such as `ﬁ` as its letters, and each of the 1,002 CJK
-  compatibility ideographs as its ideograph. A watched path spelled with one of them, where the
-  disk has the plain spelling, receives no events from an OS watch.
-- Under polling, a young file larger than 16 MiB, and one that cannot be read, receives one
-  `Update` when it is 2 s old, even when nothing changed, including a file written just before
-  `watch` (§2.8).
-- A change of a symbolic link on the way to a watched path, or of a watched path that is a symbolic
-  link, is found only by the poll (§2.14). A link that is changed and changed back before that poll
-  is found as it was, and what the path led to in between is never reported.
-- Equal fingerprints (§2.8) hide a change where no `Written` hint arrives (FSEvents, polling). This
-  affects a rewrite of the same size that restores the old modification time; a file that is
-  removed and, within the delete delay, replaced by another of the same size and time on a file
-  system that reuses inode numbers (ext4); and a second write of the same size within one step of a
-  file system that counts time in steps between 20 ms and 1 s.
-- Linux and Windows: a write through another hard link of a watched file, under a name in a
-  directory that is not watched, is not reported. On NTFS the record names the entry that was
-  written (measured).
-- FSEvents and Windows: after `rm -r` of the directories above a watched path, the engine learns
-  that an upper directory is gone only at the next poll.
+  APFS treats some characters as equal to plain ones (measured): the Greek question mark as `;`, the
+  Greek varia as `` ` ``, the Kelvin sign as `k`, and each of the 1,002 CJK compatibility ideographs
+  as its ideograph. On a case-insensitive volume, the default, it also treats `ß` and `ẞ` as `ss`,
+  the long s as `s`, and the seven ligatures U+FB00 to U+FB06, such as `ﬁ`, as their letters. A
+  watched path spelled with one of them, where the disk has the plain spelling, receives no events
+  from an OS watch.
+- Where only the poll looks at a file (under polling, in a directory that has no OS watch, and at
+  a watched path that is a symbolic link, with every backend), a young file larger than 16 MiB, and
+  one that cannot be read, receives one `Update` when it is 2 s old, even when nothing changed,
+  including a file written just before `watch` (§2.8).
+- A symbolic link on the way to a watched path, or a watched path that is a symbolic link, is
+  looked at whenever a hint marks it and at every poll (§2.14). When the link is replaced, a hint
+  for its name arrives wherever the watch of its directory reports entries: always with inotify,
+  and with every backend when that directory wants its contents (a watched link to a file, or a
+  link inside a watched directory). The change is then found within the quiet time. Only the poll
+  finds it on FSEvents and Windows where the directory of the link asks only for names, and
+  wherever the real path behind a link changes while the link stays. A link that is changed and
+  changed back before that look is found as it was, and what the path led to in between is never
+  reported.
+- Equal fingerprints (§2.8) hide a change where no `Written` hint arrives: under FSEvents, under
+  polling, and with inotify and Windows for a file that only the poll looks at (a file in a
+  directory without an OS watch, a watched symbolic link to a file). This affects a rewrite of the
+  same size that restores the old modification time. It affects a file that is removed and
+  replaced by another of the same size and time before the engine looks at it again, on a file
+  system that reuses inode numbers (ext4). inotify sends `Written` for a created file, so this
+  happens only where the poll looks, and the window is the time between two polls, plus the delete
+  delay when a poll finds the file missing (polling has none). Under FSEvents only, it also affects
+  a second write of the same size within one step of a file system that counts time in steps
+  between 20 ms and 1 s. A file that only the poll looks at is young for 2 s and is read (§2.8).
+- Linux and Windows: a write through one hard link of a file is reported only under the name that
+  was written, and only when that name is watched. The other names of the file get no `Update`,
+  even when they are watched or are in the same watched directory, because the engine does not
+  link two names of one file. On NTFS the record names the entry that was written (measured).
+- Windows: after `rm -r` of the directories above a watched path, the engine learns that an upper
+  directory is gone only at the next poll. FSEvents learns it at once from the guards (§4.2), with
+  two exceptions. A directory that got no guard (`ulimit -n`) is polled. And a check that finds a
+  directory gone asks its parent for `Contents`. When the parent is gone too, but the notice of its
+  guard has not been taken yet, that `watch` fails, and the key leaves the directories asked for
+  names. The notice then reaches no key, so a tree made again there is found only by the next
+  poll.
 - Where the OS watches are placed depends on what was watched and unwatched before, because a
-  stream stays where it is until the streams are replaced. Nothing is missed.
+  stream stays where it is until the streams are replaced, or until nothing watched remains at or
+  below its paths (§4.2). Nothing is missed.
 
-The known limitations of the backends are described in §4.1 to §4.3. The Windows backend has only
+Some known limitations of the backends are measured in §4.1 to §4.3, and the Windows save with two
+records and the second step of a junction are in §2.13 and §2.5. The full list of what a user
+observes is in `behavior.md`, "Known limitations". The Windows backend has only
 been run on Windows 11 with NTFS. Android has never been run. It is configured to use the same code
 as Linux, and is only type-checked.
 
@@ -1696,12 +1898,12 @@ as Linux, and is only type-checked.
 beside them. `SimFs` is an in-memory file system with inodes, a clock, and a mode that ignores
 letter case. `SimBackend` emulates an OS watch API on it in three modes: by inode (inotify), by path
 prefix with real paths (FSEvents), and by handle for a tree (Windows). A stream in the second mode
-ends when a directory at or above its path is renamed or removed, and reports this at once, whereas
-the real backend detects it at its next commit (§4.2). The test decides when each notification is
-delivered: now, late, twice, or never, with or without the notice that it was lost. The disk can
-change in the middle of an engine call. The backend keeps a log of every `watch` and `unwatch`
-call, and the disk tells where an OS watch currently stands. `MOVE_SELF` of inotify and the shared
-handles of Windows are not emulated.
+ends when a directory at or above its path is renamed or removed, and reports this at once, as the
+real backend does through its guard (§4.2). The real stream itself stops only at a later commit. The
+test decides when each notification is delivered: now, late, twice, or never, with or without the
+notice that it was lost. The disk can change in the middle of an engine call. The backend keeps a
+log of every `watch` and `unwatch` call, and the disk tells where an OS watch currently stands.
+`MOVE_SELF` of inotify and the shared handles of Windows are not emulated.
 
 **The two checks at every settle** (`fixtures/caught_up.rs`). Each time a test lets everything
 settle (every notification delivered, every delay expired, and more than two polls), the fixtures
@@ -1710,26 +1912,31 @@ check two things, by rules that they implement independently:
 1. Each fingerprint that the engine stored equals a fresh look at the disk.
 2. The told set is the set of files that a walk of the disk finds from the watched paths.
 
-Every story ends with this check (`caught_up`), or states why it cannot (`not_caught_up`). A batch
-is sorted before it is compared, so no test depends on the order of the engine. An engine whose
+On a loose disk the driver also runs the engine's own check that each flag of another spelling
+still matches the disk (`Engine::check_spellings`, §2.2). Every story ends with these checks and
+with `Engine::check_idle` (`caught_up`), or states why it cannot (`not_caught_up`). A batch is
+sorted before it is compared, so no test depends on the order of the engine. An engine whose
 deadline never passes fails the test rather than hanging it. **The invariants** of §2.1 are checked
-after every engine call.
+after every `watch`, `unwatch` and `tick`. The fuzzer also checks them after each of its steps,
+deliveries, overflows and a failed backend among them.
 
 The test files of the simulator:
 
-- The rows of the contract (`design.md` §2) are the `contract` stories of `tests/stories`, which
-  run here in each mode and also with the poll backend.
-- `check_table` has one test for each row of the table in §2.4. `baseline`, `young` and
+- The rows of the contract (`design.md` §2) are the `contract` stories of `tests/stories`. All of
+  them run here in each mode and also with the poll backend, except the two that need the real
+  disk: S1 with a kept time stamp and size, and S3 inside the delete delay.
+- `check_table` has a test for each row of the table in §2.4 except "no answer", which `failures`
+  covers (`a_mark_that_the_disk_did_not_answer_is_kept`). `baseline`, `young` and
   `delete_delay` cover §2.7 to §2.9. `unwatch` covers §2.7, `want` covers §2.10 and where the OS
   watches are placed, `filter` covers §2.11, and `spelling` covers §2.2.
-- `links`, `moved_directories`, `failures`, `timers` and `regressions` hold every case that was once
-  a way to miss a change, or to report one that did not happen, grouped by topic. `regressions`
-  holds the cases that fit no topic.
+- The cases that were once a way to miss a change, or to report one that did not happen, are grouped
+  by topic: `links`, `moved_directories`, `failures` and `timers`, and for the young rule and the
+  baseline, `young` and `baseline`. `regressions` holds the cases that fit no topic.
 - `fuzz` runs random file system operations mixed with deliveries, clock steps, `watch` and
   `unwatch` calls and failures, including a disk that stops answering in the middle of an engine
   call. A run emulates the handler by its own rules. When everything has settled, the handler must
   know exactly the files that the watched paths stand for, each with its current content, and the
-  two checks must hold.
+  two checks, `check_spellings` and `check_idle` must hold.
 - `sim` tests the fixtures themselves, and that the checks above fail when they should.
 - `allocations` sets budgets for how often the engine allocates memory. A test fails when a budget
   is exceeded.
@@ -1749,10 +1956,14 @@ The test files of the simulator:
 - Each backend alone (`tests/inotify.rs`, `fsevents.rs`, `windows/os.rs`, each on its own OS).
   `windows/parts.rs` runs on Windows only. In `fsevents.rs` a test that makes many changes runs
   alone, and after the others where possible (`Turn`), because a flood makes FSEvents report
-  losses, and a test running beside it was observed to receive one too. No test there starts when
-  more than 50,000 files lie next to the test program (see the measurements in §4.2).
+  losses, and a test running beside it was observed to receive one too. No test there that takes
+  a `Turn` starts when more than 50,000 files lie next to the test program (see the measurements in
+  §4.2). The two tests of the engine on a `RealEngine` (`an_idle_watcher_polls_nothing` and the
+  ignored `the_cost_of_single_files`) take no `Turn`, so a flood can also run beside them.
 - The watcher thread (`tests/watcher.rs`): `watch`, `unwatch`, `close` and `drop` from every side,
-  relative paths, an invalid path, the queue bound, and a backend that cannot start.
+  the queue bound, and a backend that cannot start, and on Windows only, also the paths that Windows
+  takes or refuses (a drive with no root, shares, names that Windows changes). Relative and bad
+  paths on every OS are stories of promise 8 in `promises`.
 - The stories (`tests/stories`):
   - `contract`: the rows of the contract.
   - `projects`: what editors and large projects do.
@@ -1768,10 +1979,11 @@ The test files of the simulator:
   links, renames, `watch`, `unwatch`, `expect`) runs first on each simulated backend of
   `tests/sim`, where it takes no time and its end state is checked against the disk. A story that
   sets a delete delay skips polling, which has none (§2.9), and says so. On the real disk these
-  tests mostly wait rather than compute. Measured on macOS with each test run alone, 34 s of the
-  56 s are the quiet time of 300 ms after each `expect`. 17 s are the wait for the events (the
-  debounce, the delete delay, the poll of a symbolic link once per second, and about 10 ms of the
-  OS), 4 s are the changes that the tests make, and 0.2 s are the `watch` calls.
+  tests mostly wait rather than compute. Measured on macOS at f31cd1d with each of the 74 stories
+  run alone, about 62 s of the about 106 s are the quiet time of 300 ms after each `expect`. The
+  rest is the wait for the events (the debounce, the delete delay, the marker files of `sync`, the
+  poll of a symbolic link once per second, and the OS), the two pauses of 2.5 s of one story
+  (`pass`), the changes that the tests make, and the `watch` calls.
 
 **The repository.**
 
@@ -1883,38 +2095,55 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p pathwatch --no-deps
 The terms of the rules are defined in `design.md` §6. The code also uses the words below, each for
 one thing only, in the order in which a change meets them.
 
-- **Watched path.** A path given to `watch` and not yet unwatched. Its node `is_path`.
-- **Registered.** A node that is a watched path or leads to one (`is_ancestor`). A registered node
-  stays in the tree while nothing is at its path.
+- **Watched path.** A path given to `watch` that the filter does not skip (§2.7), and not yet
+  unwatched. Its node `is_path`.
+- **Registered.** A node that is a watched path or leads to one (`is_registered`: `is_path` or
+  `is_ancestor`). A registered node stays in the tree while nothing is at its path.
 - **Key.** A `NodeKey`: the slot of a node in the arena, plus a generation. The backend knows a
   directory by its key and never by its path, so the two sides need not agree on a spelling.
 - **Arm, narrow.** To arm is to ask the backend for the watch of a directory, because it wants more
   than was requested or because the watch may be gone. To narrow is to release a watch, because the
-  directory wants less after an `unwatch`.
-- **Cover.** A watch above covers a directory below it (`Watch::FromAbove`). In the FSEvents
-  backend, a cover is the real directory that a key stands for.
-- **Place.** Where the OS watches are put when there are more directories than the OS lets a
-  process watch at once: the deepest directories that the paths have in common.
-- **Mark.** A request to check a name at the next flush. A hint leaves one, and so does the engine
+  directory wants less after an `unwatch` or after `uncover`.
+- **Cover.** In the FSEvents backend, a cover is a directory that the engine watches and that a
+  stream reports, filed under its real path (`Covers`, §4.2). A `Names` key that no stream reports
+  (`named`) and a key answered `NotWatched` are not covers. Elsewhere "cover" is only a verb. An OS
+  watch covers a directory that it reports (a tree watch above: `Watch::covers_below`,
+  `FromAbove`), and a watched path covers the names at and below it, as far as listed names and
+  complete directories reach (`is_covered`, `covered_by_parent`, `uncover`).
+- **Place.** Where a backend that watches whole trees puts its OS watches (`place`): each top
+  directory that wants `Contents`. When there are more of them than the bound of the backend
+  itself, which is 64 (`MAX_STREAM_PATHS` of FSEvents, placed again on 56), they move up to the
+  deepest directories that they have in common. The OS allows far more (§4.2).
+- **Mark.** A request to check a name in a later flush. A hint leaves one, and so does the engine
   when it has to look again. A mark records whether a directory is to be scanned deep, whether the
-  file was written, and whether only a loss report requested it.
-- **Flush.** The pass that checks every mark and then runs the scans, round after round, until
-  nothing is queued. When it is over, `finish` reads the events off the tree.
+  file was written, and whether only a loss report requested it. The mark of a hint waits for the
+  quiet time, and a mark that only a loss report requested waits for the end of the rest (§2.13).
+- **Flush.** The pass that checks the marks that are due (§2.3) and then runs the scans, round after
+  round, until nothing is queued. When it is over, `finish` reads the events off the tree.
 - **Look.** One read of the disk for one path: an `lstat`, a `stat`, or a listing.
 - **Check.** The look at one node, and what the engine does with the result (the table of §2.4).
 - **Scan.** The check of every node of one directory, with a listing when the node is complete. The
-  depths are `Names`, `Shallow` and `Deep` (§2.5).
+  depths are `Names` (§2.2), `Shallow` and `Deep` (§2.5).
 - **Appear, still there, vanish.** A directory is found where the tree had none; a directory is
   still the same directory; a directory is gone, with everything below it.
-- **Anchor.** In `register`, the deepest node on the way to a new watched path that has only
-  directories above it on disk. The first look is made there.
-- **Plain.** A name consisting only of ASCII characters and Han ideographs, so that its other
-  spellings differ only in the case of its ASCII letters, and the table of the tree finds all of
-  them (§2.2).
+- **Mark at** (`mark_at` in `register`). The deepest node on the way to a new watched path that has
+  only directories on disk above it, each listed by the directory above it. The deep mark of the
+  first look goes there (§2.7).
+- **Plain.** A name consisting only of ASCII characters and the ideographs of the CJK Unified
+  Ideographs blocks. The engine takes its other spellings to differ only in the case of its ASCII
+  letters, which the table of the tree finds (§2.2). APFS also treats a few other characters as
+  plain ones (`ß`, the Kelvin sign, a ligature), and the table does not find those spellings
+  (§5).
 - **Twin.** Another node of the same directory whose name differs from this one only in the case of
   ASCII letters.
 - **Frozen.** A node below a held node. Nothing is done there before the second look above.
-- **Uncover, let go.** A node is no longer a watched path and no watched directory covers it, so
-  what the tree holds there is forgotten. A node that is no longer registered becomes an entry like
-  any other, or is freed.
-- **Settle** (tests). Deliver every notification and run every deadline until nothing is left.
+- **Uncover, let go.** No watched path and no complete directory covers a node any more: after an
+  `unwatch`, or because the directory above lists it under another spelling (§2.2). What the tree
+  holds there is forgotten, except what the watched paths below it need (`uncover`: silently after
+  an `unwatch`, with `Delete` events after a respelling), and a directory that stays may be
+  narrowed. A node that is no longer registered becomes an entry like any other, or is freed
+  (`let_go`).
+- **Settle** (tests). `Driver::settle`: deliver every notification and run every deadline inside one
+  window (two poll intervals, the delete delay, two quiet times and 2 s), then move the clock to its
+  end. Every delay expires in it and more than two polls run, so nothing is left to find. The polls
+  themselves go on.

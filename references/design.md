@@ -24,20 +24,26 @@ The following are out of scope:
 The whole contract follows from three definitions.
 
 1. **A watched path stands for a set of files.** If a file is at the path, the set is that file.
-   If a directory is there, the set is every file below it, at any depth, except what the ignore
-   filter excludes. If nothing is there, the set is empty. A file is anything that is not a
-   directory. A watched path that is a symbolic link, or that passes through one, is followed. A
-   symbolic link below a watched directory is a file.
+   If a directory is there, the set is every file below it, at any depth. If nothing is there, the
+   set is empty. The ignore filter applies to the path itself, to the directories above it, and to
+   every entry below it (§4.8). What it ignores counts as nothing there. A file is anything that
+   is not a directory. A watched path that is a symbolic link, or that passes through one, is
+   followed. A symbolic link below a watched directory is a file, except while a watched path is
+   at it or passes through it (§4.9).
 2. **Events are the difference between the told set and the disk.** The **told set** is what the
    handler believes exists: the baseline of each `watch`, plus every `Create`, minus every
-   `Delete`. Once the watcher has caught up, the told set equals the set of files that the watched
-   paths stand for.
+   `Delete`, minus what an `unwatch` forgets (§4.4). Once the watcher has caught up, the told set
+   equals the set of files that the watched paths stand for.
 3. **A batch has at most one event per path.** `Create` means that the path was not told and a
    file is there. `Delete` means that the path was told and no file is there. `Update` means that
    the path was told, a file is there, and it is a different file or may have different content.
    The last event for a path therefore gives its state.
 
-Extra `Update` events are allowed. A missed change is not.
+Extra `Update` events are allowed. A missed change is not, with two exceptions that the rules
+below accept on purpose. Where no write is reported, an old file with an equal fingerprint counts
+as unchanged (§4.6), so a rewrite of the same size that restores the old modification time is
+missed. A disk that other machines change is reported, not polled (§4.10). Every other known miss
+comes from the OS, or is a bug not fixed yet. `behavior.md` lists them under "Known limitations".
 
 The table applies these rules to examples. `R` is a watched path.
 
@@ -55,33 +61,42 @@ The table applies these rules to examples. `R` is a watched path.
 | S10 | a tree moved into the directory `R` | `Create` for each file |
 | S11 | a subdirectory moved out of `R`, or removed with `rm -r` | `Delete` for each told file |
 | S12 | the directory `R` removed or renamed away, then restored | `Delete` for each told file, then `Create` for each file; within the delete delay, only what differs |
-| S13 | the file `R = proj/lib/a.js`; `mv proj/lib proj/lib2`, and back | `Delete R`; `Create R` |
+| S13 | the file `R = proj/lib/a.js`; `mv proj/lib proj/lib2`, and back | `Delete R`; `Create R`; within the delete delay, only what differs |
 | S14 | an ignored directory below `R` | nothing from inside it; renamed from an ignored name to a visible one, `Create` for each file; renamed from a visible name to an ignored one, `Delete` for each told file |
 
 ## 3. Principles
 
 The rules in sections 4 and 5 follow from seven principles.
 
-1. **The disk is the truth.** An OS notification says where something may have changed, never
-   what changed. Every event comes from comparing a look at the disk with the told set. A
-   notification that arrives twice, or late, costs one look and changes nothing.
+1. **The disk is the truth.** An OS notification says where something may have changed, not what
+   changed. The one exception is a reported write (§4.6). It makes a told file that the look still
+   finds count as changed, whatever its fingerprint. Every other event comes from comparing a look
+   at the disk with the told set. A notification that arrives twice, or late, costs one more check
+   of its place, a scan of everything below it for a directory. At worst it adds `Update` events,
+   which the contract allows.
 2. **Watch, then read.** A directory is read only after a watch over it is live. A change made
    before the watch is found by the read, and a change made after it produces a notification. No
    change can fall between the two.
 3. **Absence must be confirmed.** A look that gets no answer from the disk changes nothing and is
-   repeated. A told file is reported gone only when a second look, one delete delay after the
-   first, still finds nothing. A file that a tool removes and writes again is therefore not
-   reported as deleted.
+   repeated. A told file is reported gone only when a second look still finds nothing. That look
+   comes one delete delay after the hint that requested the first look, or after the first look
+   when no hint requested it (§4.5). A file that a tool removes and writes again within the delete
+   delay is therefore not reported as deleted. With a delete delay of zero, the first look
+   decides.
 4. **When in doubt, report `Update`.** Equal metadata does not prove equal content, because two
    writes of the same size can share one timestamp. Where a change cannot be ruled out, the file
    is reported as updated.
 5. **The backend decides when, not what.** The OS watch decides how soon a change is found, never
-   which events are reported. Every backend, and polling, must produce the same events. For this
-   reason the engine applies the ignore filter and the spelling rules, and a backend never sees
-   them.
+   which events are reported. Every backend, and polling, must produce the same events, with two
+   exceptions. A backend that reports each write (§4.6) can add `Update` events, and it finds a
+   rewrite that leaves the fingerprint unchanged, which the others miss. A watcher that polls
+   everything has a delete delay of zero (§4.5), so a file that is removed and written again can be
+   a `Delete` and a `Create` there. For this reason the engine applies the ignore filter and the
+   spelling rules, and a backend never sees them.
 6. **Nothing is left unobserved.** A directory that no OS watch covers is polled. This applies
    when the OS does not watch it, when its watch failed, and when the backend cannot start or has
-   stopped. An error is reported, and the watcher keeps running.
+   stopped. A failed watch, and a backend that cannot start or that stops, are reported as errors.
+   The watcher keeps running.
 7. **Cost is bounded.** Work that no notification requested by name, such as a poll or the rescans
    after lost notifications, is paced by the time it took. A continuous stream of notifications
    cannot postpone a batch indefinitely.
@@ -106,8 +121,9 @@ events.
 ### 4.2 From hint to event
 
 - A backend turns each OS notification into **hints**. A hint names a place to check: a directory
-  that the engine asked the backend to watch, identified by its key, and a path relative to it. A
-  hint never says what happened. A hint for a directory requests a check of everything below it.
+  that the engine asked the backend to watch, identified by its key, and a path relative to it.
+  Apart from a reported write (§4.6), a hint never says what happened. A hint for a directory
+  requests a check of everything below it.
 - A **loss report** states that notifications were lost, either at and below one directory or
   everywhere. The engine checks that place, watches it again, and scans everything below it.
 - Hints leave **marks** in the tree. Once no hint has arrived for the quiet time (§4.11), the
@@ -134,7 +150,8 @@ about a file at the node, and whether a file is there now.
 | any other case | | none |
 
 - What happens within one flush needs no special rule. A file that appears and disappears
-  produces nothing, and a file that disappears and reappears produces one `Update`.
+  produces nothing. A told file that disappears and reappears produces one `Update` if it changed
+  (§4.6), and nothing otherwise.
 - A change of kind is never an `Update`, and it does not wait. The `Delete` of the file, or of
   every file below the directory, is in the same batch as what replaced it.
 - A directory that appears produces a `Create` for each file below it, and a directory that is
@@ -142,16 +159,18 @@ about a file at the node, and whether a file is there now.
 
 ### 4.4 `watch`, the baseline, and `unwatch`
 
-- `watch` registers a batch of paths, looks at them, and returns once the state of every path is
-  known. A path that is already watched is skipped. The whole batch is registered before the look,
-  and each node is checked once per flush.
+- `watch` registers a batch of paths, looks at them in one flush, and returns. A look that gets
+  no answer from the disk is made again in a later flush (§4.10). That look is no longer part of
+  this `watch`, so what it finds is reported. A path that is already watched is skipped. The whole
+  batch is registered before the look, so a node that several paths of the batch share is checked
+  once, not once per path.
 - **The baseline.** What `watch` finds is not reported. A file that should have been reported
   before this `watch` is not silenced, however, because an older watched path or an older complete
   directory already covered it. A complete directory whose listing failed (no permission, or
   another program held the directory) covered nothing, so a path watched below it later reports
   what it finds as new. Silence therefore applies only to:
   - A file at a path that this `watch` made a watched path, in a directory that was not complete
-    before.
+    before, or under a name that the directory does not list (an unlisted name, §4.7).
   - Every entry of a directory that became complete during this `watch`.
 - A reported write that was in flight when `watch` looked produces an `Update` for a file that the
   baseline has just seen. A reported write counts as a change (§4.6), and nothing shows whether it
@@ -177,17 +196,19 @@ once.
   the quiet time before the first look does not add to the delay. When no hint requested the first
   look (a poll or a scan), the second look comes one delete delay after the first. A first look
   that comes later than that gets its second look in the next flush. The second look happens even
-  when no hint arrives, and also under polling.
+  when no hint arrives, and also in a polled directory.
 - If the second look still finds nothing, a file is reported as a `Delete`, and a directory as a
-  `Delete` for each told file below it, in one batch. If the disk gives no answer, the hold stays
-  until it does. An error that does not establish whether the path exists is never a `Delete`.
+  `Delete` for each told file below it, in one batch. If the disk gives no answer (§4.10), the
+  hold stays until it does, so such an error is never a `Delete`. An entry that cannot be read at
+  all counts as missing (§4.10), and its `Delete` comes after the second look.
 - If the path is back, a file is compared with the stored fingerprint. The result is an `Update`
   if it differs, and nothing if it is the same file. A directory is watched again and scanned deep,
   and each file below it is compared in the same way.
 - A change of kind ends the hold at once. A file that was not yet told is not held. When it is
   gone, it is forgotten. If a node above a held node is also found missing, the upper node decides
   for both.
-- With a delete delay of zero nothing is held, and a `Delete` comes at the first look.
+- With a delete delay of zero nothing is held, and a `Delete` comes at the first look. A watcher
+  that polls everything has a delete delay of zero.
 
 ### 4.6 Fingerprints and young files
 
@@ -202,22 +223,28 @@ once.
   or when it is young and its content may differ.
 
 Two writes of the same size can share one timestamp, and equal fingerprints then hide a change. Two
-guards close this gap:
+guards narrow this gap:
 
-1. **Reported writes.** A backend whose notifications correspond one to one to writes reports each
-   write, and the engine reports `Update` without consulting the fingerprint.
+1. **Reported writes.** A backend whose OS follows every write with a notification that this file
+   was written reports each such notification as a write. One notification may stand for several
+   writes. The engine reports `Update` without consulting the fingerprint.
 2. **Young files.** A file is **young** while its modification time is so recent that another
    write could leave its fingerprint unchanged, or while that time lies in the future. For a young
    file, an equal fingerprint proves nothing. Either its content is compared, or, where every write
    produces a hint, the absence of a hint is the proof. The absence counts only once every
    notification from the time the file was young has arrived. Until then, a look that may have
    missed a hint counts the file as written. A file whose content cannot be compared (too large, or
-   unreadable) is counted as changed no later than the first look that finds it old.
+   unreadable) is counted as changed no later than the first look that finds it old. A file that is
+   neither a regular file nor a symbolic link, such as a FIFO, a socket or a device, is never
+   young. It has no content to compare, so its fingerprint alone decides.
 
-Youth is measured by the watcher's clock, not by the disk's. A file whose modification time lies
-far ahead of the clock is young for a bounded time after the first look that found its current
-fingerprint, and old after that. A symbolic link entry is never opened. Its content is the text of
-its target.
+Youth is measured by the watcher's clock, not by the disk's. Where no write is reported, the gap
+stays open for a file that looks old too soon. On a disk whose clock is behind the watcher's, a file
+written just now is never young. A youth shorter than the time step of the disk ends while another
+write can still leave the time unchanged. A file whose modification time lies far ahead of the clock
+is young for a bounded time after the first look that found its current fingerprint, and old after
+that while its time stays far ahead. A symbolic link entry is never opened. Its content is the text
+of its target.
 
 ### 4.7 Spelling
 
@@ -241,8 +268,8 @@ watches must produce the same events.
 - **Loose or strict** is a property of the watcher, not a question asked of each directory. A
   watcher treats every directory as loose, or every directory as strict.
 - **A hint applies to every name it can denote.** This includes every registered name that may be
-  another spelling of the name in the hint and, in a complete directory, every name that differs
-  from it only in letter case. The look at each of them decides.
+  another spelling of the name in the hint and, in a complete directory of a loose watcher, every
+  name that differs from it only in letter case. The look at each of them decides.
 - **When the disk spells a name differently**, the directory has no entry of that name. A name
   that is not registered is gone at once, without a hold, because a second look would find the
   entry again. A registered name remains the caller's path, but the directory above does not cover
@@ -279,10 +306,11 @@ The filter is asked about three things:
    is ignored, the path can never be reported. It costs no watch, no look and no poll, and an
    `unwatch` of it does nothing. The spelling of a watched path never changes, so this question is
    asked once. A directory on the way to a watched path is therefore never ignored.
-3. **The path itself**, as both kinds, whatever is on disk. If both kinds are ignored, the path is
-   skipped in the same way. Every other path becomes a watched path. When it exists, it is asked
-   about with its kind, like every entry. While the answer is "ignored", the path counts as
-   missing. Nothing is listed or watched for it, and it is asked about again when its kind changes.
+3. **The path itself**, as a file whatever is on disk, and also as a directory when the answer for a
+   file is "ignored". If both kinds are ignored, the path is skipped in the same way. Every other
+   path becomes a watched path. When it exists, it is asked about with its kind, like every entry.
+   While the answer is "ignored", the path counts as missing. Nothing is listed or watched for it,
+   and it is asked about again when its kind changes.
 
 **The filter alone never produces an event.** A watched path that counts as missing was never
 reported, so nothing is deleted when it disappears. A file that replaces an ignored directory at a
@@ -303,29 +331,32 @@ an ignored file replaces are gone from the disk, so each of them gets a `Delete`
   link is watched on its own.
 - Nothing watches a symbolic link itself. Every poll checks each registered name that is a link.
 - When `watch` places a watched path at or behind a link that was not followed until then, what
-  lies behind the link becomes the baseline of that `watch`. After `unwatch` the link is a file
-  entry again (§4.4).
+  lies behind the link becomes the baseline of that `watch`. There is one exception, a link to a
+  file that a complete directory has already told. The told file was the link entry, and the file
+  behind it has another fingerprint, so this `watch` reports an `Update` for it (§4.4). After
+  `unwatch` the link is a file entry again (§4.4).
 
 ### 4.10 Errors from the disk
 
 Every failed look falls into one of two classes.
 
-- **Missing.** The disk establishes that no entry is there (not found, or not a directory). An
-  entry that cannot be read at all also counts as missing for events, and its error is reported
-  once. Examples are a path that the OS cannot represent, an entry that the watcher may not read,
-  and a symbolic link loop. Its node is polled, so a later change is found. An entry that is being
-  deleted counts as missing. It is looked at again in each flush until the name is gone or the file
-  is there, because the deletion can be cancelled without a notification.
+- **Missing.** The disk establishes that no entry is there (not found, or not a directory). An entry
+  that cannot be read at all also counts as missing for events, and its error is reported once.
+  Examples are a path that the OS cannot represent, an entry that the watcher may not read, and a
+  symbolic link loop. The directory that holds it is polled, so a later change is found. An entry
+  that is being deleted counts as missing. It is looked at again in each flush until the name is
+  gone or the file is there, because the deletion can be cancelled without a notification.
 - **No answer.** Any error that does not establish whether the entry exists. The tree stays as it
-  is, no `Delete` is reported, the mark stays for the next flush, and the node is polled until a
-  scan of it succeeds. The error is reported once, unless another program merely holds the entry
-  for a moment. Nothing is wrong with the disk in that case.
+  is, no `Delete` is reported, the node is marked again for the next flush, and it is polled until a
+  scan of it succeeds. The error is reported once, except an error that says another program
+  holds the entry. That error is never reported, however long the hold lasts, because nothing is
+  wrong with the disk.
 
 Further rules:
 
-- A failed watch is reported in the same way, except when the directory is gone. In that case the
-  scan that follows finds it missing. A lack of room for one more watch is reported once for the
-  lifetime of the engine, not once per directory.
+- A failed watch is reported once, even when another program holds the directory, except when the
+  directory is gone. In that case the scan that follows finds it missing. A lack of room for one
+  more watch is reported once for the lifetime of the engine, not once per directory.
 - At most one error of each kind is delivered per flush.
 - **A disk that other machines also change.** Where an OS watch cannot see the changes that other
   machines make, the watcher reports this once per disk, even when one flush finds two such disks.
@@ -348,8 +379,10 @@ Further rules:
     the directory decides for it.
 
   A check made by a scan takes the mark waiting on its node with it. The look is made now, and
-  what the hint said about the node still applies. None of this affects the delete delay, which
-  counts from the hint, or from the look that found nothing.
+  what the hint said about the node still applies. The delete delay counts from the hint, or, when
+  no hint requested the look, from the look that found nothing. A scan that takes the mark of a
+  hint does not keep the time of the hint. The delay then counts from the look of the scan, and
+  the `Delete` can come later, by at most the time that the hint still had to wait.
 - **Pacing.** Two kinds of work are requested by no hint that names a path, and can recur
   indefinitely: a poll, and the scans after a loss report.
   - After the scans of the loss reports of one flush, the next such scans rest for a time that
@@ -358,8 +391,9 @@ Further rules:
   - The next poll starts one poll interval after the end of the current one, and no sooner than
     the duration of one round after that end, so that polling uses at most half of the time. A
     `watch` call in between does not move it.
-  - The time counted is that of the whole flush in which the poll or the scans ran, up to a bound,
-    because the clock keeps running while the machine sleeps.
+  - The time counted is that of the whole flush in which the poll or the scans ran, up to a bound.
+    A clock may keep running while the machine sleeps, and a flush that a sleep fell into would
+    then seem to have taken hours.
 - Notifications that the watcher cannot hold count as lost. They are a loss report for everything.
 
 ### 4.12 What a directory requests from the backend
@@ -372,16 +406,24 @@ Further rules:
   the project, not on the home directory with everything else in it.
 - When directories above a watched path are missing, the lowest existing directory is therefore
   asked for `Contents`. A backend that watches whole trees then finds a `mkdir -p` together with a
-  file without a poll.
-- No file is looked at before its watch is live (principle 2).
-- For one directory the want only increases. It decreases in one case only: when an `unwatch`
-  leaves a directory whose registered names are all directories on disk, its watch is reduced to
-  names.
+  file without a poll, unless it answers `NotWatched` for that directory, as a backend may for a
+  top directory such as the root. There the poll finds the `mkdir -p`.
+- A file's state comes only from a look made after a watch that reports its changes is live
+  (principle 2). Two earlier reads decide nothing by themselves. The first reads the kind of a
+  watched path that the tree does not know, only to choose the want, and it is not stored. The
+  second is a check that finds a file at a registered name in a directory asked for names only.
+  That directory is then asked for `Contents`, and the name is looked at again once that watch is
+  live.
+- For one directory the want only increases, with two exceptions. In both, a watch asked for
+  contents is reduced to names when every registered name in the directory is a directory on disk.
+  The first is an `unwatch` that leaves the directory so. The second is a check that finds the
+  directory, or a directory above it, under another spelling, which makes it partial (§4.7).
 - A directory that no OS watch covers is **polled**, which means that a timer scans it. With an OS
   backend the timer covers few directories. With polling it covers every directory, at the poll
   interval. Polling is this timer combined with a backend that watches nothing. The timer runs only
-  while there is something to poll, so an idle watcher with an OS backend sleeps until a
-  notification arrives.
+  while there is something to poll: a polled directory, or a registered name that is a symbolic
+  link (§4.9). An idle watcher therefore sleeps until a notification arrives only when its backend
+  watches every directory on the way to each watched path and no registered name is a link.
 - A refusal of the backend to watch a directory is not permanent. When an OS watch later comes to
   cover the directory, the engine requests it again and stops polling it.
 - If the backend reports that it cannot continue, the error is reported once, every directory is
@@ -398,18 +440,22 @@ hints.
 - A **key** identifies one directory of the engine. The backend puts it into every hint for that
   directory, so the two sides never need to match a path spelling.
 - A **want** is what the engine asks the backend to report about a directory (§4.12). `Names`
-  covers a name in the directory that appears, disappears or is replaced. `Contents` covers that,
-  and also writes to the files in the directory.
+  covers a registered name in the directory that disappears or is replaced. By the want rule, each
+  such name is a directory with a watch of its own. A backend may therefore serve `Names` through
+  those watches and report the change under the key of that directory, with an empty `rel`. A name
+  that appears next to them need not be reported. `Contents` covers every name in the directory
+  that appears, disappears or is replaced, and also writes to the files in it.
 - A **coverage** is the answer to a watch request:
-  - `Watched`: changes in this directory produce hints.
+  - `Watched`: the changes that the want covers produce hints, for `Names` possibly under the keys
+    of the directories in it.
   - `WatchedTree`: changes in this directory and in every real directory below it produce hints,
     and the engine does not ask for the directories below.
   - `NotWatched`: the backend does not watch this directory, and the engine polls it.
   - `Failed`: the backend tried and failed. The engine reports the error, polls the directory, and
     asks again later.
-- A **commit** makes every watch requested since the previous commit live. It returns the keys
-  whose watch could not be made live, and the keys that received `NotWatched` and that an OS watch
-  now covers.
+- A **commit** makes every watch requested since the previous commit live. For each key whose
+  watch could not be made live, it either returns the key, or sends a loss report for it before it
+  returns. It also returns the keys that received `NotWatched` and that an OS watch now covers.
 - The **hints** are the following:
   - `Changed { dir, rel }`: the entry at `rel` below `dir` appeared, disappeared or was replaced.
     If it is a directory, anything below it may also have changed. An empty `rel` is a loss report
@@ -428,11 +474,13 @@ hints.
 Other sections refer to these rules by number.
 
 1. **One sequence.** Every request of the engine, and the translation of every raw notification,
-   happens in one sequence on the engine's side. The backend's own threads only queue raw
-   notifications.
+   happens in one sequence on the engine's side. The backend's own threads make no hint. They queue
+   raw notifications, and they may run the OS calls of a request, such as opening or closing an OS
+   watch, when the engine either waits for these calls or does not depend on when they end.
 2. **Watch, commit, scan.** The engine reads a directory only after `watch` and then `commit`. A
-   watch is therefore live when `commit` returns, unless `commit` listed its key. `commit` opens no
-   gap in a watch that is already live.
+   watch is therefore live when `commit` returns, unless `commit` listed its key or sent a loss
+   report for it (`Changed` with an empty `rel`). The engine then checks the directory, asks again,
+   and scans it deep. `commit` opens no gap in a watch that is already live.
 3. **`watch` again.** A second `watch` for a key means that the watch must stand on the directory
    that is at `dir` now. If that requires a new OS watch, the new one is live before the old one is
    removed.
@@ -448,8 +496,10 @@ Other sections refer to these rules by number.
    that key. A backend whose OS reports real paths maps them back.
 8. **Where, not what.** `Changed` for a directory makes the engine scan everything below it. A
    notice that only says "this directory was touched" is therefore dropped, or sent as `Written`.
-9. **`Written` only when the OS reports each event separately.** An OS that merges or repeats its
-   flags never sends it.
+9. **`Written` only when the OS itself says, after every write, that the file was written.** One
+   notification may stand for several writes, but the flag must belong to the event it comes with.
+   An OS that merges the flags of different events into one record, or repeats them in later
+   records, never sends it.
 10. **A dead watch.** If the OS dropped the watch, forget it. If the directory was moved, keep the
     watch and its keys. In both cases, send `Changed` with an empty `rel` for each of its keys. A
     watch bound to the text of a path is dead as soon as a directory at or above that path is
@@ -466,12 +516,14 @@ Other sections refer to these rules by number.
     queue of the OS, and sends `Delivered` behind everything it read, with the time at which the
     last read began. Every notification of a change before that time is therefore ahead of it, and
     so is the loss report of such a change. This holds only for an OS that puts a notification,
-    and a loss report, into its queue before the call that made the change returns. A later
-    request replaces one that has not been answered yet.
+    and a loss report, into its queue before the call that made the change returns. Requests
+    that are not answered yet merge into one, for the latest of their times, and the backend
+    answers once, after that time.
 
 ## 6. Terms
 
-- **Watched path.** A path passed to `watch` and not yet passed to `unwatch`.
+- **Watched path.** A path passed to `watch` and not yet passed to `unwatch`, unless the filter
+  skips it (§4.8).
 - **Registered name.** A watched path, or a name on the way to one (§4.1).
 - **Listed name.** A name found below a watched directory, spelled as the disk spells it (§4.7).
 - **Complete, partial.** A directory that the engine tracks entry by entry, or only for its
@@ -479,18 +531,23 @@ Other sections refer to these rules by number.
 - **Told set.** The files that the handler believes exist (§2). A node is **told** when the
   handler believes that a file is at it.
 - **Baseline.** What a `watch` call finds. The handler knows it without an event (§4.4).
-- **Hint.** What a backend derives from a raw notification: where to look, or that notifications
-  were lost. A hint never says what happened.
+- **Hint.** What a backend derives from raw notifications: a place to check, a file whose content
+  was written, that notifications were lost, or that every notification of a change before a
+  time has arrived (rule 13). A hint never decides the event. The engine reads the disk, and a
+  reported write only makes a told file count as changed (§4.6).
 - **Loss report.** A hint stating that notifications were lost, at and below one directory or
   everywhere.
-- **Mark.** A request to check a name at the next flush. A hint leaves one, and so does the engine
-  when it has to look again.
-- **Flush.** The pass that checks every mark, then runs the scans that the checks queued, and
-  delivers the events as one batch.
+- **Mark.** A request to check a name in a later flush. A hint leaves one, and so does the engine
+  when it has to look again. The mark of a hint waits for the quiet time, and a mark that only a
+  loss report requested waits for the end of the rest (§4.11).
+- **Flush.** The pass that checks the marks that are due (§4.11), then runs the scans that the
+  checks queued, and delivers the events as one batch.
 - **Look, check, scan.** One read of the disk for one path; the look at one node and the update of
   that node; the check of every node of one directory (§4.2).
 - **Held.** A look found nothing where the tree has a file or a directory. The node waits for a
-  second look one delete delay later, and only that look decides (§4.5).
+  second look one delete delay after its hint, or after the look when no hint requested it, and
+  only that look can report it gone. A look before it that finds the path back, or another kind,
+  ends the hold at once (§4.5).
 - **Fingerprint.** The modification time, the size and the ID of a file. It distinguishes one
   state of the file from the next without reading it (§4.6).
 - **Young.** A file whose modification time is so recent that another write could leave its
@@ -498,7 +555,9 @@ Other sections refer to these rules by number.
 - **Quiet time.** How long no hint may arrive before the disk is checked (§4.11).
 - **Delete delay.** The time from the hint to the second look at a path that was found missing
   (§4.5).
-- **Polled.** No OS watch covers the directory, so a timer scans it (§4.12).
+- **Polled.** A timer scans the directory. No OS watch covers it (§4.12), or a look in it failed
+  with an error other than not found or not a directory, and no scan of it has succeeded since
+  (§4.10).
 - **Want, coverage.** What a directory requests from the backend, and the backend's answer
   (§5).
 - **Loose, strict.** A directory where two spellings of a name (letter case, Unicode form) are one

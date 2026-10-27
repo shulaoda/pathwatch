@@ -295,11 +295,11 @@ fn the_want_of_a_directory_never_goes_down() {
   caught_up(&mut d);
 }
 
-/// `unwatch` is the one way down for a want, and the want can go up again after it. The
-/// directory gives its watch back when its watched file is taken back: a watch for the tree
-/// goes, and a watch for the one directory is asked again, for names, so that a write in the
-/// directory wakes nobody. When the watched directory next to that file becomes a file later,
-/// the directory is asked for its contents once more.
+/// `unwatch` is one way down for a want (the other is a directory found under another spelling),
+/// and the want can go up again after it. The directory gives its watch back when its watched file
+/// is taken back: a watch for the tree goes, and a watch for the one directory is asked again, for
+/// names, so that a write in the directory wakes nobody. When the watched directory next to that
+/// file becomes a file later, the directory is asked for its contents once more.
 #[test]
 fn the_want_goes_down_with_unwatch_and_up_again() {
   for mode in Mode::ALL {

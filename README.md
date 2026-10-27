@@ -60,7 +60,7 @@ Only files are reported, never a directory. A batch has at most one event for a 
 | Windows | `ReadDirectoryChangesW` |
 | every other target | none: always polling |
 
-The promises, the known holes and the timing are in
+The promises, the known limitations and the timing are in
 [`references/behavior.md`](references/behavior.md); the rules it follows are in
 [`references/design.md`](references/design.md), and how the code follows them is in
 [`references/architecture.md`](references/architecture.md).

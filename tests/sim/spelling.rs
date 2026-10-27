@@ -328,8 +328,8 @@ fn a_directory_is_renamed_to_another_letter_case() {
   });
 }
 
-/// The same for a link below a watched directory. The disk cannot be asked how it spells a
-/// link (the real path of a link is the path of its target), so the listing is believed.
+/// The same for a link below a watched directory. The disk is asked how it spells the link
+/// itself, not its target.
 #[test]
 fn a_link_is_renamed_to_another_letter_case() {
   on_all(&loose(), |d, on| {

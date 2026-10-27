@@ -1,6 +1,6 @@
-//! One test for each row of the table of `check`: what the tree has at a name, and what a look
-//! finds there. A test is named for its row. `flush` runs one look, and `pending` lists the
-//! deletes that are held after it.
+//! One test for each row of the table of `check` but "no answer", which `failures` covers: what the
+//! tree has at a name, and what a look finds there. A test is named for its row. `flush` runs one
+//! look, and `pending` lists the deletes that are held after it.
 
 use std::{path::Path, time::Duration};
 

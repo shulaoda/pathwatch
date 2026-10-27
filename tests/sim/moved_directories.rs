@@ -140,9 +140,9 @@ fn the_baseline_inside_a_replaced_directory() {
 }
 
 /// A directory above a known file is replaced, and in the new one the path of the file is a
-/// directory. The `Delete` of the file came from the old directory going away, which is held
-/// back; the `Create` below its path came at once. For 100 ms the handler knew a file and a
-/// file below it.
+/// directory. The old directory going away does not hold the `Delete` of the file back: it comes
+/// in the same batch as the `Create` below its path (design.md 4.3), so the handler never knows a
+/// file and a file below it.
 #[test]
 fn a_file_becomes_a_directory_when_its_parent_is_replaced() {
   for mode in Mode::ALL {

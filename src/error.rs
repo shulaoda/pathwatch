@@ -7,7 +7,8 @@ use std::{
 pub enum ErrorKind {
   /// The path cannot be watched, for example an empty path or a file system root.
   InvalidPath,
-  /// The OS has no room for more watches, so the rest is polled.
+  /// No room is left for one more watch, by a limit of the OS or one that pathwatch keeps. What
+  /// got no watch is polled.
   WatchLimit,
   /// No permission to read or watch a path. Events treat the path as missing.
   PermissionDenied,

@@ -539,7 +539,7 @@ fn a_scan_that_waited_runs_inside_a_watch_of_a_file_below() {
     assert_eq!(d.watch(&["/e/a"]), ["C /e/a", "C /e/z"], "{on}");
     // A handle above saw the two files written (NTFS gives a record for the content of a new
     // file), and those records were still on their way when `watch` ran: a write that the
-    // backend reports is an `Update`, also for a file the baseline has just seen (5.8).
+    // backend reports is an `Update`, also for a file the baseline has just seen (design.md 4.4).
     let late = if on == "Handle" { vec!["U /e/a", "U /e/z"] } else { NONE.to_vec() };
     assert_eq!(d.settled(), late, "{on}");
     d.caught_up();

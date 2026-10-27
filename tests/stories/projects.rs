@@ -18,9 +18,9 @@ fn slow_delete() -> Settings {
   Settings::delete_delay(Duration::from_secs(2))
 }
 
-/// Longer than the poll of the directories above a watched path (a second), and shorter than
-/// the delete delay of `slow_delete`: a directory that is away this long is found gone and
-/// held, and is back before its second look.
+/// Long enough for the watcher to find the directory gone, and shorter than the delete delay of
+/// `slow_delete`: a directory that is away this long is found gone and held, and is back before
+/// its second look.
 const AWAY: Duration = Duration::from_millis(1200);
 
 /// A fixed sequence of numbers, so that a test picks the same things in every run.
@@ -164,10 +164,10 @@ fn a_directory_is_moved_away_changed_and_moved_back() {
   });
 }
 
-/// A watch of macOS stands below the renamed directory and hears nothing about the renames:
-/// the poll of the directories above finds the directory gone within a second, and the
-/// delete delay holds it until it is back. Moved back before that second, the changes would
-/// not be noticed (behavior.md, "Known limitations").
+/// A stream of macOS stands below the renamed directory and gets no record of the renames. The
+/// guard of the renamed directory reports the rename at once, and the stream below is reported
+/// lost even when the directory is back by then. The delete delay holds the files until the
+/// directory is back (architecture.md 4.2).
 #[test]
 fn a_directory_above_a_watched_path_is_moved_away_changed_and_moved_back() {
   on_disk_with(&slow_delete(), |w| {
@@ -342,7 +342,7 @@ fn watched_paths_below_a_symlinked_prefix() {
       (Create, "prefix/proj/later/x.js"),
     ]);
 
-    // Nothing watches a link: the poll finds that it points elsewhere now.
+    // The link is replaced: the next look at its name, from a hint or the poll, finds its target.
     w.write("other/proj/src/c.js", "1");
     w.remove("prefix");
     assert!(w.symlink("other", "prefix"));
