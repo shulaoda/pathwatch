@@ -18,20 +18,25 @@ use pathwatch::{
 
 use super::SimFs;
 
-/// Compares each stored fingerprint (`Engine::fingerprints`) with a fresh look at the disk.
-/// The error names the first file whose fingerprint is not the one on disk. A file that was
-/// looked at before its watch was live, and never again, fails here and in no other check.
+/// Compares each stored fingerprint (`Engine::fingerprints`) with a fresh look at the disk, and
+/// each link that the engine keeps as a file of its directory (`Engine::link_entries`) with
+/// the link itself. The error names the first file whose fingerprint is not the one on disk. A
+/// file that was looked at before its watch was live, and never again, fails here and in no
+/// other check.
 pub fn check_fingerprints(
   fs: &SimFs,
   watched: &BTreeSet<PathBuf>,
   stored: &[(PathBuf, Fingerprint)],
+  entries: &[(PathBuf, Fingerprint)],
 ) -> Result<(), String> {
-  let followed = followed(watched);
-  for (path, stored) in stored {
+  let looks = stored.iter().map(|(path, stored)| (path, stored, watched.contains(path)));
+  for (path, stored, at_watched_path) in
+    looks.chain(entries.iter().map(|(path, stored)| (path, stored, false)))
+  {
     let fail = |disk: &str| {
       Err(format!("{}: the engine stored {stored:?}, and the disk has {disk}", path.display()))
     };
-    match fs.quiet(|| look(fs, &followed, path)) {
+    match fs.quiet(|| look(fs, at_watched_path, path)) {
       Ok(meta) if meta.kind == FileType::Dir => return fail("a directory"),
       Ok(meta) if Fingerprint::of(&meta) != *stored => {
         return fail(&format!("{:?}", Fingerprint::of(&meta)));
@@ -47,20 +52,20 @@ pub fn check_fingerprints(
 /// from each watched path that `watch` takes ([`can_be_watched`]).
 ///
 /// A watched path stands for itself if a file is there, and for every file below it if a
-/// directory is there. The filter is asked about every file and every directory of the walk,
-/// the watched path too: one that it ignores for the kind that is there counts as missing.
+/// directory is there. It is read through its links, and nothing below it is: a link there is
+/// a file. Each watched path is walked on its own, so a link inside a watched directory that a
+/// watched path goes through is a file of the directory, and what is behind it belongs to the
+/// path only. The filter is asked about every file and every directory of the walk, the watched
+/// path too: one that it ignores for the kind that is there counts as missing.
 pub fn reportable(
   fs: &SimFs,
   ignored: &dyn Fn(&Path, EntryKind) -> bool,
   watched: &BTreeSet<PathBuf>,
 ) -> BTreeSet<PathBuf> {
-  let taken: BTreeSet<PathBuf> =
-    watched.iter().filter(|path| can_be_watched(ignored, path)).cloned().collect();
-  let followed = followed(&taken);
-  let mut walk = Walk { fs, ignored, followed, files: BTreeSet::new() };
+  let mut walk = Walk { fs, ignored, files: BTreeSet::new() };
   fs.quiet(|| {
-    for path in &taken {
-      walk.visit(path);
+    for path in watched.iter().filter(|path| can_be_watched(ignored, path)) {
+      walk.visit(path, true);
     }
   });
   walk.files
@@ -78,13 +83,12 @@ pub fn can_be_watched(ignored: &dyn Fn(&Path, EntryKind) -> bool, path: &Path) -
 struct Walk<'a> {
   fs: &'a SimFs,
   ignored: &'a dyn Fn(&Path, EntryKind) -> bool,
-  followed: BTreeSet<PathBuf>,
   files: BTreeSet<PathBuf>,
 }
 
 impl Walk<'_> {
-  fn visit(&mut self, path: &Path) {
-    let Ok(meta) = look(self.fs, &self.followed, path) else { return };
+  fn visit(&mut self, path: &Path, at_watched_path: bool) {
+    let Ok(meta) = look(self.fs, at_watched_path, path) else { return };
     let kind = if meta.kind == FileType::Dir { EntryKind::Dir } else { EntryKind::File };
     if (self.ignored)(path, kind) {
       return;
@@ -96,19 +100,19 @@ impl Walk<'_> {
     let mut names = Vec::new();
     if self.fs.read_dir(path, &mut |name, _| names.push(name.to_owned())).is_ok() {
       for name in names {
-        self.visit(&path.join(name));
+        self.visit(&path.join(name), false);
       }
     }
   }
 }
 
-/// Every watched path and every path above one. Only these are followed when they are links.
+/// Every watched path and every path above one: the paths that a watched path is read through.
 pub fn followed(watched: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
   watched.iter().flat_map(|path| path.ancestors()).map(Path::to_path_buf).collect()
 }
 
-/// What the engine finds at `path` when it looks now: a followed path is read through its
-/// link, every other path is not.
-fn look(fs: &SimFs, followed: &BTreeSet<PathBuf>, path: &Path) -> std::io::Result<Meta> {
-  if followed.contains(path) { fs.stat(path) } else { fs.lstat(path) }
+/// What the engine finds at `path` when it looks now: a watched path is read through its link,
+/// a path below a watched directory is not.
+fn look(fs: &SimFs, at_watched_path: bool, path: &Path) -> std::io::Result<Meta> {
+  if at_watched_path { fs.stat(path) } else { fs.lstat(path) }
 }

@@ -133,9 +133,10 @@ watcher of 50,000 files then grew to 8 to 11 MiB, about half of it unused, and i
 with it. With blocks, the heap is about 6.3 MiB, 30% of it unused, and 15 MiB is allocated in total
 instead of 40 MiB. Each node has the list of its children, and one table for the whole
 tree finds a child by its parent and name. Small side tables next to the arena hold what only a few
-nodes have: the link of a registered name (§2.14), the content hash of a young file (§2.8), the
-time of a hold (§2.9), the first look at a file whose time is ahead of the clock (§2.8), and the
-registered names that are not plain, grouped by directory (§2.2).
+nodes have: the link of a registered name with its entry and its target watch (§2.14), the
+content hash of a young file (§2.8), the time of a hold (§2.9), the first look at a file whose time
+is ahead of the clock (§2.8), and the registered names that are not plain, grouped by directory
+(§2.2).
 
 A tree that shrinks returns its memory (`Tree::give_back`). A node never moves, because its key is
 its position. Only the end of the arena can therefore be released, and only as far as no node
@@ -451,8 +452,8 @@ The parent of `node` is a directory on disk, and `path` is the path of `node`.
   first. An ignored entry is missing and costs no `lstat`.
 - `lstat(path)` is called, unless the listing of the running scan provided everything (see
   below). For a registered name that is a symbolic link, `stat(path)` is also called, which follows
-  the link (§2.14). An unregistered symbolic link is a file. Errors are handled as described in
-  §2.12.
+  the link (§2.14). The `lstat` result is then the link entry of the directory, when the directory
+  is complete. An unregistered symbolic link is a file. Errors are handled as described in §2.12.
 
 **A complete listing** (`fs::Entry::File`, `fs::Entry::Dir`). On APFS one call
 (`getattrlistbulk`) returns the entries of a directory together with what `lstat` would report for
@@ -654,7 +655,8 @@ to be retried after the call reports what it finds.
   was wrong either way. While the tree has nothing at a registered name, the wide watch stays.
   When the `unwatch` of a tree makes many levels release such a watch, only the top one queues the
   deep scan. That scan reaches the others, and everything below is scanned once.
-- A symbolic link that was registered becomes a file entry again, so it gets one check.
+- A symbolic link that was registered loses what was behind it in silence. In a complete directory
+  its node becomes the file entry that it kept (§2.14), and it gets one check.
 
 Then one flush runs, as for `watch`.
 
@@ -773,9 +775,10 @@ that found its current fingerprint (`Tree::ahead_since`), and old after that. Wh
 within 2 s of that time, the table applies again, and the file is young until its youth after that
 time has passed.
 
-"Only the poll looks at it" means that the directory of the file is polled, or that the node is a
-symbolic link (§2.14). Such a young file larger than 16 MiB, or one that cannot be read, therefore
-gets one `Update` when it is 2 s old, even when nothing changed (§5).
+"Only the poll looks at it" means that no `Written` hint reaches the file: the directory of the
+file is polled, or the node is a symbolic link (§2.14), whose target directory is watched only to
+look sooner. Such a young file larger than 16 MiB, or one that cannot be read, therefore gets one
+`Update` when it is 2 s old, even when nothing changed (§5).
 
 When the file disappears between the `lstat` and the read for the hash, the check reports nothing,
 and the node is checked again in the next flush.
@@ -1140,12 +1143,50 @@ Without this bound, a flush interrupted by sleep on Windows, a process stopped f
 ### 2.14 Symbolic links
 
 The rules are those of `design.md` §4.9. For a registered name that is a symbolic link, the engine
-stores a hash of the real path behind it and compares it at each look. If the look behind the link
-gets no answer, the stored hash stays as it was. A node reached through a link never becomes
-`FromAbove`, so the backend is asked about it. Every poll puts a mark with no flags on each
-registered link whose parent is not polled, and the shallow scan of a polled parent checks the
-others (§2.10), and `mark_moved` treats a node behind a link like a node with a polled
-parent. An unregistered link is never opened (§2.8).
+keeps a record beside the arena (`tree::Link`). It holds a hash of the real path behind the link,
+compared at each look. If the look behind the link gets no answer, the record stays as it was. A
+node reached through a link never becomes `FromAbove`, so the backend is asked about it. Every poll
+puts a mark with no flags on each registered link whose parent is not polled, and the shallow scan
+of a polled parent checks the others (§2.10), and `mark_moved` treats a node behind a link like a
+node with a polled parent. An unregistered link is never opened (§2.8).
+
+**The link as an entry.** The node of a registered link stands for what is behind it. When its
+directory is complete and lists the name, the record also keeps the link as a file of that
+directory (`LinkEntry`): the fingerprint from `lstat`, and a hash of the text of the target. The
+look compares both (`settle_entry`, after the result of the look behind the link is applied), so
+a link pointed elsewhere is an `Update` even when `rm` and `ln -s` in one tick of the clock give
+the new link the inode, time and size of the old one. The node counts as a file for the handler
+while it is a file or keeps an entry (`finish`, `event_of`). What is behind the link is never part
+of the directory: `is_covered`, `covered_by_parent` and `watched_before` stop at a link, and the
+look takes a directory behind a link for complete only when the link is a watched path. The cases:
+
+- A listed link becomes registered (a `watch` at it or through it). Its node had the link as a
+  listed file. That file becomes the entry (`take_entry_of`), with its young hash compared to the
+  text of the target, and what is behind the link is new: the baseline of the call, or news.
+- The entry appears for a node that was registered before: a new link, or a directory that becomes
+  complete. It is a `Create` when the directory was watched before this call. Otherwise it joins
+  the baseline (`Link::entry_baseline`, cleared by `finish`), so that a second look in the same
+  call gives no `Update` for a path that the handler has not heard of.
+- The entry changes, or the file behind the link comes or goes while the entry stays: `Update`.
+- The look finds nothing at the name: the node is held as usual (§2.9), and the entry goes with it
+  at the second look. A node with nothing behind its link and only the entry is held too.
+- The entry goes while the node stays registered: the directory no longer lists the link, or it
+  is now a real file or directory. It is reported like the end of a listed file. A directory above
+  that vanishes or is uncovered takes the entries of its children (`drop_entry`), with a `Delete`
+  when it vanishes and in silence when it is uncovered.
+- A listed directory that becomes a link is uncovered with a `Delete` for each told file in it, as
+  for a directory that a file replaces. The link then appears as an entry.
+- The registration ends (`let_go`): what was behind the link is forgotten in silence, and the node
+  becomes the entry, a listed file.
+
+**The target watch.** A watched path that is a link to a file asks the backend to watch the
+directory of the real path of that file for its contents, under the key of the node
+(`watch_target`). Every notification from it marks the node, so a write there is looked at within
+the quiet time. It is asked again when the real path changes, and given back when the node is no
+longer such a file (`forget_file`) or no longer a link (`unwatch_target`). Its notifications are not
+`Written` hints, so the file still counts as one that only the poll looks at (§2.8), and the poll of
+the links stays, for a change further along the chain. Previously, only that poll found a write to
+the file, within one second.
 
 ## 3. Backend interface
 
@@ -1849,9 +1890,9 @@ The known limitations of the engine:
   watched path spelled with one of them, where the disk has the plain spelling, receives no events
   from an OS watch.
 - Where only the poll looks at a file (under polling, in a directory that has no OS watch, and at
-  a watched path that is a symbolic link, with every backend), a young file larger than 16 MiB, and
-  one that cannot be read, receives one `Update` when it is 2 s old, even when nothing changed,
-  including a file written just before `watch` (§2.8).
+  a watched path that is a symbolic link, with every backend, §2.8), a young file larger than
+  16 MiB, and one that cannot be read, receives one `Update` when it is 2 s old, even when nothing
+  changed, including a file written just before `watch`.
 - A symbolic link on the way to a watched path, or a watched path that is a symbolic link, is
   looked at whenever a hint marks it and at every poll (§2.14). When the link is replaced, a hint
   for its name arrives wherever the watch of its directory reports entries: always with inotify,
@@ -2137,12 +2178,14 @@ one thing only, in the order in which a change meets them.
 - **Twin.** Another node of the same directory whose name differs from this one only in the case of
   ASCII letters.
 - **Frozen.** A node below a held node. Nothing is done there before the second look above.
+- **Link entry.** A registered symbolic link as a file of the complete directory that lists it,
+  kept beside what is behind the link (§2.14).
 - **Uncover, let go.** No watched path and no complete directory covers a node any more: after an
-  `unwatch`, or because the directory above lists it under another spelling (§2.2). What the tree
-  holds there is forgotten, except what the watched paths below it need (`uncover`: silently after
-  an `unwatch`, with `Delete` events after a respelling), and a directory that stays may be
-  narrowed. A node that is no longer registered becomes an entry like any other, or is freed
-  (`let_go`).
+  `unwatch`, because the directory above lists it under another spelling (§2.2), or because it is
+  now a symbolic link (§2.14). What the tree holds there is forgotten, except what the watched paths
+  below it need (`uncover`: silently after an `unwatch`, with `Delete` events after a respelling or
+  a link), and a directory that stays may be narrowed. A node that is no longer registered becomes
+  an entry like any other, or is freed (`let_go`).
 - **Settle** (tests). `Driver::settle`: deliver every notification and run every deadline inside one
   window (two poll intervals, the delete delay, two quiet times and 2 s), then move the clock to its
   end. Every delay expires in it and more than two polls run, so nothing is left to find. The polls

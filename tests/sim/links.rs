@@ -141,6 +141,66 @@ fn an_old_directory_is_not_looked_at_again() {
   }
 }
 
+/// A watched path that is a link to a file: the directory of the file behind it is watched
+/// too, so a write there is heard at once, with no help from the poll. When the link points to
+/// a file in another directory, that directory is watched in its place.
+#[test]
+fn the_file_behind_a_watched_link_is_heard_at_once() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().mkdir_all("/shared/a").unwrap();
+    d.fs().mkdir("/shared/b").unwrap();
+    d.fs().mkdir("/p").unwrap();
+    d.fs().write("/shared/a/config.json", "1").unwrap();
+    d.fs().write("/shared/b/config.json", "1").unwrap();
+    d.fs().symlink("/shared/a/config.json", "/p/config.json").unwrap();
+    // Old files: a young one is read at every look.
+    d.advance(Duration::from_secs(3));
+    assert_eq!(d.watch(&["/p/config.json"]), NONE, "{on}");
+
+    d.fs().write("/shared/a/config.json", "22").unwrap();
+    assert!(d.fs().pending_raw() > 0 || on == "Poll", "{on}: no watch on the directory");
+    assert_eq!(d.window(), ["U /p/config.json"], "{on}");
+
+    d.fs().remove("/p/config.json").unwrap();
+    d.fs().symlink("/shared/b/config.json", "/p/config.json").unwrap();
+    assert_eq!(d.settled(), ["U /p/config.json"], "{on}");
+    d.fs().write("/shared/b/config.json", "22").unwrap();
+    assert!(d.fs().pending_raw() > 0 || on == "Poll", "{on}: no watch on the new directory");
+    assert_eq!(d.window(), ["U /p/config.json"], "{on}");
+    d.fs().write("/shared/a/config.json", "333").unwrap();
+    assert_eq!(d.settled(), NONE, "{on}");
+    d.caught_up();
+  });
+}
+
+/// A link to a file inside a watched directory, and a watched path at the link: one known file,
+/// which the directory has as the link and the path as the file behind it. Each of the two
+/// reports its own changes, and the file is gone only when both are.
+#[test]
+fn a_link_to_a_file_that_a_directory_and_a_watched_path_both_have() {
+  on_all(&Options::default(), |d, on| {
+    d.fs().mkdir_all("/p").unwrap();
+    d.fs().mkdir("/shared").unwrap();
+    d.fs().write("/shared/.env", "1").unwrap();
+    d.fs().symlink("/shared/.env", "/p/.env").unwrap();
+    d.advance(Duration::from_secs(3));
+    assert_eq!(d.watch(&["/p", "/p/.env"]), NONE, "{on}");
+    assert_eq!(d.known(), ["/p/.env"], "{on}");
+
+    d.fs().write("/shared/.env", "22").unwrap();
+    assert_eq!(d.settled(), ["U /p/.env"], "{on}");
+    // The file behind the link goes, and the link is still a file of `/p`.
+    d.fs().remove("/shared/.env").unwrap();
+    assert_eq!(d.settled(), ["U /p/.env"], "{on}");
+    d.fs().write("/shared/.env", "333").unwrap();
+    assert_eq!(d.settled(), ["U /p/.env"], "{on}");
+    // The link goes too: nothing is left at the path.
+    d.fs().remove("/p/.env").unwrap();
+    assert_eq!(d.settled(), ["D /p/.env"], "{on}");
+    d.caught_up();
+  });
+}
+
 /// One directory under two spellings. Each watched path gets its events under its own
 /// spelling, with no help from the poll.
 #[test]
@@ -159,7 +219,8 @@ fn each_watched_path_keeps_its_spelling() {
 }
 
 /// A watch for a whole tree reports the real directories below it. A directory that is reached
-/// through a link is not one of them and needs a watch of its own.
+/// through a link is not one of them and needs a watch of its own. For the watched directory
+/// the link is a file, and what is behind it belongs to the watched path at the link.
 #[test]
 fn a_linked_directory_inside_a_covered_tree() {
   for mode in Mode::ALL {
@@ -167,7 +228,7 @@ fn a_linked_directory_inside_a_covered_tree() {
     d.fs.mkdir_all("/real/dir/deep").unwrap();
     d.fs.mkdir("/p").unwrap();
     d.fs.symlink("/real/dir", "/p/link").unwrap();
-    d.watch(&["/p", "/p/link/x.js"]);
+    d.watch(&["/p", "/p/link"]);
 
     d.fs.write("/real/dir/x.js", "1").unwrap();
     d.fs.write("/real/dir/deep/y.js", "1").unwrap();
@@ -212,7 +273,8 @@ fn a_link_entry_pointed_elsewhere_in_the_same_time_step() {
     d.fs.remove("/p/r/l").unwrap();
     d.fs.symlink("/x/b", "/p/r/l").unwrap();
     let watched = BTreeSet::from([PathBuf::from("/p/r")]);
-    assert_eq!(check_fingerprints(&d.fs, &watched, &stored), Ok(()), "{on}: the fingerprint tells");
+    let tells = check_fingerprints(&d.fs, &watched, &stored, &[]);
+    assert_eq!(tells, Ok(()), "{on}: the fingerprint tells");
   }
   for mode in Mode::ALL {
     let mut d = Driver::sim(mode, Options::default());
@@ -351,8 +413,10 @@ fn the_real_path_behind_a_link_changes_and_the_disk_stops_answering() {
 }
 
 /// A link took the place of a directory inside a watched directory, and before the engine hears
-/// of it, `watch` registers that name. Only a registered name is followed, so the call has to
-/// look at the name itself: what is behind the link is its baseline. (Fuzz seed 97001874.)
+/// of it, `watch` registers a name below it. The call looks at the name on the way and finds the
+/// link: for the watched directory, the directory is gone and a file came in its place, as for
+/// any file that replaces a directory. The new watched path is followed through the link, and
+/// nothing is behind it. (Fuzz seed 97001874.)
 #[test]
 fn a_directory_became_a_link_before_its_name_is_registered() {
   on_all(&Options::default(), |d, on| {
@@ -366,10 +430,12 @@ fn a_directory_became_a_link_before_its_name_is_registered() {
     // No hint of this reaches the engine before the next `watch`.
     d.fs().rename("/p/a/c", "/p/away").unwrap();
     d.fs().symlink("/t", "/p/a/c").unwrap();
-    assert_eq!(d.watch(&["/p/a/c/gen/x.js"]), NONE, "{on}");
-    assert_eq!(d.known(), ["/p/a/c/new.js", "/p/a/c/old.js"], "{on}");
-    // The `Delete` waited for the delete delay.
-    assert_eq!(d.settled(), ["D /p/a/c/old.js"], "{on}");
+    assert_eq!(d.watch(&["/p/a/c/gen/x.js"]), ["C /p/a/c", "D /p/a/c/old.js"], "{on}");
+    assert_eq!(d.known(), ["/p/a/c"], "{on}");
+    // The creation of the link is still on its way where the OS reports it as a write, and a
+    // reported write counts as a change even when it came before the look.
+    let late = d.settled();
+    assert!(late.is_empty() || late == ["U /p/a/c"], "{on}: {late:?}");
     d.caught_up();
   });
 }

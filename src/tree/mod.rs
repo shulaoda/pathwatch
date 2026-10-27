@@ -197,6 +197,20 @@ pub enum Content {
   Pending,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct LinkEntry {
+  pub file: Fingerprint,
+  pub text: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Link {
+  real_place: u64,
+  entry: Option<LinkEntry>,
+  entry_baseline: bool,
+  watched: Option<u64>,
+}
+
 #[derive(Debug)]
 pub struct Tree {
   slots: Slots,
@@ -204,7 +218,7 @@ pub struct Tree {
   first_generation: u32,
   names: Names,
   table: HashTable<u32>,
-  links: FxHashMap<NodeKey, u64>,
+  links: FxHashMap<NodeKey, Link>,
   contents: FxHashMap<NodeKey, Content>,
   holds: FxHashMap<NodeKey, Instant>,
   ahead: FxHashMap<NodeKey, Instant>,
@@ -493,15 +507,61 @@ impl Tree {
     if unknown { None } else { Some(Want::Names) }
   }
 
+  fn link_of(&self, key: NodeKey) -> Option<&Link> {
+    if self.links.is_empty() { None } else { self.links.get(&key) }
+  }
+
+  fn link_of_mut(&mut self, key: NodeKey) -> Option<&mut Link> {
+    if self.links.is_empty() { None } else { self.links.get_mut(&key) }
+  }
+
   pub fn link(&self, key: NodeKey) -> Option<u64> {
-    self.links.get(&key).copied()
+    self.link_of(key).map(|link| link.real_place)
   }
 
   pub fn set_link(&mut self, key: NodeKey, link: Option<u64>) {
     match link {
-      Some(real_place) => self.links.insert(key, real_place),
-      None => self.links.remove(&key),
-    };
+      Some(real_place) => {
+        let new = Link { real_place, entry: None, entry_baseline: false, watched: None };
+        self.links.entry(key).or_insert(new).real_place = real_place;
+      }
+      None if !self.links.is_empty() => {
+        self.links.remove(&key);
+      }
+      None => {}
+    }
+  }
+
+  pub fn entry(&self, key: NodeKey) -> Option<LinkEntry> {
+    self.link_of(key)?.entry
+  }
+
+  pub fn set_entry(&mut self, key: NodeKey, entry: Option<LinkEntry>) {
+    if let Some(link) = self.link_of_mut(key) {
+      link.entry = entry;
+      link.entry_baseline &= entry.is_some();
+    }
+  }
+
+  pub fn mark_entry_baseline(&mut self, key: NodeKey) {
+    if let Some(link) = self.link_of_mut(key) {
+      link.entry_baseline = link.entry.is_some();
+    }
+  }
+
+  pub fn take_entry_baseline(&mut self, key: NodeKey) -> Option<bool> {
+    let link = self.link_of_mut(key)?;
+    link.entry.map(|_| mem::take(&mut link.entry_baseline))
+  }
+
+  pub fn watched_target(&self, key: NodeKey) -> Option<u64> {
+    self.link_of(key)?.watched
+  }
+
+  pub fn set_watched_target(&mut self, key: NodeKey, watched: Option<u64>) {
+    if let Some(link) = self.link_of_mut(key) {
+      link.watched = watched;
+    }
   }
 
   pub fn links(&self) -> impl Iterator<Item = NodeKey> + '_ {

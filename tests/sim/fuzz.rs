@@ -621,8 +621,10 @@ fn tracked(filter: u8, watched: &BTreeSet<PathBuf>, dir: &Path) -> bool {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Content {
   Bytes(String),
-  /// A link that is not followed: a file entry of its own.
+  /// A link that a watched directory lists: a file entry of its own.
   Link(PathBuf),
+  /// Such a link that is a watched path to a file too: the link, and the file read through it.
+  Both(PathBuf, String),
   /// No file: the path is gone, or it is a directory.
   Nothing,
   /// The disk changed while the engine read it, so the handler may have read the state
@@ -630,20 +632,50 @@ enum Content {
   Either,
 }
 
-fn content(fs: &SimFs, followed: &BTreeSet<PathBuf>, path: &Path) -> Content {
-  if !followed.contains(path)
-    && let Some(target) = fs.read_link(path)
-  {
-    return Content::Link(target);
+/// A link can only be known as a file of the directory that lists it, unless it is a watched
+/// path with a file behind it. Then it is read through the link, and it is the link too when a
+/// watched directory lists it.
+fn content(fs: &SimFs, filter: u8, watched: &BTreeSet<PathBuf>, path: &Path) -> Content {
+  let bytes = fs.read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+  match (fs.read_link(path), bytes) {
+    (Some(target), Some(bytes)) if watched.contains(path) => {
+      if is_listed(fs, filter, watched, path) {
+        Content::Both(target, bytes)
+      } else {
+        Content::Bytes(bytes)
+      }
+    }
+    (Some(target), _) => Content::Link(target),
+    (None, bytes) => bytes.map_or(Content::Nothing, Content::Bytes),
   }
-  fs.read(path)
-    .map_or(Content::Nothing, |bytes| Content::Bytes(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-/// Whether the engine takes `path` for a directory.
-fn is_directory(fs: &SimFs, followed: &BTreeSet<PathBuf>, path: &Path) -> bool {
-  let meta = fs.quiet(|| if followed.contains(path) { fs.stat(path) } else { fs.lstat(path) });
-  meta.is_ok_and(|meta| meta.kind == FileType::Dir)
+/// Whether the engine takes `path` for a directory. A link is a file of the directory that lists
+/// it, so it is never one.
+fn is_directory(fs: &SimFs, watched: &BTreeSet<PathBuf>, path: &Path) -> bool {
+  let at_watched_path = watched.contains(path);
+  let meta = fs.quiet(|| if at_watched_path { fs.stat(path) } else { fs.lstat(path) });
+  meta.is_ok_and(|meta| meta.kind == FileType::Dir) && fs.read_link(path).is_none()
+}
+
+/// Whether a watched directory lists the entry at `path`, under the name that the disk gives.
+fn is_listed(fs: &SimFs, filter: u8, watched: &BTreeSet<PathBuf>, path: &Path) -> bool {
+  !ignored(filter, path, EntryKind::File)
+    && fs.spelled_as_on_disk(path)
+    && path.parent().is_some_and(|dir| is_walked(fs, filter, watched, dir))
+}
+
+/// Whether the walk of a watched path lists `dir`: it is a watched path with a directory at it,
+/// or a directory (not a link) in such a listed directory. Read from the disk itself, also while
+/// the engine finds it offline.
+fn is_walked(fs: &SimFs, filter: u8, watched: &BTreeSet<PathBuf>, dir: &Path) -> bool {
+  if ignored(filter, dir, EntryKind::Dir) || fs.dir_object(dir).is_none() {
+    return false;
+  }
+  watched.contains(dir)
+    || (fs.read_link(dir).is_none()
+      && fs.spelled_as_on_disk(dir)
+      && dir.parent().is_some_and(|up| is_walked(fs, filter, watched, up)))
 }
 
 /// For every path on the way to a watched path: the directory it leads to now, and whether a
@@ -812,7 +844,6 @@ struct Run<B: Deliver> {
   now: Instant,
   shared: Arc<Shared>,
   watched: BTreeSet<PathBuf>,
-  followed: BTreeSet<PathBuf>,
   /// What the handler knows: every file it was told about, with the content the file had when
   /// the handler heard of it last.
   known: BTreeMap<PathBuf, Content>,
@@ -856,7 +887,6 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
       now: Instant::now(),
       shared,
       watched: BTreeSet::new(),
-      followed: BTreeSet::new(),
       known: BTreeMap::new(),
       held: Vec::new(),
       away: Vec::new(),
@@ -892,7 +922,11 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
   /// size), no event follows, and none can: an equal fingerprint is what makes a repeated hint
   /// cost nothing. So after such a call the content is not held against the engine.
   fn content_told(&self, path: &Path, trapped: bool) -> Content {
-    if trapped { Content::Either } else { content(&self.fs, &self.followed, path) }
+    if trapped {
+      Content::Either
+    } else {
+      content(&self.fs, self.config.filter, &self.watched, path)
+    }
   }
 
   fn hear(&mut self, out: &Output, trapped: bool) {
@@ -926,7 +960,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
         }
       }
       // The disk did not change since the engine read it, so the event must fit it.
-      if !trapped && event.kind != EventKind::Delete && is_directory(&self.fs, &self.followed, path)
+      if !trapped && event.kind != EventKind::Delete && is_directory(&self.fs, &self.watched, path)
       {
         fail!("directory", "{:?} for a directory: {}", event.kind, path.display());
       }
@@ -935,9 +969,11 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
       self.say(format!("    ->{line}"));
     }
     // A path is a file or a directory for the handler, never both: when the kind changes, the
-    // `Delete`s are in the same batch as the `Create`s.
-    for (above, below) in self.known.keys().zip(self.known.keys().skip(1)) {
-      if below.starts_with(above) {
+    // `Delete`s are in the same batch as the `Create`s. A link is the exception: it is a file of
+    // the watched directory that lists it, and a watched path can go through it.
+    for ((above, told), below) in self.known.iter().zip(self.known.keys().skip(1)) {
+      let as_link = matches!(told, Content::Link(_) | Content::Both(..) | Content::Either);
+      if below.starts_with(above) && !as_link {
         fail!("kind", "the handler knows {} and {}", above.display(), below.display());
       }
     }
@@ -1007,8 +1043,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     // Silence is only for what no older watched path had to report.
     let before = reportable(&self.fs, self.config.filter, &self.watched);
     let after = reportable(&self.fs, self.config.filter, &new_watched);
-    self.followed = followed(&new_watched);
-    self.watched.clone_from(&new_watched);
+    let before_watched = mem::replace(&mut self.watched, new_watched.clone());
     *lock(&self.shared.watched) = new_watched;
 
     let traps = self.fs.traps_run();
@@ -1044,7 +1079,34 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
         self.known.insert(path, content);
       }
     }
+    self.retell_links(&before_watched, trapped);
     self.check_view();
+  }
+
+  /// What the handler reads at a link that a watched directory lists changes with the watched
+  /// paths alone: a watched path at the link adds what is read through it, and its `unwatch`
+  /// takes that away, as the `unwatch` of the directory takes the link away. This holds also
+  /// when a change was still to be reported, and when the disk is not there to be read. No event
+  /// tells about it, and none is owed.
+  fn retell_links(&mut self, before: &BTreeSet<PathBuf>, trapped: bool) {
+    let (fs, filter, watched) = (&self.fs, self.config.filter, &self.watched);
+    for (path, told) in &mut self.known {
+      let forgotten = before.contains(path) && !watched.contains(path);
+      let unlisted = !path.parent().is_some_and(|dir| tracked(filter, watched, dir));
+      if let Content::Both(target, bytes) = &mut *told
+        && (forgotten || unlisted)
+      {
+        *told = if forgotten {
+          Content::Link(mem::take(target))
+        } else {
+          Content::Bytes(mem::take(bytes))
+        };
+      } else if fs.read_link(path).is_some()
+        && (forgotten || *told == content(fs, filter, before, path))
+      {
+        *told = if trapped { Content::Either } else { content(fs, filter, watched, path) };
+      }
+    }
   }
 
   /// A watched path as a caller can spell it on a disk that takes two spellings of a name for
@@ -1079,7 +1141,6 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
       texts.push(text);
     }
     self.say(format!("unwatch {texts:?}"));
-    self.followed = followed(&new_watched);
     let before = mem::replace(&mut self.watched, new_watched.clone());
     *lock(&self.shared.watched) = new_watched;
 
@@ -1094,18 +1155,23 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     // whose `Delete` waits.
     let (filter, watched) = (self.config.filter, &self.watched);
     self.known.retain(|path, _| covered(filter, watched, path));
-    if self.config.folds() {
-      // Where only the disk says whether a watched directory covers a name, the engine is
-      // believed: it kept the answer of its last look, and `Engine::check_spellings` holds
-      // that answer to the disk. A `Create` in the same call is for a file that was forgotten.
-      let view = self.engine.view();
-      let event = |path: &Path| out.events.iter().find(|event| event.path == path);
-      self.known.retain(|path, _| {
-        !through_registered(&before, watched, path)
-          || event(path).map_or(view.contains(path), |event| event.kind != EventKind::Create)
-      });
-    }
+    // Where only the disk says whether a watched directory covers a name, the engine is
+    // believed: it kept the answer of its last look. That is a name that is another spelling of
+    // an entry, on a disk that takes two spellings of a name for one (`Engine::check_spellings`
+    // holds that answer to the disk), and a link that a watched path went through: what is
+    // behind it was the path's, and the directory has the link as a file. So is a watched path
+    // that the handler knows as such a link, or read while the disk changed: whether it is a
+    // file of the path too is what the engine saw at its last look at the path. A `Create` in
+    // the same call is for a file that was forgotten.
+    let view = self.engine.view();
+    let event = |path: &Path| out.events.iter().find(|event| event.path == path);
+    self.known.retain(|path, told| {
+      let unsure = watched.contains(path) && matches!(told, Content::Link(_) | Content::Either);
+      !(unsure || through_registered(&before, watched, path))
+        || event(path).map_or(view.contains(path), |event| event.kind != EventKind::Create)
+    });
     self.hear(&out, trapped);
+    self.retell_links(&before, trapped);
     self.check_view();
   }
 
@@ -1423,7 +1489,7 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
       );
     }
     for (path, told) in &self.known {
-      let now = content(&self.fs, &self.followed, path);
+      let now = content(&self.fs, self.config.filter, &self.watched, path);
       if *told != now && *told != Content::Either {
         fail!(
           "content",
@@ -1434,7 +1500,8 @@ impl<B: Deliver<Raw: Clone>> Run<B> {
     }
     // Also after a change in the middle of a call, where the content above is not held against
     // the engine: whatever the engine read then, it must have looked again since.
-    if let Err(stale) = check_fingerprints(&self.fs, &self.watched, &self.engine.fingerprints()) {
+    let (stored, entries) = (self.engine.fingerprints(), self.engine.link_entries());
+    if let Err(stale) = check_fingerprints(&self.fs, &self.watched, &stored, &entries) {
       fail!("stale", "{stale}");
     }
     if let Err(wrong) = self.fs.quiet(|| self.engine.check_spellings()) {

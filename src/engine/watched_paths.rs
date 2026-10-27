@@ -84,9 +84,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     if node.is_path() && node.added() == Added::No {
       return true;
     }
-    if node.is_unlisted() {
-      return false;
-    }
+    !node.is_unlisted() && self.tree.link(key).is_none() && self.entry_watched_before(key)
+  }
+
+  pub(super) fn entry_watched_before(&self, key: NodeKey) -> bool {
     let Some(parent) = self.tree.parent(key) else { return false };
     if self.tree[parent].is_complete() {
       !self.tree[parent].baseline()
@@ -97,6 +98,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   pub(super) fn covered_by_parent(&self, key: NodeKey) -> bool {
     !self.tree[key].is_unlisted()
+      && self.tree.link(key).is_none()
       && self.tree.parent(key).is_some_and(|parent| self.tracks_every_entry(parent))
   }
 
@@ -114,7 +116,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if node.is_path() && (!before_call || node.added() == Added::No) {
         return true;
       }
-      let Some(parent) = self.tree.parent(at).filter(|_| !node.is_unlisted()) else {
+      let followed = self.tree.link(at).is_some();
+      let Some(parent) = self.tree.parent(at).filter(|_| !node.is_unlisted() && !followed) else {
         return false;
       };
       at = parent;
@@ -159,9 +162,11 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let mut gone = Vec::new();
     let mut next = Some((key, false));
     let mut stack = Vec::new();
+    let top = key;
     while let Some((key, mut scan_comes)) = next.take().or_else(|| stack.pop()) {
+      let keeps_entry = key == top && self.tree.entry(key).is_some();
       let node = &mut self.tree[key];
-      if !tell_delete {
+      if !tell_delete && !keeps_entry {
         node.set_told(false);
       }
       let stays = node.is_ancestor();
@@ -178,8 +183,14 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       } else {
         gone.push(key);
       }
-      let below = self.tree.children(key).filter(|&child| !self.tree[child].is_path());
-      stack.extend(below.map(|child| (child, scan_comes)));
+      let mut child = self.tree.children(key).next();
+      while let Some(at) = child {
+        child = self.tree.next_sibling(at);
+        self.drop_entry(at, tell_delete);
+        if !self.tree[at].is_path() {
+          stack.push((at, scan_comes));
+        }
+      }
     }
     for key in gone.into_iter().rev() {
       self.vanish(key);
@@ -187,16 +198,18 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 
   fn let_go(&mut self, key: NodeKey) {
-    let covered = self.covered_by_parent(key);
+    if !self.covered_by_parent(key) {
+      self.uncover(key, false);
+    }
     self.tree[key].set_unlisted(false);
     if self.tree.link(key).is_some() {
+      if let Some(entry) = self.tree.entry(key) {
+        self.tree[key].kind = Kind::File(entry.file);
+      }
       self.tree.set_link(key, None);
-      if covered {
+      if self.covered_by_parent(key) {
         self.tree.mark(key, Mark::default());
       }
-    }
-    if !covered {
-      self.uncover(key, false);
     }
     self.tree.prune(key);
   }

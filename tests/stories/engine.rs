@@ -254,28 +254,6 @@ fn a_watched_link_to_a_file_is_read_through_its_target() {
   });
 }
 
-/// A link to a directory inside a watched directory is a file entry, until a watched path
-/// goes through it: then the link is followed and is no file any more, and what is behind it
-/// is a part of the watched directory.
-#[test]
-fn a_link_in_a_watched_directory_becomes_a_way_to_a_watched_path() {
-  everywhere(|w| {
-    w.mkdir("p/d");
-    w.write("q/dir/x.js", "1");
-    if !w.symlink("q/dir", "p/d/l") {
-      return;
-    }
-    w.watch(&["p/d"]);
-    w.expect(&[]);
-
-    w.watch(&["p/d/l/x.js"]);
-    w.expect(&[(Delete, "p/d/l")]);
-    w.write("q/dir/x.js", "22");
-    w.write("q/dir/y.js", "1");
-    w.expect(&[(Update, "p/d/l/x.js"), (Create, "p/d/l/y.js")]);
-  });
-}
-
 /// A link that the filter ignores as a file sits in a watched directory. Then it becomes a
 /// watched path: it is followed from now on, with what is behind it as the baseline. The
 /// directory above never had to report it: for it the link was an ignored file.

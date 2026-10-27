@@ -131,7 +131,29 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(super) fn unwatch_dir(&mut self, key: NodeKey) {
     if let Some(backend) = &mut self.backend {
       backend.unwatch(key);
-      self.unwatched_since_commit = true;
+      self.uncommitted = true;
+    }
+  }
+
+  pub(super) fn watch_target(&mut self, key: NodeKey, path: &Path) {
+    let Some(real_place) = self.tree.link(key).filter(|&real_place| real_place != 0) else {
+      return;
+    };
+    if self.tree.watched_target(key) == Some(real_place) {
+      return;
+    }
+    let Some(backend) = &mut self.backend else { return };
+    let Ok(target) = self.fs.real_path(path) else { return };
+    let Some(dir) = target.parent() else { return };
+    backend.watch(key, dir, Want::Contents);
+    self.tree.set_watched_target(key, Some(real_place));
+    self.uncommitted = true;
+  }
+
+  pub(super) fn unwatch_target(&mut self, key: NodeKey) {
+    if self.tree.watched_target(key).is_some() {
+      self.tree.set_watched_target(key, None);
+      self.unwatch_dir(key);
     }
   }
 

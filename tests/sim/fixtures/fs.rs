@@ -234,6 +234,14 @@ impl SimFs {
     }
   }
 
+  /// Whether the last name of `path` is spelled as the disk spells it, also when the engine
+  /// may not read it.
+  pub fn spelled_as_on_disk(&self, path: impl AsRef<Path>) -> bool {
+    let (path, state) = (path.as_ref(), self.lock());
+    let name = state.resolve(path, false).map(|id| state.inodes[&id].name.clone());
+    name.is_ok_and(|name| path.file_name() == Some(name.as_os_str()))
+  }
+
   /// The directory that `path` leads to, links followed: a number for it and its real path.
   /// Unlike an inode number, the number is never given to another directory. `None`: `path`
   /// leads to no directory.

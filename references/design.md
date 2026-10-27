@@ -28,8 +28,9 @@ The whole contract follows from three definitions.
    set is empty. The ignore filter applies to the path itself, to the directories above it, and to
    every entry below it (§4.8). What it ignores counts as nothing there. A file is anything that
    is not a directory. A watched path that is a symbolic link, or that passes through one, is
-   followed. A symbolic link below a watched directory is a file, except while a watched path is
-   at it or passes through it (§4.9).
+   followed. A symbolic link below a watched directory is a file of that directory, also while a
+   watched path is at it or passes through it. What is behind the link belongs to that watched
+   path alone (§4.9).
 2. **Events are the difference between the told set and the disk.** The **told set** is what the
    handler believes exists: the baseline of each `watch`, plus every `Create`, minus every
    `Delete`, minus what an `unwatch` forgets (§4.4). Once the watcher has caught up, the told set
@@ -110,13 +111,16 @@ events.
 
 - The tree is a sparse copy of the directory tree. One node is one name, and the node records
   what is at that name: nothing, a file, or a directory. When a path changes its kind, its node
-  changes. Nothing moves to another place.
+  changes. Nothing moves to another place. A registered name that is a symbolic link records what
+  is behind the link and, in a complete directory, the link itself as a file of that directory
+  (§4.9).
 - A **registered name** is a watched path or a name on the way to one. Its node remains while
   nothing is on disk at its path.
-- A directory is **complete** when its path is a watched path or its parent is complete, provided
-  in both cases that the filter does not ignore it as a directory. The engine tracks every entry of
-  a complete directory. Every other directory on the way to a watched path is **partial**, and the
-  engine tracks only its registered names. Nothing next to a watched path is tracked or reported.
+- A directory is **complete** when its path is a watched path, or when its parent is complete and
+  its name is not a symbolic link, provided in both cases that the filter does not ignore it as a
+  directory. The engine tracks every entry of a complete directory. Every other directory on the way
+  to a watched path is **partial**, and the engine tracks only its registered names. Nothing next to
+  a watched path is tracked or reported.
 
 ### 4.2 From hint to event
 
@@ -178,10 +182,9 @@ about a file at the node, and whether a file is there now.
 - `unwatch` undoes a `watch` of exactly the same paths and reports nothing. What only this path
   covered is forgotten: the file at it, or every file below it down to the next watched path. The
   handler is not told, even when a `Delete` of the file was pending. Whether a file is covered is
-  decided by the rule of §4.1, from the paths alone and without a look at the disk. What another
-  watched path still covers stays as it is.
-- There is one exception. A symbolic link inside a watched directory is followed only while it is
-  registered. After `unwatch` it is a file entry again, and its check can report a change (§4.9).
+  decided by the rule of §4.1, from the paths and the links that the tree knows on the way, without
+  a look at the disk. What another watched path still covers stays as it is. A symbolic link that
+  a watched directory has as a file is one of these, even when the path was at it.
 - A path that is watched again later gets a new baseline.
 
 ### 4.5 Absence and the delete delay
@@ -262,8 +265,8 @@ spells it, and each entry has exactly one such name. Each watched path is an ind
 Two watched paths that are two spellings of one file both receive its events. A watched path inside
 a watched directory that is spelled differently from the disk receives its events alongside those
 that the directory reports under the disk's name. Symbolic links follow the same rule: a registered
-link is followed, and a listed link is a file. Polling behaves this way by construction, and the OS
-watches must produce the same events.
+link is followed for its watched path, and the same link, listed, is a file of its directory.
+Polling behaves this way by construction, and the OS watches must produce the same events.
 
 - **Loose or strict** is a property of the watcher, not a question asked of each directory. A
   watcher treats every directory as loose, or every directory as strict.
@@ -319,22 +322,26 @@ an ignored file replaces are gone from the disk, so each of them gets a `Delete`
 
 ### 4.9 Symbolic links
 
-- A symbolic link **inside a watched directory** that is not registered is a file entry. It is
-  never followed and never opened.
-- A **registered name** that is a symbolic link is followed. Event paths keep the registered
-  spelling.
+- A symbolic link **inside a watched directory** is a file entry of that directory. It is never
+  followed and never opened for the directory, also while a registered name is at it (§4.6).
+- A **registered name** that is a symbolic link is followed for the watched path that is at it or
+  behind it. Event paths keep the registered spelling. What is behind the link belongs to that
+  watched path alone. The directory that lists the link does not cover it, and a directory behind
+  the link is complete only when the link is itself a watched path (§4.1).
+- So the `watch` and the `unwatch` of a path at or through a link change nothing for the
+  directory that lists the link. What is behind the link becomes the baseline of that `watch`, and
+  that `unwatch` forgets it (§4.4).
+- A link that is a watched path to a file, and a file of a complete directory too, is one path with
+  two sources. It is a file while either of the two has a file there. A change of either is an
+  `Update`, and the `Delete` comes when neither has one.
 - When what lies behind a registered name changes and the directory is still the same one, the
   directory is watched again and scanned deep. This covers a name that becomes a link or stops
   being one, and a link that now leads to another real path. Otherwise a watch bound to a path
   would be dead. If the look behind the link gets no answer, nothing changes.
 - A tree watch does not report what lies behind a symbolic link, so a directory reached through a
-  link is watched on its own.
+  link is watched on its own. So is the directory of a file behind a watched path that is a link.
+  That watch only brings the look sooner. Its notifications are hints, not reported writes (§4.6).
 - Nothing watches a symbolic link itself. Every poll checks each registered name that is a link.
-- When `watch` places a watched path at or behind a link that was not followed until then, what
-  lies behind the link becomes the baseline of that `watch`. There is one exception, a link to a
-  file that a complete directory has already told. The told file was the link entry, and the file
-  behind it has another fingerprint, so this `watch` reports an `Update` for it (§4.4). After
-  `unwatch` the link is a file entry again (§4.4).
 
 ### 4.10 Errors from the disk
 

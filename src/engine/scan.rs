@@ -179,6 +179,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       while let Some(child) = next_child {
         next_child = self.tree.next_sibling(child);
         self.tree.take_mark(child);
+        self.drop_entry(child, true);
         match self.tree[child].kind {
           Kind::File(_) => self.forget_file(child),
           Kind::Dir(_) => stack.push(child),

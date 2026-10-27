@@ -262,12 +262,11 @@ fn unwatch_one_of_two_files_costs_nothing() {
   });
 }
 
-/// A link inside a watched directory is followed only while a watched path goes through it, or
-/// is the link itself. When that path is taken back, the link is a file entry of the watched
-/// directory again. For a link to a directory that is the change of kind that it is: the files
-/// that were known behind the link go, and the link comes. A link to a file stays known: it is
-/// the link itself that the directory reports now, and the stored fingerprint is the one of the
-/// link.
+/// A link inside a watched directory is a file of that directory, also while a watched path
+/// goes through it or is the link itself. The `watch` and the `unwatch` of such a path change
+/// nothing for the directory: what is behind the link is the path's alone, and it is forgotten
+/// with the path. A link to a file at a watched path is one known file with two sources, and the
+/// directory keeps it.
 #[test]
 fn unwatch_a_path_behind_a_link_inside_a_watched_directory() {
   on_all(&Options::default(), |d, on| {
@@ -282,15 +281,15 @@ fn unwatch_a_path_behind_a_link_inside_a_watched_directory() {
     d.advance(Duration::from_secs(3));
     assert_eq!(d.watch(&["/p/R", "/p/R/link.js"]), NONE, "{on}");
     assert_eq!(d.known(), ["/p/R/link", "/p/R/link.js"], "{on}");
-    // The link to the directory is followed from now on: what is behind it is the baseline.
-    assert_eq!(d.watch(&["/p/R/link/a.js"]), ["D /p/R/link"], "{on}");
-    assert_eq!(d.known(), ["/p/R/link/a.js", "/p/R/link/b.js", "/p/R/link.js"], "{on}");
+    // The watched path is followed through the link: the file behind it is its baseline.
+    assert_eq!(d.watch(&["/p/R/link/a.js"]), NONE, "{on}");
+    assert_eq!(d.known(), ["/p/R/link", "/p/R/link/a.js", "/p/R/link.js"], "{on}");
+    d.fs().write("/store/a.js", "22").unwrap();
+    d.fs().write("/store/b.js", "22").unwrap();
+    d.fs().write("/target.js", "new content").unwrap();
+    assert_eq!(d.settled(), ["U /p/R/link/a.js", "U /p/R/link.js"], "{on}");
 
-    // One `Update` too many for the link to the file is allowed here; a stale fingerprint is
-    // not.
-    let mut events = d.unwatch(&["/p/R/link/a.js", "/p/R/link.js"]);
-    events.retain(|event| event != "U /p/R/link.js");
-    assert_eq!(events, ["C /p/R/link", "D /p/R/link/a.js", "D /p/R/link/b.js"], "{on}");
+    assert_eq!(d.unwatch(&["/p/R/link/a.js", "/p/R/link.js"]), NONE, "{on}");
     assert_eq!(d.known(), ["/p/R/link", "/p/R/link.js"], "{on}");
     // The targets are not read any more.
     d.fs().write("/store/a.js", "22").unwrap();

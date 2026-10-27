@@ -17,7 +17,8 @@ use crate::{
   fs::{DirId, Entry, FileType, Fs, is_delete_pending, is_link_loop, is_missing},
   path::push_name,
   tree::{
-    Added, Content, Depth, Dir, Fingerprint, Kind, Mark, Watch, nanos, nanos_of, room_to_keep,
+    Added, Content, Depth, Dir, Fingerprint, Kind, LinkEntry, Mark, Watch, nanos, nanos_of,
+    room_to_keep,
   },
 };
 
@@ -31,6 +32,23 @@ pub(super) enum Found {
   File(FileType, Fingerprint),
   Dir { id: DirId, complete: bool, relinked: bool, young: bool },
   NoAnswer,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum EntryLook {
+  Keep,
+  Gone,
+  Now { before: Option<LinkEntry>, entry: Option<LinkEntry>, changed: bool },
+}
+
+impl EntryLook {
+  fn of(before: Option<LinkEntry>, entry: Option<LinkEntry>, changed: bool) -> Self {
+    if before.is_none() && entry.is_none() {
+      Self::Keep
+    } else {
+      Self::Now { before, entry, changed }
+    }
+  }
 }
 
 #[derive(Clone, Copy)]
@@ -96,8 +114,17 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let was_unlisted = node.is_unlisted();
 
     push_name(path, self.tree.name(key));
-    let (found, on_disk) = self.read_entry(parent, key, path, listed);
-    self.apply(key, path, found, was_unlisted, why);
+    let on_disk = if registered {
+      let (found, on_disk, entry) = self.read_registered_name(parent, key, path, listed, why);
+      let had = self.tree[key].kind;
+      self.apply(key, path, found, was_unlisted, why);
+      self.settle_entry(key, entry, had, why);
+      on_disk
+    } else {
+      let (found, on_disk) = self.read_entry(parent, key, path, listed);
+      self.apply(key, path, found, was_unlisted, why);
+      on_disk
+    };
 
     let wants_more = registered && !self.tree[key].is_dir() && self.tells_names_only(parent);
     let can_go = !registered && matches!(self.tree[key].kind, Kind::Missing);
@@ -133,9 +160,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     path: &Path,
     listed: Listed,
   ) -> (Found, Option<OsString>) {
-    if self.tree[key].is_registered() {
-      self.read_registered_name(parent, key, path, listed)
-    } else if self.tree[parent].is_complete() {
+    if self.tree[parent].is_complete() {
       self.read_listed_name(parent, key, path, listed)
     } else if self.tracks_every_entry(parent) {
       (Found::NoAnswer, None)
@@ -150,7 +175,8 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     key: NodeKey,
     path: &Path,
     listed: Listed,
-  ) -> (Found, Option<OsString>) {
+    why: Mark,
+  ) -> (Found, Option<OsString>, EntryLook) {
     let node = &self.tree[key];
     let (is_ancestor, is_path, was_unlisted) =
       (node.is_ancestor(), node.is_path(), node.is_unlisted());
@@ -158,12 +184,16 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     let unsure = in_complete && self.tree.loose_spelling && self.spelling_is_unsure(key, listed);
     let mut meta = match self.fs.lstat(path) {
       Ok(meta) => meta,
-      Err(error) => return (self.look_error(parent, key, path, listed, error), None),
+      Err(error) => {
+        let found = self.look_error(parent, key, path, listed, error);
+        let entry = if matches!(found, Found::Missing) { EntryLook::Gone } else { EntryLook::Keep };
+        return (found, None, entry);
+      }
     };
     let other = if unsure {
       match self.other_spelling(key, path) {
         Ok(other) => other,
-        Err(error) => return (self.disk_error(parent, path, error), None),
+        Err(error) => return (self.disk_error(parent, path, error), None, EntryLook::Keep),
       }
     } else {
       None
@@ -173,25 +203,43 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       .then(|| self.fs.real_path(path).map_or(0, |real| hash_of(&real)));
     let old = self.tree.link(key);
     let relinked = old != link;
+    let (mut before, mut changed) = (self.tree.entry(key), false);
+    let entry = (link.is_some()
+      && in_complete
+      && other.is_none()
+      && !self.ignores(key, path, EntryKind::File))
+    .then(|| LinkEntry { file: Fingerprint::of(&meta), text: self.link_text(path) });
+    if old.is_some() && link.is_none() {
+      self.unwatch_target(key);
+    }
     self.tree.set_link(key, link);
+    let mut behind = None;
     if link.is_some() {
-      meta = match self.fs.stat(path) {
-        Ok(meta) => meta,
-        Err(error) => {
-          let found = self.disk_error(parent, path, error);
-          if matches!(found, Found::NoAnswer) {
+      match self.fs.stat(path) {
+        Ok(followed) => meta = followed,
+        Err(error) => match self.disk_error(parent, path, error) {
+          Found::NoAnswer => {
             self.tree.set_link(key, old);
             self.tree[key].set_unlisted(was_unlisted);
+            return (Found::NoAnswer, None, EntryLook::Keep);
           }
-          return match found {
-            Found::Missing if !is_path => respelled(other),
-            found => (found, None),
-          };
-        }
-      };
+          found => behind = Some(found),
+        },
+      }
+      if old.is_none()
+        && let Some(entry) = entry
+      {
+        (before, changed) = self.take_entry_of(key, entry.text, why);
+      }
+    }
+    let entry = EntryLook::of(before, entry, changed);
+    match behind {
+      Some(Found::Missing) if !is_path => return with(respelled(other), entry),
+      Some(found) => return (found, None, entry),
+      None => {}
     }
 
-    let inside = is_path || (in_complete && other.is_none());
+    let inside = is_path || (in_complete && other.is_none() && link.is_none());
     let kind = entry_kind(meta.kind);
     let visible = inside && !self.ignores(key, path, kind);
     let found = match kind {
@@ -200,9 +248,84 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         Found::Dir { id: meta.dir_id, complete: visible, relinked, young }
       }
       EntryKind::File if visible => Found::File(meta.kind, Fingerprint::of(&meta)),
-      _ => return respelled(other),
+      _ => return with(respelled(other), entry),
     };
-    (found, other.filter(|_| !was_unlisted))
+    (found, other.filter(|_| !was_unlisted), entry)
+  }
+
+  fn link_text(&self, path: &Path) -> u64 {
+    self.fs.link_target(path).map_or(0, |target| hash_of(&target))
+  }
+
+  fn take_entry_of(&mut self, key: NodeKey, text: u64, why: Mark) -> (Option<LinkEntry>, bool) {
+    let Kind::File(file) = self.tree[key].kind else { return (None, false) };
+    let changed = match self.tree.content(key) {
+      None => false,
+      Some(Content::Hash(old)) => text != old,
+      Some(Content::Pending) => self.hint_may_be_lost(key, why),
+      Some(Content::Unknown) => true,
+    };
+    self.tree[key].kind = Kind::Missing;
+    self.tree.set_content(key, None);
+    self.tree.set_ahead_since(key, None);
+    self.tree.unhold(key);
+    (Some(LinkEntry { file, text }), changed)
+  }
+
+  fn settle_entry(&mut self, key: NodeKey, look: EntryLook, had: Kind, why: Mark) {
+    match look {
+      EntryLook::Keep => {}
+      EntryLook::Gone => {
+        if self.tree.entry(key).is_none() {
+          return;
+        }
+        if matches!(had, Kind::Missing) {
+          self.missing(key, why.since);
+        }
+        if !self.tree[key].is_held() {
+          self.tree.set_entry(key, None);
+          self.touched.push(key);
+        }
+      }
+      EntryLook::Now { before, entry, changed } => {
+        self.tree.set_entry(key, entry);
+        let is_file = matches!(self.tree[key].kind, Kind::File(_));
+        let file_went = matches!(had, Kind::File(_)) && !is_file;
+        match (before, entry) {
+          (None, None) => {}
+          (None, Some(_))
+            if self.entry_watched_before(key) || (self.tree[key].told() && !is_file) =>
+          {
+            let node = &mut self.tree[key];
+            if node.told() {
+              node.set_changed(true);
+            } else if is_file {
+              node.set_baseline(false);
+            }
+            self.touched.push(key);
+          }
+          (None, Some(_)) => {
+            if !is_file {
+              self.tree.mark_entry_baseline(key);
+            }
+            self.touched.push(key);
+          }
+          (Some(old), Some(new)) if old == new && !changed && !file_went && !why.written => {}
+          (Some(_), Some(_)) => {
+            self.tree[key].set_changed(true);
+            self.touched.push(key);
+          }
+          (Some(_), None) if self.tree[key].is_held() && matches!(had, Kind::File(_)) => {}
+          (Some(_), None) => {
+            self.tree[key].set_changed(is_file);
+            self.touched.push(key);
+          }
+        }
+        if matches!(self.tree[key].kind, Kind::Missing) {
+          self.tree.unhold(key);
+        }
+      }
+    }
   }
 
   fn read_listed_name(
@@ -341,6 +464,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
         if let Kind::File(_) = had {
           self.forget_file(key);
         }
+        self.tree.unhold(key);
         self.appear(key, path, id, complete, relinked);
         self.look_again_at_a_new_dir(key, young);
       }
@@ -354,9 +478,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           dir.id = id;
         }
         let unlisted = self.tree[key].is_unlisted();
+        let respelled = unlisted && (was_complete || !was_unlisted);
         if complete && !was_complete {
           self.make_complete(key, relinked);
-        } else if !complete && unlisted && (was_complete || !was_unlisted) {
+        } else if !complete && (respelled || (was_complete && self.tree.link(key).is_some())) {
           self.uncover(key, true);
         } else if complete && relinked && self.tree[key].added() == Added::Registered {
           self.tree[key].set_baseline(true);
@@ -440,7 +565,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let baseline = !self.watched_before(key);
       let node = &mut self.tree[key];
       node.set_baseline(baseline);
-      node.told()
+      node.told() && !baseline
     };
     let node = &mut self.tree[key];
     if changed {
@@ -459,6 +584,9 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.set_content(key, content);
     if young && trusts_hints {
       self.await_delivery(key, fingerprint.modified, only_polled);
+    }
+    if self.tree[key].is_path() {
+      self.watch_target(key, path);
     }
   }
 
@@ -567,6 +695,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       backend.ask_delivered(at);
     }
   }
+}
+
+fn with(
+  (found, on_disk): (Found, Option<OsString>),
+  entry: EntryLook,
+) -> (Found, Option<OsString>, EntryLook) {
+  (found, on_disk, entry)
 }
 
 fn respelled(other: Option<OsString>) -> (Found, Option<OsString>) {

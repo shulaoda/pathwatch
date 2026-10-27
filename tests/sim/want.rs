@@ -248,7 +248,8 @@ fn a_watched_directory_that_the_filter_ignores() {
 }
 
 /// A watched path that is a link is followed, also by the look for its kind: behind a link to
-/// a directory there is a watched directory, and behind a link to a file a watched file.
+/// a directory there is a watched directory, and behind a link to a file a watched file. The
+/// directory of that file is watched for its contents too, under the key of the link.
 #[test]
 fn a_watched_link() {
   let mut d = Driver::sim(Mode::Inode, Options::default());
@@ -261,6 +262,7 @@ fn a_watched_link() {
   d.watch(&["/p/dir", "/q/file.js"]);
   let calls = [
     at("/", Some(Names)),
+    at("/", Some(Contents)),
     at("/p", Some(Names)),
     at("/q", Some(Contents)),
     at("/p/dir", Some(Contents)),

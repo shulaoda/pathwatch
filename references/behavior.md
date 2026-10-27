@@ -33,7 +33,7 @@ The README gives a short overview, `design.md` states the rules behind this beha
 | `Watcher::new(handler)` | Starts a watcher with the default `Config`. Nothing is watched yet. It fails only when the watcher thread, or the queue that feeds it, cannot be created. When the watch API of the OS cannot start, the handler receives one error (`WatchLimit` or `Io`) and the watcher polls everything. |
 | `Watcher::with_config(config, handler)` | Starts a watcher with the given `Config`, in the same way. |
 | `watch(paths)` | Watches the given paths as one operation. Each path can be a file, a directory together with everything below it, or a path that does not exist yet. Returns once every path is watched. Watching a path that is already watched has no effect. |
-| `unwatch(paths)` | Undoes an earlier `watch` of exactly these paths. Nothing is reported for them, with one exception. When such a path was followed through a symbolic link inside a watched directory, the link becomes an ordinary file of that directory again, and this change is reported (promise 12). |
+| `unwatch(paths)` | Undoes an earlier `watch` of exactly these paths. Nothing is reported for them (promise 7). |
 | `close()` | Stops the watcher and waits for its thread to exit. A disk check in progress stops at its next step, so it adds at most one look at the disk, and a handler call that is running is waited for until it returns. Afterwards the handler is not called again, and `watch` and `unwatch` return `Closed`. Dropping the `Watcher` has the same effect. |
 
 The handler has the type `FnMut(Result<Vec<Event>, Error>) + Send + 'static`, and `Watcher` is
@@ -199,9 +199,8 @@ The story with sockets (promise 1) runs on Unix only.
    or renamed) produces one `Delete` for each known file below it.
 7. **`unwatch` reports nothing.** A file that another watched path still covers remains known, and
    its changes are reported as before. A watched directory covers the names that it lists, not a
-   path that is spelled differently from the disk (promise 13). There is one exception. A symbolic
-   link inside a watched directory, through which the path was followed, becomes an ordinary file
-   of that directory again, and this change is reported (promise 12).
+   path that is spelled differently from the disk (promise 13), and not what lies behind a symbolic
+   link in it (promise 12).
 8. **Paths.** A relative path is resolved against the current directory at the time of the call.
    `.`, repeated separators and a trailing separator are removed, and `..` removes the component
    before it. All of this is done on the text, and no symbolic link is resolved. The result, the
@@ -240,13 +239,12 @@ The story with sockets (promise 1) runs on Unix only.
 11. **Nothing beside a watched path.** A file next to a watched file is not reported.
 12. **Symbolic links.** A watched path that is a symbolic link, or that passes through one, is
     followed, and its events use the spelling that was given. A symbolic link inside a watched
-    directory is a file and is not followed. While a watched path is at such a link or passes
-    through it, the directory follows the link too. For a link to a directory, the `watch` of that
-    path reports the link as gone, and what lies behind the link becomes the baseline of that
-    `watch`. The `unwatch` of that path reports the link as a new file and a `Delete` for each
-    known file behind it (promise 6), although these files are still on the disk. A link to a file
-    stays a known file of the directory. The `watch` and the `unwatch` of a watched path at it
-    each report an `Update` of the link.
+    directory is a file of that directory and is not followed, also while a watched path is at it
+    or passes through it. What lies behind the link belongs to that watched path alone, so its
+    `watch` and its `unwatch` report nothing for the directory. A watched path at a link to a file
+    that a watched directory also lists is one known file: a change of the link or of the file
+    behind it is an `Update`, and the `Delete` comes when neither is there. A write to the file
+    behind a watched link is heard through an OS watch of the directory of that file.
 13. **Spelling.** Some disks treat two spellings of a name as one entry, such as two letter cases
     or two Unicode normalization forms. The default disks of macOS and Windows do so. On such a
     disk, a watched path is the text that was given. It refers to whatever the OS finds at that
@@ -359,7 +357,7 @@ the watcher gets in the way of other programs. None of them is fixed.
   is removed and made again at once can keep its inode (`architecture.md` §2.2). In both cases the
   watcher reports every young file whose fingerprint could hide such a write. macOS is not
   affected, because it reads such a file.
-- **A young file larger than 16 MiB, or one that cannot be read, that only the poll inspects**
+- **A young file larger than 16 MiB, or one that cannot be read, for which no write is reported**
   receives one `Update` when it becomes 2 s old, even when nothing changed, and even when it was
   written just before `watch`. Under polling this is every such file. With an OS backend it is a
   watched symbolic link to such a file, and such a file in a polled directory, for example beyond
@@ -375,9 +373,12 @@ the watcher gets in the way of other programs. None of them is fixed.
   or within the poll interval when polling is on. A link that points elsewhere and back within
   that time is not detected, and nothing that happened at the other target in between is
   reported.
-- **A watched path that is a symbolic link to a file.** A write to the file behind it is detected
-  by the same poll, within one second, with every backend. A rewrite of the same size that restores
-  the old modification time is not reported for such a path, on Linux either.
+- **A watched path that is a symbolic link to a file.** The OS watch of the directory of the file
+  behind it only brings the look sooner, and no write is reported for that file. So a rewrite of
+  the same size that restores the old modification time is not reported for such a path, on Linux
+  either. Where the directory gets no OS watch (`/`, `/Users` or a home directory on macOS, beyond
+  the inotify watch limit), a write to the file is found by the poll of the links, within one
+  second.
 - **Windows: the directories above a watched path** are polled once per second. When one of them is
   created, recreated or removed, the events can arrive up to one second late. On macOS each of them
   is instead held open for kernel events, which arrive at once. One case is late: after `rm -r` of
@@ -429,9 +430,7 @@ the watcher gets in the way of other programs. None of them is fixed.
 ## Timing
 
 - **Normally** an event arrives within the quiet time (none on macOS, 10 ms elsewhere) plus the
-  time that the OS takes to report the change, about 1 to 15 ms. For a watched path that is a
-  symbolic link to a file, a write to the file behind it is found by the poll of the links, within
-  one second.
+  time that the OS takes to report the change, about 1 to 15 ms.
 - **Under polling** a change is found by the next round, and its event comes when that round ends.
   This takes at most the poll interval (100 ms) plus the duration of two rounds (a round takes about
   50 ms for 20,000 files on APFS), or three times the duration of a round when a round takes longer
@@ -472,7 +471,7 @@ the watcher gets in the way of other programs. None of them is fixed.
 | ignore initial | always on | Not configurable. What exists when `watch` returns is not reported, except in the cases of promise 4. Read the directory yourself if you need the list. |
 | directory events | none | Not supported. A directory is reported as its files, so a moved directory needs no walk on the caller's side. |
 | rename events | none | Not supported. A rename is a `Delete` and a `Create`. The watcher does not report the renames that the OS describes. It compares the disk with what it has reported. The one exception is a write that the OS reports (Linux, Windows), which is an `Update` even when the disk looks the same. On Linux a file that is moved in also counts as written, so a file renamed away and back within the delete delay gives one `Update` there and nothing elsewhere. |
-| symlinks | no option | Supported differently. A watched path is followed, and a symbolic link inside a watched directory is a file. Following links inside a watched directory is not supported. |
+| symlinks | no option | Supported differently. A watched path is followed, and a symbolic link inside a watched directory is a file, also while a watched path goes through it. Following links inside a watched directory is not supported. |
 | errors | `Err(error)` to the handler | Supported. The watcher keeps running after every error. |
 | depth, `since` | none | Not supported. There is no depth limit, and no changes from before the call are reported. |
 

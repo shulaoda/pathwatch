@@ -12,9 +12,10 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   pub(super) fn finish(&mut self, out: &mut Output) {
     let mut touched = std::mem::take(&mut self.touched);
     for key in touched.drain(..) {
+      let entry = self.tree.take_entry_baseline(key);
       let Some(node) = self.tree.get_mut(key) else { continue };
-      let kind = event_of(node);
-      node.set_told(matches!(node.kind, Kind::File(_)));
+      let kind = event_of(node, entry);
+      node.set_told(matches!(node.kind, Kind::File(_)) || entry.is_some());
       node.set_changed(false);
       node.set_added(Added::No);
       node.set_baseline(false);
@@ -33,7 +34,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     match self.tree[key].kind {
       Kind::File(_) => self.forget_file(key),
       Kind::Dir(_) => self.vanish(key),
-      Kind::Missing => {}
+      Kind::Missing => self.tree.unhold(key),
     }
   }
 
@@ -42,7 +43,26 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.set_content(key, None);
     self.tree.set_ahead_since(key, None);
     self.tree.unhold(key);
+    self.unwatch_target(key);
     self.touched.push(key);
+  }
+
+  pub(super) fn drop_entry(&mut self, key: NodeKey, tell: bool) {
+    if self.tree.entry(key).is_none() {
+      return;
+    }
+    self.tree.set_entry(key, None);
+    if matches!(self.tree[key].kind, Kind::Missing) {
+      self.tree.unhold(key);
+    }
+    let node = &mut self.tree[key];
+    let is_file = matches!(node.kind, Kind::File(_));
+    if tell {
+      node.set_changed(is_file);
+      self.touched.push(key);
+    } else {
+      node.set_told(is_file);
+    }
   }
 
   pub(super) fn missing(&mut self, key: NodeKey, since: Option<Instant>) {
@@ -90,11 +110,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   }
 }
 
-fn event_of(node: &Node) -> Option<EventKind> {
-  match (node.told(), matches!(node.kind, Kind::File(_))) {
+fn event_of(node: &Node, entry: Option<bool>) -> Option<EventKind> {
+  let file = matches!(node.kind, Kind::File(_));
+  let baseline = if file { node.baseline() } else { entry == Some(true) };
+  match (node.told(), file || entry.is_some()) {
     (true, false) => Some(EventKind::Delete),
     (true, true) if node.changed() => Some(EventKind::Update),
-    (false, true) if !node.baseline() => Some(EventKind::Create),
+    (false, true) if !baseline => Some(EventKind::Create),
     _ => None,
   }
 }
@@ -139,7 +161,7 @@ mod tests {
       node.set_told(told);
       node.set_changed(changed);
       node.set_baseline(baseline);
-      assert_eq!(event_of(node), expected, "{what}");
+      assert_eq!(event_of(node, None), expected, "{what}");
     }
   }
 }

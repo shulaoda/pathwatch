@@ -215,8 +215,8 @@ impl<B: Deliver> Driver<B> {
     let ignored = |path: &Path, kind: EntryKind| {
       self.ignored.as_ref().is_some_and(|ignored| ignored(path, kind))
     };
-    let stored = self.engine.fingerprints();
-    if let Err(stale) = check_fingerprints(&self.fs, &self.watched, &stored) {
+    let (stored, entries) = (self.engine.fingerprints(), self.engine.link_entries());
+    if let Err(stale) = check_fingerprints(&self.fs, &self.watched, &stored, &entries) {
       panic!("not caught up: {stale}");
     }
     if let Err(wrong) = self.fs.quiet(|| self.engine.check_spellings()) {

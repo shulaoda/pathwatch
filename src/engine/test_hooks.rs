@@ -30,6 +30,12 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     self.tree.nodes().filter_map(stored).collect()
   }
 
+  pub fn link_entries(&self) -> Vec<(PathBuf, Fingerprint)> {
+    let entry =
+      |(key, _): (NodeKey, &Node)| Some((self.tree.path(key), self.tree.entry(key)?.file));
+    self.tree.nodes().filter_map(entry).collect()
+  }
+
   pub fn pending_deletes(&self) -> BTreeSet<PathBuf> {
     let waits =
       |key: NodeKey, node: &Node| node.told() && (node.is_held() || self.tree.frozen(key));
@@ -85,10 +91,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       let fail = |what: &str| Err(format!("{}: {what}", self.tree.path(key).display()));
 
       let Some(parent) = self.tree.parent(key) else {
-        let fixed = node
-          .dir()
-          .is_some_and(|dir| !dir.complete && dir.asked.is_none() && dir.watch == Watch::Polled);
-        if !fixed || node.is_path() || node.is_marked() || node.told() {
+        if !is_the_root_as_always(node) {
           return fail("the root is not what it always is");
         }
         continue;
@@ -97,14 +100,19 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       if !matches!(node.kind, Kind::Missing) && !parent_is_dir {
         return fail("the tree has it below a node that is no directory");
       }
-      if node.told() != matches!(node.kind, Kind::File(_)) {
+      let (frozen, waits) = (self.tree.frozen(key), self.mark_waits_above(key));
+      let (entry, listed) = (self.tree.entry(key).is_some(), self.tree[parent].is_complete());
+      if node.told() != (matches!(node.kind, Kind::File(_)) || entry) {
         return fail("the handler and the tree do not agree about a file here");
+      }
+      if entry && !((listed && !node.is_unlisted()) || frozen || waits) {
+        return fail("keeps a link as a file of a directory that does not list it");
       }
       if node.changed() || node.baseline() || node.added() != Added::No {
         return fail("an event, or the baseline, is left over from a call");
       }
       if node.is_held() {
-        if matches!(node.kind, Kind::Missing) {
+        if matches!(node.kind, Kind::Missing) && !entry {
           return fail("is held, and the tree has nothing there");
         }
         let queued = self
@@ -115,8 +123,6 @@ impl<B: Backend, F: Fs> Engine<B, F> {
           return fail("is held, and nothing brings its second look");
         }
       }
-      let frozen = self.tree.frozen(key);
-      let waits = self.mark_waits_above(key);
       match &node.kind {
         Kind::Missing => {
           if !node.is_registered() && !node.is_marked() {
@@ -190,6 +196,13 @@ impl<B: Backend, F: Fs> Engine<B, F> {
   fn mark_waits_above(&self, key: NodeKey) -> bool {
     iter::successors(Some(key), |&at| self.tree.parent(at)).any(|at| self.tree[at].is_marked())
   }
+}
+
+fn is_the_root_as_always(node: &Node) -> bool {
+  let dir = node.dir();
+  let fixed =
+    dir.is_some_and(|dir| !dir.complete && dir.asked.is_none() && dir.watch == Watch::Polled);
+  fixed && !node.is_path() && !node.is_marked() && !node.told()
 }
 
 fn keeps_not_ignored(node: &Node) -> bool {

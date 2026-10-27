@@ -106,7 +106,7 @@ pub struct Engine<B: Backend, F: Fs> {
   flush_time: i64,
   flush_ticks: Duration,
   away_scan: bool,
-  unwatched_since_commit: bool,
+  uncommitted: bool,
   touched: Vec<NodeKey>,
   narrowing: Vec<NodeKey>,
   stop: Option<Arc<AtomicBool>>,
@@ -163,7 +163,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
       flush_time: 0,
       flush_ticks: Duration::ZERO,
       away_scan: false,
-      unwatched_since_commit: false,
+      uncommitted: false,
       touched: Vec::new(),
       narrowing: Vec::new(),
       stop: None,
@@ -326,7 +326,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
     loss_scans_ran |= self.check_marks(&mut path, rest_is_over, hints_due);
     self.due_holds = emptied(mem::take(&mut self.due_holds));
     let mut entries = mem::take(&mut self.entries);
-    while (!self.tree.to_scan.is_empty() || self.unwatched_since_commit) && !self.stopped() {
+    while (!self.tree.to_scan.is_empty() || self.uncommitted) && !self.stopped() {
       self.round(&mut path, &mut entries);
     }
     self.tree.tidy_marked();
@@ -383,7 +383,7 @@ impl<B: Backend, F: Fs> Engine<B, F> {
 
   fn round(&mut self, path: &mut PathBuf, entries: &mut Vec<ScanEntry>) {
     let now_watched = self.commit();
-    self.unwatched_since_commit = false;
+    self.uncommitted = false;
     let mut scans = mem::take(&mut self.scans);
     self.tree.take_scans(&mut scans);
     self.ask_again(now_watched);

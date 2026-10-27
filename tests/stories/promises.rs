@@ -24,7 +24,8 @@
 //! 11. Nothing beside a watched path: `nothing_is_reported_beside_a_watched_path`.
 //! 12. Symbolic links: `p::two_spellings_of_one_directory`,
 //!     `p::watched_paths_below_a_symlinked_prefix`, `a_watched_link_to_a_file_is_followed`,
-//!     `a_link_inside_a_watched_directory_is_a_file`.
+//!     `a_link_inside_a_watched_directory_is_a_file`,
+//!     `a_link_inside_a_watched_directory_stays_a_file_of_it`.
 //! 13. Spelling: `p::watched_paths_in_another_spelling`, `a_watched_file_in_another_unicode_form`,
 //!     `names_below_a_watched_directory_are_spelled_as_on_the_disk`,
 //!     `a_file_is_renamed_to_another_letter_case`,
@@ -541,6 +542,36 @@ fn a_watched_link_to_a_file_is_followed() {
     w.expect(&[(Delete, "link.txt")]);
     w.write("real/f.txt", "1");
     w.expect(&[(Create, "link.txt")]);
+  });
+}
+
+/// A watched path at or through a link inside a watched directory is a question of its own.
+/// The directory has the link as a file before, during and after the watch of that path, and
+/// what is behind the link is the path's alone.
+#[test]
+fn a_link_inside_a_watched_directory_stays_a_file_of_it() {
+  everywhere(|w| {
+    w.write("outside/dir/a.txt", "1");
+    w.write("outside/f.txt", "1");
+    w.mkdir("r");
+    if !w.symlink("outside/dir", "r/to_dir") {
+      return;
+    }
+    assert!(w.symlink("outside/f.txt", "r/to_file"));
+    w.watch(&["r"]);
+    w.watch(&["r/to_dir/a.txt", "r/to_file"]);
+    w.expect(&[]);
+
+    w.write("outside/dir/a.txt", "22");
+    w.write("outside/dir/b.txt", "1");
+    w.write("outside/f.txt", "22");
+    w.expect(&[(Update, "r/to_dir/a.txt"), (Update, "r/to_file")]);
+    w.unwatch(&["r/to_dir/a.txt", "r/to_file"]);
+    w.expect(&[]);
+    w.write("outside/dir/a.txt", "333");
+    w.write("outside/f.txt", "333");
+    w.write("r/seen.txt", "1");
+    w.expect(&[(Create, "r/seen.txt")]);
   });
 }
 
